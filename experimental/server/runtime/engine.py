@@ -381,6 +381,16 @@ def _ensure_plugin_path() -> None:
 
 def _import_runtime():
     """Import the C++ pybind module."""
+    try:
+        runtime_facade = importlib.import_module("tensorrt_edgellm.runtime")
+        native_package = importlib.import_module("tensorrt_edgellm._native")
+        try:
+            return runtime_facade.load()
+        except native_package.NativeManifestNotFoundError:
+            # Source checkouts have no generated variants.json.
+            pass
+    except ImportError:
+        pass
     _ensure_plugin_path()
     try:
         return importlib.import_module("tensorrt_edgellm._edgellm_runtime")

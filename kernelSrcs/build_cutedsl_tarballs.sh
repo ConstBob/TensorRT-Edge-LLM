@@ -40,7 +40,7 @@ case "${host_cuda_major}" in
         ;;
     12)
         : "${CUTE_DSL_CUPY_PACKAGE:=cupy-cuda12x==12.3.0}"
-        : "${CUTE_DSL_TARGETS:=x86_64:sm_80,x86_64:sm_90,x86_64:sm_100,x86_64:sm_120,aarch64:sm_87,aarch64:sm_110,aarch64:sm_121}"
+        : "${CUTE_DSL_TARGETS:=x86_64:sm_80,x86_64:sm_90,x86_64:sm_100,x86_64:sm_120,aarch64:sm_110,aarch64:sm_121}"
         ;;
     *)
         if [[ -z "${CUTE_DSL_CUPY_PACKAGE:-}" ]] || [[ -z "${CUTE_DSL_TARGETS:-}" ]]; then

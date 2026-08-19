@@ -15,10 +15,22 @@
 
 cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
 
+option(EDGELLM_PYTHON_ONLY_WHEEL
+       "Configure only the Python sources for the wheel fan-in base" OFF)
+if(EDGELLM_PYTHON_ONLY_WHEEL)
+  set(_EDGELLM_PROJECT_LANGUAGES NONE)
+else()
+  set(_EDGELLM_PROJECT_LANGUAGES C CXX CUDA)
+endif()
+
 project(
   tensorrt_edgellm_sdk
   VERSION 0.10.0
-  LANGUAGES C CXX CUDA)
+  LANGUAGES ${_EDGELLM_PROJECT_LANGUAGES})
+
+if(EDGELLM_PYTHON_ONLY_WHEEL)
+  return()
+endif()
 
 # Specify the C++ standard and flags
 set(CMAKE_CXX_STANDARD 17)
@@ -105,7 +117,8 @@ endif()
 set_ifndef(CUDA_CTK_VERSION 12.8)
 set_ifndef(CUDA_DIR /usr/local/cuda-${CUDA_CTK_VERSION})
 
-if(NOT AARCH64_BUILD)
+# Wheel payloads are single-SM builds; preserve the caller's architecture.
+if(NOT DEFINED EDGELLM_WHEEL_PAYLOAD_DIR AND NOT AARCH64_BUILD)
   set(CMAKE_CUDA_ARCHITECTURES 80;86;89;90)
   if(CUDA_CTK_VERSION VERSION_GREATER_EQUAL 12.8)
     list(APPEND CMAKE_CUDA_ARCHITECTURES 100a 120)
@@ -264,4 +277,8 @@ endif()
 
 if(BUILD_PYTHON_BINDINGS)
   add_subdirectory(experimental/pybind)
+  if(DEFINED EDGELLM_WHEEL_PAYLOAD_DIR AND NOT EDGELLM_WHEEL_PAYLOAD_DIR
+                                           STREQUAL "")
+    include(${CMAKE_SOURCE_DIR}/packaging/cmake/InstallWheel.cmake)
+  endif()
 endif()

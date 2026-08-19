@@ -11,6 +11,20 @@ variables:
   TRT10_X86_VERSION: "10.16.0.72"
   TRT10_THOR_VERSION: "10.16.0.72"
   TRT11_VERSION: "11.0.0.114"
+  WHEEL_IMAGE_UBUNTU2204_CU13: "artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:main-native-x86_64-ubuntu22.04-cuda13.0"
+  WHEEL_IMAGE_UBUNTU2404_CU13: "artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:main-native-x86_64-ubuntu24.04-cuda13.2"
+  WHEEL_IMAGE_JETPACK70: "urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:main-cross-aarch64-ubuntu24.04-cuda13.2"
+  WHEEL_IMAGE_JETPACK71: "urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:main-cross-aarch64-ubuntu24.04-cuda13.2"
+  WHEEL_IMAGE_JETPACK72: "urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:main-cross-aarch64-ubuntu24.04-cuda13.2"
+  WHEEL_IMAGE_DRIVE72: "urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:main-cross-aarch64-d7l-cuda13.3-n1auto"
+  WHEEL_IMAGE_DGX_SPARK: "ubuntu:24.04"
+  WHEEL_TRT10_X86_UBUNTU2204_CU13_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT10_X86_VERSION/TensorRT-$TRT10_X86_VERSION.x86_64.cuda-13.2"
+  WHEEL_TRT10_X86_UBUNTU2404_CU13_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT10_X86_VERSION/TensorRT-$TRT10_X86_VERSION.x86_64.cuda-13.2"
+  WHEEL_TRT11_X86_UBUNTU2404_CU13_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT11_VERSION/TensorRT-$TRT11_VERSION.x86_64.cuda-13.2"
+  WHEEL_TRT10_JETPACK72_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT10_THOR_VERSION/TensorRT-$TRT10_THOR_VERSION.aarch64.cuda-13.2"
+  WHEEL_TRT10_JETPACK70_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT10_THOR_VERSION/TensorRT-$TRT10_THOR_VERSION.d7l.cuda-13.2"
+  WHEEL_TRT10_JETPACK71_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT10_THOR_VERSION/TensorRT-$TRT10_THOR_VERSION.d7l.cuda-13.2"
+  WHEEL_TRT10_DRIVE72_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT10_THOR_VERSION/TensorRT-$TRT10_THOR_VERSION.d7l.cuda-13.2"
   L0_STORAGE_IMAGE: "python:3.12-alpine"
   DEVICE_CONTROLLER_IMAGE: "artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-osbase:native-x86_64-ubuntu24.04"
   SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar" # Defines the location of the analysis task cache
@@ -70,6 +84,8 @@ include:
   - local: '.gitlab/ci/precheck-jobs.yml'
   - local: '.gitlab/ci/setup-jobs.yml'
   - local: '.gitlab/ci/cutedsl-jobs.yml'
+  - local: '.gitlab/ci/wheel-jobs.yml'
+  - local: '.gitlab/ci/wheel-generated.yml'
   - local: '.gitlab/ci/l0-jobs.yml'
   - local: '.gitlab/ci/l1-jobs.yml'
   - local: '.gitlab/ci/sonar-jobs.yml'
@@ -83,6 +99,8 @@ include:
 stages:
 - precheck
 - setup
+- wheel-build
+- wheel-assemble
 - l0_test
 - l1_test
 - sonar

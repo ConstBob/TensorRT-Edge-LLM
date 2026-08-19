@@ -86,12 +86,12 @@ The default matrix generates these tarballs and matching `.sha256` files under
 
 ```text
 cutedsl_x86_64_sm_80_cuda13.tar.gz
+cutedsl_x86_64_sm_86_cuda13.tar.gz
 cutedsl_x86_64_sm_90_cuda13.tar.gz
 cutedsl_x86_64_sm_100_cuda13.tar.gz
 cutedsl_x86_64_sm_120_cuda13.tar.gz
 cutedsl_x86_64_sm_120_cuda12.tar.gz
 cutedsl_aarch64_sm_87_cuda13.tar.gz
-cutedsl_aarch64_sm_87_cuda12.tar.gz
 cutedsl_aarch64_sm_90_cuda13.tar.gz
 cutedsl_aarch64_sm_101_cuda12.tar.gz
 cutedsl_aarch64_sm_110_cuda13.tar.gz
@@ -230,7 +230,7 @@ a clean full-matrix rebuild so stale archive members cannot be retained.
 | `--gpu_arch SM` | auto-detected | Target GPU SM (e.g. `sm_100`); auto-detected via cupy / nvidia-smi when omitted. The CuTe DSL compile architecture is derived automatically, including the required Blackwell `a` suffix. |
 | `--arch ARCH` | auto-detected | Target CPU arch `x86_64` or `aarch64`. If it differs from the build host, kernels are cross-compiled (target host objects). |
 | `--cuda-version VERSION` | host CUDA | Artifact CUDA flavor used to select `cu12` or `cu13` runtime objects. |
-| `--runtime-libs-version VERSION` | CuTe DSL package version | Target-architecture runtime-libs wheel version; useful with internal compiler wheels. |
+| `--runtime-libs-version VERSION` | CuTe DSL package version | Target-architecture runtime-libs wheel version; use when compiler and runtime-libs package versions differ. |
 | `--output_dir DIR` | `cpp/kernels/cuteDSLArtifact` | Root output dir (artifacts go under `{DIR}/{arch}/sm_<NN>/`). |
 | `-j JOBS` | CPU count | Parallel compile jobs, defaulting to the CPUs available to the process (use `-j 1` if GPU memory is limited). |
 | `--verbose` | off | Show per-variant kernel script output. |

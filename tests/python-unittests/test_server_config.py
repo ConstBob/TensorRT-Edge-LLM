@@ -20,6 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
 from packaging.requirements import Requirement
 
 try:
@@ -42,6 +43,7 @@ def test_server_dependencies_exclude_export_and_native_build_toolchains():
     with open(project_root / "pyproject.toml", "rb") as file:
         project = tomllib.load(file)["project"]
 
+    base = _dependency_names(project["dependencies"])
     extras = project["optional-dependencies"]
     builder = _dependency_names(extras["builder"])
     server = _dependency_names(extras["server"])
@@ -59,7 +61,8 @@ def test_server_dependencies_exclude_export_and_native_build_toolchains():
         "numpy",
         "python-multipart",
     } <= server
-    assert "cuda-python" in builder
+    assert {"cuda-python", "numpy"} <= base
+    assert not builder
     assert not server & {
         "torch",
         "transformers",
