@@ -177,6 +177,11 @@ MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, SpecDecodeDraftingConfig
             "Failed to load " + std::string(binding_names::kDraftVocabMapFileName) + " from engine directory");
         check::check(vocabMapTensors.size() == 1,
             std::string(binding_names::kDraftVocabMapFileName) + " should contain exactly one tensor");
+        // dataPointer<int32_t>() below is an unchecked reinterpret_cast: a
+        // wrong-dtype sidecar (e.g. int64) of the right length would pass the
+        // shape/range checks and silently corrupt the table, so refuse it here.
+        check::check(
+            vocabMapTensors[0].getDataType() == nvinfer1::DataType::kINT32, "draft vocab_map tensor should be INT32");
         check::check(vocabMapTensors[0].getShape().getNumDims() == 1, "draft vocab_map tensor should be 1D");
         int32_t const reducedVocabSize = static_cast<int32_t>(vocabMapTensors[0].getShape()[0]);
         check::check(reducedVocabSize == mRuntime.deployment.draft->outputVocabSize,
@@ -611,7 +616,11 @@ bool MTPDecoder::buildTreeVerifyInputs(int32_t activeBatchSize, cudaStream_t str
     check::check(
         mRuntime.base.pipelineIO.selectTokenIndices.reshape({activeBatchSize, verifySize}), "Tensor reshape failed");
 
-    // MTP has no draft vocab reduction, so no reduced-to-full mapping is passed.
+    // Reduced-vocab MTP is chain-only (the constructor rejects tree drafting),
+    // so no reduced-to-full mapping is passed here. If tree support is ever
+    // wired: ddtreeBuild's map slot expects the DIRECT map (full = T[reduced],
+    // what DFlashDecoder passes) — mDraftVocabMappingTable holds OFFSETS
+    // (full = draftIdx + T[draftIdx]) and must NOT be passed as-is.
     Tensor const& baseKVCacheLengths = mRuntime.base.cacheManager.getKVCacheLengths();
     kernel::DDTreeBuildParams const buildParams{{mStackedDraftLogits, mDraftRootTokenId, baseKVCacheLengths, nullptr},
         {mTreeTokenIds, mRuntime.base.pipelineIO.specTreeDepths, mRuntime.base.pipelineIO.specTreeParentIds,

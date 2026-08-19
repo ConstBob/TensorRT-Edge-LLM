@@ -1333,6 +1333,39 @@ def _export_diffusion_gemma(model_dir: str,
     logger.info("[DiffusionGemma] Done: %s", output_dir)
 
 
+def _write_draft_vocab_sidecar(model, draft_out_dir: str, full_size: int,
+                               reduced_size: "int | None",
+                               draft_reduced_vocab_dir: str,
+                               log_tag: str) -> None:
+    """Write the draft vocab map sidecar the C++ runtime consumes, plus a provenance JSON.
+
+    Single writer for every draft export path (MTP, DFlash, JetSpec): the
+    sidecar is a runtime contract — kDraftVocabMapFileName; see its @note in
+    cpp/common/bindingNames.h for the consumers and their semantics — so the
+    writer must not fork per draft family.
+    """
+    from tensorrt_edgellm._safetensors_io import save_file as _save_safetensors
+
+    from ..vocab_reduction.constants import (DRAFT_VOCAB_INFO_NAME,
+                                             DRAFT_VOCAB_MAP_NAME)
+    vocab_map = model._reduced_vocab_map_for_runtime
+
+    map_path = os.path.join(draft_out_dir, DRAFT_VOCAB_MAP_NAME)
+    _save_safetensors({"vocab_map": vocab_map.cpu().to(torch.int32)}, map_path)
+    logger.info("%s Wrote draft vocab map: %s (%d tokens)", log_tag, map_path,
+                vocab_map.numel())
+
+    with open(os.path.join(draft_out_dir, DRAFT_VOCAB_INFO_NAME), "w") as fh:
+        json.dump(
+            {
+                "vocab_size": full_size,
+                "reduced_vocab_size": reduced_size,
+                "source": draft_reduced_vocab_dir
+            },
+            fh,
+            indent=2)
+
+
 def _export_mtp_draft(model_dir: str,
                       draft_out_dir: str,
                       externalize_weights: "list[str] | None" = None,
@@ -1391,29 +1424,9 @@ def _export_mtp_draft(model_dir: str,
 
     # --- Save draft vocab map sidecar for the C++ runtime ---
     if draft_reduced_vocab_dir:
-        from tensorrt_edgellm._safetensors_io import \
-            save_file as _save_safetensors
-
-        from ..vocab_reduction.constants import (DRAFT_VOCAB_INFO_NAME,
-                                                 DRAFT_VOCAB_MAP_NAME)
-        vocab_map = model._reduced_vocab_map_for_runtime
-
-        map_path = os.path.join(draft_out_dir, DRAFT_VOCAB_MAP_NAME)
-        _save_safetensors({"vocab_map": vocab_map.cpu().to(torch.int32)},
-                          map_path)
-        logger.info("[MTP Draft] Wrote draft vocab map: %s (%d tokens)",
-                    map_path, vocab_map.numel())
-
-        with open(os.path.join(draft_out_dir, DRAFT_VOCAB_INFO_NAME),
-                  "w") as fh:
-            json.dump(
-                {
-                    "vocab_size": full_size,
-                    "reduced_vocab_size": reduced_size,
-                    "source": draft_reduced_vocab_dir
-                },
-                fh,
-                indent=2)
+        _write_draft_vocab_sidecar(model, draft_out_dir, full_size,
+                                   reduced_size, draft_reduced_vocab_dir,
+                                   "[MTP Draft]")
 
     logger.info("[MTP Draft] Done: %s", output_path)
 
@@ -1541,29 +1554,9 @@ def _export_dflash_draft(model_dir: str,
 
     # --- Save draft vocab map sidecar for C++ runtime ---
     if draft_reduced_vocab_dir:
-        from tensorrt_edgellm._safetensors_io import \
-            save_file as _save_safetensors
-
-        from ..vocab_reduction.constants import (DRAFT_VOCAB_INFO_NAME,
-                                                 DRAFT_VOCAB_MAP_NAME)
-        vocab_map = model._reduced_vocab_map_for_runtime
-
-        map_path = os.path.join(draft_out_dir, DRAFT_VOCAB_MAP_NAME)
-        _save_safetensors({"vocab_map": vocab_map.cpu().to(torch.int32)},
-                          map_path)
-        logger.info("[DFlash Draft] Wrote draft vocab map: %s (%d tokens)",
-                    map_path, vocab_map.numel())
-
-        with open(os.path.join(draft_out_dir, DRAFT_VOCAB_INFO_NAME),
-                  "w") as fh:
-            json.dump(
-                {
-                    "vocab_size": full_size,
-                    "reduced_vocab_size": reduced_size,
-                    "source": draft_reduced_vocab_dir
-                },
-                fh,
-                indent=2)
+        _write_draft_vocab_sidecar(model, draft_out_dir, full_size,
+                                   reduced_size, draft_reduced_vocab_dir,
+                                   "[DFlash Draft]")
 
     logger.info("[DFlash Draft] Done: %s", output_path)
 
@@ -1613,27 +1606,9 @@ def _export_jetspec_draft(model_dir: str,
         raise SystemExit(1) from exc
 
     if draft_reduced_vocab_dir:
-        from tensorrt_edgellm._safetensors_io import \
-            save_file as _save_safetensors
-
-        from ..vocab_reduction.constants import (DRAFT_VOCAB_INFO_NAME,
-                                                 DRAFT_VOCAB_MAP_NAME)
-        vocab_map = model._reduced_vocab_map_for_runtime
-        map_path = os.path.join(draft_out_dir, DRAFT_VOCAB_MAP_NAME)
-        _save_safetensors({"vocab_map": vocab_map.cpu().to(torch.int32)},
-                          map_path)
-        logger.info("[JetSpec Draft] Wrote draft vocab map: %s (%d tokens)",
-                    map_path, vocab_map.numel())
-        with open(os.path.join(draft_out_dir, DRAFT_VOCAB_INFO_NAME),
-                  "w") as fh:
-            json.dump(
-                {
-                    "vocab_size": full_size,
-                    "reduced_vocab_size": reduced_size,
-                    "source": draft_reduced_vocab_dir
-                },
-                fh,
-                indent=2)
+        _write_draft_vocab_sidecar(model, draft_out_dir, full_size,
+                                   reduced_size, draft_reduced_vocab_dir,
+                                   "[JetSpec Draft]")
 
     logger.info("[JetSpec Draft] Done: %s", output_path)
 
