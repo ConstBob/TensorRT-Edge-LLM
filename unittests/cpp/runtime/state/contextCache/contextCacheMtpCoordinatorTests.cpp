@@ -209,9 +209,10 @@ protected:
     {
         ContextCacheBatchAdmission admission;
         admission.speculativeRequest = speculativeRequest;
+        DecodingKvHeadroom const headroom = speculativeRequest ? DecodingKvHeadroom{4, 2} : DecodingKvHeadroom{1, 0};
         admission.lookupPolicy = lookupPolicy;
         admission.sequences.push_back(ContextCacheSequenceAdmission{std::move(tokens), {}});
-        ContextCacheCoordinator::BeginRequestResult result = mCoordinator->beginRequest(admission, mStream);
+        ContextCacheCoordinator::BeginRequestResult result = mCoordinator->beginRequest(admission, headroom, mStream);
         EXPECT_EQ(result.status, ContextCacheCoordinatorStatus::kOk);
         EXPECT_TRUE(result.admission.has_value());
         return std::move(*result.admission);

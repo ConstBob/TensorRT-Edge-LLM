@@ -279,6 +279,11 @@ std::vector<int32_t> const& DFlashDecoder::commonMaterializedStateLengths() cons
     return mCommonStateTracker.commonMaterializedStateLengths();
 }
 
+DecodingKvHeadroom DFlashDecoder::requiredKvHeadroom() const
+{
+    return {mBlockDraft.verifySize, mBlockDraft.blockSize};
+}
+
 bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
 {
     NVTX_SCOPED_RANGE(nvtx_dflash_draft, "DFlashDecoder::runDraftForward", nvtx_colors::DARK_ORANGE);
@@ -1133,20 +1138,10 @@ void DFlashDecoder::resetForNewSequences(Tensor& reuseLengths, cudaStream_t stre
 }
 
 void DFlashDecoder::onBatchEvict(std::vector<int32_t> const& batchMapping, int32_t oldActiveBatch,
-    int32_t newActiveBatch, Tensor& deviceBatchMapping, cudaStream_t stream, BatchCompactionMode mode)
+    int32_t newActiveBatch, Tensor& deviceBatchMapping, cudaStream_t stream)
 {
     ELLM_CHECK(batchMapping.size() == static_cast<size_t>(oldActiveBatch),
         "DFlash batch mapping does not match the old active batch");
-    if (mode == BatchCompactionMode::kLegacyPhysicalKv)
-    {
-        mDraftCacheManager.compactBatch(deviceBatchMapping, oldActiveBatch, newActiveBatch, stream);
-        mDraftCacheManager.setActiveBatchSize(newActiveBatch);
-    }
-    else
-    {
-        ELLM_CHECK(mode == BatchCompactionMode::kManagedPageRows, "DFlash received an invalid batch compaction mode");
-    }
-
     mCommonStateTracker.compact(batchMapping, oldActiveBatch, newActiveBatch);
     if (newActiveBatch == 0)
     {

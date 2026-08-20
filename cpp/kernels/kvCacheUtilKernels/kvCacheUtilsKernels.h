@@ -116,5 +116,12 @@ void gatherPagedKVToSplit(void const* pool, void* kDst, void* vDst, int32_t cons
     int32_t maxPagesPerSeq, int32_t batchSize, int32_t seqLen, int32_t numKVHeads, int32_t headDim, size_t elemSize,
     bool dequantFp8, float kScale, float vScale, cudaStream_t stream);
 
+//! Gather a paged NHD K/V pool into the head-major [B,H,S,D] layout consumed by action engines.
+//! Tokens at or beyond each slot's live length are zero-filled, including the tail of a partial page.
+//! Element bytes are copied without conversion, preserving FP16 and one-byte FP8 storage semantics.
+void gatherPagedKVToHeadMajor(void const* pool, void* kDst, void* vDst, int32_t const* pageTable,
+    int32_t const* kvSeqLens, int32_t maxPagesPerSeq, int32_t batchSize, int32_t seqLen, int32_t numKVHeads,
+    int32_t headDim, size_t elemSize, cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm

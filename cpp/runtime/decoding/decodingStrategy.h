@@ -68,13 +68,6 @@ constexpr bool shouldUseHybridMtpEndpointReuse(DecodingStrategyKind selectedStra
         && (contextCacheLookupEnabled || contextCachePublicationEnabled);
 }
 
-//! Selects whether decoder-owned cache state is physically compacted or only its slot metadata is moved.
-enum class BatchCompactionMode : uint8_t
-{
-    kLegacyPhysicalKv,
-    kManagedPageRows,
-};
-
 struct DecodingStrategyCapabilities
 {
     bool ownsBaseVerificationCudaGraphs{false};
@@ -161,6 +154,11 @@ public:
         return {};
     }
 
+    virtual DecodingKvHeadroom requiredKvHeadroom() const
+    {
+        return {/*.baseExtraTokens=*/1, /*.draftExtraTokens=*/0};
+    }
+
     virtual bool decodeStep(DecodingInferenceContext& context) = 0;
     virtual bool captureCudaGraphs(cudaStream_t stream) = 0;
 
@@ -192,8 +190,7 @@ public:
         std::vector<tokenizer::Rank> const&, int32_t, cudaStream_t) = 0;
 
     virtual void resetForNewSequences(Tensor&, cudaStream_t) = 0;
-    virtual void onBatchEvict(std::vector<int32_t> const&, int32_t, int32_t, Tensor&, cudaStream_t, BatchCompactionMode)
-        = 0;
+    virtual void onBatchEvict(std::vector<int32_t> const&, int32_t, int32_t, Tensor&, cudaStream_t) = 0;
 };
 
 } // namespace rt

@@ -113,6 +113,7 @@ public:
     //! @param absLayerIdx Absolute decoder-layer index.
     //! @return Reference to the page pool [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim].
     rt::Tensor& getCombinedKVCache(int32_t absLayerIdx);
+    rt::Tensor const& getCombinedKVCache(int32_t absLayerIdx) const;
 
     //! Get the K-half and V-half of a given attention layer's pool as separate tensor views.
     //! @param absLayerIdx Absolute decoder-layer index.
@@ -136,6 +137,7 @@ public:
     //! @brief Direct access to the KV cache sub-manager.
     //! @return Reference to the KVCacheManager.
     KVCacheManager& getKVCacheManager() noexcept;
+    KVCacheManager const& getKVCacheManager() const noexcept;
 
     //! @brief Direct access to the Mamba state sub-manager.
     //! @return Reference to the MambaCacheManager.

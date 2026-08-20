@@ -316,6 +316,11 @@ DSparkDecoder::DSparkDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
         mMarkovRank, mHasConfidenceHead ? "true" : "false");
 }
 
+DecodingKvHeadroom DSparkDecoder::requiredKvHeadroom() const
+{
+    return {mVerifyLen, mProposalLen};
+}
+
 void DSparkDecoder::loadHeadSidecars(std::filesystem::path const& engineDir, cudaStream_t stream)
 {
     auto const& draftCfg = *mRuntime.deployment.draft;
@@ -1291,20 +1296,10 @@ void DSparkDecoder::resetForNewSequences(Tensor& reuseLengths, cudaStream_t stre
 }
 
 void DSparkDecoder::onBatchEvict(std::vector<int32_t> const& batchMapping, int32_t oldActiveBatch,
-    int32_t newActiveBatch, Tensor& deviceBatchMapping, cudaStream_t stream, BatchCompactionMode mode)
+    int32_t newActiveBatch, Tensor& deviceBatchMapping, cudaStream_t stream)
 {
     ELLM_CHECK(batchMapping.size() == static_cast<size_t>(oldActiveBatch),
         "DSpark batch mapping does not match the old active batch");
-    if (mode == BatchCompactionMode::kLegacyPhysicalKv)
-    {
-        mDraftCacheManager.compactBatch(deviceBatchMapping, oldActiveBatch, newActiveBatch, stream);
-        mDraftCacheManager.setActiveBatchSize(newActiveBatch);
-    }
-    else
-    {
-        ELLM_CHECK(mode == BatchCompactionMode::kManagedPageRows, "DSpark received an invalid batch compaction mode");
-    }
-
     mCommonStateTracker.compact(batchMapping, oldActiveBatch, newActiveBatch);
     if (newActiveBatch == 0)
     {

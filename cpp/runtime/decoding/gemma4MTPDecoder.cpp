@@ -37,6 +37,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -98,6 +99,14 @@ Gemma4MTPDecoder::Gemma4MTPDecoder(DecodingRuntimeContext& runtime, SpecDecodeDr
         "Gemma4MTP::hostAcceptedTokenIds");
     mArgmaxScratch = Tensor(
         {maxRuntimeBatchSize * maxAcceptDepth}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "Gemma4MTP::argmax");
+}
+
+DecodingKvHeadroom Gemma4MTPDecoder::requiredKvHeadroom() const
+{
+    int32_t const draftingStep = mRuntime.deployment.specConfig->draftingStep;
+    ELLM_CHECK(draftingStep > 0 && draftingStep < std::numeric_limits<int32_t>::max(),
+        "Gemma4 MTP KV headroom is outside the supported range");
+    return {draftingStep + 1, 0};
 }
 
 bool Gemma4MTPDecoder::decodeStep(DecodingInferenceContext& context)
@@ -262,7 +271,7 @@ void Gemma4MTPDecoder::resetForNewSequences(Tensor&, cudaStream_t)
 }
 
 void Gemma4MTPDecoder::onBatchEvict(std::vector<int32_t> const& batchMapping, int32_t oldActiveBatch,
-    int32_t newActiveBatch, Tensor& deviceBatchMapping, cudaStream_t stream, BatchCompactionMode /* mode */)
+    int32_t newActiveBatch, Tensor& deviceBatchMapping, cudaStream_t stream)
 {
     if (newActiveBatch <= 0)
     {

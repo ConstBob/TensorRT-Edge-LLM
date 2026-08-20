@@ -24,6 +24,7 @@
 #include "runtime/hybridCacheManager.h"
 #include "runtime/state/contextCache/hybridSnapshotStorage.h"
 #include "runtime/state/contextCache/reusePlan.h"
+#include "runtime/state/contextCache/specStatePlan.h"
 #include "runtime/state/kvPageTable.h"
 
 #include <algorithm>
@@ -47,6 +48,19 @@ constexpr nvinfer1::DataType kBOUNDARY_HIDDEN_TYPE{nvinfer1::DataType::kHALF};
 bool shouldLogDegradation(uint64_t count) noexcept
 {
     return count != 0U && (count & (count - 1U)) == 0U;
+}
+
+void requireKvPageCoverage(ReusePlan& plan, int32_t basePages, int32_t draftPages)
+{
+    ELLM_CHECK(basePages >= 0 && draftPages >= 0, "Context cache KV-page coverage must be non-negative");
+    auto extendDemand = [](int32_t& demand, size_t boundPages, int32_t requiredPages) {
+        ELLM_CHECK(boundPages <= static_cast<size_t>(std::numeric_limits<int32_t>::max()),
+            "Context cache reuse path contains too many pages");
+        int32_t const privatePages = std::max(0, requiredPages - static_cast<int32_t>(boundPages));
+        demand = std::max(demand, privatePages);
+    };
+    extendDemand(plan.demand.baseKvPages, plan.basePageBindings.size(), basePages);
+    extendDemand(plan.demand.draftKvPages, plan.specPageBindings.size(), draftPages);
 }
 
 int32_t snapshotSlotCount(int64_t budgetBytes, size_t bytesPerSlot, char const* label)
@@ -896,18 +910,9 @@ ContextCacheCoordinator::ContextCacheCoordinator(ContextCacheConfig const& confi
     ELLM_CHECK(config.enabled, "ContextCacheCoordinator requires an enabled ContextCacheConfig");
     if (isSpecDeployment())
     {
-        ELLM_CHECK(deployment.specConfig.has_value(),
-            "Speculative context reuse requires validated speculative configuration");
         bool const pagedSpecState = ownsPagedSpecState();
         ELLM_CHECK((mDraftCache != nullptr && mDraftPageTable != nullptr) == pagedSpecState,
             "Speculative context-cache physical resources do not match the state contract");
-        mSpecVerifySize = deployment.specConfig->verifySize;
-        if (pagedSpecState)
-        {
-            ELLM_CHECK(mProfile.specReuseContract->speculativeWorkingTokens > 0,
-                "Paged speculative context reuse requires working-token headroom");
-            mSpecDraftWorkingTokens = mProfile.specReuseContract->speculativeWorkingTokens;
-        }
     }
     else
     {
@@ -980,19 +985,33 @@ ContextCacheCoordinator::~ContextCacheCoordinator() noexcept
 }
 
 ContextCacheCoordinator::AcquireSequenceResult ContextCacheCoordinator::acquireSequence(
-    ContextCacheSequenceAdmission const& admission, bool speculativeRequest, ContextCacheLookupPolicy lookupPolicy)
+    ContextCacheSequenceAdmission const& admission, bool speculativeRequest, ContextCacheLookupPolicy lookupPolicy,
+    DecodingKvHeadroom const& headroom)
 {
     ELLM_CHECK(!admission.tokenIds.empty(), "Context cache cannot admit an empty token sequence");
     ELLM_CHECK(admission.tokenIds.size() <= static_cast<size_t>(std::numeric_limits<int32_t>::max()),
         "Context cache input contains too many tokens");
-    if (deploymentHasAttention())
-    {
-        int32_t const inputPages = pageCountForStateLength(static_cast<int32_t>(admission.tokenIds.size()));
-        ELLM_CHECK(inputPages <= mBasePageTable.maxPagesPerSeq(),
-            "Context cache input exceeds the engine page-table capacity");
-        ELLM_CHECK(!speculativeRequest || !ownsPagedSpecState() || inputPages <= mDraftPageTable->maxPagesPerSeq(),
-            "Context cache input exceeds the draft engine page-table capacity");
-    }
+    ELLM_CHECK(headroom.baseExtraTokens > 0 && headroom.draftExtraTokens >= 0,
+        "Decoder KV headroom is outside the supported range");
+    ELLM_CHECK(speculativeRequest || headroom.draftExtraTokens == 0,
+        "A non-speculative request cannot require draft KV headroom");
+    ELLM_CHECK(!ownsPagedSpecState() || !speculativeRequest || headroom.draftExtraTokens > 0,
+        "A paged speculative request requires positive draft KV headroom");
+    ELLM_CHECK(headroom.draftExtraTokens == 0 || ownsPagedSpecState(),
+        "Decoder requested draft KV headroom without an independent draft page pool");
+    int32_t const inputTokenCount = static_cast<int32_t>(admission.tokenIds.size());
+    ELLM_CHECK(inputTokenCount <= std::numeric_limits<int32_t>::max() - headroom.baseExtraTokens
+            && inputTokenCount <= std::numeric_limits<int32_t>::max() - headroom.draftExtraTokens,
+        "Context cache initial KV headroom length overflow");
+    int32_t const basePages
+        = deploymentHasAttention() ? pageCountForStateLength(inputTokenCount + headroom.baseExtraTokens) : 0;
+    int32_t const draftPages = speculativeRequest && ownsPagedSpecState()
+        ? pageCountForStateLength(inputTokenCount + headroom.draftExtraTokens)
+        : 0;
+    ELLM_CHECK(basePages <= mBasePageTable.maxPagesPerSeq(),
+        "Context cache initial base KV headroom exceeds the engine page-table capacity");
+    ELLM_CHECK(draftPages == 0 || draftPages <= mDraftPageTable->maxPagesPerSeq(),
+        "Context cache initial draft KV headroom exceeds the engine page-table capacity");
     auto const planningStart = std::chrono::steady_clock::now();
     Hash128 const* mediaHashPtr
         = admission.perPositionMediaHash.empty() ? nullptr : admission.perPositionMediaHash.data();
@@ -1011,9 +1030,6 @@ ContextCacheCoordinator::AcquireSequenceResult ContextCacheCoordinator::acquireS
                     admission.tokenIds.data(), candidateLength, hashes, admission.keyExtras, mediaHashPtr)});
         }
     }
-    int32_t const inputTokenCount = static_cast<int32_t>(admission.tokenIds.size());
-    // Speculative decoding uses acquireSpec which combines planning and resource acquisition in one call; handle it
-    // separately from the plan-then-acquire flow used by vanilla and hybrid paths.
     bool const isSpecOnly = speculativeRequest && !mProfile.isHybrid();
     auto makePlan = [&](ContextCacheLookupPolicy policy) {
         if (speculativeRequest && mProfile.isHybrid())
@@ -1028,57 +1044,47 @@ ContextCacheCoordinator::AcquireSequenceResult ContextCacheCoordinator::acquireS
             return makeHybridReusePlan(hybridCandidates, hashes, inputTokenCount, kTOKENS_PER_PAGE,
                 deploymentHasAttention(), mManager.records(), policy);
         }
+        if (speculativeRequest)
+        {
+            ELLM_CHECK(mProfile.specReuseContract.has_value(),
+                "Speculative cache planning requires a speculative deployment contract");
+            return makeSpecReusePlan(SpecReusePlanInput{hashes, inputTokenCount, kTOKENS_PER_PAGE, policy,
+                                         mManager.baseIndex(), mManager.specIndex(), mManager.records()},
+                *mProfile.specReuseContract);
+        }
         return makeVanillaReusePlan(hashes, inputTokenCount, kTOKENS_PER_PAGE, mManager.baseIndex(), policy);
     };
 
-    AcquireResult acquired;
+    ReusePlan plan = makePlan(lookupPolicy);
     bool forcedCold = false;
-    if (isSpecOnly)
+    LOG_INFO("Context cache lookup: %d matched pages, %d matched tokens, %zu total hashes, mediaHash=%s",
+        static_cast<int32_t>(plan.basePageBindings.size()), plan.matchedTokenLength, hashes.size(),
+        admission.perPositionMediaHash.empty() ? "empty" : "present");
+
+    // Speculative page bindings are a coherent base+draft path. Media-aware speculative requests reach this planner
+    // with a bypass policy, so only vanilla/hybrid cache hits need base-only boundary trimming here.
+    if (!isSpecOnly && !admission.perPositionMediaHash.empty() && plan.reuseTokenLength > 0)
     {
-        ELLM_CHECK(isSpecDeployment(), "Speculative cache planning requires a speculative deployment contract");
-        acquired = mManager.acquireSpec(hashes, static_cast<int32_t>(admission.tokenIds.size()), lookupPolicy);
-        bool const cacheDerivedPlan
-            = acquired.plan.reuseTokenLength > 0 || acquired.plan.kind == ReusePlanKind::kFullInputRewind;
-        if (acquired.status == AcquireStatus::kInsufficientCapacity && cacheDerivedPlan
-            && lookupPolicy == ContextCacheLookupPolicy::kUseCache)
+        int32_t const preTrimPages = static_cast<int32_t>(plan.basePageBindings.size());
+        trimMediaBoundaryPages(plan, admission.perPositionMediaHash.data(), admission.tokenIds.size());
+        int32_t const postTrimPages = static_cast<int32_t>(plan.basePageBindings.size());
+        if (preTrimPages != postTrimPages)
         {
-            acquired = mManager.acquireSpec(
-                hashes, static_cast<int32_t>(admission.tokenIds.size()), ContextCacheLookupPolicy::kBypass);
-            forcedCold = true;
+            LOG_INFO("Context cache media trim: %d matched pages -> %d reusable pages (trimmed %d)", preTrimPages,
+                postTrimPages, preTrimPages - postTrimPages);
         }
     }
-    else
+    requireKvPageCoverage(plan, basePages, draftPages);
+    AcquireResult acquired = mManager.acquire(std::move(plan));
+    bool const cacheDerivedPlan
+        = acquired.plan.reuseTokenLength > 0 || acquired.plan.kind == ReusePlanKind::kFullInputRewind;
+    if (acquired.status == AcquireStatus::kInsufficientCapacity && cacheDerivedPlan
+        && lookupPolicy == ContextCacheLookupPolicy::kUseCache)
     {
-        ReusePlan plan = makePlan(lookupPolicy);
-        LOG_INFO("Context cache lookup: %d matched pages, %d matched tokens, %zu total hashes, mediaHash=%s",
-            static_cast<int32_t>(plan.basePageBindings.size()), plan.matchedTokenLength, hashes.size(),
-            admission.perPositionMediaHash.empty() ? "empty" : "present");
-
-        // Trim trailing reused pages that would split a contiguous media run across the reuse boundary before
-        // acquiring resources, so the lease is allocated with the correct reduced binding set and demand.
-        if (!admission.perPositionMediaHash.empty() && plan.reuseTokenLength > 0)
-        {
-            int32_t const preTrimPages = static_cast<int32_t>(plan.basePageBindings.size());
-            trimMediaBoundaryPages(plan, admission.perPositionMediaHash.data(), admission.tokenIds.size());
-            int32_t const postTrimPages = static_cast<int32_t>(plan.basePageBindings.size());
-            if (preTrimPages != postTrimPages)
-            {
-                LOG_INFO("Context cache media trim: %d matched pages -> %d reusable pages (trimmed %d)", preTrimPages,
-                    postTrimPages, preTrimPages - postTrimPages);
-            }
-        }
-
-        acquired = mManager.acquire(std::move(plan));
-        bool const cacheDerivedPlan
-            = acquired.plan.reuseTokenLength > 0 || acquired.plan.kind == ReusePlanKind::kFullInputRewind;
-        if (acquired.status == AcquireStatus::kInsufficientCapacity && cacheDerivedPlan
-            && lookupPolicy == ContextCacheLookupPolicy::kUseCache)
-        {
-            ReusePlan coldPlan = makePlan(ContextCacheLookupPolicy::kBypass);
-            // No media trim needed on bypass — reuseTokenLength is 0 for a cold plan.
-            acquired = mManager.acquire(std::move(coldPlan));
-            forcedCold = true;
-        }
+        ReusePlan coldPlan = makePlan(ContextCacheLookupPolicy::kBypass);
+        requireKvPageCoverage(coldPlan, basePages, draftPages);
+        acquired = mManager.acquire(std::move(coldPlan));
+        forcedCold = true;
     }
 
     auto const planningEnd = std::chrono::steady_clock::now();
@@ -1088,7 +1094,7 @@ ContextCacheCoordinator::AcquireSequenceResult ContextCacheCoordinator::acquireS
 }
 
 ContextCacheCoordinator::BeginRequestResult ContextCacheCoordinator::beginRequest(
-    ContextCacheBatchAdmission const& admission, cudaStream_t stream)
+    ContextCacheBatchAdmission const& admission, DecodingKvHeadroom const& headroom, cudaStream_t stream)
 {
     ELLM_CHECK(stream == mStream, "Context cache request stream differs from the coordinator construction stream");
     ELLM_CHECK(admission.lookupPolicy == ContextCacheLookupPolicy::kUseCache
@@ -1099,6 +1105,10 @@ ContextCacheCoordinator::BeginRequestResult ContextCacheCoordinator::beginReques
         "Context cache admission has an invalid commit policy");
     ELLM_CHECK(!admission.speculativeRequest || isSpecDeployment(),
         "Speculative context-cache request does not match the deployment contract");
+    bool const containsMedia = std::any_of(admission.sequences.begin(), admission.sequences.end(),
+        [](ContextCacheSequenceAdmission const& sequence) { return !sequence.perPositionMediaHash.empty(); });
+    ContextCacheLookupPolicy const lookupPolicy
+        = admission.speculativeRequest && containsMedia ? ContextCacheLookupPolicy::kBypass : admission.lookupPolicy;
     if (mPoisoned)
     {
         return BeginRequestResult{ContextCacheCoordinatorStatus::kPoisoned, std::nullopt};
@@ -1129,7 +1139,7 @@ ContextCacheCoordinator::BeginRequestResult ContextCacheCoordinator::beginReques
     for (ContextCacheSequenceAdmission const& sequenceAdmission : admission.sequences)
     {
         AcquireSequenceResult acquired
-            = acquireSequence(sequenceAdmission, admission.speculativeRequest, admission.lookupPolicy);
+            = acquireSequence(sequenceAdmission, admission.speculativeRequest, lookupPolicy, headroom);
         if (acquired.status != AcquireStatus::kAcquired || !acquired.lease.has_value())
         {
             return BeginRequestResult{ContextCacheCoordinatorStatus::kRequestFailed, std::nullopt};
@@ -1141,7 +1151,7 @@ ContextCacheCoordinator::BeginRequestResult ContextCacheCoordinator::beginReques
         sequence.keyExtras = sequenceAdmission.keyExtras;
         sequence.perPositionMediaHash = sequenceAdmission.perPositionMediaHash;
         sequence.reuseTokenLength = acquired.plan.reuseTokenLength;
-        sequence.lookupPolicy = admission.lookupPolicy;
+        sequence.lookupPolicy = lookupPolicy;
         sequence.commitPolicy = admission.commitPolicy;
         sequence.replayTailLength = admission.replayTailLength;
         sequence.committedStateLength = acquired.plan.reuseTokenLength;
@@ -1156,8 +1166,8 @@ ContextCacheCoordinator::BeginRequestResult ContextCacheCoordinator::beginReques
         mMetrics.matchedTokens += static_cast<uint64_t>(acquired.plan.matchedTokenLength);
         mMetrics.reusedTokens += static_cast<uint64_t>(acquired.plan.reuseTokenLength);
         mMetrics.hitSequences += static_cast<uint64_t>(acquired.plan.matchedTokenLength > 0);
-        mMetrics.lookupBypassSequences += static_cast<uint64_t>(
-            admission.lookupPolicy == ContextCacheLookupPolicy::kBypass || acquired.forcedCold);
+        mMetrics.lookupBypassSequences
+            += static_cast<uint64_t>(lookupPolicy == ContextCacheLookupPolicy::kBypass || acquired.forcedCold);
         if (acquired.forcedCold)
         {
             ++mMetrics.forcedColdSequences;
@@ -1219,8 +1229,6 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::preparePrefill(RequestHan
         if (runsPairedDraftWorkingSet(impl))
         {
             auto const& pages = sequence.lease.draftPages();
-            ELLM_CHECK(pages.size() == sequence.lease.basePages().size(),
-                "Paired-draft context-cache prefill requires equal base and draft page paths");
             draftRows.push_back(KVPageTableRowUpdate{static_cast<int32_t>(slot), pages.empty() ? nullptr : pages.data(),
                 static_cast<int32_t>(pages.size())});
         }
@@ -1646,16 +1654,21 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::restoreHybridMtpBoundaryH
     return mPublicationPolicy->restoreMtpBoundary(request, slot, baseHiddenStates, destinationRow);
 }
 
-ContextCacheCoordinatorStatus ContextCacheCoordinator::prepareDecodeStep(RequestHandle& request)
+ContextCacheCoordinatorStatus ContextCacheCoordinator::prepareDecodeStep(
+    RequestHandle& request, DecodingKvHeadroom const& headroom)
 {
     RequestHandle::Impl& impl = checkedImpl(request);
     ELLM_CHECK(impl.executing()
             && (!impl.hasPendingDeviceWork()
                 || (usesFrozenSpecPublication(impl) && impl.awaitingFirstSpecCompletion())),
         "Context cache decode preparation requires terminal prior work");
+    ELLM_CHECK(headroom.baseExtraTokens > 0 && headroom.draftExtraTokens >= 0,
+        "Decoder KV headroom is outside the supported range");
+    ELLM_CHECK(runsPairedDraftWorkingSet(impl) ? headroom.draftExtraTokens > 0 : headroom.draftExtraTokens == 0,
+        "Decoder draft KV headroom does not match the active cache resources");
 
-    // EAGLE and Hybrid+MTP both grow the paired base+draft working set (growSpecPages) and upload both page tables.
-    // A Hybrid+MTP lease is kHybridMtp, which growBasePages rejects, so it must take this speculative decode path.
+    // Paired speculative leases grow base and independent-draft working sets atomically and upload both page tables.
+    // Hybrid+MTP uses the same path because growBasePages rejects its paired lease.
     if (runsPairedDraftWorkingSet(impl))
     {
         struct PageDemand
@@ -1667,11 +1680,12 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::prepareDecodeStep(Request
         demands.reserve(impl.sequences.size());
         for (auto const& sequence : impl.sequences)
         {
-            ELLM_CHECK(sequence.committedStateLength <= std::numeric_limits<int32_t>::max() - mSpecVerifySize
-                    && sequence.committedStateLength <= std::numeric_limits<int32_t>::max() - mSpecDraftWorkingTokens,
-                "EAGLE context-cache working-set length overflow before decode");
-            int32_t const basePages = pageCountForStateLength(sequence.committedStateLength + mSpecVerifySize);
-            int32_t const draftPages = pageCountForStateLength(sequence.committedStateLength + mSpecDraftWorkingTokens);
+            ELLM_CHECK(sequence.committedStateLength <= std::numeric_limits<int32_t>::max() - headroom.baseExtraTokens
+                    && sequence.committedStateLength <= std::numeric_limits<int32_t>::max() - headroom.draftExtraTokens,
+                "Context-cache working-set length overflow before decode");
+            int32_t const basePages = pageCountForStateLength(sequence.committedStateLength + headroom.baseExtraTokens);
+            int32_t const draftPages
+                = pageCountForStateLength(sequence.committedStateLength + headroom.draftExtraTokens);
             if (basePages > mBasePageTable.maxPagesPerSeq() || draftPages > mDraftPageTable->maxPagesPerSeq())
             {
                 impl.markFinishing();
@@ -1735,10 +1749,10 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::prepareDecodeStep(Request
         for (size_t slot = 0; slot < impl.sequences.size(); ++slot)
         {
             auto& sequence = impl.sequences[slot];
-            int32_t const workingTokens = isSpecRequest(impl) ? mSpecVerifySize : 1;
-            ELLM_CHECK(sequence.committedStateLength <= std::numeric_limits<int32_t>::max() - workingTokens,
+            int32_t const baseExtraTokens = headroom.baseExtraTokens;
+            ELLM_CHECK(sequence.committedStateLength <= std::numeric_limits<int32_t>::max() - baseExtraTokens,
                 "Context cache working-set length overflow before decode");
-            int32_t const requiredPages = pageCountForStateLength(sequence.committedStateLength + workingTokens);
+            int32_t const requiredPages = pageCountForStateLength(sequence.committedStateLength + baseExtraTokens);
             if (requiredPages > mBasePageTable.maxPagesPerSeq())
             {
                 impl.markFinishing();
@@ -2051,11 +2065,6 @@ bool ContextCacheCoordinator::usesFrozenSpecPublication(RequestHandle::Impl cons
 bool ContextCacheCoordinator::deploymentHasAttention() const noexcept
 {
     return mProfile.hasAttention();
-}
-
-int32_t ContextCacheCoordinator::speculativeKVReserve() const noexcept
-{
-    return std::max(mSpecVerifySize, mSpecDraftWorkingTokens);
 }
 
 ContextCacheManager const& ContextCacheCoordinator::manager() const noexcept

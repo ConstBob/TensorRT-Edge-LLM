@@ -159,6 +159,13 @@ MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, SpecDecodeDraftingConfig
         cudaMemsetAsync(mDraftVocabMappingTable.rawPointer(), 0, mDraftVocabMappingTable.getMemoryCapacity(), stream));
 }
 
+DecodingKvHeadroom MTPDecoder::requiredKvHeadroom() const
+{
+    auto const& config = *mRuntime.deployment.specConfig;
+    ELLM_CHECK(config.verifySize > 0 && config.draftingStep > 0, "MTP KV headroom must be positive");
+    return {config.verifySize, config.draftingStep};
+}
+
 int64_t MTPDecoder::getRequiredContextMemorySize() const noexcept
 {
     return mDraftExecutor ? mDraftExecutor->getRequiredContextMemorySize() : 0;
@@ -1066,18 +1073,8 @@ void MTPDecoder::resetForNewSequences(Tensor& reuseLengths, cudaStream_t stream)
 }
 
 void MTPDecoder::onBatchEvict(std::vector<int32_t> const&, int32_t oldActiveBatch, int32_t newActiveBatch,
-    Tensor& deviceBatchMapping, cudaStream_t stream, BatchCompactionMode mode)
+    Tensor& deviceBatchMapping, cudaStream_t stream)
 {
-    // In managed-page (context-reuse) mode the coordinator compacts the draft KV page-table rows during its own
-    // compactBatch, so the decoder must NOT also compact the physical draft cache; it only compacts its own per-slot
-    // working state below. In legacy mode the decoder owns the physical draft KV compaction. Mirrors
-    // EagleDecoder::onBatchEvict.
-    if (mode == BatchCompactionMode::kLegacyPhysicalKv)
-    {
-        mDraftCacheManager.compactBatch(deviceBatchMapping, oldActiveBatch, newActiveBatch, stream);
-        mDraftCacheManager.setActiveBatchSize(newActiveBatch);
-    }
-
     if (mRuntime.base.pipelineIO.baseHiddenStates.getShape().getNumDims() == 3
         && mRuntime.base.pipelineIO.baseHiddenStates.getShape()[0] == oldActiveBatch && newActiveBatch > 0)
     {

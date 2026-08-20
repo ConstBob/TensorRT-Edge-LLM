@@ -35,6 +35,13 @@ namespace rt
 
 class LayerDebugger; // Few-layer-validation debug: per-layer logits/KV dump (runtime/debug/layerDebugger.h)
 
+//! Maximum KV positions that one decoder execution may address beyond its materialized endpoint.
+struct DecodingKvHeadroom
+{
+    int32_t baseExtraTokens{};
+    int32_t draftExtraTokens{};
+};
+
 /**
  * @brief Pre-allocated flat accumulator for per-step log-probabilities of one batch slot.
  *

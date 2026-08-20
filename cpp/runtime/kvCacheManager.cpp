@@ -139,6 +139,11 @@ rt::Tensor& KVCacheManager::getCombinedKVCache(int32_t attnLayerIdx) noexcept
     return mLayerCaches[attnLayerIdx];
 }
 
+rt::Tensor const& KVCacheManager::getCombinedKVCache(int32_t attnLayerIdx) const noexcept
+{
+    return mLayerCaches[attnLayerIdx];
+}
+
 std::pair<rt::Tensor, rt::Tensor> KVCacheManager::getSeparateKVCache(int32_t attnLayerIdx) const noexcept
 {
     KVLayerConfig const& lc = mConfig.layerConfigs[attnLayerIdx];

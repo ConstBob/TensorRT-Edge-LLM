@@ -320,7 +320,7 @@ protected:
         seq.tokenIds = tokens;
         seq.perPositionMediaHash = perPositionMediaHash;
         admission.sequences.push_back(std::move(seq));
-        return mCoordinator->beginRequest(admission, mStream);
+        return mCoordinator->beginRequest(admission, DecodingKvHeadroom{1, 0}, mStream);
     }
 
     void finalizePrefillAndFinish(

@@ -27,22 +27,28 @@ if _REPO_ROOT not in sys.path:
 from tensorrt_edgellm import config
 
 
-def test_mixed_precision_w4a16_lm_head_is_nvfp4_a16():
-    """Qwen3.6-35B-A3B-NVFP4 already lists lm_head as W4A16_NVFP4."""
-    dominant, group_size, overrides = config._parse_mixed_precision({
-        "layers.0.mlp.experts": {
-            "quant_algo": "W4A16_NVFP4",
-            "group_size": 16
-        },
-        "lm_head": {
-            "quant_algo": "W4A16_NVFP4",
-            "group_size": 16
-        },
-    })
-    assert dominant == config.QUANT_NVFP4_A16
+@pytest.mark.parametrize(("model_type", "expected_quant_type"),
+                         [("qwen3_moe", config.QUANT_NVFP4),
+                          ("nemotron_h", config.QUANT_NVFP4_A16)],
+                         ids=["qwen-generic-nvfp4", "nemotron-h-nvfp4-a16"])
+def test_mixed_precision_w4a16_dispatch_is_model_specific(
+        model_type, expected_quant_type):
+    """Qwen uses its established repacker; Nemotron-H uses Marlin A16."""
+    dominant, group_size, overrides = config._parse_mixed_precision(
+        {
+            "layers.0.mlp.experts": {
+                "quant_algo": "W4A16_NVFP4",
+                "group_size": 16
+            },
+            "lm_head": {
+                "quant_algo": "W4A16_NVFP4",
+                "group_size": 16
+            },
+        }, model_type)
+    assert dominant == expected_quant_type
     assert group_size == 16
-    assert overrides["lm_head"] == config.QUANT_NVFP4_A16
-    assert overrides["layers.0.mlp.experts"] == config.QUANT_NVFP4_A16
+    assert overrides["lm_head"] == expected_quant_type
+    assert overrides["layers.0.mlp.experts"] == expected_quant_type
 
 
 def test_parse_quant_keeps_excluded_fp16_lm_head():

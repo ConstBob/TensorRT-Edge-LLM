@@ -369,3 +369,135 @@ TEST(GatherPagedKVToSplitTest, InRangeUnmappedPageZeroFillsDestination)
         ASSERT_EQ(static_cast<float>(vOut[i]), expected) << "V flat idx " << i;
     }
 }
+
+TEST(GatherPagedKVToHeadMajorTest, NonIdentityRowsPreserveTokensAtPageBoundariesAndZeroFillTail)
+{
+    cudaStream_t stream{nullptr};
+    constexpr int32_t B{3};
+    constexpr int32_t H{2};
+    constexpr int32_t D{4};
+    constexpr int32_t maxPagesPerSeq{2};
+    constexpr int32_t numPages{8};
+    int32_t const S = rt::kTOKENS_PER_PAGE + 9;
+    std::vector<int32_t> const lengths{rt::kTOKENS_PER_PAGE - 1, rt::kTOKENS_PER_PAGE, rt::kTOKENS_PER_PAGE + 1};
+
+    size_t const pageElems = static_cast<size_t>(rt::kTOKENS_PER_PAGE) * H * D;
+    std::vector<half> poolHost(static_cast<size_t>(2) * numPages * pageElems);
+    for (int32_t page = 0; page < 2 * numPages; ++page)
+    {
+        for (int32_t token = 0; token < rt::kTOKENS_PER_PAGE; ++token)
+        {
+            for (int32_t head = 0; head < H; ++head)
+            {
+                for (int32_t dim = 0; dim < D; ++dim)
+                {
+                    size_t const offset
+                        = static_cast<size_t>(page) * pageElems + static_cast<size_t>(token) * H * D + head * D + dim;
+                    poolHost[offset]
+                        = __float2half(static_cast<float>(page * 100 + token % 17 + head * 3 + dim) / 8.0F);
+                }
+            }
+        }
+    }
+
+    rt::Tensor pool({static_cast<int64_t>(poolHost.size())}, rt::DeviceType::kGPU, DataType::kHALF);
+    copyHostToDevice(pool, poolHost);
+    rt::KVPageTable pageTable(B, maxPagesPerSeq, numPages);
+    std::vector<std::vector<int32_t>> const rows{{5}, {3}, {7, 1}};
+    for (int32_t slot = 0; slot < B; ++slot)
+    {
+        pageTable.setRow(slot, rows[slot].data(), static_cast<int32_t>(rows[slot].size()));
+    }
+    pageTable.upload(stream);
+    rt::Tensor kvSeqLens = makeKvSeqLens(lengths);
+
+    size_t const outputElements = static_cast<size_t>(B) * H * S * D;
+    rt::Tensor kDst({B, H, S, D}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor vDst({B, H, S, D}, rt::DeviceType::kGPU, DataType::kHALF);
+    std::vector<half> const canary(outputElements, __float2half(-7.0F));
+    copyHostToDevice(kDst, canary);
+    copyHostToDevice(vDst, canary);
+
+    kernel::gatherPagedKVToHeadMajor(pool.rawPointer(), kDst.rawPointer(), vDst.rawPointer(),
+        pageTable.kernelView().dataPointer<int32_t>(), kvSeqLens.dataPointer<int32_t>(), maxPagesPerSeq, B, S, H, D,
+        sizeof(half), stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    auto const kOut = copyDeviceToHost<half>(kDst);
+    auto const vOut = copyDeviceToHost<half>(vDst);
+    for (int32_t slot = 0; slot < B; ++slot)
+    {
+        for (int32_t head = 0; head < H; ++head)
+        {
+            for (int32_t token = 0; token < S; ++token)
+            {
+                for (int32_t dim = 0; dim < D; ++dim)
+                {
+                    size_t const dst = (static_cast<size_t>(slot) * H + head) * S * D + token * D + dim;
+                    half expectedK = __float2half(0.0F);
+                    half expectedV = __float2half(0.0F);
+                    if (token < lengths[slot])
+                    {
+                        int32_t const logicalPage = token / rt::kTOKENS_PER_PAGE;
+                        int32_t const inPage = token % rt::kTOKENS_PER_PAGE;
+                        int32_t const kPage = rows[slot][logicalPage];
+                        size_t const src = static_cast<size_t>(kPage) * pageElems + static_cast<size_t>(inPage) * H * D
+                            + head * D + dim;
+                        expectedK = poolHost[src];
+                        expectedV = poolHost[src + static_cast<size_t>(numPages) * pageElems];
+                    }
+                    ASSERT_EQ(__half_as_ushort(kOut[dst]), __half_as_ushort(expectedK))
+                        << "K mismatch at slot/head/token/dim " << slot << "/" << head << "/" << token << "/" << dim;
+                    ASSERT_EQ(__half_as_ushort(vOut[dst]), __half_as_ushort(expectedV))
+                        << "V mismatch at slot/head/token/dim " << slot << "/" << head << "/" << token << "/" << dim;
+                }
+            }
+        }
+    }
+}
+
+TEST(GatherPagedKVToHeadMajorTest, OneByteKvPreservesFp8StorageLayout)
+{
+    cudaStream_t stream{nullptr};
+    constexpr int32_t B{1};
+    constexpr int32_t H{2};
+    constexpr int32_t D{3};
+    constexpr int32_t maxPagesPerSeq{2};
+    constexpr int32_t numPages{4};
+    int32_t const S = rt::kTOKENS_PER_PAGE + 1;
+    size_t const pageElems = static_cast<size_t>(rt::kTOKENS_PER_PAGE) * H * D;
+    std::vector<uint8_t> poolHost(static_cast<size_t>(2) * numPages * pageElems);
+    for (size_t i = 0; i < poolHost.size(); ++i)
+    {
+        poolHost[i] = static_cast<uint8_t>((i * 37U + 11U) & 0xFFU);
+    }
+    rt::Tensor pool({static_cast<int64_t>(poolHost.size())}, rt::DeviceType::kGPU, DataType::kUINT8);
+    copyHostToDevice(pool, poolHost);
+    rt::KVPageTable pageTable(B, maxPagesPerSeq, numPages);
+    std::vector<int32_t> const row{3, 0};
+    pageTable.setRow(0, row.data(), static_cast<int32_t>(row.size()));
+    pageTable.upload(stream);
+    rt::Tensor kvSeqLens = makeKvSeqLens({S});
+    rt::Tensor kDst({B, H, S, D}, rt::DeviceType::kGPU, DataType::kUINT8);
+    rt::Tensor vDst({B, H, S, D}, rt::DeviceType::kGPU, DataType::kUINT8);
+
+    kernel::gatherPagedKVToHeadMajor(pool.rawPointer(), kDst.rawPointer(), vDst.rawPointer(),
+        pageTable.kernelView().dataPointer<int32_t>(), kvSeqLens.dataPointer<int32_t>(), maxPagesPerSeq, B, S, H, D,
+        sizeof(uint8_t), stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    auto const kOut = copyDeviceToHost<uint8_t>(kDst);
+    auto const vOut = copyDeviceToHost<uint8_t>(vDst);
+    for (int32_t head = 0; head < H; ++head)
+        for (int32_t token = 0; token < S; ++token)
+            for (int32_t dim = 0; dim < D; ++dim)
+            {
+                int32_t const logicalPage = token / rt::kTOKENS_PER_PAGE;
+                int32_t const inPage = token % rt::kTOKENS_PER_PAGE;
+                size_t const src = static_cast<size_t>(row[logicalPage]) * pageElems
+                    + static_cast<size_t>(inPage) * H * D + head * D + dim;
+                size_t const dst = static_cast<size_t>(head) * S * D + token * D + dim;
+                ASSERT_EQ(kOut[dst], poolHost[src]);
+                ASSERT_EQ(vOut[dst], poolHost[src + static_cast<size_t>(numPages) * pageElems]);
+            }
+}

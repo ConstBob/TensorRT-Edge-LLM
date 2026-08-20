@@ -43,7 +43,7 @@ public:
     //!        Positions matching any of these IDs are content-hashed for cache differentiation.
     static std::optional<ContextCacheRequest> begin(ContextCacheCoordinator& coordinator,
         LLMGenerationRequest const& request, DecodingInferenceContext const& context, bool speculativeRequest,
-        std::vector<int32_t> const& mediaTokenIds = {});
+        DecodingKvHeadroom const& headroom, std::vector<int32_t> const& mediaTokenIds = {});
 
     ContextCacheRequest(ContextCacheRequest&&) noexcept = default;
     ContextCacheRequest& operator=(ContextCacheRequest&&) = delete;
@@ -68,7 +68,7 @@ public:
     bool enqueuePrefillCaptures();
     bool completePrefill(DecodingInferenceContext const& context, std::vector<int32_t> const& commonStateLengths);
 
-    bool prepareDecodeStep(DecodingInferenceContext const& context);
+    bool prepareDecodeStep(DecodingInferenceContext const& context, DecodingKvHeadroom const& headroom);
     bool completeDecodeStep(DecodingInferenceContext const& context, std::vector<int32_t> const& commonStateLengths);
 
     bool beginBatchCompaction(std::vector<int32_t> const& oldToNew, int32_t newBatchSize, Tensor& deviceBatchMapping);

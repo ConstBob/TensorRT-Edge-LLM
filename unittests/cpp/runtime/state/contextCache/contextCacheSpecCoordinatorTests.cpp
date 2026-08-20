@@ -149,6 +149,16 @@ protected:
             validateContextCacheDeployment(mDeployment), resources, mStream, std::move(synchronizer));
     }
 
+    DecodingKvHeadroom specHeadroom() const
+    {
+        auto const& spec = *mDeployment.specConfig;
+        if (mDeployment.base.specDecodeType == SpecDecodeMode::kGemma4MTP)
+        {
+            return {spec.draftingStep + 1, 0};
+        }
+        return {spec.verifySize, spec.draftingStep * spec.draftingTopK};
+    }
+
     ContextCacheCoordinator::AdmissionResult begin(std::vector<int32_t> tokens, bool speculativeRequest = true)
     {
         return beginBatch({std::move(tokens)}, speculativeRequest);
@@ -159,11 +169,12 @@ protected:
     {
         ContextCacheBatchAdmission admission;
         admission.speculativeRequest = speculativeRequest;
+        DecodingKvHeadroom const headroom = speculativeRequest ? specHeadroom() : DecodingKvHeadroom{1, 0};
         for (auto& tokens : batch)
         {
             admission.sequences.push_back(ContextCacheSequenceAdmission{std::move(tokens), {}});
         }
-        ContextCacheCoordinator::BeginRequestResult result = mCoordinator->beginRequest(admission, mStream);
+        ContextCacheCoordinator::BeginRequestResult result = mCoordinator->beginRequest(admission, headroom, mStream);
         EXPECT_EQ(result.status, ContextCacheCoordinatorStatus::kOk);
         EXPECT_TRUE(result.admission.has_value());
         return std::move(*result.admission);
@@ -194,7 +205,7 @@ protected:
     void completeDecode(ContextCacheCoordinator::AdmissionResult& request, std::vector<int32_t> const& acceptedTokens,
         int32_t committedLength, int32_t commonLength, bool publishTerminal)
     {
-        ASSERT_EQ(mCoordinator->prepareDecodeStep(request.request), ContextCacheCoordinatorStatus::kOk);
+        ASSERT_EQ(mCoordinator->prepareDecodeStep(request.request, specHeadroom()), ContextCacheCoordinatorStatus::kOk);
         // EAGLE verification owns the existing round synchronization that makes all preceding row uploads and draft
         // work ready before this callback.
         ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
@@ -240,6 +251,56 @@ TEST_F(ContextCacheSpecCoordinatorTests, FirstVerificationPublishesPairAndNextRe
         metricsAfterConsumer.matchedTokens, metricsBeforeConsumer.matchedTokens + static_cast<uint64_t>(kInputLength));
     EXPECT_EQ(metricsAfterConsumer.specFullPageReplays, metricsBeforeConsumer.specFullPageReplays + 1U);
     EXPECT_EQ(mCoordinator->finish(consumer.request), ContextCacheCoordinatorStatus::kOk);
+}
+
+TEST_F(ContextCacheSpecCoordinatorTests, SpeculativeMediaAdmissionBypassesLookupAndPublication)
+{
+    constexpr int32_t kInputLength{2 * kTOKENS_PER_PAGE + 1};
+    std::vector<int32_t> const tokens = makeTokens(kInputLength);
+    std::vector<Hash128> mediaHashes(static_cast<size_t>(kInputLength));
+    Hash128 const mediaHash{0x1234U, 0x5678U};
+    mediaHashes[kTOKENS_PER_PAGE - 1] = mediaHash;
+    mediaHashes[kTOKENS_PER_PAGE] = mediaHash;
+    mediaHashes[kTOKENS_PER_PAGE + 1] = mediaHash;
+
+    ContextCacheBatchAdmission admission;
+    admission.speculativeRequest = true;
+    admission.lookupPolicy = ContextCacheLookupPolicy::kUseCache;
+    admission.sequences.push_back(ContextCacheSequenceAdmission{tokens, {}, std::move(mediaHashes)});
+
+    ContextCacheMetrics const before = mCoordinator->metrics();
+    ContextCacheCoordinator::BeginRequestResult result = mCoordinator->beginRequest(admission, specHeadroom(), mStream);
+    ASSERT_EQ(result.status, ContextCacheCoordinatorStatus::kOk);
+    ASSERT_TRUE(result.admission.has_value());
+    EXPECT_EQ(result.admission->prefillStarts, std::vector<int32_t>{0});
+    EXPECT_EQ(mCoordinator->metrics().lookupBypassSequences, before.lookupBypassSequences + 1U);
+
+    freezePrefill(*result.admission, kInputLength);
+    completeDecode(*result.admission, {41, 42}, kInputLength + 2, kInputLength, false);
+    EXPECT_EQ(mCoordinator->manager().records().size(), 0U);
+    EXPECT_EQ(mCoordinator->finish(result.admission->request), ContextCacheCoordinatorStatus::kOk);
+}
+
+TEST_F(ContextCacheSpecCoordinatorTests, MediaInOneSpeculativeBatchSlotBypassesEverySlot)
+{
+    constexpr int32_t kInputLength{kTOKENS_PER_PAGE + 1};
+    std::vector<Hash128> mediaHashes(static_cast<size_t>(kInputLength));
+    mediaHashes[kTOKENS_PER_PAGE - 1] = Hash128{0x1234U, 0x5678U};
+    mediaHashes[kTOKENS_PER_PAGE] = Hash128{0x1234U, 0x5678U};
+
+    ContextCacheBatchAdmission admission;
+    admission.speculativeRequest = true;
+    admission.lookupPolicy = ContextCacheLookupPolicy::kUseCache;
+    admission.sequences.push_back(ContextCacheSequenceAdmission{makeTokens(kInputLength), {}});
+    admission.sequences.push_back(ContextCacheSequenceAdmission{makeTokens(kInputLength), {}, std::move(mediaHashes)});
+
+    ContextCacheMetrics const before = mCoordinator->metrics();
+    ContextCacheCoordinator::BeginRequestResult result = mCoordinator->beginRequest(admission, specHeadroom(), mStream);
+    ASSERT_EQ(result.status, ContextCacheCoordinatorStatus::kOk);
+    ASSERT_TRUE(result.admission.has_value());
+    EXPECT_EQ(result.admission->prefillStarts, (std::vector<int32_t>{0, 0}));
+    EXPECT_EQ(mCoordinator->metrics().lookupBypassSequences, before.lookupBypassSequences + 2U);
+    EXPECT_EQ(mCoordinator->finish(result.admission->request), ContextCacheCoordinatorStatus::kOk);
 }
 
 TEST_F(ContextCacheSpecCoordinatorTests, DecodeEndPublishesOnlyTheCommonBaseDraftBoundary)
@@ -421,6 +482,24 @@ TEST_F(ContextCacheSpecCoordinatorTests, EagleRequestDoesNotConsumeBaseOnlyRecor
     EXPECT_EQ(mCoordinator->finish(consumer.request), ContextCacheCoordinatorStatus::kOk);
 }
 
+TEST_F(ContextCacheSpecCoordinatorTests, InitialHeadroomAllowsUnequalBaseAndDraftPagePaths)
+{
+    ContextCacheMetrics const before = mCoordinator->metrics();
+    ContextCacheBatchAdmission admission;
+    admission.speculativeRequest = true;
+    DecodingKvHeadroom const headroom{/*baseExtraTokens=*/2, /*draftExtraTokens=*/130};
+    admission.sequences.push_back(ContextCacheSequenceAdmission{makeTokens(kTOKENS_PER_PAGE - 1), {}});
+
+    ContextCacheCoordinator::BeginRequestResult result = mCoordinator->beginRequest(admission, headroom, mStream);
+    ASSERT_EQ(result.status, ContextCacheCoordinatorStatus::kOk);
+    ASSERT_TRUE(result.admission.has_value());
+    ContextCacheMetrics const admitted = mCoordinator->metrics();
+    EXPECT_EQ(before.baseKvPages.free - admitted.baseKvPages.free, 2);
+    EXPECT_EQ(before.draftKvPages.free - admitted.draftKvPages.free, 3);
+    EXPECT_EQ(mCoordinator->preparePrefill(result.admission->request), ContextCacheCoordinatorStatus::kOk);
+    EXPECT_EQ(mCoordinator->finish(result.admission->request), ContextCacheCoordinatorStatus::kOk);
+}
+
 class ContextCacheGemma4MtpCoordinatorTests : public ::testing::Test
 {
 protected:
@@ -469,7 +548,8 @@ protected:
         ContextCacheBatchAdmission admission;
         admission.speculativeRequest = true;
         admission.sequences.push_back(ContextCacheSequenceAdmission{std::move(tokens), {}});
-        ContextCacheCoordinator::BeginRequestResult result = mCoordinator->beginRequest(admission, mStream);
+        ContextCacheCoordinator::BeginRequestResult result
+            = mCoordinator->beginRequest(admission, DecodingKvHeadroom{5, 0}, mStream);
         EXPECT_EQ(result.status, ContextCacheCoordinatorStatus::kOk);
         EXPECT_TRUE(result.admission.has_value());
         return std::move(*result.admission);
@@ -516,7 +596,8 @@ TEST_F(ContextCacheGemma4MtpCoordinatorTests, DecodeUsesCommittedBaseBoundaryWit
     ASSERT_EQ(
         mCoordinator->finalizePrefillPublication(request.request, prefillAdvances), ContextCacheCoordinatorStatus::kOk);
 
-    ASSERT_EQ(mCoordinator->prepareDecodeStep(request.request), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(
+        mCoordinator->prepareDecodeStep(request.request, DecodingKvHeadroom{5, 0}), ContextCacheCoordinatorStatus::kOk);
     ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
     std::vector<int32_t> accepted{41, 42};
     std::vector<ContextCacheSequenceAdvance> decodeAdvances{ContextCacheSequenceAdvance{
@@ -525,7 +606,7 @@ TEST_F(ContextCacheGemma4MtpCoordinatorTests, DecodeUsesCommittedBaseBoundaryWit
         mCoordinator->completeDecodeStep(request.request, decodeAdvances, {}), ContextCacheCoordinatorStatus::kOk);
 }
 
-TEST_F(ContextCacheGemma4MtpCoordinatorTests, DecodeReservesFullVerifyWindowAcrossPageBoundary)
+TEST_F(ContextCacheGemma4MtpCoordinatorTests, AdmissionReservesFullVerifyWindowBeforeFirstDecode)
 {
     constexpr int32_t kInputLength{kTOKENS_PER_PAGE - 1};
     auto request = begin(makeTokens(kInputLength));
@@ -537,8 +618,9 @@ TEST_F(ContextCacheGemma4MtpCoordinatorTests, DecodeReservesFullVerifyWindowAcro
         mCoordinator->finalizePrefillPublication(request.request, prefillAdvances), ContextCacheCoordinatorStatus::kOk);
 
     ContextCacheMetrics const before = mCoordinator->metrics();
-    ASSERT_EQ(before.baseKvPages.capacity - before.baseKvPages.free, 1);
-    ASSERT_EQ(mCoordinator->prepareDecodeStep(request.request), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(before.baseKvPages.capacity - before.baseKvPages.free, 2);
+    ASSERT_EQ(
+        mCoordinator->prepareDecodeStep(request.request, DecodingKvHeadroom{5, 0}), ContextCacheCoordinatorStatus::kOk);
     ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
     ContextCacheMetrics const after = mCoordinator->metrics();
     EXPECT_EQ(after.baseKvPages.capacity - after.baseKvPages.free, 2);

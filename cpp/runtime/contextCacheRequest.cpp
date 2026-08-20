@@ -191,7 +191,7 @@ bool contextCacheOperationSucceeded(ContextCacheCoordinatorStatus status, char c
 
 std::optional<ContextCacheRequest> ContextCacheRequest::begin(ContextCacheCoordinator& coordinator,
     LLMGenerationRequest const& request, DecodingInferenceContext const& context, bool speculativeRequest,
-    std::vector<int32_t> const& mediaTokenIds)
+    DecodingKvHeadroom const& headroom, std::vector<int32_t> const& mediaTokenIds)
 {
     static std::vector<imageUtils::ImageData> const kEmptyImageBuffers;
     static std::vector<audioUtils::AudioData> const kEmptyAudioBuffers;
@@ -212,7 +212,8 @@ std::optional<ContextCacheRequest> ContextCacheRequest::begin(ContextCacheCoordi
             context.rawBatchedInputIds[seqIdx], context.loraWeightsName, mediaTokenIds, images, audio));
     }
 
-    ContextCacheCoordinator::BeginRequestResult admitted = coordinator.beginRequest(admission, context.stream);
+    ContextCacheCoordinator::BeginRequestResult admitted
+        = coordinator.beginRequest(admission, headroom, context.stream);
     if (!contextCacheOperationSucceeded(admitted.status, "admission") || !admitted.admission.has_value())
     {
         return std::nullopt;
@@ -280,11 +281,11 @@ bool ContextCacheRequest::completePrefill(
         mCoordinator.finalizePrefillPublication(mRequest, progress, commonStateLengthsPtr), "prefill publication");
 }
 
-bool ContextCacheRequest::prepareDecodeStep(DecodingInferenceContext const& context)
+bool ContextCacheRequest::prepareDecodeStep(DecodingInferenceContext const& context, DecodingKvHeadroom const& headroom)
 {
     ELLM_CHECK(!mTokenCountsBeforeDecode.has_value(),
         "Managed context-cache decode preparation cannot overlap a pending decode step.");
-    if (!contextCacheOperationSucceeded(mCoordinator.prepareDecodeStep(mRequest), "decode preparation"))
+    if (!contextCacheOperationSucceeded(mCoordinator.prepareDecodeStep(mRequest, headroom), "decode preparation"))
     {
         return false;
     }
