@@ -736,6 +736,22 @@ def _skip_resmooth_for_hybrid(model, quantization: str = ""):
         _ueh.requantize_resmooth_fused_llm_layers = _orig
 
 
+def _is_image_blind_calibration(model, quant_cfg: dict) -> bool:
+    """Return True if a text-only calibration would miss image activations.
+
+    Needs a visual tower and an algorithm that *reshapes* weights against the
+    calibration distribution rather than only recording ranges. ``awq_lite``
+    searches per-channel pre_quant_scales, so text-only data optimizes the
+    image-token ranges away and the model degenerates on image input.
+    ``max`` (fp8, nvfp4) only records ranges and is modality-blind either way.
+    """
+    if not any(
+            any(p in name for p in _VISUAL_PREFIXES)
+            for name, _ in model.named_modules()):
+        return False
+    return quant_cfg.get("algorithm") not in (None, "max")
+
+
 def _calibrate_multimodal(model, batches):
     """Forward-loop calibration pass for multimodal ``BatchFeature`` dicts."""
     device = model.device
@@ -826,6 +842,9 @@ def quantize_and_export(
     tower with text-only calibration produces uninitialised activation scales
     on the visual path — a multimodal calibration loader is required for
     accurate visual stats (see ``A3``).
+
+    Image calibration is selected automatically for a quantized backbone under
+    an unquantized visual tower -- see ``_is_image_blind_calibration``.
 
     ``text_dataset`` / ``image_dataset`` / ``audio_dataset`` each accept a
     registered dataset name (str), a dataset generator function, or ``None``
@@ -1085,11 +1104,15 @@ def quantize_and_export(
                 quant_cfg,
                 forward_loop=lambda m: _calibrate_asr_multimodal(m, batches),
             )
-        elif visual_quantization is not None:
+        elif (visual_quantization is not None
+              or _is_image_blind_calibration(model, quant_cfg)):
             image_ds = resolve_dataset(image_dataset, "image")
             print(f"Image calibration dataset: {dataset_name(image_ds)}")
             # Multimodal calibration: feed (image, text) pairs through the
             # whole VLM so visual + LLM quantizers both see real activations.
+            if visual_quantization is None:
+                from .gemma4_patch import apply as _apply_gemma4_patch
+                _apply_gemma4_patch(model, _get_model_type(model_dir))
             processor = AutoProcessor.from_pretrained(model_dir,
                                                       trust_remote_code=True)
             mm_samples = min(num_samples, 128)
@@ -1098,6 +1121,8 @@ def quantize_and_export(
                 image_dataset=image_ds,
                 num_samples=mm_samples,
                 is_phi4mm=_is_phi4mm_model(model_dir))
+            # Mixing text batches in was tried and reverted: it wins back
+            # some text accuracy but costs more on image benchmarks.
             mtq.quantize(
                 model,
                 quant_cfg,
