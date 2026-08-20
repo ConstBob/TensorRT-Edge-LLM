@@ -104,13 +104,26 @@ public:
         rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream) override;
 
 private:
-    //! \brief Preprocess audio buffers (PCM → mel internally) and run encoder.
-    //! \param[in] audioBuffers Input audio data carrying raw PCM (``AudioData::pcm``)
-    //! \param[out] audioTokenLengths Output token lengths for each audio clip
+    //! \brief Report whether the online GPU fbank can serve this clip, and its mel length.
+    //! \param[in] pcm Raw mono PCM for the clip
+    //! \param[out] numFramesOut Mel frame count when the GPU path is viable
+    //! \return True when ``tryOnlineGpuFbank`` will take the GPU path for this clip
+    bool gpuFbankViable(rt::audio::AudioPCM const& pcm, int32_t& numFramesOut) const;
+
+    //! \brief Size mAudioEmbedding for a whole batch, reallocating only if the
+    //!        pre-allocated capacity is short. Callers must invoke this before any
+    //!        clip is encoded — a reallocation drops rows already written.
+    //! \param[in] rows Total encoded rows across every clip in the batch
+    //! \return True if the buffer now holds ``rows`` rows
+    bool resizeEmbeddingForRows(int64_t rows);
+
+    //! \brief Run the encoder for one clip into its row slot of mAudioEmbedding.
+    //! \param[in] melSpec [1, mel_bins, T] FP16 log-mel for this clip
+    //! \param[in] destRowOffset First row this clip owns in mAudioEmbedding
+    //! \param[in] expectedRows Row count reserved for this clip; the encoder must agree
     //! \param[in] stream CUDA stream for execution
-    //! \return True if preprocessing and inference succeeded, false otherwise
-    bool preprocessAudio(std::vector<rt::audioUtils::AudioData> const& audioBuffers,
-        std::vector<int64_t>& audioTokenLengths, cudaStream_t stream);
+    //! \return True if encoding succeeded, false otherwise
+    bool encodeClip(rt::Tensor const& melSpec, int64_t destRowOffset, int64_t expectedRows, cudaStream_t stream);
 
     //! \brief Initialize persistent online-GPU-fbank state: load the CuTe DSL
     //!        GEMM module, pre-allocate every device buffer the fbank path
@@ -165,7 +178,7 @@ private:
     rt::Tensor mCuSeqlens{};          //!< [num_windows + 1] Cumulative sequence lengths (optional TRT input)
     rt::Tensor mCuSeqlensHost{};      //!< Host staging for mCuSeqlens
     rt::Tensor mKvLengths{};          //!< [num_windows + 1] Separate copy of cu_seqlens (TRT-native attention)
-    rt::Tensor mAudioEmbedding{};     //!< [num_audio_tokens, hidden_dim] Audio encoder output
+    rt::Tensor mAudioEmbedding{};     //!< [total_audio_tokens, hidden_dim] Encoder output, every clip in the batch
     bool mHasCuSeqlens{false};        //!< True when engine exposes cu_seqlens input
     bool mHasKvLengths{false};        //!< True when engine exposes kv_lengths input
 
