@@ -254,11 +254,35 @@ struct SsdCuteDslTestConfig
     int32_t ngroups;
     std::vector<int32_t> contextLengths{}; // empty = uniform (cl[b] == seqLen for all)
     bool useNonzeroInitState{false};       // when true, initialize state with deterministic random values
+    bool poisonPadding{false};             // when true, fill every padded input element with a large value
 };
 
 class SsdCuteDslTest : public ::testing::TestWithParam<SsdCuteDslTestConfig>
 {
 };
+
+TEST(SsdCuteDslCapability, SupportedConfigurationsMatchCompiledKernels)
+{
+    EXPECT_FALSE(CuteDslSSDRunner::canImplement(64, 128, 79));
+    EXPECT_TRUE(CuteDslSSDRunner::canImplement(64, 128, 80));
+    EXPECT_TRUE(CuteDslSSDRunner::canImplement(128, 64, 120));
+    EXPECT_FALSE(CuteDslSSDRunner::canImplement(80, 64, 110));
+    EXPECT_FALSE(CuteDslSSDRunner::canImplement(96, 128, 110));
+    EXPECT_EQ(CuteDslSSDRunner::getWorkspaceSize(1, 128, 8, 80, 64, 1), 0);
+
+#if defined(CUTE_DSL_SSD_BLACKWELL_ENABLED)
+    EXPECT_TRUE(CuteDslSSDRunner::canImplement(80, 128, 100));
+    EXPECT_TRUE(CuteDslSSDRunner::canImplement(80, 128, 101));
+    EXPECT_TRUE(CuteDslSSDRunner::canImplement(80, 128, 110));
+    EXPECT_FALSE(CuteDslSSDRunner::canImplement(80, 128, 80));
+    EXPECT_FALSE(CuteDslSSDRunner::canImplement(80, 128, 90));
+    EXPECT_FALSE(CuteDslSSDRunner::canImplement(80, 128, 120));
+    EXPECT_GT(CuteDslSSDRunner::getWorkspaceSize(1, 128, 96, 80, 128, 8), 0);
+#else
+    EXPECT_FALSE(CuteDslSSDRunner::canImplement(80, 128, 100));
+    EXPECT_EQ(CuteDslSSDRunner::getWorkspaceSize(1, 128, 96, 80, 128, 8), 0);
+#endif
+}
 
 TEST_P(SsdCuteDslTest, CorrectnessVsSerialReference)
 {
@@ -326,6 +350,34 @@ TEST_P(SsdCuteDslTest, CorrectnessVsSerialReference)
 
     // Optional per-batch context_lengths
     std::vector<int32_t> const* contextLengthsPtr = cfg.contextLengths.empty() ? nullptr : &cfg.contextLengths;
+    if (cfg.poisonPadding)
+    {
+        ASSERT_EQ(static_cast<int32_t>(cfg.contextLengths.size()), batch);
+        half const poison = __float2half(8.f);
+        for (int32_t b = 0; b < batch; ++b)
+        {
+            for (int32_t t = cfg.contextLengths[b]; t < seqLen; ++t)
+            {
+                for (int32_t h = 0; h < nheads; ++h)
+                {
+                    dtHost[(b * seqLen + t) * nheads + h] = poison;
+                    for (int32_t d = 0; d < dim; ++d)
+                    {
+                        xHost[((b * seqLen + t) * nheads + h) * dim + d] = poison;
+                    }
+                }
+                for (int32_t g = 0; g < ngroups; ++g)
+                {
+                    for (int32_t ds = 0; ds < dstate; ++ds)
+                    {
+                        size_t const index = ((b * seqLen + t) * ngroups + g) * dstate + ds;
+                        bHost[index] = poison;
+                        cHost[index] = poison;
+                    }
+                }
+            }
+        }
+    }
 
     // CPU reference (refState is the initial state; mutated to final by reference scan).
     std::vector<float> refState = stateHost;
@@ -498,6 +550,8 @@ INSTANTIATE_TEST_SUITE_P(SsdCuteDslSM80, SsdCuteDslTest,
         }
         if (c.useNonzeroInitState)
             name += "_initstate";
+        if (c.poisonPadding)
+            name += "_poison";
         return name;
     });
 
@@ -615,9 +669,19 @@ TEST_P(SsdCuteDslBlackwellTest, CorrectnessVsSerialReference)
     int32_t const dstate = cfg.dstate;
     int32_t const ngroups = cfg.ngroups;
 
-    if (!CuteDslSSDRunner::canImplement(dim, dstate, 100))
+    int32_t dispatchSmVersion = 100;
+    if (dim == 80)
     {
-        GTEST_SKIP() << "CuteDslSSDRunner cannot implement dim=" << dim << " dstate=" << dstate << " for SM100";
+        int device{};
+        CUDA_CHECK(cudaGetDevice(&device));
+        cudaDeviceProp prop{};
+        CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+        dispatchSmVersion = prop.major * 10 + prop.minor;
+    }
+    if (!CuteDslSSDRunner::canImplement(dim, dstate, dispatchSmVersion))
+    {
+        GTEST_SKIP() << "CuteDslSSDRunner cannot implement dim=" << dim << " dstate=" << dstate << " for SM"
+                     << dispatchSmVersion;
     }
 
     // Both Blackwell native (dim=64) and SM80 fallback (dim=128) wrappers take fp16
@@ -662,6 +726,34 @@ TEST_P(SsdCuteDslBlackwellTest, CorrectnessVsSerialReference)
 
     // Optional per-batch context_lengths
     std::vector<int32_t> const* contextLengthsPtr = cfg.contextLengths.empty() ? nullptr : &cfg.contextLengths;
+    if (cfg.poisonPadding)
+    {
+        ASSERT_EQ(static_cast<int32_t>(cfg.contextLengths.size()), batch);
+        half const poison = __float2half(8.f);
+        for (int32_t b = 0; b < batch; ++b)
+        {
+            for (int32_t t = cfg.contextLengths[b]; t < seqLen; ++t)
+            {
+                for (int32_t h = 0; h < nheads; ++h)
+                {
+                    dtHost[(b * seqLen + t) * nheads + h] = poison;
+                    for (int32_t d = 0; d < dim; ++d)
+                    {
+                        xHost[((b * seqLen + t) * nheads + h) * dim + d] = poison;
+                    }
+                }
+                for (int32_t g = 0; g < ngroups; ++g)
+                {
+                    for (int32_t ds = 0; ds < dstate; ++ds)
+                    {
+                        size_t const index = ((b * seqLen + t) * ngroups + g) * dstate + ds;
+                        bHost[index] = poison;
+                        cHost[index] = poison;
+                    }
+                }
+            }
+        }
+    }
 
     // CPU reference (refState is the initial state; mutated to final by reference scan).
     std::vector<float> refState = stateHost;
@@ -725,7 +817,7 @@ TEST_P(SsdCuteDslBlackwellTest, CorrectnessVsSerialReference)
     params.dim = dim;
     params.dstate = dstate;
     params.ngroups = ngroups;
-    params.smVersion = 100; // Force Blackwell path
+    params.smVersion = dispatchSmVersion; // Force Blackwell path for existing variants; use the exact SM for D80.
     params.dt_softplus = true;
     params.has_D = true;
     params.has_z = false;
@@ -1048,6 +1140,134 @@ INSTANTIATE_TEST_SUITE_P(GuardedInput, SsdCuteDslBlackwellTmaBounds,
         GuardedSsdInput::kX, GuardedSsdInput::kDt, GuardedSsdInput::kB, GuardedSsdInput::kC, GuardedSsdInput::kAll),
     [](testing::TestParamInfo<GuardedSsdInput> const& info) { return guardedSsdInputName(info.param); });
 
+int runSsdD80BoundsCase()
+{
+    try
+    {
+        int device{};
+        CUDA_CHECK(cudaGetDevice(&device));
+        cudaDeviceProp prop{};
+        CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+        int32_t const smVersion = prop.major * 10 + prop.minor;
+
+        int32_t constexpr batch = 1;
+        int32_t constexpr seqLen = 129;
+        int32_t constexpr nheads = 8;
+        int32_t constexpr dim = 80;
+        int32_t constexpr dstate = 128;
+        int32_t constexpr ngroups = 1;
+        if (!CuteDslSSDRunner::canImplement(dim, dstate, smVersion))
+        {
+            std::cerr << "CuteDslSSDRunner cannot implement D80/N128 for SM" << smVersion << "\n";
+            return 1;
+        }
+
+        size_t constexpr xSize = static_cast<size_t>(batch) * seqLen * nheads * dim;
+        size_t constexpr dtSize = static_cast<size_t>(batch) * seqLen * nheads;
+        size_t constexpr bSize = static_cast<size_t>(batch) * seqLen * ngroups * dstate;
+        size_t constexpr stateSize = static_cast<size_t>(batch) * nheads * dim * dstate;
+        size_t const workspaceSize = CuteDslSSDRunner::getWorkspaceSize(batch, seqLen, nheads, dim, dstate, ngroups);
+
+        GuardedDeviceBuffer xBuffer(xSize * sizeof(half));
+        GuardedDeviceBuffer stateBuffer(stateSize * sizeof(half));
+        GuardedDeviceBuffer outputBuffer(xSize * sizeof(half));
+        GuardedDeviceBuffer workspaceBuffer(workspaceSize);
+
+        rt::Tensor dtTensor = makeGpuTensor(static_cast<int64_t>(dtSize), DataType::kHALF, "dt");
+        rt::Tensor aTensor = makeGpuTensor(nheads, DataType::kFLOAT, "A");
+        rt::Tensor bTensor = makeGpuTensor(static_cast<int64_t>(bSize), DataType::kHALF, "B");
+        rt::Tensor cTensor = makeGpuTensor(static_cast<int64_t>(bSize), DataType::kHALF, "C");
+        rt::Tensor dTensor = makeGpuTensor(nheads, DataType::kHALF, "D");
+        rt::Tensor dtBiasTensor = makeGpuTensor(nheads, DataType::kHALF, "dtBias");
+
+        CUDA_CHECK(cudaMemset(xBuffer.data(), 0, xSize * sizeof(half)));
+        CUDA_CHECK(cudaMemset(dtTensor.rawPointer(), 0, dtSize * sizeof(half)));
+        CUDA_CHECK(cudaMemset(aTensor.rawPointer(), 0, nheads * sizeof(float)));
+        CUDA_CHECK(cudaMemset(bTensor.rawPointer(), 0, bSize * sizeof(half)));
+        CUDA_CHECK(cudaMemset(cTensor.rawPointer(), 0, bSize * sizeof(half)));
+        CUDA_CHECK(cudaMemset(dTensor.rawPointer(), 0, nheads * sizeof(half)));
+        CUDA_CHECK(cudaMemset(dtBiasTensor.rawPointer(), 0, nheads * sizeof(half)));
+        CUDA_CHECK(cudaMemset(stateBuffer.data(), 0, stateSize * sizeof(half)));
+        CUDA_CHECK(cudaMemset(outputBuffer.data(), 0, xSize * sizeof(half)));
+        CUDA_CHECK(cudaMemset(workspaceBuffer.data(), 0, workspaceSize));
+
+        SSDParams params{};
+        params.x = xBuffer.data();
+        params.dt = dtTensor.rawPointer();
+        params.A = aTensor.rawPointer();
+        params.B = bTensor.rawPointer();
+        params.C = cTensor.rawPointer();
+        params.D = dTensor.rawPointer();
+        params.dt_bias = dtBiasTensor.rawPointer();
+        params.state = stateBuffer.data();
+        params.output = outputBuffer.data();
+        params.workspace = workspaceBuffer.data();
+        params.batch = batch;
+        params.seq_len = seqLen;
+        params.nheads = nheads;
+        params.dim = dim;
+        params.dstate = dstate;
+        params.ngroups = ngroups;
+        params.smVersion = smVersion;
+        params.dt_softplus = true;
+        params.has_D = true;
+        params.has_init_states = true;
+
+        CuteDslSSDRunner runner;
+        int const runStatus = runner.run(params, nullptr);
+        cudaError_t const syncStatus = cudaDeviceSynchronize();
+        if (runStatus != 0)
+        {
+            std::cerr << "CuteDslSSDRunner::run failed for guarded D80\n";
+            return 1;
+        }
+        if (syncStatus != cudaSuccess)
+        {
+            std::cerr << "D80 kernel accessed beyond an exact tensor or workspace: " << cudaGetErrorString(syncStatus)
+                      << "\n";
+            return 1;
+        }
+        return 0;
+    }
+    catch (std::exception const& e)
+    {
+        std::cerr << "D80 bounds case failed: " << e.what() << "\n";
+        return 1;
+    }
+}
+
+TEST(SsdCuteDslBlackwellD80Bounds, ExactBuffersDoNotOverflow)
+{
+    int device{};
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp prop{};
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+    int32_t const smVersion = prop.major * 10 + prop.minor;
+    if (!CuteDslSSDRunner::canImplement(80, 128, smVersion))
+    {
+        GTEST_SKIP() << "D80 kernel requires SM100, SM101, or SM110";
+    }
+
+    CUDA_DRIVER_CHECK(cuInit(0));
+    CUdevice cuDevice{};
+    CUDA_DRIVER_CHECK(cuDeviceGet(&cuDevice, device));
+    int vmmSupported{};
+    CUDA_DRIVER_CHECK(
+        cuDeviceGetAttribute(&vmmSupported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, cuDevice));
+    if (vmmSupported == 0)
+    {
+        GTEST_SKIP() << "CUDA VMM is required for the guard-page allocation";
+    }
+
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT(
+        {
+            int const exitCode = runSsdD80BoundsCase();
+            std::_Exit(exitCode);
+        },
+        ::testing::ExitedWithCode(0), "");
+}
+
 // =============================================================================
 // Chunked prefill simulation -- exercises has_init_states correctness end-to-end.
 // Splits a single seq of length 2*chunkLen into two consecutive runner calls; the
@@ -1274,6 +1494,13 @@ INSTANTIATE_TEST_SUITE_P(SsdCuteDslBlackwell, SsdCuteDslBlackwellTest,
         SsdCuteDslTestConfig{1, 1024, 8, 128, 128, 1},
         // D=128, N=64: SM80 fallback
         SsdCuteDslTestConfig{1, 128, 8, 128, 64, 1}, SsdCuteDslTestConfig{1, 256, 8, 128, 64, 1},
+        // D=80, N=128: one launch with two D=64 scheduler work tiles. Covers the routing boundary,
+        // a partial chunk, multi-chunk execution, poisoned ragged padding, restored state,
+        // and the exact Nemotron-3 Nano H=96/G=8 shape.
+        SsdCuteDslTestConfig{1, 128, 8, 80, 128, 1}, SsdCuteDslTestConfig{1, 129, 8, 80, 128, 1},
+        SsdCuteDslTestConfig{1, 512, 8, 80, 128, 1},
+        SsdCuteDslTestConfig{2, 384, 8, 80, 128, 1, {131, 384}, false, true},
+        SsdCuteDslTestConfig{1, 256, 8, 80, 128, 1, {}, true}, SsdCuteDslTestConfig{1, 128, 96, 80, 128, 8},
         // Varlen: explicit context_lengths (Blackwell varlen path target)
         SsdCuteDslTestConfig{1, 256, 8, 64, 128, 1, {256}},                // batch=1 cl==seqLen sanity
         SsdCuteDslTestConfig{1, 256, 8, 64, 128, 1, {200}},                // batch=1 partial
@@ -1317,6 +1544,8 @@ INSTANTIATE_TEST_SUITE_P(SsdCuteDslBlackwell, SsdCuteDslBlackwellTest,
         }
         if (c.useNonzeroInitState)
             name += "_initstate";
+        if (c.poisonPadding)
+            name += "_poison";
         return name;
     });
 

@@ -227,6 +227,23 @@ KERNEL_VARIANTS = [
                      "--function_prefix", "ssd_prefill_blackwell_d64_n128_init_states"],
     ),
     KernelVariant(
+        name="ssd_prefill_blackwell_d80_n128",
+        group="ssd",
+        supported_sms=[100, 101, 110],
+        script="ssd_cutedsl/ssd_prefill_blackwell.py",
+        script_args=["--export_only", "--dim", "80", "--dstate", "128"],
+    ),
+    KernelVariant(
+        name="ssd_prefill_blackwell_d80_n128_init_states",
+        group="ssd",
+        supported_sms=[100, 101, 110],
+        script="ssd_cutedsl/ssd_prefill_blackwell.py",
+        script_args=["--export_only", "--dim", "80", "--dstate", "128",
+                     "--has_init_states",
+                     "--file_name", "ssd_prefill_blackwell_d80_n128_init_states",
+                     "--function_prefix", "ssd_prefill_blackwell_d80_n128_init_states"],
+    ),
+    KernelVariant(
         name="ssd_prefill_blackwell_d64_n64",
         group="ssd",
         supported_sms=[100, 101, 110],
