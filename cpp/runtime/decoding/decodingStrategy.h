@@ -170,6 +170,16 @@ public:
         return {/*.baseExtraTokens=*/1, /*.draftExtraTokens=*/0};
     }
 
+    virtual DecodingTokenStateContract tokenStateContract() const noexcept
+    {
+        return DecodingTokenStateContract::kCommittedPlusLookahead;
+    }
+
+    virtual ContextCacheCommitPolicy contextCacheCommitPolicy(ContextCacheCommitPolicy requested) const noexcept
+    {
+        return requested;
+    }
+
     virtual bool decodeStep(DecodingInferenceContext& context) = 0;
     virtual bool captureCudaGraphs(cudaStream_t stream) = 0;
 

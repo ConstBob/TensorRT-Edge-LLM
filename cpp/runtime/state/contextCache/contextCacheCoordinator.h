@@ -66,6 +66,7 @@ struct ContextCacheBatchAdmission
 {
     std::vector<ContextCacheSequenceAdmission> sequences;
     bool speculativeRequest{};
+    DecodingTokenStateContract tokenStateContract{DecodingTokenStateContract::kCommittedPlusLookahead};
     ContextCacheLookupPolicy lookupPolicy{ContextCacheLookupPolicy::kUseCache};
     ContextCacheCommitPolicy commitPolicy{ContextCacheCommitPolicy::kIncludingGeneratedTokens};
     //! Carried-through Hybrid+MTP replay tail length. Not consumed by this stage.
@@ -218,6 +219,8 @@ private:
     void validateEagleDecodeAdvances(RequestHandle::Impl const& request,
         std::vector<ContextCacheSequenceAdvance> const& advances, std::vector<int32_t> const* commonStateLengths) const;
     void validateVanillaDecodeAdvances(RequestHandle::Impl const& request,
+        std::vector<ContextCacheSequenceAdvance> const& advances, std::vector<int32_t> const* commonStateLengths) const;
+    void validateFullyCommittedDecodeAdvances(RequestHandle::Impl const& request,
         std::vector<ContextCacheSequenceAdvance> const& advances, std::vector<int32_t> const* commonStateLengths) const;
     void validateMtpDecodeAdvances(RequestHandle::Impl const& request,
         std::vector<ContextCacheSequenceAdvance> const& advances, std::vector<int32_t> const* commonStateLengths) const;

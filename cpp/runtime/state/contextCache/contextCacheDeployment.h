@@ -69,6 +69,7 @@ struct ContextCacheDeploymentProfile
     {
         return isSpeculative() && specReuseContract->ownsPagedSpecState;
     }
+
 };
 
 //! Validate the logical deployment contract and return its context-cache profile.

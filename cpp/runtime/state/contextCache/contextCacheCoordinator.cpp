@@ -316,6 +316,7 @@ struct ContextCacheCoordinator::RequestHandle::Impl
     ContextCacheCoordinator* owner{};
     cudaStream_t stream{};
     bool speculativeRequest{};
+    DecodingTokenStateContract tokenStateContract{DecodingTokenStateContract::kCommittedPlusLookahead};
     std::vector<int32_t> pendingCompactionMapping;
     int32_t pendingCompactionBatchSize{-1};
     Tensor const* pendingDeviceBatchMapping{};
@@ -486,7 +487,14 @@ public:
         std::vector<int32_t> const* commonStateLengths) override
     {
         auto& impl = mCoordinator.checkedImpl(request);
-        mCoordinator.validateVanillaDecodeAdvances(impl, advances, commonStateLengths);
+        if (impl.tokenStateContract == DecodingTokenStateContract::kFullyCommitted)
+        {
+            mCoordinator.validateFullyCommittedDecodeAdvances(impl, advances, commonStateLengths);
+        }
+        else
+        {
+            mCoordinator.validateVanillaDecodeAdvances(impl, advances, commonStateLengths);
+        }
         mCoordinator.applyAdvances(impl, advances);
         mCoordinator.assertUniqueCompletedSlots(impl, publishableCompletedSlots);
         impl.markDeviceWorkResolvedWithoutSync();
@@ -1045,6 +1053,9 @@ ContextCacheCoordinator::BeginRequestResult ContextCacheCoordinator::beginReques
     ELLM_CHECK(admission.commitPolicy == ContextCacheCommitPolicy::kIncludingGeneratedTokens
             || admission.commitPolicy == ContextCacheCommitPolicy::kPrefillStateOnly,
         "Context cache admission has an invalid commit policy");
+    ELLM_CHECK(admission.tokenStateContract == DecodingTokenStateContract::kCommittedPlusLookahead
+            || admission.tokenStateContract == DecodingTokenStateContract::kFullyCommitted,
+        "Context cache admission has an invalid token-state contract");
     ELLM_CHECK(!admission.speculativeRequest || isSpecDeployment(),
         "Speculative context-cache request does not match the deployment contract");
     bool const containsMedia = std::any_of(admission.sequences.begin(), admission.sequences.end(),
@@ -1066,6 +1077,7 @@ ContextCacheCoordinator::BeginRequestResult ContextCacheCoordinator::beginReques
     auto request = std::make_unique<RequestHandle::Impl>(*this, stream);
     activeRollback.dismiss();
     request->speculativeRequest = admission.speculativeRequest;
+    request->tokenStateContract = admission.tokenStateContract;
     mPublicationPolicy = makePublicationPolicy(admission.speculativeRequest);
     int32_t maxBatchSize = mBaseCache.getKVCacheManager().getConfig().maxBatchSize;
     if (admission.speculativeRequest && ownsPagedSpecState())
@@ -1512,6 +1524,26 @@ void ContextCacheCoordinator::validateVanillaDecodeAdvances(RequestHandle::Impl 
     validateCommittedLookaheadAdvances(request, advances, /*tokensPerStep=*/TokensPerDecodeStep::kExactlyOne);
 }
 
+void ContextCacheCoordinator::validateFullyCommittedDecodeAdvances(RequestHandle::Impl const& request,
+    std::vector<ContextCacheSequenceAdvance> const& advances, std::vector<int32_t> const* commonStateLengths) const
+{
+    ELLM_CHECK(commonStateLengths == nullptr || commonStateLengths->empty(),
+        "Fully committed decode supplied speculative common-state lengths");
+    for (size_t slot = 0; slot < request.sequences.size(); ++slot)
+    {
+        auto const& sequence = request.sequences[slot];
+        auto const& delta = advances[slot];
+        int64_t const expectedCommittedStateLength = static_cast<int64_t>(sequence.committedStateLength)
+            + static_cast<int64_t>(delta.acceptedTokenCount);
+        int64_t const expectedTokenCount = static_cast<int64_t>(sequence.tokenIds.size())
+            + static_cast<int64_t>(delta.acceptedTokenCount);
+        ELLM_CHECK(delta.acceptedTokenCount > 0 && expectedCommittedStateLength <= std::numeric_limits<int32_t>::max()
+                && delta.committedStateLength == expectedCommittedStateLength
+                && expectedTokenCount == expectedCommittedStateLength,
+            "Fully committed decode progress must append exactly its committed token prefix without a lookahead token");
+    }
+}
+
 void ContextCacheCoordinator::validateMtpDecodeAdvances(RequestHandle::Impl const& request,
     std::vector<ContextCacheSequenceAdvance> const& advances, std::vector<int32_t> const* commonStateLengths) const
 {
@@ -1569,9 +1601,18 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::finalizePrefillPublicatio
     {
         auto const& sequence = impl.sequences[slot];
         auto const& delta = advances[slot];
-        ELLM_CHECK(delta.acceptedTokenCount == 1
-                && delta.committedStateLength == static_cast<int32_t>(sequence.tokenIds.size()),
-            "Context cache prefill progress does not describe a complete input plus one lookahead");
+        if (impl.tokenStateContract == DecodingTokenStateContract::kFullyCommitted)
+        {
+            ELLM_CHECK(delta.acceptedTokenCount == 0
+                    && delta.committedStateLength == static_cast<int32_t>(sequence.tokenIds.size()),
+                "Fully committed prefill must publish only its materialized prompt boundary");
+        }
+        else
+        {
+            ELLM_CHECK(delta.acceptedTokenCount == 1
+                    && delta.committedStateLength == static_cast<int32_t>(sequence.tokenIds.size()),
+                "Context cache prefill progress does not describe a complete input plus one lookahead");
+        }
     }
     mPublicationPolicy->onPrefillFinalized(request, advances, commonStateLengths);
     return ContextCacheCoordinatorStatus::kOk;

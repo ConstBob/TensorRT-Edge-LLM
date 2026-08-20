@@ -41,6 +41,7 @@ public:
     static std::optional<ManagedKVCacheRequest> begin(ContextCacheCoordinator* contextCache,
         BoundedSwaKVPageManager* swaPageManager, LLMGenerationRequest const& request,
         DecodingInferenceContext const& context, bool speculativeRequest, DecodingKvHeadroom const& headroom,
+        DecodingTokenStateContract tokenStateContract, ContextCacheCommitPolicy commitPolicy,
         std::vector<int32_t> const& mediaTokenIds = {});
 
     ManagedKVCacheRequest(ManagedKVCacheRequest&&) noexcept = default;

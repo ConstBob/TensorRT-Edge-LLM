@@ -42,6 +42,15 @@ struct DecodingKvHeadroom
     int32_t draftExtraTokens{};
 };
 
+//! Relationship between the runtime token list and the model state materialized in KV cache.
+enum class DecodingTokenStateContract : uint8_t
+{
+    //! The token list ends with one sampled token whose KV has not yet been materialized.
+    kCommittedPlusLookahead,
+    //! Every token in the runtime token list already has materialized KV state.
+    kFullyCommitted,
+};
+
 /**
  * @brief Pre-allocated flat accumulator for per-step log-probabilities of one batch slot.
  *

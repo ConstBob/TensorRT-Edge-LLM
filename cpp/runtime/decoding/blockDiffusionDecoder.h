@@ -51,6 +51,21 @@ public:
         return false;
     }
 
+    DecodingKvHeadroom requiredKvHeadroom() const override
+    {
+        return {/*.baseExtraTokens=*/mCanvasLen, /*.draftExtraTokens=*/0};
+    }
+
+    DecodingTokenStateContract tokenStateContract() const noexcept override
+    {
+        return DecodingTokenStateContract::kFullyCommitted;
+    }
+
+    ContextCacheCommitPolicy contextCacheCommitPolicy(ContextCacheCommitPolicy) const noexcept override
+    {
+        return ContextCacheCommitPolicy::kPrefillStateOnly;
+    }
+
     bool decodeStep(DecodingInferenceContext& context) override;
     bool captureCudaGraphs(cudaStream_t stream) override;
 
