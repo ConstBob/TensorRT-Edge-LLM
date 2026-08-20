@@ -140,7 +140,7 @@ protected:
         {
             admission.sequences.push_back(ContextCacheSequenceAdmission{tokens, {}});
         }
-        return mCoordinator->beginRequest(admission, mStream);
+        return mCoordinator->beginRequest(admission, DecodingKvHeadroom{1, 0}, mStream);
     }
 
     void finalizePrefillWithLengths(
@@ -270,7 +270,8 @@ TEST_F(ContextCacheCoordinatorTests, PrefillOnlyPolicyDoesNotAttemptDecodePublic
     finalizePrefillWithLengths(*request.admission, {kInputLength});
     size_t const recordsAfterPrefill = mCoordinator->manager().records().size();
 
-    ASSERT_EQ(mCoordinator->prepareDecodeStep(request.admission->request), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(mCoordinator->prepareDecodeStep(request.admission->request, DecodingKvHeadroom{1, 0}),
+        ContextCacheCoordinatorStatus::kOk);
     ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
     int32_t const nextLookahead = 9002;
     std::vector<ContextCacheSequenceAdvance> progress{ContextCacheSequenceAdvance{&nextLookahead, 1, kInputLength + 1}};
@@ -293,12 +294,14 @@ TEST_F(ContextCacheCoordinatorTests, SequenceIdentityAppliesToGeneratedPageBound
     producerSequence.keyExtras.isolationDigest = kIDENTITY_A;
     ContextCacheBatchAdmission producerBatch;
     producerBatch.sequences.push_back(std::move(producerSequence));
-    ContextCacheCoordinator::BeginRequestResult producer = mCoordinator->beginRequest(producerBatch, mStream);
+    ContextCacheCoordinator::BeginRequestResult producer
+        = mCoordinator->beginRequest(producerBatch, DecodingKvHeadroom{1, 0}, mStream);
     ASSERT_EQ(producer.status, ContextCacheCoordinatorStatus::kOk);
     ASSERT_TRUE(producer.admission.has_value());
     finalizePrefillWithLengths(*producer.admission, {kINPUT_LENGTH});
 
-    ASSERT_EQ(mCoordinator->prepareDecodeStep(producer.admission->request), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(mCoordinator->prepareDecodeStep(producer.admission->request, DecodingKvHeadroom{1, 0}),
+        ContextCacheCoordinatorStatus::kOk);
     ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
     int32_t const nextLookahead = 9002;
     std::vector<ContextCacheSequenceAdvance> progress{ContextCacheSequenceAdvance{&nextLookahead, 1, kTOKENS_PER_PAGE}};
@@ -314,7 +317,8 @@ TEST_F(ContextCacheCoordinatorTests, SequenceIdentityAppliesToGeneratedPageBound
     matchingSequence.keyExtras.isolationDigest = kIDENTITY_A;
     ContextCacheBatchAdmission matchingBatch;
     matchingBatch.sequences.push_back(std::move(matchingSequence));
-    ContextCacheCoordinator::BeginRequestResult matching = mCoordinator->beginRequest(matchingBatch, mStream);
+    ContextCacheCoordinator::BeginRequestResult matching
+        = mCoordinator->beginRequest(matchingBatch, DecodingKvHeadroom{1, 0}, mStream);
     ASSERT_EQ(matching.status, ContextCacheCoordinatorStatus::kOk);
     ASSERT_TRUE(matching.admission.has_value());
     EXPECT_EQ(matching.admission->prefillStarts[0], kTOKENS_PER_PAGE);
@@ -325,7 +329,8 @@ TEST_F(ContextCacheCoordinatorTests, SequenceIdentityAppliesToGeneratedPageBound
     isolatedSequence.keyExtras.isolationDigest = kIDENTITY_B;
     ContextCacheBatchAdmission isolatedBatch;
     isolatedBatch.sequences.push_back(std::move(isolatedSequence));
-    ContextCacheCoordinator::BeginRequestResult isolated = mCoordinator->beginRequest(isolatedBatch, mStream);
+    ContextCacheCoordinator::BeginRequestResult isolated
+        = mCoordinator->beginRequest(isolatedBatch, DecodingKvHeadroom{1, 0}, mStream);
     ASSERT_EQ(isolated.status, ContextCacheCoordinatorStatus::kOk);
     ASSERT_TRUE(isolated.admission.has_value());
     EXPECT_EQ(isolated.admission->prefillStarts[0], 0);

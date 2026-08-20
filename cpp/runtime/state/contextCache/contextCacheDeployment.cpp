@@ -110,7 +110,7 @@ void validateSpecDeploymentTuple(DeploymentConfig const& deployment)
     validateStateContract(*deployment.draft, "draft engine");
     ELLM_CHECK(deployment.specConfig->verifySize > 0 && deployment.specConfig->draftingStep > 0
             && deployment.specConfig->draftingTopK > 0,
-        "Speculative context reuse has invalid working-set geometry.");
+        "Speculative context reuse has invalid execution geometry.");
 }
 
 } // namespace

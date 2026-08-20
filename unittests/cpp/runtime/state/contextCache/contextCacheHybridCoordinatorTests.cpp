@@ -172,7 +172,8 @@ protected:
     {
         ContextCacheBatchAdmission admission;
         admission.sequences.push_back(ContextCacheSequenceAdmission{std::move(tokens), std::move(keyExtras)});
-        ContextCacheCoordinator::BeginRequestResult result = mCoordinator->beginRequest(admission, mStream);
+        ContextCacheCoordinator::BeginRequestResult result
+            = mCoordinator->beginRequest(admission, DecodingKvHeadroom{1, 0}, mStream);
         EXPECT_EQ(result.status, ContextCacheCoordinatorStatus::kOk);
         EXPECT_TRUE(result.admission.has_value());
         return std::move(*result.admission);
@@ -333,7 +334,8 @@ TEST_F(ContextCacheHybridCoordinatorTests, DecodeEndCheckpointUsesOneCaptureSync
     seedKvPage(mPageTable->hostRow(0)[1], 0x21, 0x71);
     publishPrefill(producer, kInputLength, 9001);
 
-    ASSERT_EQ(mCoordinator->prepareDecodeStep(producer.request), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(mCoordinator->prepareDecodeStep(producer.request, DecodingKvHeadroom{1, 0}),
+        ContextCacheCoordinatorStatus::kOk);
     seedRecurrent(0x32, 0x62);
     seedKvPage(mPageTable->hostRow(0)[1], 0x22, 0x72);
     ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);

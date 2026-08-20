@@ -101,6 +101,7 @@ public:
     //! @return A reference to the tensor with shape
     //!         [2, numPages(), kTOKENS_PER_PAGE, numKVHeads_i, headDim_i].
     rt::Tensor& getCombinedKVCache(int32_t attnLayerIdx) noexcept;
+    rt::Tensor const& getCombinedKVCache(int32_t attnLayerIdx) const noexcept;
 
     //! Get the K-half and V-half of the given attention layer's pool as separate tensor views.
     //! @param attnLayerIdx The index of the attention layer.

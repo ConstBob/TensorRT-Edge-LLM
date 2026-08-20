@@ -388,5 +388,70 @@ void gatherPagedKVToSplit(void const* pool, void* kDst, void* vDst, int32_t cons
     CUDA_CHECK(cudaGetLastError());
 }
 
+__global__ void gatherPagedKVToHeadMajorKernel(uint8_t const* __restrict__ pool, uint8_t* __restrict__ kDst,
+    uint8_t* __restrict__ vDst, int32_t const* __restrict__ pageTable, int32_t const* __restrict__ kvSeqLens,
+    int32_t maxPagesPerSeq, int32_t seqLen, int32_t numKVHeads, int32_t headDim, size_t elemSize)
+{
+    int32_t const batch = blockIdx.x;
+    int32_t const logicalPage = blockIdx.y;
+    int32_t const head = blockIdx.z;
+    int32_t const tokenStart = logicalPage * rt::kTOKENS_PER_PAGE;
+    int32_t const tokensInPage = min(rt::kTOKENS_PER_PAGE, seqLen - tokenStart);
+    int32_t const kPage = pageTable[(static_cast<size_t>(batch) * 2 + 0) * maxPagesPerSeq + logicalPage];
+    int32_t const vPage = pageTable[(static_cast<size_t>(batch) * 2 + 1) * maxPagesPerSeq + logicalPage];
+    size_t const tokenBytes = static_cast<size_t>(numKVHeads) * headDim * elemSize;
+    size_t const headBytes = static_cast<size_t>(headDim) * elemSize;
+    size_t const pageBytes = static_cast<size_t>(rt::kTOKENS_PER_PAGE) * tokenBytes;
+
+    for (int32_t scalar = threadIdx.x; scalar < tokensInPage * headDim; scalar += blockDim.x)
+    {
+        int32_t const token = scalar / headDim;
+        int32_t const dim = scalar % headDim;
+        size_t const dstOffset
+            = ((static_cast<size_t>(batch) * numKVHeads + head) * seqLen + tokenStart + token) * headBytes
+            + static_cast<size_t>(dim) * elemSize;
+        bool const live = tokenStart + token < kvSeqLens[batch] && kPage >= 0 && vPage >= 0;
+        if (!live)
+        {
+            for (size_t byte = 0; byte < elemSize; ++byte)
+            {
+                kDst[dstOffset + byte] = 0;
+                vDst[dstOffset + byte] = 0;
+            }
+            continue;
+        }
+
+        size_t const srcElement = (static_cast<size_t>(token) * numKVHeads + head) * headDim + dim;
+        size_t const kOffset = static_cast<size_t>(kPage) * pageBytes + srcElement * elemSize;
+        size_t const vOffset = static_cast<size_t>(vPage) * pageBytes + srcElement * elemSize;
+        for (size_t byte = 0; byte < elemSize; ++byte)
+        {
+            kDst[dstOffset + byte] = pool[kOffset + byte];
+            vDst[dstOffset + byte] = pool[vOffset + byte];
+        }
+    }
+}
+
+void gatherPagedKVToHeadMajor(void const* pool, void* kDst, void* vDst, int32_t const* pageTable,
+    int32_t const* kvSeqLens, int32_t maxPagesPerSeq, int32_t batchSize, int32_t seqLen, int32_t numKVHeads,
+    int32_t headDim, size_t elemSize, cudaStream_t stream)
+{
+    check::check(batchSize > 0 && seqLen > 0 && numKVHeads > 0 && headDim > 0 && elemSize > 0,
+        "gatherPagedKVToHeadMajor: dimensions and element size must be positive.");
+    check::check(pageTable != nullptr && kvSeqLens != nullptr,
+        "gatherPagedKVToHeadMajor: page table and sequence lengths are required.");
+    int32_t const numLogicalPages = (seqLen + rt::kTOKENS_PER_PAGE - 1) / rt::kTOKENS_PER_PAGE;
+    check::check(
+        numLogicalPages <= maxPagesPerSeq, "gatherPagedKVToHeadMajor: sequence length exceeds the page-table row.");
+
+    constexpr int32_t kTHREADS_PER_BLOCK{256};
+    dim3 const grid(
+        static_cast<uint32_t>(batchSize), static_cast<uint32_t>(numLogicalPages), static_cast<uint32_t>(numKVHeads));
+    gatherPagedKVToHeadMajorKernel<<<grid, kTHREADS_PER_BLOCK, 0, stream>>>(static_cast<uint8_t const*>(pool),
+        static_cast<uint8_t*>(kDst), static_cast<uint8_t*>(vDst), pageTable, kvSeqLens, maxPagesPerSeq, seqLen,
+        numKVHeads, headDim, elemSize);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace kernel
 } // namespace trt_edgellm

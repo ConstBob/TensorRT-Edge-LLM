@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "action/actionKvBatch.h"
 #include "action/alpamayo1ActionRunner.h"
 #include "common/hashUtils.h"
 #include "common/tensor.h"
@@ -59,6 +60,7 @@ namespace trt_edgellm
 {
 namespace rt
 {
+
 class ContextCacheCoordinator;
 class ContextCacheRequest;
 
@@ -301,6 +303,7 @@ private:
     std::unique_ptr<MultimodalRunner> mVisionRunner{nullptr};      //!< Vision multimodal runner (optional)
     std::unique_ptr<MultimodalRunner> mAudioRunner{nullptr};       //!< Audio multimodal runner (optional)
     std::unique_ptr<Alpamayo1ActionRunner> mActionRunner{nullptr}; //!< Action/diffusion head runner (optional)
+    std::unique_ptr<ActionKvBatchCollector> mActionKvBatchCollector;
     tokenizer::Tokenizer* mTokenizer{nullptr};                     //!< Shared tokenizer owned by RuntimeCoordinator
     std::unique_ptr<EncoderEmbeddingCache> mEncoderEmbeddingCache; //!< Content-addressed encoder output cache
     hash_utils::HashMap<std::tuple<std::string, std::string>, SystemPromptKVCache>

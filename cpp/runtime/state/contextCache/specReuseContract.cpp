@@ -32,49 +32,29 @@ std::optional<SpecReuseContract> resolveSpecReuseContract(DeploymentConfig const
         "Speculative context reuse requires draft and speculative deployment configuration.");
 
     SpecReuseContract contract;
-    int64_t workingTokens{};
     switch (deployment.base.specDecodeType)
     {
     case SpecDecodeMode::kNONE: return std::nullopt;
     case SpecDecodeMode::kMTP:
-        contract = SpecReuseContract{/*ownsPagedSpecState=*/true, /*futureDependencyTokens=*/1,
-            /*speculativeWorkingTokens=*/0};
-        workingTokens = static_cast<int64_t>(deployment.specConfig->draftingStep)
-            * static_cast<int64_t>(deployment.specConfig->draftingTopK);
+        contract = SpecReuseContract{/*ownsPagedSpecState=*/true, /*futureDependencyTokens=*/1};
         break;
     case SpecDecodeMode::kEAGLE:
-        // EAGLE shifts draft token IDs by one relative to base hidden states and uses a padded step-by-fanout tree.
-        contract = SpecReuseContract{/*ownsPagedSpecState=*/true, /*futureDependencyTokens=*/1,
-            /*speculativeWorkingTokens=*/0};
-        workingTokens = static_cast<int64_t>(deployment.specConfig->draftingStep)
-            * static_cast<int64_t>(deployment.specConfig->draftingTopK);
+        contract = SpecReuseContract{/*ownsPagedSpecState=*/true, /*futureDependencyTokens=*/1};
         break;
     case SpecDecodeMode::kGemma4MTP:
         // The assistant mutates only target-owned KV lengths and owns no page pool.
-        contract = SpecReuseContract{/*ownsPagedSpecState=*/false, /*futureDependencyTokens=*/0,
-            /*speculativeWorkingTokens=*/0};
+        contract = SpecReuseContract{/*ownsPagedSpecState=*/false, /*futureDependencyTokens=*/0};
         break;
     case SpecDecodeMode::kDFlash:
     case SpecDecodeMode::kJetSpec:
-        // One draft forward writes the complete configured block.
-        contract = SpecReuseContract{/*ownsPagedSpecState=*/true, /*futureDependencyTokens=*/0,
-            /*speculativeWorkingTokens=*/0};
-        workingTokens = deployment.specConfig->dflashBlockSize;
+        contract = SpecReuseContract{/*ownsPagedSpecState=*/true, /*futureDependencyTokens=*/0};
         break;
     case SpecDecodeMode::kDSpark:
-        // DSpark's proposal is bounded by the exported block size.
-        contract = SpecReuseContract{/*ownsPagedSpecState=*/true, /*futureDependencyTokens=*/0,
-            /*speculativeWorkingTokens=*/0};
-        workingTokens = deployment.draft->specDraftBlockSize;
+        contract = SpecReuseContract{/*ownsPagedSpecState=*/true, /*futureDependencyTokens=*/0};
         break;
     default: ELLM_CHECK(false, "resolveSpecReuseContract: unhandled SpecDecodeMode");
     }
 
-    ELLM_CHECK(workingTokens >= 0 && workingTokens <= std::numeric_limits<int32_t>::max(),
-        "Speculative context reuse working-set geometry exceeds int32.");
-    ELLM_CHECK(!contract.ownsPagedSpecState || workingTokens > 0,
-        "Paged speculative context reuse requires a positive speculative working set.");
-    contract.speculativeWorkingTokens = static_cast<int32_t>(workingTokens);
     return contract;
 }
 

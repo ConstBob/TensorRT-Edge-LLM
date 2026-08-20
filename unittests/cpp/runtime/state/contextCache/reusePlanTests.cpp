@@ -138,8 +138,7 @@ ReusePlan makeEagleReusePlan(std::vector<BlockHash> const& inputFullBlockHashes,
     BaseBlockIndex const& baseIndex, SpecStateIndex const& specIndex, CacheRecordStore const& records,
     ContextCacheLookupPolicy lookupPolicy = ContextCacheLookupPolicy::kUseCache)
 {
-    SpecReuseContract const contract{
-        /*ownsPagedSpecState=*/true, /*futureDependencyTokens=*/1, /*speculativeWorkingTokens=*/2};
+    SpecReuseContract const contract{/*ownsPagedSpecState=*/true, /*futureDependencyTokens=*/1};
     return makeSpecReusePlan(SpecReusePlanInput{inputFullBlockHashes, inputTokenCount, kPAGE_SIZE, lookupPolicy,
                                  baseIndex, specIndex, records},
         contract);

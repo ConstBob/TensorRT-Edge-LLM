@@ -23,6 +23,7 @@
 //
 
 #include "runtime/llmInferenceRuntime.h"
+#include "runtime/llmRankRuntime.h"
 
 #include "common/bindingNames.h"
 #include "common/cudaUtils.h"
@@ -291,8 +292,14 @@ protected:
         ON_CALL(*engine, captureGraph(_)).WillByDefault(Return(false));
         // The logits binding is only reachable through the tensor map the runtime hands to prepare().
         ON_CALL(*engine, prepare(_, _, _, _))
-            .WillByDefault([this](int32_t, rt::InferenceDims const&, rt::TensorMap const& map, cudaStream_t) {
+            .WillByDefault([this](int32_t, rt::InferenceDims const&, rt::TensorMap const& map, cudaStream_t stream) {
                 mLogits = map.get(binding_names::kLogits);
+                rt::Tensor* const pageTable = map.get(binding_names::kKVPageTable);
+                int32_t firstPage{};
+                CUDA_CHECK(cudaMemcpyAsync(
+                    &firstPage, pageTable->rawPointer(), sizeof(firstPage), cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                mFirstPagePerPrepare.push_back(firstPage);
                 return true;
             });
         return engine;
@@ -314,6 +321,7 @@ protected:
     std::filesystem::path mModelDir;
     //! Captured by `makeEngine`'s prepare() default; valid from the first prepare() until the runtime dies.
     rt::Tensor* mLogits{nullptr};
+    std::vector<int32_t> mFirstPagePerPrepare;
 };
 
 TEST_F(RuntimeAssemblyTest, AssemblesWithoutAnyEngineFileOnDisk)
@@ -461,6 +469,47 @@ TEST_F(RuntimeAssemblyTest, CompactsTheBatchWhenOneSlotFinishesAheadOfTheOther)
     EXPECT_EQ(response.finishReasons[1], rt::FinishReason::kLength);
 }
 
+TEST_F(RuntimeAssemblyTest, LogicalEvictionRemapsTheSurvivorAndTheNextRequestRestoresIdentity)
+{
+    using ::testing::_;
+    using ::testing::InSequence;
+
+    constexpr int64_t kMaxGenerateLength{4};
+    auto engine = makeEngine();
+    auto& mock = *engine;
+
+    auto artifacts = makeVanillaArtifacts(mModelDir, std::move(engine), mStream);
+    auto const eosId = static_cast<int32_t>(artifacts.tokenizer->getEosId());
+
+    {
+        InSequence seq;
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({}));
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({eosId, -1}));
+        EXPECT_CALL(mock, execute(_)).Times(kMaxGenerateLength - 2).WillRepeatedly(emit({}));
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({eosId}));
+    }
+
+    rt::LLMInferenceRuntime runtime{
+        std::move(artifacts), mModelDir.string(), /*multimodalEngineDir=*/"", {}, std::nullopt, mStream};
+
+    auto firstRequest = makeGreedyRequest("a", kMaxGenerateLength);
+    firstRequest.requests.push_back(firstRequest.requests.front());
+    rt::LLMGenerationResponse firstResponse;
+    ASSERT_TRUE(runtime.handleRequest(firstRequest, firstResponse, mStream));
+
+    ASSERT_GE(mFirstPagePerPrepare.size(), 3U);
+    EXPECT_NE(mFirstPagePerPrepare.back(), 0) << "logical compaction must preserve the old slot-1 physical page";
+
+    size_t const beforeSecondRequest = mFirstPagePerPrepare.size();
+    auto const secondRequest = makeGreedyRequest("a", /*maxGenerateLength=*/2);
+    rt::LLMGenerationResponse secondResponse;
+    ASSERT_TRUE(runtime.handleRequest(secondRequest, secondResponse, mStream));
+
+    ASSERT_GT(mFirstPagePerPrepare.size(), beforeSecondRequest);
+    EXPECT_EQ(mFirstPagePerPrepare[beforeSecondRequest], 0)
+        << "a new unmanaged request must restore the base page table to identity";
+}
+
 // --------------------------------------------------------------------------
 // MTP speculative decoding: the same assembly with a second engine.
 // --------------------------------------------------------------------------
@@ -471,8 +520,8 @@ constexpr int32_t kDraftingTopK{1};
 constexpr int32_t kDraftingStep{3};
 constexpr int32_t kVerifySize{kDraftingStep + 1};
 
-//! Unmanaged speculative decoding reserves a fixed 100 tokens of KV per request before admitting any generation
-//! (`kLEGACY_SPEC_KV_CACHE_RESERVE`), so the vanilla deployment's capacity would admit nothing here.
+//! MTP CUDA-graph capture simulates a 128-token resident prefix plus proposal headroom, so this fixture needs more
+//! capacity than the tiny vanilla assembly configuration.
 constexpr int64_t kMtpKvCacheCapacity{256};
 
 //! Speculative engines have no cross-request page retention, so `requireMinimumActiveKVPool` demands the pool be

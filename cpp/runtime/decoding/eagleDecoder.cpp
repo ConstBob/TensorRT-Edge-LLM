@@ -193,6 +193,16 @@ EagleDecoder::EagleDecoder(DecodingRuntimeContext& runtime, std::filesystem::pat
     }
 }
 
+DecodingKvHeadroom EagleDecoder::requiredKvHeadroom() const
+{
+    auto const& config = *mRuntime.deployment.specConfig;
+    int64_t const draftExtra = static_cast<int64_t>(config.draftingStep) * config.draftingTopK;
+    ELLM_CHECK(config.verifySize > 0 && draftExtra > 0
+            && draftExtra <= static_cast<int64_t>(std::numeric_limits<int32_t>::max()),
+        "EAGLE KV headroom is outside the supported range");
+    return {config.verifySize, static_cast<int32_t>(draftExtra)};
+}
+
 int64_t EagleDecoder::getRequiredContextMemorySize() const noexcept
 {
     return mDraftExecutor ? mDraftExecutor->getRequiredContextMemorySize() : 0;
@@ -951,14 +961,8 @@ void EagleDecoder::resetForNewSequences(Tensor& reuseLengths, cudaStream_t strea
 }
 
 void EagleDecoder::onBatchEvict(std::vector<int32_t> const& batchMapping, int32_t oldActiveBatch,
-    int32_t newActiveBatch, Tensor& deviceBatchMapping, cudaStream_t stream, BatchCompactionMode mode)
+    int32_t newActiveBatch, Tensor& deviceBatchMapping, cudaStream_t stream)
 {
-    if (mode == BatchCompactionMode::kLegacyPhysicalKv)
-    {
-        mDraftCacheManager.compactBatch(deviceBatchMapping, oldActiveBatch, newActiveBatch, stream);
-        mDraftCacheManager.setActiveBatchSize(newActiveBatch);
-    }
-
     mCommonStateTracker.compact(batchMapping, oldActiveBatch, newActiveBatch);
 
     if (mCommonStateTracker.draftPrefillOutputsPending())

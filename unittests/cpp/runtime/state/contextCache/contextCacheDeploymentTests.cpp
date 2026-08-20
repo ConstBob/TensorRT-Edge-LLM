@@ -236,7 +236,6 @@ TEST(ContextCacheDeploymentTests, AdmitsHybridMtpAndRejectsAttentionOnlyOrShared
     ASSERT_TRUE(profile.specReuseContract.has_value());
     EXPECT_TRUE(profile.specReuseContract->ownsPagedSpecState);
     EXPECT_EQ(profile.specReuseContract->futureDependencyTokens, 1);
-    EXPECT_EQ(profile.specReuseContract->speculativeWorkingTokens, 6);
 
     DeploymentConfig attentionOnly = makeHybridMtpDeployment();
     attentionOnly.base = makeAttentionConfig();
@@ -250,13 +249,12 @@ TEST(ContextCacheDeploymentTests, AdmitsHybridMtpAndRejectsAttentionOnlyOrShared
     EXPECT_THROW(validateContextCacheDeployment(sharedKv), std::runtime_error);
 }
 
-TEST(ContextCacheDeploymentTests, ResolvesPerMethodSpeculativeWorkingTokens)
+TEST(ContextCacheDeploymentTests, ResolvesPerMethodReuseContract)
 {
     DeploymentConfig eagle = makeEagleDeployment();
     SpecReuseContract const eagleContract = *validateContextCacheDeployment(eagle).specReuseContract;
     EXPECT_TRUE(eagleContract.ownsPagedSpecState);
     EXPECT_EQ(eagleContract.futureDependencyTokens, 1);
-    EXPECT_EQ(eagleContract.speculativeWorkingTokens, 2);
 
     for (SpecDecodeMode const mode : {SpecDecodeMode::kDFlash, SpecDecodeMode::kJetSpec})
     {
@@ -267,7 +265,6 @@ TEST(ContextCacheDeploymentTests, ResolvesPerMethodSpeculativeWorkingTokens)
         SpecReuseContract const contract = *validateContextCacheDeployment(blockDraft).specReuseContract;
         EXPECT_TRUE(contract.ownsPagedSpecState);
         EXPECT_EQ(contract.futureDependencyTokens, 0);
-        EXPECT_EQ(contract.speculativeWorkingTokens, 7);
     }
 
     DeploymentConfig dspark = makeEagleDeployment();
@@ -277,13 +274,11 @@ TEST(ContextCacheDeploymentTests, ResolvesPerMethodSpeculativeWorkingTokens)
     SpecReuseContract const dsparkContract = *validateContextCacheDeployment(dspark).specReuseContract;
     EXPECT_TRUE(dsparkContract.ownsPagedSpecState);
     EXPECT_EQ(dsparkContract.futureDependencyTokens, 0);
-    EXPECT_EQ(dsparkContract.speculativeWorkingTokens, 9);
 
     SpecReuseContract const gemmaContract
         = *validateContextCacheDeployment(makeGemma4MTPDeployment()).specReuseContract;
     EXPECT_FALSE(gemmaContract.ownsPagedSpecState);
     EXPECT_EQ(gemmaContract.futureDependencyTokens, 0);
-    EXPECT_EQ(gemmaContract.speculativeWorkingTokens, 0);
 }
 
 TEST(ContextCacheDeploymentTests, ClassifiesSupportedEagle)

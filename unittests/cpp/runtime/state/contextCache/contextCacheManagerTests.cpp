@@ -81,7 +81,7 @@ CacheRequestLease acquirePrivatePages(ContextCacheManager& manager, int32_t coun
 
 SpecReuseContract eagleSpecReuseContract()
 {
-    return SpecReuseContract{/*ownsPagedSpecState=*/true, /*futureDependencyTokens=*/1, /*speculativeWorkingTokens=*/2};
+    return SpecReuseContract{/*ownsPagedSpecState=*/true, /*futureDependencyTokens=*/1};
 }
 
 std::vector<PageId> const& eaglePagePath(CacheRecord const& record)

@@ -45,12 +45,9 @@ struct ContractExpectation
 constexpr int32_t kPAGE_SIZE = 128;
 constexpr BlockHash kHASH_A{0x1111111111111111ULL, 0xAAAAAAAAAAAAAAAAULL};
 constexpr BlockHash kHASH_B{0x2222222222222222ULL, 0xBBBBBBBBBBBBBBBBULL};
-constexpr SpecReuseContract kEAGLE_CONTRACT{
-    /*ownsPagedSpecState=*/true, /*futureDependencyTokens=*/1, /*speculativeWorkingTokens=*/2};
-constexpr SpecReuseContract kGEMMA4_MTP_CONTRACT{
-    /*ownsPagedSpecState=*/false, /*futureDependencyTokens=*/0, /*speculativeWorkingTokens=*/0};
-constexpr SpecReuseContract kBLOCK_DRAFT_CONTRACT{
-    /*ownsPagedSpecState=*/true, /*futureDependencyTokens=*/0, /*speculativeWorkingTokens=*/7};
+constexpr SpecReuseContract kEAGLE_CONTRACT{/*ownsPagedSpecState=*/true, /*futureDependencyTokens=*/1};
+constexpr SpecReuseContract kGEMMA4_MTP_CONTRACT{/*ownsPagedSpecState=*/false, /*futureDependencyTokens=*/0};
+constexpr SpecReuseContract kBLOCK_DRAFT_CONTRACT{/*ownsPagedSpecState=*/true, /*futureDependencyTokens=*/0};
 
 RecordId insertSpecRecord(CacheRecordStore& records, SpecStateIndex& specIndex)
 {

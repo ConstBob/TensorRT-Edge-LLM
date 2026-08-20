@@ -47,7 +47,6 @@ struct SpecReuseContract
 {
     bool ownsPagedSpecState{};
     int32_t futureDependencyTokens{};
-    int32_t speculativeWorkingTokens{};
 };
 
 enum class ResourceType : uint8_t

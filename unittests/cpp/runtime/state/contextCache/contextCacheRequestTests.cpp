@@ -205,7 +205,8 @@ protected:
     std::optional<ContextCacheRequest> begin(DecodingInferenceContext const& context, bool speculativeRequest = false)
     {
         LLMGenerationRequest request{};
-        return ContextCacheRequest::begin(*mCoordinator, request, context, speculativeRequest);
+        return ContextCacheRequest::begin(
+            *mCoordinator, request, context, speculativeRequest, DecodingKvHeadroom{1, 0});
     }
 
     cudaStream_t mStream{};
@@ -244,8 +245,8 @@ TEST_F(ContextCacheRequestTests, VanillaDecodePublishesOneTokenPageBoundaryAndRe
     ASSERT_TRUE(request.has_value());
     completeRuntimePrefill(*request, context);
 
-    ASSERT_TRUE(request->prepareDecodeStep(context));
-    EXPECT_THROW(request->prepareDecodeStep(context), std::runtime_error);
+    ASSERT_TRUE(request->prepareDecodeStep(context, DecodingKvHeadroom{1, 0}));
+    EXPECT_THROW(request->prepareDecodeStep(context, DecodingKvHeadroom{1, 0}), std::runtime_error);
     ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
     context.tokenIds[0].push_back(9002);
     ++context.currentGenerateLengths[0];
@@ -271,7 +272,7 @@ TEST_F(ContextCacheRequestTests, CancelledAndErrorSlotsAreNotPublished)
     completeRuntimePrefill(*request, context);
 
     ContextCacheMetrics const beforeDecode = mCoordinator->metrics();
-    ASSERT_TRUE(request->prepareDecodeStep(context));
+    ASSERT_TRUE(request->prepareDecodeStep(context, DecodingKvHeadroom{1, 0}));
     ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
     for (int32_t slot = 0; slot < context.activeBatchSize; ++slot)
     {
@@ -371,7 +372,7 @@ protected:
     std::optional<ContextCacheRequest> begin(DecodingInferenceContext const& context)
     {
         LLMGenerationRequest request{};
-        return ContextCacheRequest::begin(*mCoordinator, request, context, false);
+        return ContextCacheRequest::begin(*mCoordinator, request, context, false, DecodingKvHeadroom{1, 0});
     }
 
     cudaStream_t mStream{};
@@ -436,7 +437,8 @@ protected:
     std::optional<ContextCacheRequest> begin(DecodingInferenceContext const& context, bool speculativeRequest = true)
     {
         LLMGenerationRequest request{};
-        return ContextCacheRequest::begin(*mCoordinator, request, context, speculativeRequest);
+        DecodingKvHeadroom const headroom = speculativeRequest ? DecodingKvHeadroom{4, 4} : DecodingKvHeadroom{1, 0};
+        return ContextCacheRequest::begin(*mCoordinator, request, context, speculativeRequest, headroom);
     }
 
     cudaStream_t mStream{};
@@ -471,7 +473,7 @@ TEST_F(ContextCacheRequestEagleTests, ForwardsCommonMaterializedStateAndUsesPair
     completeRuntimePrefill(*producer, producerContext, {kINPUT_LENGTH});
     EXPECT_EQ(mCoordinator->manager().records().size(), 0U);
 
-    ASSERT_TRUE(producer->prepareDecodeStep(producerContext));
+    ASSERT_TRUE(producer->prepareDecodeStep(producerContext, DecodingKvHeadroom{4, 4}));
     ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
     producerContext.tokenIds[0].push_back(41);
     producerContext.tokenIds[0].push_back(42);

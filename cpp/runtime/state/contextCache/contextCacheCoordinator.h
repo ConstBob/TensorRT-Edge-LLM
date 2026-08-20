@@ -21,6 +21,7 @@
 #include "runtime/state/contextCache/contextCacheDeployment.h"
 #include "runtime/state/contextCache/contextCacheManager.h"
 #include "runtime/state/contextCache/contextCacheMetrics.h"
+#include "runtime/state/decodingInferenceContext.h"
 
 #include <cuda_runtime_api.h>
 
@@ -137,7 +138,8 @@ public:
     ContextCacheCoordinator(ContextCacheCoordinator const&) = delete;
     ContextCacheCoordinator& operator=(ContextCacheCoordinator const&) = delete;
 
-    BeginRequestResult beginRequest(ContextCacheBatchAdmission const& admission, cudaStream_t stream);
+    BeginRequestResult beginRequest(
+        ContextCacheBatchAdmission const& admission, DecodingKvHeadroom const& headroom, cudaStream_t stream);
 
     //! Bind every admitted row and reset logical cache lengths to the selected reuse boundaries.
     ContextCacheCoordinatorStatus preparePrefill(RequestHandle& request);
@@ -159,7 +161,7 @@ public:
     ContextCacheCoordinatorStatus restoreHybridMtpBoundaryHidden(
         RequestHandle& request, int32_t slot, Tensor& baseHiddenStates, int32_t destinationRow);
     //! Grow and upload every row needed for the next decode working set before model execution.
-    ContextCacheCoordinatorStatus prepareDecodeStep(RequestHandle& request);
+    ContextCacheCoordinatorStatus prepareDecodeStep(RequestHandle& request, DecodingKvHeadroom const& headroom);
     //! Apply the post-decode sequence advance after the decoder's existing synchronization.
     //! For EAGLE, commonStateLengths excludes any unmaterialized accepted suffix and speculative lookahead.
     ContextCacheCoordinatorStatus completeDecodeStep(RequestHandle& request,
@@ -176,7 +178,6 @@ public:
     ContextCacheCoordinatorStatus shutdown() noexcept;
 
     ContextCacheMetrics metrics() const noexcept;
-    int32_t speculativeKVReserve() const noexcept;
     ContextCacheManager const& manager() const noexcept;
 
 private:
@@ -200,8 +201,8 @@ private:
 
     std::unique_ptr<PublicationPolicy> makePublicationPolicy(bool speculativeRequest);
 
-    AcquireSequenceResult acquireSequence(
-        ContextCacheSequenceAdmission const& admission, bool speculativeRequest, ContextCacheLookupPolicy lookupPolicy);
+    AcquireSequenceResult acquireSequence(ContextCacheSequenceAdmission const& admission, bool speculativeRequest,
+        ContextCacheLookupPolicy lookupPolicy, DecodingKvHeadroom const& headroom);
     ContextCacheCoordinatorStatus applyAdvances(
         RequestHandle::Impl& request, std::vector<ContextCacheSequenceAdvance> const& advances);
     //! How far committedStateLength advances per decode step, which is the only difference between the vanilla and
@@ -268,8 +269,6 @@ private:
     KVPageTable& mBasePageTable;
     HybridCacheManager* mDraftCache{};
     KVPageTable* mDraftPageTable{};
-    int32_t mSpecVerifySize{};
-    int32_t mSpecDraftWorkingTokens{};
     cudaStream_t mStream{};
     StreamSynchronizer mSynchronizer;
     ContextCacheMetrics mMetrics;

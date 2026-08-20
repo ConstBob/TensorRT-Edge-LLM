@@ -53,6 +53,8 @@ public:
         return true;
     }
 
+    DecodingKvHeadroom requiredKvHeadroom() const override;
+
     bool decodeStep(DecodingInferenceContext& context) override;
     bool captureCudaGraphs(cudaStream_t stream) override;
     bool initializeForGeneration(DecodingInferenceContext& context) override;
@@ -69,7 +71,7 @@ public:
 
     void resetForNewSequences(Tensor& reuseLengths, cudaStream_t stream) override;
     void onBatchEvict(std::vector<int32_t> const& batchMapping, int32_t oldActiveBatch, int32_t newActiveBatch,
-        Tensor& deviceBatchMapping, cudaStream_t stream, BatchCompactionMode mode) override;
+        Tensor& deviceBatchMapping, cudaStream_t stream) override;
 
 private:
     bool runDraftModelPrefill(DecodingInferenceContext& context);

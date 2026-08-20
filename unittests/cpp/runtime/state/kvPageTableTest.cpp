@@ -56,6 +56,7 @@ TEST(KVPageTableTest, IdentityLayout)
 
     KVPageTable table(maxBatch, maxPagesPerSeq, numPages);
     table.setIdentity();
+    EXPECT_TRUE(table.isIdentity());
 
     for (int32_t b = 0; b < maxBatch; ++b)
     {
@@ -232,6 +233,7 @@ TEST(KVPageTableTest, CompactRowsMovesBindingsWithoutRenumberingPhysicalPages)
     table.setRow(2, row2.data(), static_cast<int32_t>(row2.size()));
 
     table.compactRows({-1, 1, 0}, 2);
+    EXPECT_FALSE(table.isIdentity());
 
     EXPECT_EQ(hostEntry(table, 0, 0, 0, maxPagesPerSeq), 10);
     EXPECT_EQ(hostEntry(table, 0, 0, 1, maxPagesPerSeq), 11);

@@ -585,9 +585,13 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
         {
             std::string actionDir = multimodalEngineDir + "/action";
             LOG_INFO("Attempting to load Action runner from %s", actionDir.c_str());
-            mActionRunner = std::make_unique<Alpamayo1ActionRunner>(actionDir, mCheckpointDir, stream,
-                mSharedResources->cacheManagers[0]->getKVCacheManager().getConfig(),
-                mSharedResources->kvPageTables[0]->isIdentity());
+            auto actionRunner = std::make_unique<Alpamayo1ActionRunner>(
+                actionDir, mCheckpointDir, stream, mSharedResources->cacheManagers[0]->getKVCacheManager().getConfig());
+            auto const& basePageTable = *mSharedResources->kvPageTables[0];
+            auto actionKvBatchCollector = std::make_unique<ActionKvBatchCollector>(
+                mMaxRuntimeBatchSize, basePageTable.maxPagesPerSeq(), basePageTable.numPages());
+            mActionRunner = std::move(actionRunner);
+            mActionKvBatchCollector = std::move(actionKvBatchCollector);
             LOG_INFO("Alpamayo 1 action expert loaded.");
         }
         catch (std::exception const& e)
@@ -986,6 +990,34 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
         }
     }
 
+    bool const hasActionRequest = mActionRunner != nullptr
+        && std::any_of(request.requests.begin(), request.requests.end(),
+            [](auto const& req) { return req.pastTrajectory.has_value(); });
+    if (hasActionRequest)
+    {
+        ELLM_CHECK(mActionKvBatchCollector != nullptr, "Action KV batch collector was not initialized");
+        if (mVisionRunner == nullptr || mVisionRunner->getModelType() != multimodal::ModelType::QWEN3_VL)
+        {
+            LOG_ERROR("Alpamayo1ActionRunner requires a Qwen3-VL vision runner for MRoPE deltas.");
+            return false;
+        }
+        auto* qwenVision = static_cast<rt::QwenViTRunner*>(mVisionRunner.get());
+        std::vector<int64_t> const& ropeDeltas = qwenVision->getMropeRopeDeltasPerBatch();
+        if (ropeDeltas.size() != request.requests.size())
+        {
+            LOG_ERROR("MRoPE delta count %zu does not match request batch size %zu", ropeDeltas.size(),
+                request.requests.size());
+            return false;
+        }
+        std::vector<bool> actionSlots;
+        actionSlots.reserve(request.requests.size());
+        for (auto const& slot : request.requests)
+        {
+            actionSlots.push_back(slot.pastTrajectory.has_value());
+        }
+        mActionKvBatchCollector->beginRequest(actionSlots, ropeDeltas);
+    }
+
     // Reject overlong inputs with the marker consumed by the Python server's
     // HTTP 413 mapping, before TensorRT reports a less actionable shape error.
     for (size_t i = 0; i < context.rawBatchedInputIds.size(); ++i)
@@ -1049,27 +1081,11 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
         context.slotStreams[i].maxStopLen = maxLen;
     }
 
-    int32_t const kvCacheCapacity = enableSpecDecode
-        ? std::min(mDeployment.base.maxKVCacheCapacity, mDeployment.draft->maxKVCacheCapacity)
-        : mDeployment.base.maxKVCacheCapacity;
-    int32_t kvcReserve = 0;
-    if (enableSpecDecode)
-    {
-        // Preserve the historical reserve for unmanaged speculative strategies. Managed context reuse preflights
-        // exact base-verification and assistant working sets, so its admission clamp uses configured geometry.
-        constexpr int32_t kLEGACY_SPEC_KV_CACHE_RESERVE{100};
-        kvcReserve = kLEGACY_SPEC_KV_CACHE_RESERVE;
-        if (mContextCache != nullptr && decodingStrategy.isSpeculative() && !mHybridMtpContextReuseDeployment)
-        {
-            kvcReserve = mContextCache->speculativeKVReserve();
-            ELLM_CHECK(kvcReserve > 0, "Speculative KV-cache working-set reserve must be positive");
-        }
-        else if (decodingStrategy.kind() == DecodingStrategyKind::kDSpark)
-        {
-            ELLM_CHECK(mDeployment.specConfig.has_value(), "DSpark decoding requires speculative configuration");
-            kvcReserve = mDeployment.specConfig->verifySize;
-        }
-    }
+    DecodingKvHeadroom const kvHeadroom = decodingStrategy.requiredKvHeadroom();
+    ELLM_CHECK(
+        kvHeadroom.baseExtraTokens > 0 && kvHeadroom.draftExtraTokens >= 0, "Decoder returned invalid KV headroom");
+    ELLM_CHECK(!enableSpecDecode || kvHeadroom.draftExtraTokens == 0 || mDeployment.draft.has_value(),
+        "Decoder requested draft KV headroom without a draft engine");
 
     // In production, the system-prompt KV cache is saved during warm-up.
     // We disable profiling here to make benchmarking closer to production inference result.
@@ -1115,7 +1131,7 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
     if (mContextCache != nullptr)
     {
         std::optional<ContextCacheRequest> admitted = ContextCacheRequest::begin(
-            *mContextCache, request, context, decodingStrategy.isSpeculative(), mediaTokenIds);
+            *mContextCache, request, context, decodingStrategy.isSpeculative(), kvHeadroom, mediaTokenIds);
         if (!admitted.has_value())
         {
             return false;
@@ -1160,19 +1176,23 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
     }
     StreamChannelFinalizer streamFinalizer(context, *mTokenizer);
 
-    std::vector<int32_t> contextCacheResidentInputLengths;
-    std::vector<int32_t> const* capacityInputLengths = &context.effectivePrefillLengths;
-    if (managedRequest != nullptr)
+    // Visual-token pruning is data-dependent and runs inside prefill after embeddings are assembled. Use the
+    // unpruned resident endpoint here so prefill is always capacity-safe; this may conservatively reduce generation
+    // length for a request that is subsequently pruned.
+    std::vector<int32_t> residentInputLengths;
+    residentInputLengths.reserve(context.rawBatchedInputIds.size());
+    for (std::vector<int32_t> const& tokenIds : context.rawBatchedInputIds)
     {
-        contextCacheResidentInputLengths.reserve(context.rawBatchedInputIds.size());
-        for (std::vector<int32_t> const& tokenIds : context.rawBatchedInputIds)
-        {
-            contextCacheResidentInputLengths.push_back(static_cast<int32_t>(tokenIds.size()));
-        }
-        capacityInputLengths = &contextCacheResidentInputLengths;
+        residentInputLengths.push_back(static_cast<int32_t>(tokenIds.size()));
     }
-    int32_t const clampedMaxGenerateLength = clampMaxGenerateLengthForKVCapacity(
-        *capacityInputLengths, request.maxGenerateLength, kvCacheCapacity, kvcReserve);
+    int32_t clampedMaxGenerateLength = clampMaxGenerateLengthForKVCapacity(residentInputLengths,
+        request.maxGenerateLength, mDeployment.base.maxKVCacheCapacity, kvHeadroom.baseExtraTokens);
+    if (kvHeadroom.draftExtraTokens > 0)
+    {
+        ELLM_CHECK(mDeployment.draft.has_value(), "Draft KV headroom requires a draft engine");
+        clampedMaxGenerateLength = clampMaxGenerateLengthForKVCapacity(residentInputLengths, clampedMaxGenerateLength,
+            mDeployment.draft->maxKVCacheCapacity, kvHeadroom.draftExtraTokens);
+    }
     if (clampedMaxGenerateLength != context.maxGenerateLength)
     {
         context.maxGenerateLength = clampedMaxGenerateLength;
@@ -1361,7 +1381,8 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
             auto& s = context.slotStreams[i];
             // terminalReason is set for all slots; non-streaming slots surface it via
             // BatchResult.terminalReason -> response.finishReasons.
-            if (mActionRunner && mActionRunner->getModelType() == action::ActionModelType::ALPAMAYO1)
+            if (hasActionRequest
+                && request.requests[static_cast<size_t>(context.batchIndexMapping[i])].pastTrajectory.has_value())
             {
                 if (context.tokenIds[i].size() > 1 && trajFutureStartId >= 0
                     && context.tokenIds[i][context.tokenIds[i].size() - 2] == trajFutureStartId)
@@ -1421,6 +1442,21 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
         }
     };
 
+    auto performBatchEvictAndSnapshot = [&]() {
+        if (hasActionRequest)
+        {
+            mActionKvBatchCollector->captureFinished(*mSharedResources->kvPageTables[0],
+                mSharedResources->cacheManagers[0]->getKVCacheLengths(), context.finishedStates,
+                context.batchIndexMapping, context.stream);
+        }
+        bool const status = performBatchEvict(context, decodingStrategy, thinkingDone, managedRequest);
+        if (status && hasActionRequest)
+        {
+            mActionKvBatchCollector->completeCapture();
+        }
+        return status;
+    };
+
     // Post-prefill per-iter pipeline:
     //   cancel → decode (emitDelta + stop match) → finalize (EOS/length/stop) → emit
     // DiffusionGemma prefill writes prompt KV only and does not produce a generated token.
@@ -1442,10 +1478,10 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
         // Managed page rows can be compacted without moving physical KV. Keep the unmanaged lifecycle unchanged;
         // Qwen-style MTP cannot compact its recurrent draft state after partial prefill eviction.
         bool const supportsPartialPrefillEviction
-            = managedRequest != nullptr && decodingStrategy.kind() != DecodingStrategyKind::kMTP;
+            = (managedRequest != nullptr && decodingStrategy.kind() != DecodingStrategyKind::kMTP) || hasActionRequest;
         if (context.activeBatchSize > 0 && (supportsPartialPrefillEviction || checkAllFinished()))
         {
-            bool const batchEvictStatus = performBatchEvict(context, decodingStrategy, thinkingDone, managedRequest);
+            bool const batchEvictStatus = performBatchEvictAndSnapshot();
             if (!batchEvictStatus)
             {
                 LOG_ERROR("Failed to perform batch eviction.");
@@ -1465,7 +1501,7 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
             return false;
         }
 
-        if (managedRequest != nullptr && !managedRequest->prepareDecodeStep(context))
+        if (managedRequest != nullptr && !managedRequest->prepareDecodeStep(context, kvHeadroom))
         {
             return false;
         }
@@ -1492,8 +1528,7 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
         context.generationRound += 1;
 
         // Perform batch eviction after all old-slot progress and terminal publication are complete.
-        bool const batchEvictStatus = performBatchEvict(context, decodingStrategy, thinkingDone, managedRequest);
-        if (!batchEvictStatus)
+        if (!performBatchEvictAndSnapshot())
         {
             LOG_ERROR("Failed to perform batch eviction.");
             return false;
@@ -1612,42 +1647,30 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
         }
     }
 
-    bool const hasTrajectoryHistory = std::any_of(request.requests.begin(), request.requests.end(),
-        [](auto const& req) { return req.pastTrajectory.has_value(); });
-    // If action engine is loaded, run one batched trajectory sample and fill output for all batch items.
-    if (hasTrajectoryHistory && mActionRunner && mActionRunner->getModelType() == action::ActionModelType::ALPAMAYO1)
+    if (hasActionRequest)
     {
-        if (!mVisionRunner)
-        {
-            LOG_ERROR("Alpamayo1ActionRunner requires a vision runner (e.g. QwenViTRunner) for MRoPE rope deltas.");
-            return false;
-        }
-
-        multimodal::ModelType const visionType = mVisionRunner->getModelType();
-        bool const isQwen3ViT = visionType == multimodal::ModelType::QWEN3_VL;
-        if (!isQwen3ViT)
-        {
-            LOG_ERROR(
-                "Alpamayo1ActionRunner requires a Qwen3-VL vision runner but a different vision runner is loaded.");
-            return false;
-        }
-        // MultimodalRunner::create() uses QwenViTRunner only for Qwen3-VL.
-        auto* qwenVision = static_cast<rt::QwenViTRunner*>(mVisionRunner.get());
-        std::vector<int64_t> const& ropeDeltas = qwenVision->getMropeRopeDeltasPerBatch();
-        rt::HybridCacheManager& kvcache = *mSharedResources->cacheManagers[0];
+        rt::ActionKvBatchView const actionKvBatch = mActionKvBatchCollector->materialize(stream);
+        rt::HybridCacheManager const& kvcache = *mSharedResources->cacheManagers[0];
         std::vector<std::vector<rt::FutureTrajectoryPoint>> trajectories
-            = mActionRunner->sampleTrajectory(stream, activeBatchSize, kvcache, ropeDeltas);
-        if (trajectories.size() != static_cast<size_t>(activeBatchSize))
+            = mActionRunner->sampleTrajectory(stream, kvcache, actionKvBatch);
+        if (trajectories.size() != static_cast<size_t>(actionKvBatch.batchSize))
         {
             LOG_ERROR("Alpamayo1ActionRunner trajectory sampling failed.");
             return false;
         }
-        for (size_t i = 0; i < trajectories.size() && i < static_cast<size_t>(activeBatchSize); ++i)
+        auto const& originalRequestIndices = mActionKvBatchCollector->originalRequestIndices();
+        ELLM_CHECK(response.outputTrajectories.size() == request.requests.size(),
+            "Action trajectory output batch does not match the request batch");
+        ELLM_CHECK(trajectories.size() == originalRequestIndices.size(),
+            "Action trajectory count does not match the materialized Action batch");
+        for (size_t denseIndex = 0; denseIndex < trajectories.size(); ++denseIndex)
         {
-            if (!trajectories[i].empty())
-            {
-                response.outputTrajectories[i] = std::move(trajectories[i]);
-            }
+            int32_t const originalIndex = originalRequestIndices[denseIndex];
+            ELLM_CHECK(originalIndex >= 0 && originalIndex < static_cast<int32_t>(response.outputTrajectories.size()),
+                "Action trajectory original request index is out of range");
+            ELLM_CHECK(response.outputTrajectories[static_cast<size_t>(originalIndex)].empty(),
+                "Action trajectory output slot was already populated");
+            response.outputTrajectories[static_cast<size_t>(originalIndex)] = std::move(trajectories[denseIndex]);
         }
     }
 
@@ -2685,6 +2708,15 @@ bool LLMRankRuntime::setUpForPrefillExecution(DecodingInferenceContext& context,
     }
     else
     {
+        for (auto& pageTable : mSharedResources->kvPageTables)
+        {
+            if (!pageTable->isIdentity())
+            {
+                pageTable->setIdentity();
+                pageTable->upload(context.stream);
+            }
+        }
+
         // Record the length of the reused legacy system-prompt KV cache for each sequence.
         check::check(mHostReuseKVCacheLengths.reshape({activeBatchSize}), "Tensor reshape failed");
         int32_t* reuseKVCacheLengthsData = mHostReuseKVCacheLengths.dataPointer<int32_t>();
@@ -2988,13 +3020,22 @@ bool LLMRankRuntime::performBatchEvict(DecodingInferenceContext& context, Decodi
     }
     else
     {
-        // The legacy identity path owns its mapping upload and physical KV-row copy.
         check::check(mDeviceBatchMapping.reshape({oldActiveBatch}), "Tensor reshape failed");
         CUDA_CHECK(cudaMemcpyAsync(mDeviceBatchMapping.rawPointer(), batchMapping.data(),
             static_cast<size_t>(oldActiveBatch) * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
-        mSharedResources->cacheManagers[0]->compactBatch(
-            mDeviceBatchMapping, oldActiveBatch, newActiveBatch, context.stream);
-        mSharedResources->cacheManagers[0]->setActiveBatchSize(newActiveBatch);
+        ELLM_CHECK(mSharedResources->cacheManagers.size() == mSharedResources->kvPageTables.size(),
+            "KV cache managers and page tables are not index-aligned");
+        size_t const activeCacheCount = strategy.isSpeculative() ? mSharedResources->cacheManagers.size() : 1U;
+        ELLM_CHECK(activeCacheCount > 0, "Active decoding strategy has no KV cache resource");
+        for (size_t cacheIndex = 0; cacheIndex < activeCacheCount; ++cacheIndex)
+        {
+            auto& pageTable = *mSharedResources->kvPageTables[cacheIndex];
+            auto& cacheManager = *mSharedResources->cacheManagers[cacheIndex];
+            pageTable.compactRows(batchMapping, newActiveBatch);
+            pageTable.upload(context.stream);
+            cacheManager.compactBatchSlotState(mDeviceBatchMapping, oldActiveBatch, newActiveBatch, context.stream);
+            cacheManager.setActiveBatchSize(newActiveBatch);
+        }
     }
 
     // Compact base model's RoPE cache (stored per-batch for MRope on mPipelineIO->mropeCosSin).
@@ -3011,10 +3052,7 @@ bool LLMRankRuntime::performBatchEvict(DecodingInferenceContext& context, Decodi
         }
     }
 
-    BatchCompactionMode const compactionMode
-        = managedContextCache ? BatchCompactionMode::kManagedPageRows : BatchCompactionMode::kLegacyPhysicalKv;
-    strategy.onBatchEvict(
-        batchMapping, oldActiveBatch, newActiveBatch, mDeviceBatchMapping, context.stream, compactionMode);
+    strategy.onBatchEvict(batchMapping, oldActiveBatch, newActiveBatch, mDeviceBatchMapping, context.stream);
 
     // Consume the existing eviction synchronization. Managed paging moves page-table rows and slot state only;
     // physical KV pages remain in place.
