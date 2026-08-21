@@ -54,3 +54,4 @@ tests:
   - tests/python-unittests/test_export_kv_page_table.py::test_dflash_target_kv_update_requires_page_table_argument
   - tests/python-unittests/test_export_kv_page_table.py::test_dflash_target_kv_update_schema_keeps_name_and_has_seven_inputs
   - tests/python-unittests/test_export_kv_page_table.py::test_dflash_target_kv_update_call_sites_pass_page_table
+  - tests/python-unittests/test_export_kv_page_table.py::test_nvfp4_fp8_kv_qkv_fusion_preserves_export_scales

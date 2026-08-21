@@ -386,7 +386,22 @@ class Attention(nn.Module):
 # ---------------------------------------------------------------------------
 
 _QKV_PROJ_NAMES = ("q_proj", "k_proj", "v_proj")
+_FP8_KV_SCALE_NAMES = ("q_scale", "k_scale", "v_scale")
 _NVFP4_SCALAR_SCALE_SUFFIXES = ("input_scale", "weight_scale_2")
+
+
+def _fp8_kv_scales_as_floats(attn: nn.Module) -> List[float]:
+    """Read Q/K/V attention scales before projection modules are fused."""
+    q_buf = getattr(getattr(attn, "q_proj", None), "q_scale", None)
+    k_buf = getattr(getattr(attn, "k_proj", None), "k_scale", None)
+    v_buf = getattr(getattr(attn, "v_proj", None), "v_scale", None)
+    if v_buf is None and getattr(attn, "attention_k_eq_v", False):
+        v_buf = k_buf
+    return [
+        float(q_buf.item()) if q_buf is not None else 1.0,
+        float(k_buf.item()) if k_buf is not None else 1.0,
+        float(v_buf.item()) if v_buf is not None else 1.0,
+    ]
 
 
 def _can_fuse_nvfp4_scales(attn: "Attention") -> bool:
@@ -415,8 +430,8 @@ def fuse_qkv_projections(model: nn.Module) -> int:
     Per quant type: FP16 always fuses; NVFP4 fuses only when the per-tensor
     scales (``input_scale``, ``weight_scale_2``) match across Q/K/V (mismatch
     => warn and fall back to 3 GEMMs + concat); other quant types skip.
-    FP8-KV-cache layers also skip — ``k_scale`` / ``v_scale`` live on
-    ``k_proj`` / ``v_proj`` and are read at export time.
+    For FP8 KV cache, the Q/K/V attention scales are preserved as Python
+    floats before the original projection modules are removed.
 
     Fused layers replace the three sub-modules with ``qkv_proj_fused``
     (auto-detected in ``Attention.forward``). Returns the number fused.
@@ -431,8 +446,6 @@ def fuse_qkv_projections(model: nn.Module) -> int:
         attn: Attention = module
         if hasattr(attn, "qkv_proj_fused"):
             continue  # idempotent
-        if attn.enable_fp8_kv_cache:
-            continue  # k_scale / v_scale buffers must stay on k_proj / v_proj
         # Defensive: skip any layer that doesn't own all three projections.
         if any(getattr(attn, n, None) is None for n in _QKV_PROJ_NAMES):
             continue
@@ -458,6 +471,9 @@ def fuse_qkv_projections(model: nn.Module) -> int:
             # INT4, FP8, MXFP8, etc. — not fusible.
             continue
 
+        fp8_kv_scales = (_fp8_kv_scales_as_floats(attn)
+                         if attn.enable_fp8_kv_cache else None)
+
         # --- Fuse: concatenate weights along output dim (dim 0) ----------
         fused_buffers: dict = {}
         # Union across all three projections so an attribute missing on any
@@ -467,6 +483,12 @@ def fuse_qkv_projections(model: nn.Module) -> int:
                 itertools.chain.from_iterable(
                     itertools.chain(p._buffers, p._parameters)
                     for p in proj_modules)))
+        # These are AttentionPlugin attributes, not GEMM quantization state.
+        # They live on separate Q/K/V projections only to match checkpoint
+        # keys and were captured above before those modules are removed.
+        attr_names = [
+            attr for attr in attr_names if attr not in _FP8_KV_SCALE_NAMES
+        ]
         # The checkpoint loader may rebind `bias` as a plain attribute
         # (outside _buffers/_parameters); include it explicitly.
         if "bias" not in attr_names and any(
@@ -520,6 +542,8 @@ def fuse_qkv_projections(model: nn.Module) -> int:
 
         # Replace: add fused, delete originals.
         attn.qkv_proj_fused = fused_linear
+        if fp8_kv_scales is not None:
+            attn._qkv_scales_float = fp8_kv_scales
         for proj_name in _QKV_PROJ_NAMES:
             delattr(attn, proj_name)
 

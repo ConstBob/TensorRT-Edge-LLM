@@ -713,6 +713,13 @@ def setup_fp8_qkv_scales_for_export(model: "torch.nn.Module") -> None:
         if not (getattr(module, "enable_fp8_kv_cache", False)
                 or getattr(module, "enable_fp8_mha", False)):
             continue
+        if hasattr(module, "qkv_proj_fused"):
+            scales = getattr(module, "_qkv_scales_float", None)
+            if scales is None or len(scales) != 3:
+                raise RuntimeError(
+                    "Fused FP8-KV attention is missing its Q/K/V scales")
+            module._qkv_scales_float = [float(scale) for scale in scales]
+            continue
         q_buf = getattr(module, "q_scale", None)
         if q_buf is None:
             q_buf = getattr(getattr(module, "q_proj", None), "q_scale", None)
