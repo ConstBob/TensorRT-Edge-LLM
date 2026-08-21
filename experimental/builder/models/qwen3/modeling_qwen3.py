@@ -31,9 +31,7 @@ class Qwen3Attention(QKNormDecoderAttention):
     def packed_qkv(self, hidden_states):
         """Use the provider's fused NVFP4 QKV projection when compatible."""
         projections = (self.q_proj, self.k_proj, self.v_proj)
-        supported_execution = ((self.cfg.tp_size == 1
-                                and self.cfg.kv_cache_quant != "fp8")
-                               or self.cfg.tp_size == 2)
+        supported_execution = self.cfg.tp_size in (1, 2)
         can_fuse = (self.ctx.backend == "edgellm" and supported_execution
                     and all(projection.quant_type() == quantization.QUANT_NVFP4
                             for projection in projections)

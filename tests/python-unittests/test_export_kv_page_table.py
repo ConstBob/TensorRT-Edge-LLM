@@ -28,12 +28,15 @@ import os
 import pathlib
 
 import onnx
+import torch
 
-from tensorrt_edgellm.config import ModelConfig
-from tensorrt_edgellm.models.default.modeling_default import CausalLM
+from tensorrt_edgellm.config import QUANT_NVFP4, ModelConfig, QuantConfig
+from tensorrt_edgellm.models.default.modeling_default import (
+    CausalLM, fuse_qkv_projections)
 from tensorrt_edgellm.models.ops import (KV_PAGE_SIZE,
                                          dflash_target_kv_cache_update)
-from tensorrt_edgellm.onnx.export import _export_model
+from tensorrt_edgellm.onnx.export import (_export_model,
+                                          setup_fp8_qkv_scales_for_export)
 from tensorrt_edgellm.onnx.onnx_custom_schemas import \
     register_tensorrt_edgellm_onnx_custom_schemas
 
@@ -73,6 +76,63 @@ def _export_tiny_model(tmp_path) -> str:
     output_path = os.path.join(str(tmp_path), "model.onnx")
     _export_model(model, output_path)
     return output_path
+
+
+def test_nvfp4_fp8_kv_qkv_fusion_preserves_export_scales(tmp_path):
+    config = _tiny_default_config()
+    config.quant = QuantConfig(quant_type=QUANT_NVFP4,
+                               group_size=16,
+                               kv_cache_quant="fp8")
+    model = CausalLM(config)
+
+    expected_scales = []
+    expected_weights = []
+    for layer_index, layer in enumerate(model.model.layers):
+        attn = layer.self_attn
+        scales = [0.5 + layer_index, 0.25 + layer_index, 0.125 + layer_index]
+        for proj, scale_name, scale in zip(
+            (attn.q_proj, attn.k_proj, attn.v_proj),
+            ("q_scale", "k_scale", "v_scale"), scales):
+            getattr(proj, scale_name).fill_(scale)
+        expected_scales.append(scales)
+        expected_weights.append(
+            torch.cat([
+                attn.q_proj.weight,
+                attn.k_proj.weight,
+                attn.v_proj.weight,
+            ],
+                      dim=0).clone())
+
+    assert fuse_qkv_projections(model) == config.num_hidden_layers
+    setup_fp8_qkv_scales_for_export(model)
+
+    for layer, scales, weight in zip(model.model.layers, expected_scales,
+                                     expected_weights):
+        attn = layer.self_attn
+        assert not hasattr(attn, "q_proj")
+        assert not hasattr(attn, "k_proj")
+        assert not hasattr(attn, "v_proj")
+        assert attn._qkv_scales_float == scales
+        assert torch.equal(attn.qkv_proj_fused.weight, weight)
+        assert not any(
+            hasattr(attn.qkv_proj_fused, name)
+            for name in ("q_scale", "k_scale", "v_scale"))
+
+    output_path = os.path.join(str(tmp_path), "fused_nvfp4_fp8kv.onnx")
+    _export_model(model, output_path)
+    onnx_model = onnx.load(output_path, load_external_data=False)
+    attention_nodes = [
+        node for node in onnx_model.graph.node
+        if node.op_type == "AttentionPlugin"
+    ]
+    assert len(attention_nodes) == config.num_hidden_layers
+    for node, scales in zip(attention_nodes, expected_scales):
+        attributes = {
+            attr.name: onnx.helper.get_attribute_value(attr)
+            for attr in node.attribute
+        }
+        assert attributes["enable_fp8_kv_cache"] == 1
+        assert attributes["qkv_scales"] == scales
 
 
 def test_kv_page_table_graph_input_shape(tmp_path):
