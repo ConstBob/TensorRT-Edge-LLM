@@ -114,6 +114,50 @@ class OpenAIServingChat:
                 f"unknown tool parser {config.tool_call_parser!r}; "
                 f"available: {available}")
 
+    @staticmethod
+    def _resolve_guided_decoding(request, normalize_response_format,
+                                 normalize_guided_decoding):
+        """Resolve the two guided-decoding entry points into one low-level guide.
+
+        `response_format` is the OpenAI-compatible surface and covers only json_object
+        and json_schema; `guided_decoding` is the low-level field and additionally
+        reaches regex, ebnf, structural_tag and choice. Setting both is rejected rather
+        than silently picking one.
+
+        Validation runs here so a malformed schema comes back as a 400 naming the
+        offending field, instead of surfacing later as a generic request failure.
+        """
+        try:
+            from_format = normalize_response_format(request.response_format)
+        except ValueError as exc:
+            raise InvalidRequestError(str(exc),
+                                      param="response_format") from exc
+        try:
+            from_guide = normalize_guided_decoding(request.guided_decoding)
+        except ValueError as exc:
+            raise InvalidRequestError(str(exc),
+                                      param="guided_decoding") from exc
+
+        if from_format is not None and from_guide is not None:
+            raise InvalidRequestError(
+                "response_format and guided_decoding cannot be used together",
+                param="guided_decoding")
+        resolved = from_guide if from_guide is not None else from_format
+        if resolved is None:
+            return None
+
+        param = "guided_decoding" if from_guide is not None else "response_format"
+        from ..runtime.engine import _GUIDE_TYPE_ENUM, _import_runtime
+        runtime = _import_runtime()
+
+        guide_type, guide = resolved
+        params = runtime.GuidedDecodingParams(
+            _GUIDE_TYPE_ENUM[guide_type](runtime), guide)
+        valid, reason = runtime.validate_guided_decoding_params(params)
+        if not valid:
+            raise InvalidRequestError(reason, param=param)
+        return resolved
+
     def prepare_request(self,
                         request: ChatCompletionRequest) -> PreparedChatRequest:
         capabilities = self._client.capabilities
@@ -155,11 +199,6 @@ class OpenAIServingChat:
         if request.seed is not None:
             raise UnsupportedFeatureError(
                 "seed is not supported by the Edge-LLM runtime", param="seed")
-        if request.response_format is not None:
-            raise UnsupportedFeatureError(
-                "response_format requires structured decoding, which is not "
-                "implemented",
-                param="response_format")
 
         try:
             tool_config = validate_tool_request(request.messages,
@@ -209,12 +248,17 @@ class OpenAIServingChat:
             raise InvalidRequestError(str(exc),
                                       param="reasoning_parser") from exc
 
-        from ..runtime.engine import _normalize_logit_bias
+        from ..runtime.engine import (_normalize_guided_decoding,
+                                      _normalize_logit_bias,
+                                      _normalize_response_format)
 
         try:
             logit_bias = _normalize_logit_bias(request.logit_bias)
         except ValueError as exc:
             raise InvalidRequestError(str(exc), param="logit_bias") from exc
+
+        guided_decoding = self._resolve_guided_decoding(
+            request, _normalize_response_format, _normalize_guided_decoding)
 
         num_logprobs = 0
         if request.logprobs:
@@ -230,6 +274,7 @@ class OpenAIServingChat:
             num_logprobs=num_logprobs,
             stop=request.stop_strings,
             logit_bias=logit_bias,
+            guided_decoding=guided_decoding,
             skip_special_tokens=(parser is None
                                  and not tool_config.parse_output),
             reuse_context=request.reuse_context,

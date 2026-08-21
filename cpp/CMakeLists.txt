@@ -221,6 +221,10 @@ if(ENABLE_CUTEDSL_MODULE_TEST_HOOK)
                              PRIVATE ENABLE_CUTEDSL_MODULE_TEST_HOOK)
 endif()
 target_link_libraries(edgellmCore PRIVATE ${CMAKE_DL_LIBS})
+# Guided decoding: XGrammar is referenced only from
+# runtime/decoding/guidedDecoder.cpp; PUBLIC so downstream executables that link
+# edgellmCore statically also pull in the archive.
+target_link_libraries(edgellmCore PUBLIC xgrammarCore)
 # Apply FMHA SM exclusion definitions
 target_compile_definitions(edgellmCore PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
 edgellm_apply_qnx_warning_suppressions(edgellmCore)

@@ -92,6 +92,40 @@ struct LogprobEntry
     std::string piece; //!< Raw token bytes; empty until filled at assembly time
 };
 
+/*!
+ * \brief Which grammar dialect a guided-decoding request supplies.
+ *
+ * The set mirrors the low-level `guided_decoding` request field. All but kChoice map
+ * onto an XGrammar entry point directly; kChoice has no native primitive. The
+ * high-level OpenAI-compatible `response_format` is a server-side translation onto
+ * this same enum.
+ */
+enum class GuideType : int32_t
+{
+    kJsonObject,    //!< Any JSON *object*; compiled as the schema {"type":"object"}.
+    kJsonSchema,    //!< A JSON Schema document.
+    kRegex,         //!< XGrammar's regex dialect (not PCRE: no lookaround/backreferences).
+    kEbnf,          //!< XGrammar's GBNF-style EBNF; must define a rule named "root".
+    kStructuralTag, //!< A structural-tag document (modern "triggered_tags" form).
+    kChoice         //!< JSON array of the permitted outputs; lowered to an EBNF alternation.
+};
+
+/*!
+ * \brief Per-request grammar constraint (discriminated union).
+ *
+ * A single string holds every dialect: structural tags and choice lists keep their
+ * JSON document here verbatim and are parsed by the backend, matching how vLLM and
+ * SGLang carry the same field. `guide` is empty only for kJsonObject.
+ */
+struct GuidedDecodingParams
+{
+    GuideType type{GuideType::kJsonObject};
+    std::string guide;
+};
+
+//! Human-readable name for logs and error messages.
+char const* guideTypeName(GuideType type);
+
 /*! \brief LLM Generation Request structure
  */
 struct LLMGenerationRequest
@@ -121,6 +155,11 @@ struct LLMGenerationRequest
 
         //! Sparse per-token logit bias map keyed by full tokenizer token ID.
         std::unordered_map<int32_t, float> logitBias;
+
+        //! Optional grammar constraint. Unset means unconstrained generation.
+        //! Independent of `logitBias`: that is a soft preference applied to every
+        //! step alike, this is a hard per-step constraint recomputed from grammar state.
+        std::optional<GuidedDecodingParams> guidedDecoding;
 
         mutable FormattedRequest formatted; //!< Formatted request (populated by tokenizer or user-provided)
     };

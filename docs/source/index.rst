@@ -46,6 +46,7 @@ and action models on NVIDIA edge platforms.
    user_guide/features/FP8KV.md
    user_guide/features/fp8-embedding.md
    user_guide/features/streaming.md
+   user_guide/features/guided-decoding.md
    user_guide/features/visual-token-pruning.md
    user_guide/features/kv-cache-reuse.md
 

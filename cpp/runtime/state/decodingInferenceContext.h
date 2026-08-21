@@ -93,6 +93,17 @@ struct DecodingInferenceContext
     //! treat a missing entry as 0).
     std::vector<int32_t> prunedPrefillTokens;
     std::vector<int8_t> finishedStates; //!< Finished state for each sequence
+    //! Per-slot thinking tracker: 1 once thinking is complete (end marker emitted, or the model
+    //! never entered thinking). Lives here, rather than as a `handleRequest` local, so batch
+    //! compaction reindexes it together with every other per-slot vector; otherwise an eviction
+    //! leaves entry `i` pointing at a different request.
+    std::vector<int8_t> thinkingDone;
+    //! Per-slot guided-decoding gate: 1 once the reasoning block is over. Deliberately not
+    //! `thinkingDone`, which also flips when the first generated token is not a thinking
+    //! marker -- that token is answer content, so treating it as "reasoning over" would let
+    //! it past the mask and out of the matcher's prefix. Only the end marker opens this one;
+    //! it starts open when the request has thinking off.
+    std::vector<int8_t> guidedReasoningEnded;
 
     std::unordered_map<int32_t, BatchResult> completedBatches; //!< Results of completed batches
     std::vector<int32_t> batchIndexMapping;                    //!< Maps current batch index to original index
@@ -124,6 +135,17 @@ struct DecodingInferenceContext
         logitBiasPerSlot;          //!< Per-active-slot sparse logit bias maps in output-vocab space
     bool hasLogitBias{false};      //!< True when any active slot has logit bias entries
     bool logitBiasGpuDirty{false}; //!< True when CPU-side bias state must be uploaded to GPU
+
+    //! True when at least one slot compiled a grammar; gates all per-step guided work. The
+    //! matchers live in the runtime-owned GuidedDecoder under this same slot numbering.
+    bool hasGuidedDecoding{false};
+    //! Scratch reused every step: slots whose grammar admitted no token at all.
+    std::vector<int32_t> guidedUnsatisfiableSlots;
+    //! Scratch reused every step: per-slot "leave unconstrained this step" flags, combining
+    //! finished slots with slots still inside their thinking block.
+    std::vector<int8_t> guidedMaskSuppressedPerSlot;
+    //! Mirrors LLMGenerationRequest::enableThinking.
+    bool enableThinking{false};
 
     bool outputThinkerEmbeddings{false}; //!< Whether to capture hidden states for the Talker pipeline
 

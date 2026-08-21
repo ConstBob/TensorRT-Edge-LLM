@@ -10,13 +10,15 @@
       - git config --global url."https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git".insteadOf "https://github.com/google/googletest.git"
       - git config --global url."https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git".insteadOf "https://github.com/nlohmann/json.git"
       - git config --global url."https://gitlab-master.nvidia.com/ftp/GitHubSync/NVTX-mirror.git".insteadOf "https://github.com/NVIDIA/NVTX.git"
+      - git config --global url."https://gitlab-master.nvidia.com/ftp/GitHubSync/xgrammar.git".insteadOf "https://github.com/mlc-ai/xgrammar.git"
+      - git config --global url."https://gitlab-master.nvidia.com/ftp/GitHubSync/dlpack.git".insteadOf "https://github.com/dmlc/dlpack.git"
   variables:
     GIT_SUBMODULE_STRATEGY: recursive
 
 .ci_test_submodules:
   extends: .ci_internal_submodules
   variables:
-    GIT_SUBMODULE_PATHS: "3rdParty/googletest 3rdParty/nlohmannJson"
+    GIT_SUBMODULE_PATHS: "3rdParty/googletest 3rdParty/nlohmannJson 3rdParty/xgrammar"
 
 # ==============================================================================
 # RULE TEMPLATES

@@ -162,6 +162,38 @@ void applyLogitBiasRepeatedRows(rt::Tensor& logits, rt::Tensor const& tokenIds, 
     rt::Tensor const& offsets, int32_t rowsPerSlot, cudaStream_t stream);
 
 /*!
+ * \brief Sentinel written to grammar-forbidden logits by \ref applyTokenBitmask.
+ *
+ * Not -inf: this sampler has no NaN/inf guards, and an all--inf row makes the
+ * softmax denominator zero (`exp(-inf - (-FLT_MAX))`), which divides by zero
+ * downstream. Not -FLT_MAX either, because logits are scaled by `1/temperature`
+ * first and `-FLT_MAX * 10` overflows straight back to -inf. -1e30 stays finite
+ * until the inverse temperature exceeds ~3e8, and leaves a fully masked row
+ * uniformly random rather than undefined.
+ */
+constexpr float kMaskedLogitValue = -1e30F;
+
+/*!
+ * \brief Zero out grammar-forbidden tokens ahead of sampling.
+ *
+ * The bitmask is dense and bit-packed, one bit per output-vocabulary entry, with a
+ * set bit meaning *allowed*. Its width equals the logits width, so no vocabulary
+ * lookup is needed. Row `r` of the bitmask constrains row `r` of the logits. Rows are
+ * not slots: each slot owns `rowsPerSlot` consecutive rows, exactly as in
+ * \ref applyLogitBiasRepeatedRows.
+ *
+ * \param[in,out] logits Logits [GPU, Float] with shape [num-rows, vocab-size]
+ * \param[in] bitmask Packed mask [GPU, Int32] with shape [>= num-rows, ceil(vocab-size / 32)]
+ * \param[in] rowNeedsMask Per-row flag [GPU, Int32], shape [>= num-rows]; rows set to 0 are
+ *            skipped entirely, so unconstrained requests in a mixed batch cost nothing
+ * \param[in] numRows Number of logits rows to constrain
+ * \param[in] stream CUDA stream to execute the kernel
+ * \throws std::runtime_error If tensor validation or CUDA launch fails
+ */
+void applyTokenBitmask(rt::Tensor& logits, rt::Tensor const& bitmask, rt::Tensor const& rowNeedsMask, int32_t numRows,
+    cudaStream_t stream);
+
+/*!
  * \brief Select all top-K elements from input tensor.
  *
  * Returns topK indices and raw values from input with no transformations applied.

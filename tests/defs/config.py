@@ -2391,6 +2391,8 @@ class TestConfig:
             "tests/test_cases/ragged_batch.json",
             "llm_logit_bias":
             "tests/test_cases/llm_logit_bias.json",
+            "llm_guided_decoding":
+            "tests/test_cases/llm_guided_decoding.json",
             "llm_lora":
             "tests/test_cases/llm_lora.json",
             "llm_context_reuse":

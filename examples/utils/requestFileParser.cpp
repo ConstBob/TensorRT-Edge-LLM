@@ -23,6 +23,7 @@
 #include "common/stringUtils.h"
 #include "runtime/audioLoader.h"
 #include "runtime/audioUtils.h"
+#include "runtime/decoding/guidedDecoder.h"
 #include "runtime/imageUtils.h"
 #include "sampler/sampling.h" // kMaxLogprobsK
 
@@ -30,6 +31,7 @@
 #include <fstream>
 #include <limits>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <stdexcept>
 
 namespace trt_edgellm
@@ -76,6 +78,99 @@ std::unordered_map<int32_t, float> parseLogitBias(Json const& logitBiasJson, std
         logitBias[static_cast<int32_t>(tokenIdLong)] = bias;
     }
     return logitBias;
+}
+
+/*!
+ * @brief Parse the low-level `guided_decoding` field into runtime parameters.
+ *
+ * Flat, mutually exclusive fields rather than a {type, guide} pair, because that reads
+ * far better in a hand-written JSON file. `json_schema` and `structural_tag` accept an
+ * inline object, and `choice` an inline array -- requiring an escaped JSON string would
+ * make them nearly unusable -- and the value is re-serialized so that different
+ * formatting of the same schema collapse onto one compiled-grammar cache entry.
+ */
+std::optional<rt::GuidedDecodingParams> parseGuidedDecoding(Json const& guidedJson, std::string const& fieldName)
+{
+    check::check(guidedJson.is_object(), fieldName + " must be an object");
+
+    struct FieldSpec
+    {
+        char const* key;
+        rt::GuideType type;
+    };
+    // Order matches the documented modes.
+    constexpr FieldSpec kFIELDS[] = {
+        {"json_object", rt::GuideType::kJsonObject},
+        {"json_schema", rt::GuideType::kJsonSchema},
+        {"regex", rt::GuideType::kRegex},
+        {"ebnf", rt::GuideType::kEbnf},
+        {"structural_tag", rt::GuideType::kStructuralTag},
+        {"choice", rt::GuideType::kChoice},
+    };
+
+    std::optional<rt::GuidedDecodingParams> parsed;
+    std::string firstKey;
+    for (auto const& [key, type] : kFIELDS)
+    {
+        if (!guidedJson.contains(key) || guidedJson[key].is_null())
+        {
+            continue;
+        }
+        auto const& value = guidedJson[key];
+
+        rt::GuidedDecodingParams candidate;
+        candidate.type = type;
+        if (type == rt::GuideType::kJsonObject)
+        {
+            check::check(value.is_boolean(), fieldName + ".json_object must be a boolean");
+            if (!value.get<bool>())
+            {
+                continue; // `false` means "not requested", not "constrain to nothing".
+            }
+        }
+        else if (type == rt::GuideType::kChoice)
+        {
+            check::check(value.is_array(), fieldName + ".choice must be an array of strings");
+            candidate.guide = value.dump();
+        }
+        else if (value.is_string())
+        {
+            candidate.guide = value.get<std::string>();
+            // An empty string means "unset". Treating it as a grammar would compile to a
+            // language accepting nothing and surface as an unsatisfiable mask.
+            if (candidate.guide.empty())
+            {
+                continue;
+            }
+        }
+        else if (type == rt::GuideType::kJsonSchema || type == rt::GuideType::kStructuralTag)
+        {
+            check::check(value.is_object(), fieldName + "." + key + " must be an object or a JSON string");
+            candidate.guide = value.dump();
+        }
+        else
+        {
+            throw std::runtime_error(fieldName + "." + key + " must be a string");
+        }
+
+        check::check(!parsed.has_value(),
+            format::fmtstr("%s sets both '%s' and '%s'; exactly one guided decoding mode may be used",
+                fieldName.c_str(), firstKey.c_str(), key));
+        firstKey = key;
+        parsed = std::move(candidate);
+    }
+
+    if (parsed.has_value())
+    {
+        // Same validation the runtime applies, run here so the CLI reports the real
+        // reason instead of a generic request rejection.
+        std::string failReason;
+        // Validate first and test afterwards: the two arguments of check::check are
+        // unsequenced, so building the message inline can read failReason before it is set.
+        bool const valid = rt::validateGuidedDecodingParams(*parsed, failReason);
+        check::check(valid, fieldName + ": " + failReason);
+    }
+    return parsed;
 }
 
 rt::ContextCacheLookupPolicy parseContextCacheLookupPolicy(Json const& input)
@@ -165,6 +260,12 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
     if (inputData.contains("logit_bias") && !inputData["logit_bias"].is_null())
     {
         defaultLogitBias = parseLogitBias(inputData["logit_bias"], "logit_bias");
+    }
+    // A top-level guided_decoding applies to every request unless a request overrides it.
+    std::optional<rt::GuidedDecodingParams> defaultGuidedDecoding;
+    if (inputData.contains("guided_decoding") && !inputData["guided_decoding"].is_null())
+    {
+        defaultGuidedDecoding = parseGuidedDecoding(inputData["guided_decoding"], "guided_decoding");
     }
     // Top-level num_logprobs is the default for every request; a request may raise it.
     // A CLI override (>= 0) takes precedence over both file levels, mirroring
@@ -424,6 +525,14 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
             {
                 request.logitBias
                     = parseLogitBias(requestItem["logit_bias"], format::fmtstr("requests[%zu].logit_bias", requestIdx));
+            }
+
+            // Optional per-request grammar constraint ("guided_decoding": {...}).
+            request.guidedDecoding = defaultGuidedDecoding;
+            if (requestItem.contains("guided_decoding") && !requestItem["guided_decoding"].is_null())
+            {
+                request.guidedDecoding = parseGuidedDecoding(
+                    requestItem["guided_decoding"], format::fmtstr("requests[%zu].guided_decoding", requestIdx));
             }
 
             // Optional per-request stop strings ("stop": string | string[]).

@@ -27,6 +27,7 @@
 #include "runtime/config/deploymentConfig.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/decoding/decoderRegistry.h"
+#include "runtime/decoding/guidedDecoder.h"
 #include "runtime/decoding/logitBias.h"
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/exec/tensorMap.h"
@@ -304,7 +305,10 @@ private:
     std::unique_ptr<MultimodalRunner> mAudioRunner{nullptr};       //!< Audio multimodal runner (optional)
     std::unique_ptr<Alpamayo1ActionRunner> mActionRunner{nullptr}; //!< Action/diffusion head runner (optional)
     std::unique_ptr<ActionKvBatchCollector> mActionKvBatchCollector;
-    tokenizer::Tokenizer* mTokenizer{nullptr};                     //!< Shared tokenizer owned by RuntimeCoordinator
+    tokenizer::Tokenizer* mTokenizer{nullptr}; //!< Shared tokenizer owned by RuntimeCoordinator
+
+    //! Grammar-constrained decoding state; inert unless a request asks for it.
+    GuidedDecoder mGuidedDecoder;
     std::unique_ptr<EncoderEmbeddingCache> mEncoderEmbeddingCache; //!< Content-addressed encoder output cache
     hash_utils::HashMap<std::tuple<std::string, std::string>, SystemPromptKVCache>
         mSystemPromptKVCacheBase;          //!< System prompt KVCache for base model
@@ -331,6 +335,7 @@ private:
     // [4] Host pinned memory tensors for optimized CPU-GPU memory transfers
     rt::Tensor mHostPackedTokenIds;      //!< Host pinned memory for packed token IDs
     rt::Tensor mHostSelectedTokenIds;    //!< Host pinned memory for selected token IDs from sampling
+    rt::Tensor mHostOutputSpaceIds;      //!< Host pinned copy of the sampled indices taken before reduced-vocab remap
     rt::Tensor mHostReuseKVCacheLengths; //!< Host pinned memory for reuse KV cache lengths
 
     // [5] Multimodal support tensors for audio/image token indexing
@@ -408,8 +413,8 @@ private:
     //! @param context Inference context
     //! @return True on success, false on failure
     //! @throws std::runtime_error if a CUDA error occurs
-    bool performBatchEvict(DecodingInferenceContext& context, DecodingStrategy& strategy,
-        std::vector<int8_t>& thinkingDone, ContextCacheRequest* contextCacheRequest);
+    bool performBatchEvict(
+        DecodingInferenceContext& context, DecodingStrategy& strategy, ContextCacheRequest* contextCacheRequest);
 
     // Stage-specific metrics
     metrics::LLMPrefillMetrics mPrefillMetrics;

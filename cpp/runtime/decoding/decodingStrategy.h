@@ -45,6 +45,8 @@ namespace trt_edgellm
 namespace rt
 {
 
+class GuidedDecoder;
+
 struct LogitBias;
 
 enum class DecodingStrategyKind : int32_t
@@ -81,6 +83,10 @@ struct SamplingBuffers
     Tensor& baseVocabMappingTable;
     Tensor& hostPackedTokenIds;
     Tensor& hostSelectedTokenIds;
+    //! Sampled indices captured *before* mapReducedVocabToFullVocab, i.e. still in the
+    //! engine's output vocabulary. Grammar matchers live in that space (see GuidedDecoder),
+    //! so they must be advanced with these rather than the remapped full IDs.
+    Tensor& hostOutputSpaceIds;
 };
 
 /*!
@@ -133,6 +139,7 @@ struct DecodingRuntimeContext
     PreprocessResources preprocess;
     tokenizer::Tokenizer& tokenizer;
     LogitBias& logitBias;
+    GuidedDecoder& guidedDecoder;
     SamplingBuffers sampling;
     LogprobsBuffers logprobs;
 

@@ -38,6 +38,21 @@ namespace trt_edgellm
 {
 namespace rt
 {
+
+char const* guideTypeName(GuideType type)
+{
+    switch (type)
+    {
+    case GuideType::kJsonObject: return "json_object";
+    case GuideType::kJsonSchema: return "json_schema";
+    case GuideType::kRegex: return "regex";
+    case GuideType::kEbnf: return "ebnf";
+    case GuideType::kStructuralTag: return "structural_tag";
+    case GuideType::kChoice: return "choice";
+    }
+    return "unknown";
+}
+
 namespace
 {
 
