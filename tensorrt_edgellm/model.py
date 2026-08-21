@@ -551,12 +551,24 @@ class AutoModel:
         # single config override is sufficient and the modeling code needs no
         # change.  This covers the plain default ``CausalLM`` path (e.g. Qwen3)
         # AND registered hybrid base models (Qwen3.5 linear+full / Gated DeltaNet,
-        # Nemotron-H Mamba), which also build per-layer from ``layer_types``.  The
-        # eagle/mtp/dflash/gemma4-mtp speculative-decoding variants have a
-        # different per-layer structure and remain out of scope.
+        # Nemotron-H Mamba), which also build per-layer from ``layer_types``.
+        #
+        # Single-checkpoint MTP (``--mtp``) is also covered: its draft head reads
+        # only the base's *last* hidden state, which stays well defined after
+        # truncation.  (The draft was trained against the full stack, so its
+        # proposals are near-useless on a truncated base and acceptance collapses
+        # to one token per round -- that costs speed, not correctness, and the
+        # few-layer comparison is about the base model's committed state.)
+        #
+        # The remaining variants stay out of scope because they name specific
+        # target layers -- eagle3_target_layer_ids, dflash_target_layer_ids
+        # (default [1, 8, 15, 22, 29]), jetspec_target_layer_ids -- which a
+        # truncation invalidates outright, so each needs its own answer rather
+        # than a shared one.  The MTP *draft* is likewise excluded: only the base
+        # is compared against the golden.
         if num_decoder_layers is not None:
-            if (eagle_base or config.eagle_base or mtp_base or config.mtp_base
-                    or dflash_base or config.dflash_base or jetspec_base
+            if (eagle_base or config.eagle_base or dflash_base
+                    or config.dflash_base or jetspec_base
                     or config.jetspec_base or dspark_base or config.dspark_base
                     or mtp_draft or dflash_draft or jetspec_draft
                     or dspark_draft or config.is_jetspec_draft
@@ -565,8 +577,8 @@ class AutoModel:
                     or config.gemma4_mtp_draft):
                 raise NotImplementedError(
                     "num_decoder_layers cannot be combined with the "
-                    "eagle/mtp/dflash/jetspec/dspark/gemma4-mtp speculative-decoding variants."
-                )
+                    "eagle/dflash/jetspec/dspark/gemma4-mtp speculative-decoding "
+                    "variants (single-checkpoint MTP base is supported).")
             if not 1 <= num_decoder_layers <= config.num_hidden_layers:
                 raise ValueError(
                     f"num_decoder_layers={num_decoder_layers} out of range "

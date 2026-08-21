@@ -99,6 +99,9 @@ class BuildArgs:
     dense_quant: str = "auto"  # auto | nvfp4-qdq | fp16
     int4_gemm_plugin_version: int = 2
     externalize_weights: Tuple[str, ...] = ()
+    #: Build only the first N decoder layers (few-layer numeric validation).
+    #: 0 keeps the checkpoint's own layer count.
+    num_decoder_layers: int = 0
 
     @functools.cached_property
     def weight_policy(self) -> WeightPolicy:
@@ -413,8 +416,12 @@ def load_device_config(args: BuildArgs) -> DeviceConfig:
     """Load and configure the model metadata used for one engine build."""
     from ..models import registry as model_registry
 
-    cfg = DeviceConfig.from_pretrained(args.model_dir, args.resolved_component,
-                                       args.tp_size, args.tp_rank)
+    cfg = DeviceConfig.from_pretrained(
+        args.model_dir,
+        args.resolved_component,
+        args.tp_size,
+        args.tp_rank,
+        num_decoder_layers=args.num_decoder_layers or None)
     paired_target = None
     if args.target_model_dir:
         paired_target = DeviceConfig.from_pretrained(args.target_model_dir,

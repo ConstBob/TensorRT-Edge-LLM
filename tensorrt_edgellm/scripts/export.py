@@ -73,7 +73,8 @@ if TYPE_CHECKING:
 # Register model-family implementations before AutoModel dispatch below.
 from .. import _export_api as _registered_export_api  # noqa: F401
 from ..checkpoint.checkpoint_utils import normalize_rope_scaling_for_runtime
-from ..config import _is_diffusion_gemma_model_type
+from ..config import (_is_diffusion_gemma_model_type,
+                      set_default_quantize_activations)
 from ..external_weights import (EXTERNAL_WEIGHT_CHOICES,
                                 EXTERNAL_WEIGHT_NVFP4_MOE,
                                 resolve_externalize_weights)
@@ -4048,10 +4049,26 @@ def main() -> None:
               "Applies on-the-fly quantization during export (e.g. INT4 RTN "
               "for QAT models stored in BF16)."),
     )
+    p.add_argument(
+        "--no-quantize-activations",
+        dest="quantize_activations",
+        action="store_false",
+        help=(
+            "Export quantized dense Linears without the activation Q-DQ pair, "
+            "leaving MatMul(fp16 activation, DQ(quantized weight)) -- W4A16 / "
+            "W8A16 instead of the checkpoint's W4A4 / W8A8. This does not "
+            "select a weight-only GEMM: TensorRT dequantizes the weights on "
+            "every step, so the engine is substantially slower. Intended for "
+            "isolating activation quantization as an accuracy error source. "
+            "Rejected by FusedNvfp4GemmAllReduce (row-parallel TP), which "
+            "quantizes activations inside the plugin."),
+    )
     args = p.parse_args()
 
     # Select the INT4 GEMM plugin backend before any weight repack / op emission.
     set_int4_gemm_plugin_version(args.int4_gemm_plugin_version)
+    # Applies to every QuantConfig parsed from here on (backbone and drafts).
+    set_default_quantize_activations(args.quantize_activations)
 
     model_dir = _resolve_model_dir(args.model)
     config = _load_config(model_dir)
@@ -4253,11 +4270,13 @@ def main() -> None:
     if args.num_decoder_layer is not None:
         if args.num_decoder_layer < 1:
             p.error("--num-decoder-layer must be >= 1")
-        if (args.eagle_base or args.mtp or args.dflash_base
-                or args.dflash_draft or args.jetspec_base or args.jetspec_draft
-                or args.dspark_base or args.dspark_draft):
+        if (args.eagle_base or args.dflash_base or args.dflash_draft
+                or args.jetspec_base or args.jetspec_draft or args.dspark_base
+                or args.dspark_draft):
+            # --mtp is allowed: its draft head reads only the base's last hidden
+            # state. The rest name specific target layers that truncation removes.
             p.error("--num-decoder-layer cannot be combined with "
-                    "--eagle-base / --mtp / --dflash-base / --dflash-draft / "
+                    "--eagle-base / --dflash-base / --dflash-draft / "
                     "--jetspec-base / --jetspec-draft / "
                     "--dspark-base / --dspark-draft")
 

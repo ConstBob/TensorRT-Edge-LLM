@@ -308,7 +308,8 @@ class DeviceConfig:
             model_dir: str,
             component: "contracts.Component | str" = contracts.Component.LLM,
             tp_size: int = 1,
-            tp_rank: int = 0) -> "DeviceConfig":
+            tp_rank: int = 0,
+            num_decoder_layers: Optional[int] = None) -> "DeviceConfig":
         bundle = BundleConfig.from_pretrained(model_dir)
         resolved_component = (component
                               if isinstance(component, contracts.Component)
@@ -330,6 +331,8 @@ class DeviceConfig:
         model_type = _component_model_type(llm, selected, root,
                                            resolved_component)
         llm = _normalize_layer_count(llm)
+        if num_decoder_layers is not None and resolved_component in LLM_COMPONENTS:
+            llm = _truncate_layers(llm, num_decoder_layers)
         hidden_size = int(llm["hidden_size"])
         num_attn_heads = int(llm["num_attention_heads"])
         head_dim = int(llm.get("head_dim", hidden_size // num_attn_heads))
@@ -726,6 +729,26 @@ def _normalize_layer_count(llm: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(llm)
     normalized["num_hidden_layers"] = len(raw)
     return normalized
+
+
+def _truncate_layers(llm: Dict[str, Any], num_layers: int) -> Dict[str, Any]:
+    """Keep only the first ``num_layers`` decoder layers (few-layer validation).
+
+    Everything downstream is derived from ``num_hidden_layers`` and the per-layer
+    type list, and the weight loader pulls tensors by name, so the dropped layers
+    are simply never asked for.
+    """
+    total = int(llm["num_hidden_layers"])
+    if not 1 <= num_layers <= total:
+        raise ValueError(
+            f"num_decoder_layers={num_layers} out of range [1, {total}]")
+    truncated = dict(llm)
+    truncated["num_hidden_layers"] = num_layers
+    for key in ("layers_block_type", "layer_types"):
+        raw = truncated.get(key)
+        if isinstance(raw, (list, tuple)) and raw:
+            truncated[key] = list(raw)[:num_layers]
+    return truncated
 
 
 def _parse_num_deepstack_features(llm: Dict[str, Any], root: Dict[str,

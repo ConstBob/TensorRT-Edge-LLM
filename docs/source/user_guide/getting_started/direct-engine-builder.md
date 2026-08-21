@@ -284,6 +284,12 @@ rejected for native Qwen MTP because its draft layers are in
 | Tensor parallel rank | `--tp-size N --tp-rank R` |
 | Detailed TensorRT profiling names | `--profiling-detailed` |
 | Partial component rebuild | `--components NAME[,NAME...]` |
+| First N decoder layers only | `--num-decoder-layer N` |
+
+`--num-decoder-layer` truncates the LLM to its first N decoder layers, for the
+few-layer numeric validation (`scripts/few-layer-validation.sh`). Weights are read
+by name, so the dropped layers are simply never requested and the checkpoint needs
+no preparation.
 
 Tensor parallelism currently builds one rank per invocation. Invoke the command
 once for each `--tp-rank` and place the rank artifacts according to the normal

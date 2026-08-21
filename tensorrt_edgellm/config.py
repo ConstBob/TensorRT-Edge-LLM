@@ -393,6 +393,21 @@ class ActionConfig:
             scale_config, self.head_dim, 1.0 / (float(self.head_dim)**0.5))
 
 
+_DEFAULT_QUANTIZE_ACTIVATIONS = True
+
+
+def set_default_quantize_activations(value: bool) -> None:
+    """Set :attr:`QuantConfig.quantize_activations` for configs parsed later.
+
+    The export CLI calls this once from its argument parsing. A whole export can
+    build several QuantConfigs (backbone plus any draft model), all of them
+    parsed from their checkpoints afterwards, so one assignment covers the run
+    without threading the flag through every ``_export_*`` entry point.
+    """
+    global _DEFAULT_QUANTIZE_ACTIVATIONS
+    _DEFAULT_QUANTIZE_ACTIVATIONS = value
+
+
 @dataclass
 class QuantConfig:
     """Quantization parameters extracted from the checkpoint config."""
@@ -419,6 +434,15 @@ class QuantConfig:
     layer_overrides: dict = field(default_factory=dict)
     # True when quant_algo is MIXED_PRECISION: unlisted modules are FP16.
     is_mixed_precision: bool = False
+    # False exports quantized dense Linears without the activation Q-DQ pair,
+    # leaving ``MatMul(fp16_activation, DQ(quantized_weight))``. Not a choice of
+    # kernel: the weights stay in the checkpoint's format and TensorRT is left
+    # to dequantize them, so this trades a large amount of decode throughput for
+    # the accuracy of an unquantized activation. The default reproduces the
+    # checkpoint's own recipe (W4A4 / W8A8); see
+    # :func:`set_default_quantize_activations`.
+    quantize_activations: bool = field(
+        default_factory=lambda: _DEFAULT_QUANTIZE_ACTIVATIONS)
 
     @property
     def is_quantized(self) -> bool:

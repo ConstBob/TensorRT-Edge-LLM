@@ -178,6 +178,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out",
                    default="/tmp/qwen3_0.6b_golden_4layer.safetensors",
                    help="output safetensors path")
+    p.add_argument(
+        "--no-quantize-activations",
+        dest="quantize_activations",
+        action="store_false",
+        help=("Mirror the export's --no-quantize-activations: leave the "
+              "activation in fp16 and dequantize only the weight."))
     return p.parse_args()
 
 
@@ -188,24 +194,40 @@ _DTYPE_MAP = {
 }
 
 
-def _apply_chat_template(tokenizer, messages: list) -> list[int]:
-    """Apply the chat template to one request's messages and return a token-id list.
+def _tokenize_request(tokenizer, messages: list, opts: dict) -> list[int]:
+    """Tokenize one request's messages the way EdgeLLM's applyChatTemplate would.
 
-    Matches EdgeLLM: add_generation_prompt=True, enable_thinking=False. Some tokenizers' templates
-    don't accept the enable_thinking kwarg, in which case we fall back to omitting it. With
-    transformers 5.x, ``tokenize=True`` returns a BatchEncoding (dict), so we uniformly extract
+    ``opts`` carries the input JSON's ``apply_chat_template`` / ``add_generation_prompt`` /
+    ``enable_thinking``; the defaults are EdgeLLM's. With ``apply_chat_template`` off the runtime
+    drops the role wrappers and the generation prompt and just concatenates each message's text,
+    so the golden has to do the same or the two sides tokenize different sequences (the alignment
+    check in the comparison catches that, but only after a full run).
+
+    Some tokenizers' templates don't accept the enable_thinking kwarg; fall back to omitting it.
+    With transformers 5.x ``tokenize=True`` returns a BatchEncoding, so uniformly extract
     input_ids into a list[int].
     """
+    if not opts["apply_chat_template"]:
+        parts = []
+        for message in messages:
+            content = message["content"]
+            if isinstance(content, str):
+                parts.append(content)
+                continue
+            parts.extend(c["text"] for c in content
+                         if isinstance(c, dict) and c.get("type") == "text")
+        return list(
+            tokenizer("".join(parts), add_special_tokens=False)["input_ids"])
     try:
         res = tokenizer.apply_chat_template(
             messages,
-            add_generation_prompt=_ADD_GENERATION_PROMPT,
-            enable_thinking=_ENABLE_THINKING,
+            add_generation_prompt=opts["add_generation_prompt"],
+            enable_thinking=opts["enable_thinking"],
             tokenize=True)
     except TypeError:
         res = tokenizer.apply_chat_template(
             messages,
-            add_generation_prompt=_ADD_GENERATION_PROMPT,
+            add_generation_prompt=opts["add_generation_prompt"],
             tokenize=True)
     if hasattr(res, "keys"):  # BatchEncoding / dict -> take input_ids
         res = res["input_ids"]
@@ -242,8 +264,17 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
 
     # ---- 2. Apply the chat template, then left-pad into a batch ----
+    template_opts = {
+        "apply_chat_template":
+        bool(req_cfg.get("apply_chat_template", True)),
+        "add_generation_prompt":
+        bool(req_cfg.get("add_generation_prompt", _ADD_GENERATION_PROMPT)),
+        "enable_thinking":
+        bool(req_cfg.get("enable_thinking", _ENABLE_THINKING)),
+    }
     id_lists = [
-        _apply_chat_template(tokenizer, r["messages"]) for r in requests
+        _tokenize_request(tokenizer, r["messages"], template_opts)
+        for r in requests
     ]
     enc = tokenizer.pad({"input_ids": id_lists},
                         padding=True,
@@ -307,7 +338,7 @@ def main() -> None:
             m = AutoModelForCausalLM.from_config(config,
                                                  attn_implementation=attn_impl)
             m = m.to(torch_dtype)
-            _load_quantized_state(m, ckpt)
+            _load_quantized_state(m, ckpt, args.quantize_activations)
             return m
         return AutoModelForCausalLM.from_pretrained(
             ckpt,
@@ -400,7 +431,7 @@ def main() -> None:
         "batch_size": str(bs),
         "input_file": args.input_file,
         "chat_template":
-        f"add_generation_prompt={_ADD_GENERATION_PROMPT},enable_thinking={_ENABLE_THINKING}",
+        ",".join(f"{k}={v}" for k, v in template_opts.items()),
         "padding_side": "left",
         "kv_layout": "[batch, num_kv_heads, seq, head_dim]",
         "seq_len_prefill": str(seq_len_prefill),
@@ -539,7 +570,9 @@ def _set_submodule(root: torch.nn.Module, dotted: str,
         setattr(parent, last, new)
 
 
-def _load_quantized_state(model: torch.nn.Module, ckpt: str) -> None:
+def _load_quantized_state(model: torch.nn.Module,
+                          ckpt: str,
+                          quantize_activations: bool = True) -> None:
     """Patch the recipe-quantized Linears to fake-quant and load all weights.
 
     A projection ``P`` is quantized iff the checkpoint has ``P.weight_scale``
@@ -621,6 +654,7 @@ def _load_quantized_state(model: torch.nn.Module, ckpt: str) -> None:
         else:
             new = _GoldenFP8Linear(in_f, out_f, has_bias)
             counts["FP8"] += 1
+        new.quantize_activations = quantize_activations
         _set_submodule(model, prefix, new)
     n_built = sum(counts.values())
 
