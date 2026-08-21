@@ -19,6 +19,7 @@
 #include "common/checkMacros.h"
 #include "common/cudaMacros.h"
 #include "xqaKernelTypes.h"
+#include "xqaLaunchConfig.h"
 
 #include <algorithm>
 #include <array>
@@ -341,32 +342,6 @@ bool isJitKernelSupportedByBuild(XQAJitKey const& key) noexcept
 #endif // SUPPORTS_CLUSTER_LAUNCH
 }
 
-#if SUPPORTS_CLUSTER_LAUNCH
-void launch2CtaHeadDim512ClusterKernel(XQAKernelFuncInfo const& kernelInfo, dim3 const& dimGrid, dim3 const& dimCta,
-    cudaStream_t const& stream, void** kernelParams)
-{
-    CUlaunchAttribute launchAttr{};
-    launchAttr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
-    launchAttr.value.clusterDim.x = kSPLIT_HEAD_DIM_512_CLUSTER_SIZE;
-    launchAttr.value.clusterDim.y = 1U;
-    launchAttr.value.clusterDim.z = 1U;
-
-    CUlaunchConfig launchConfig{};
-    launchConfig.gridDimX = dimGrid.x;
-    launchConfig.gridDimY = dimGrid.y;
-    launchConfig.gridDimZ = dimGrid.z;
-    launchConfig.blockDimX = dimCta.x;
-    launchConfig.blockDimY = dimCta.y;
-    launchConfig.blockDimZ = dimCta.z;
-    launchConfig.sharedMemBytes = kernelInfo.mSharedMemBytes;
-    launchConfig.hStream = stream;
-    launchConfig.attrs = &launchAttr;
-    launchConfig.numAttrs = 1U;
-
-    CUDA_DRIVER_CHECK(cuLaunchKernelEx(&launchConfig, kernelInfo.mDeviceFunction, kernelParams, nullptr));
-}
-#endif // SUPPORTS_CLUSTER_LAUNCH
-
 uint32_t getXQAKernelGridDimX(XQAKernelFuncInfo const& kernelInfo) noexcept
 {
     return kernelInfo.mRequiresClusterLaunch ? kSPLIT_HEAD_DIM_512_CLUSTER_SIZE : 1U;
@@ -379,19 +354,38 @@ dim3 getXQAKernelCtaDim(XQAKernelFuncInfo const& kernelInfo) noexcept
 }
 
 void launchXQAKernel(XQAKernelFuncInfo const& kernelInfo, dim3 const& dimGrid, dim3 const& dimCta,
-    cudaStream_t const& stream, void** kernelParams)
+    cudaStream_t const& stream, void** kernelParams, bool const enablePdl, int32_t const smVersion)
 {
     bool const useClusterLaunch = kernelInfo.mRequiresClusterLaunch;
-#if SUPPORTS_CLUSTER_LAUNCH
-    // Keep the cluster and regular launch paths shared by decode and spec-decode dispatch.
-    if (useClusterLaunch)
+#if !SUPPORTS_CLUSTER_LAUNCH
+    check::check(!useClusterLaunch, "XQA head_dim=512 2CTA cluster kernel is unavailable.");
+#endif // SUPPORTS_CLUSTER_LAUNCH
+
+#if SUPPORTS_CLUSTER_LAUNCH || SUPPORTS_PROGRAMMATIC_DEPENDENT_LAUNCH
+    XQALaunchAttributes launchAttributes
+        = makeXQALaunchAttributes(useClusterLaunch, kSPLIT_HEAD_DIM_512_CLUSTER_SIZE, enablePdl, smVersion);
+    if (launchAttributes.count > 0U)
     {
-        launch2CtaHeadDim512ClusterKernel(kernelInfo, dimGrid, dimCta, stream, kernelParams);
+        CUlaunchConfig launchConfig{};
+        launchConfig.gridDimX = dimGrid.x;
+        launchConfig.gridDimY = dimGrid.y;
+        launchConfig.gridDimZ = dimGrid.z;
+        launchConfig.blockDimX = dimCta.x;
+        launchConfig.blockDimY = dimCta.y;
+        launchConfig.blockDimZ = dimCta.z;
+        launchConfig.sharedMemBytes = kernelInfo.mSharedMemBytes;
+        launchConfig.hStream = stream;
+        launchConfig.attrs = launchAttributes.attrs.data();
+        launchConfig.numAttrs = launchAttributes.count;
+
+        CUDA_DRIVER_CHECK(cuLaunchKernelEx(&launchConfig, kernelInfo.mDeviceFunction, kernelParams, nullptr));
         return;
     }
 #else
-    check::check(!useClusterLaunch, "XQA head_dim=512 2CTA cluster kernel is unavailable.");
-#endif // SUPPORTS_CLUSTER_LAUNCH
+    (void) enablePdl;
+    (void) smVersion;
+#endif // SUPPORTS_CLUSTER_LAUNCH || SUPPORTS_PROGRAMMATIC_DEPENDENT_LAUNCH
+
     CUDA_DRIVER_CHECK(cuLaunchKernel(kernelInfo.mDeviceFunction, dimGrid.x, dimGrid.y, dimGrid.z, dimCta.x, dimCta.y,
         dimCta.z, kernelInfo.mSharedMemBytes, stream, kernelParams, nullptr));
 }
@@ -662,7 +656,7 @@ void DecoderXQARunner::dispatchXQAKernel(XQALaunchParams& params, cudaStream_t c
     dim3 const dimGrid{
         getXQAKernelGridDimX(kernelInfo), static_cast<uint32_t>(mNumKVHeads), static_cast<uint32_t>(mBatchSize)};
     dim3 const dimCta = getXQAKernelCtaDim(kernelInfo);
-    launchXQAKernel(kernelInfo, dimGrid, dimCta, stream, kernelParams.data());
+    launchXQAKernel(kernelInfo, dimGrid, dimCta, stream, kernelParams.data(), params.enablePdl, mSmVersion);
 }
 
 void DecoderXQARunner::dispatchSpecDecodeXQAKernel(XQALaunchParams& params, cudaStream_t const& stream)
@@ -692,5 +686,5 @@ void DecoderXQARunner::dispatchSpecDecodeXQAKernel(XQALaunchParams& params, cuda
     dim3 const dimGrid{getXQAKernelGridDimX(kernelInfo), static_cast<uint32_t>(mNumKVHeads * tokenBlockPerGroup),
         static_cast<uint32_t>(mBatchSize)};
     dim3 const dimCta = getXQAKernelCtaDim(kernelInfo);
-    launchXQAKernel(kernelInfo, dimGrid, dimCta, stream, kernelParams.data());
+    launchXQAKernel(kernelInfo, dimGrid, dimCta, stream, kernelParams.data(), params.enablePdl, mSmVersion);
 }
