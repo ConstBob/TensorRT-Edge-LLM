@@ -591,6 +591,38 @@ _trt_mxfp8_dequantize_linear_schema = OpSchema(
 )
 
 # ---------------------------------------------------------------------------
+# trt_edgellm::QkvConcatPlugin
+# ---------------------------------------------------------------------------
+
+_qkv_concat_schema = OpSchema(
+    name="QkvConcatPlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc="Pack three contiguous FP16 Q/K/V tensors along the last dimension.",
+    inputs=[
+        OpSchema.FormalParameter(
+            name=name,
+            description=f"{name.upper()} projection",
+            type_str="T",
+        ) for name in ("q", "k", "v")
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="qkv",
+            description="Packed QKV tensor",
+            type_str="T",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T",
+            ["tensor(float16)"],
+            "Q/K/V and output data type.",
+        ),
+    ],
+)
+
+# ---------------------------------------------------------------------------
 # trt_edgellm::Int4GroupwiseGemmPlugin (AWQ swizzled weights)
 # ---------------------------------------------------------------------------
 
@@ -1847,6 +1879,7 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _trt_mxfp8_dynamic_quantize_schema,
     _trt_mxfp8_dequantize_linear_schema,
     _int4_groupwise_gemm_schema,
+    _qkv_concat_schema,
     _int4_groupwise_gemm_v2_schema,
     _nvfp4_a16_gemm_schema,
     _causal_conv1d_schema,
