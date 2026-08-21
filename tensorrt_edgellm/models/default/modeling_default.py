@@ -49,8 +49,8 @@ import torch.nn.functional as F
 
 from ...config import ModelConfig
 from ..linear import (FP16Linear, NVFP4LinearMethod, ReplicatedLinear, TPMode,
-                      is_nvfp4_linear, make_linear)
-from ..ops import KV_PAGE_SIZE, attention_plugin
+                      is_int4_linear, is_nvfp4_linear, make_linear)
+from ..ops import KV_PAGE_SIZE, attention_plugin, qkv_concat
 
 logger = logging.getLogger(__name__)
 
@@ -249,6 +249,10 @@ class Attention(nn.Module):
                                   bias=config.attention_bias,
                                   module_name=f"{module_prefix}.v_proj",
                                   tp_mode=TPMode.COL)
+        self._uses_int4_qkv = any(
+            is_int4_linear(proj)
+            for proj in (self.q_proj, self.k_proj, self.v_proj))
+
         # FP8 attention scales live on the projection modules (checkpoint keys
         # ``...{q,k,v}_proj.{q,k,v}_scale``); they are not part of FP8Linear's
         # per-tensor weight/input scales.
@@ -322,12 +326,13 @@ class Attention(nn.Module):
         if hasattr(self, "qkv_proj_fused"):
             qkv = self.qkv_proj_fused(hidden_states)
         else:
-            qkv = torch.cat([
-                self.q_proj(hidden_states),
-                self.k_proj(hidden_states),
-                self.v_proj(hidden_states),
-            ],
-                            dim=-1)
+            q = self.q_proj(hidden_states)
+            k = self.k_proj(hidden_states)
+            v = self.v_proj(hidden_states)
+            if self._uses_int4_qkv:
+                qkv = qkv_concat(q, k, v)
+            else:
+                qkv = torch.cat([q, k, v], dim=-1)
 
         # qk_norm is fused inside the AttentionPlugin — do NOT apply q_norm / k_norm here.
         # The modules stay registered only so checkpoint loading finds their weights.
