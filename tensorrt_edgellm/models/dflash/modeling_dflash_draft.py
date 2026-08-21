@@ -54,8 +54,9 @@ from ..gemma4.modeling_gemma4_text import (Gemma4MLP, Gemma4RMSNorm,
                                            _rotary_dim_from_rope_config,
                                            _uses_attention_k_eq_v)
 # yapf: enable
-from ..linear import FP16Linear, make_linear
-from ..ops import KV_PAGE_SIZE, attention_plugin, dflash_target_kv_cache_update
+from ..linear import FP16Linear, is_int4_linear, make_linear
+from ..ops import (KV_PAGE_SIZE, attention_plugin,
+                   dflash_target_kv_cache_update, qkv_concat)
 
 __all__ = ["DFlashDraftModel"]
 
@@ -158,6 +159,11 @@ class DFlashCachedAttention(nn.Module):
                                   config.hidden_size,
                                   module_name=f"{prefix}.o_proj")
 
+        qkv_projections = [self.q_proj, self.k_proj]
+        if not self.attention_k_eq_v:
+            qkv_projections.append(self.v_proj)
+        self._uses_int4_qkv = any(
+            is_int4_linear(proj) for proj in qkv_projections)
         norm_cls = Gemma4RMSNorm if self.is_gemma4 else RMSNorm
         self.q_norm = norm_cls(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = norm_cls(self.head_dim, eps=config.rms_norm_eps)
@@ -222,7 +228,8 @@ class DFlashCachedAttention(nn.Module):
         # --- AttentionPlugin: proposal attention over full context ---
         # (packed QKV: dflash applies q/k_norm explicitly above, so pack here)
         attn_4d, present_kv = attention_plugin(
-            torch.cat([q, k_self, v_self], dim=-1),
+            (qkv_concat(q, k_self, v_self) if self._uses_int4_qkv else
+             torch.cat([q, k_self, v_self], dim=-1)),
             updated_kv,
             context_lengths,
             rope_cos_sin,

@@ -928,6 +928,28 @@ def _(hidden_states, qweight, scales, gemm_n, gemm_k, group_size):
 
 
 # ---------------------------------------------------------------------------
+# Custom op: trt::qkv_concat
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt::qkv_concat", mutates_args=())
+def qkv_concat(q: torch.Tensor, k: torch.Tensor,
+               v: torch.Tensor) -> torch.Tensor:
+    """Pack contiguous Q/K/V projections without exposing an ONNX Concat."""
+    return torch.cat((q, k, v), dim=-1)
+
+
+@qkv_concat.register_fake
+def _(q, k, v):
+    if q.shape[:-1] != k.shape[:-1] or q.shape[:-1] != v.shape[:-1]:
+        raise ValueError("Q, K, and V must have identical leading shapes")
+    return torch.empty(*q.shape[:-1],
+                       q.shape[-1] + k.shape[-1] + v.shape[-1],
+                       dtype=q.dtype,
+                       device=q.device)
+
+
+# ---------------------------------------------------------------------------
 # Custom op: trt::nvfp4_a16_gemm  (dense FP16-A / NVFP4-W4 Marlin GEMM)
 #
 # Inputs are already in Marlin-packed layout (see
