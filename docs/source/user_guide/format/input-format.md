@@ -69,6 +69,7 @@ This guide describes the input JSON format for the LLM inference tool. The forma
 - **`disable_spec_decode`** (optional, default: false): Disable EAGLE speculative decoding for this request even if draft engine is loaded
 - **`logit_bias`** (optional): Request-specific sparse logit-bias map. When set, it overrides the top-level `logit_bias` default for this request.
 - **`num_logprobs`** (optional): Overrides the top-level `num_logprobs` default for this request. Applied batch-uniformly (like `disable_spec_decode`): the batch computes at the maximum value requested by any request in it.
+- **`guided_decoding`** (optional): Constrain the output to a schema, pattern, or grammar. Exactly one mode may be set. Like `logit_bias`, a top-level `guided_decoding` applies to every request unless a request overrides it. See [Guided Decoding](../features/guided-decoding.md).
 - **`stop`** (optional): String or array of strings that halt generation when produced in the output. The stop string itself is excluded from the returned text. Each request in a batch may declare its own list independently. Defaults to no stop strings.
 
 ### Message Fields
@@ -244,6 +245,44 @@ Top-level `logit_bias` applies to every request by default. A request-level `log
 ```
 
 **Speculative decoding limitation:** Requests with a non-empty `logit_bias` map are rejected while speculative decoding is active. Set `disable_spec_decode: true` to explicitly use vanilla decoding for that batch before sending logit bias.
+
+### Guided Decoding
+
+`guided_decoding` constrains generation token by token so the output is guaranteed to match the guide. Set exactly one of `json_object`, `json_schema`, `regex`, `ebnf`, `structural_tag`, or `choice`.
+
+```json
+{
+    "requests": [
+        {
+            "messages": [
+                {"role": "user", "content": "Give me a person record."}
+            ],
+            "guided_decoding": {
+                "json_schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "age": {"type": "integer"}
+                    },
+                    "required": ["name", "age"]
+                }
+            }
+        },
+        {
+            "messages": [
+                {"role": "user", "content": "Answer yes or no."}
+            ],
+            "guided_decoding": {"choice": ["yes", "no"]}
+        }
+    ]
+}
+```
+
+`json_schema` and `structural_tag` accept an inline object, `choice` an inline array, and every mode also accepts an escaped JSON string.
+
+**Speculative decoding limitation:** guided requests are rejected while speculative decoding is active. Set `disable_spec_decode: true` to use vanilla decoding for that batch.
+
+See [Guided Decoding](../features/guided-decoding.md) for all six modes, schema support, and build instructions.
 
 ### Top-N Log-Probabilities
 

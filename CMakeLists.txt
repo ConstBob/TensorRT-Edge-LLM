@@ -242,6 +242,10 @@ set(ENABLE_CUTE_DSL
       "CuTe DSL kernels: fmha (default), ALL, or semicolon-separated group list (fmha;gdn;f16_moe;rmsnorm)"
 )
 
+# Guided decoding: defines XGRAMMAR_INCLUDE_DIRS and the xgrammarCore target.
+# Must precede add_subdirectory(cpp) so edgellmCore can link it.
+include(${CMAKE_SOURCE_DIR}/cmake/GuidedDecoding.cmake)
+
 # Build Core libraries of the project. attentionPlugin shared library and
 # edgellmCore/edgellmBuilder static library will be generated.
 add_subdirectory(cpp)

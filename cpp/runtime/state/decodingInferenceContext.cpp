@@ -44,6 +44,10 @@ void DecodingInferenceContext::initialize(int32_t batchSize, int32_t maxGenLengt
     currentGenerateLengths.resize(batchSize, 0);
     effectivePrefillLengths.resize(batchSize, 0);
     finishedStates.resize(batchSize, 0);
+    thinkingDone.clear();
+    thinkingDone.resize(batchSize, 0);
+    guidedReasoningEnded.clear();
+    guidedReasoningEnded.resize(batchSize, 0);
     slotStreams.clear();
     slotStreams.resize(batchSize);
     stopStringsPerSlot.clear();
@@ -52,6 +56,10 @@ void DecodingInferenceContext::initialize(int32_t batchSize, int32_t maxGenLengt
     logitBiasPerSlot.resize(batchSize);
     hasLogitBias = false;
     logitBiasGpuDirty = false;
+    hasGuidedDecoding = false;
+    guidedUnsatisfiableSlots.clear();
+    guidedMaskSuppressedPerSlot.clear();
+    enableThinking = false;
     callbackEmittedTokenCounts.clear();
     callbackEmittedTokenCounts.resize(batchSize, 0);
     shouldStopAfterAcceptedToken = {};

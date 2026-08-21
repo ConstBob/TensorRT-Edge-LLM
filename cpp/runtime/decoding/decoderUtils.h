@@ -38,6 +38,14 @@ namespace decoder_utils
 std::unique_ptr<EngineExecutor> loadDraftEngine(
     std::filesystem::path const& engineDir, DeploymentConfig const& deployment);
 
+//! @brief Append one sampled token per active slot to the host-side token lists.
+//!
+//! Slots already marked finished are skipped: they are evicted at the end of this step, so a
+//! token appended to them is never fed back and only pollutes the output. This mirrors
+//! collectLogprobsFromHost, which skips the same slots, keeping tokenIds and stepLogprobs in
+//! step with each other.
+void appendSampledTokens(DecodingInferenceContext& context, int32_t const* sampledTokenIds, int32_t activeBatchSize);
+
 //! @brief Copy accepted tokens from device buffers into the host-side context token lists.
 //! On return, hostAcceptLengths holds the number of tokens actually appended per slot.
 void appendAcceptedTokens(DecodingInferenceContext& context, Tensor& hostAcceptLengths, Tensor& hostAcceptedTokenIds,

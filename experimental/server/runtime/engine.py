@@ -44,7 +44,7 @@ import threading
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, Dict, Iterator, List, Mapping,
-                    Optional, Sequence, Union)
+                    Optional, Sequence, Tuple, Union)
 
 from ..config import ContextCacheConfig
 from ..parsing.tool_calling import (ToolConfig, parse_assistant_output,
@@ -85,6 +85,9 @@ class SamplingParams:
     num_logprobs: int = 0
     stop: List[str] = field(default_factory=list)
     logit_bias: Dict[int, float] = field(default_factory=dict)
+    # Low-level grammar constraint as (guide_type, guide_text); see
+    # _normalize_guided_decoding. None means unconstrained.
+    guided_decoding: Optional[Tuple[str, str]] = None
     skip_special_tokens: bool = True
     reuse_context: bool = True
     cache_generated_tokens: bool = True
@@ -422,6 +425,111 @@ def _import_runtime():
         "Could not import _edgellm_runtime. Build the C++ extension first:\n"
         "  TRT_PACKAGE_DIR=/path/to/tensorrt python experimental/server/setup_pybind.py build_ext --inplace"
     )
+
+
+_GUIDE_TYPE_NAMES = ("json_object", "json_schema", "regex", "ebnf",
+                     "structural_tag", "choice")
+
+# The pybind module is imported at runtime, so the enum members are resolved lazily.
+_GUIDE_TYPE_ENUM = {
+    "json_object": lambda rt: rt.GuideType.JSON_OBJECT,
+    "json_schema": lambda rt: rt.GuideType.JSON_SCHEMA,
+    "regex": lambda rt: rt.GuideType.REGEX,
+    "ebnf": lambda rt: rt.GuideType.EBNF,
+    "structural_tag": lambda rt: rt.GuideType.STRUCTURAL_TAG,
+    "choice": lambda rt: rt.GuideType.CHOICE,
+}
+
+
+def _normalize_response_format(
+        response_format: Optional[Dict[str,
+                                       Any]]) -> Optional[Tuple[str, str]]:
+    """Translate OpenAI's `response_format` into a low-level guide.
+
+    `strict` is ignored: guided decoding is always enforced, matching vLLM. The
+    high-level field cannot express regex / ebnf / structural_tag, which is why the
+    low-level `guided_decoding` field stays available alongside it.
+    """
+    if response_format is None:
+        return None
+    if not isinstance(response_format, dict):
+        raise ValueError("'response_format' must be an object")
+
+    kind = response_format.get("type")
+    if kind in (None, "text"):
+        return None
+    if kind == "json_object":
+        return ("json_object", "")
+    if kind == "json_schema":
+        wrapper = response_format.get("json_schema")
+        if not isinstance(wrapper, dict):
+            raise ValueError("'response_format.json_schema' must be an object")
+        schema = wrapper.get("schema")
+        if not isinstance(schema, dict):
+            raise ValueError(
+                "'response_format.json_schema.schema' must be an object")
+        return ("json_schema", json.dumps(schema, sort_keys=True))
+    raise ValueError(
+        f"'response_format.type' must be text, json_object or json_schema, got {kind!r}"
+    )
+
+
+def _normalize_guided_decoding(
+        guided_decoding: Optional[Dict[str,
+                                       Any]]) -> Optional[Tuple[str, str]]:
+    """Validate the low-level `guided_decoding` field and flatten it to (type, guide).
+
+    Exactly one mode may be set. An empty string or list means "not requested" rather
+    than "constrain to nothing", which would otherwise compile to a grammar accepting
+    no token at all.
+    """
+    if guided_decoding is None:
+        return None
+    if not isinstance(guided_decoding, dict):
+        raise ValueError("'guided_decoding' must be an object")
+
+    unknown = set(guided_decoding) - set(_GUIDE_TYPE_NAMES)
+    if unknown:
+        raise ValueError("'guided_decoding' has unknown field(s): " +
+                         ", ".join(sorted(unknown)))
+
+    chosen: Optional[Tuple[str, str]] = None
+    for name in _GUIDE_TYPE_NAMES:
+        value = guided_decoding.get(name)
+        if value is None:
+            continue
+        if name == "json_object":
+            if not isinstance(value, bool):
+                raise ValueError(
+                    "'guided_decoding.json_object' must be a boolean")
+            if not value:
+                continue
+            guide = ""
+        elif name == "choice":
+            # Checked before the string branch: a bare string would otherwise be carried
+            # through as a guide and only fail in the backend as "not valid JSON".
+            if not isinstance(value, list):
+                raise ValueError(
+                    "'guided_decoding.choice' must be an array of strings")
+            if not value:
+                continue
+            guide = json.dumps(value)
+        elif isinstance(value, str):
+            if not value:
+                continue
+            guide = value
+        elif name in ("json_schema", "structural_tag") and isinstance(
+                value, dict):
+            guide = json.dumps(value, sort_keys=True)
+        else:
+            raise ValueError(f"'guided_decoding.{name}' must be a string")
+
+        if chosen is not None:
+            raise ValueError(
+                "'guided_decoding' sets more than one mode; exactly one is allowed"
+            )
+        chosen = (name, guide)
+    return chosen
 
 
 def _normalize_logit_bias(
@@ -919,6 +1027,10 @@ class LLM:
         req.audio_buffers = audio_buffers
         req.stop_strings = params.stop
         req.logit_bias = normalized_logit_bias
+        if params.guided_decoding is not None:
+            guide_type, guide = params.guided_decoding
+            req.guided_decoding = self._rt.GuidedDecodingParams(
+                _GUIDE_TYPE_ENUM[guide_type](self._rt), guide)
         request.requests = [req]
         if stream_channel is not None:
             request.stream_channels = [stream_channel]

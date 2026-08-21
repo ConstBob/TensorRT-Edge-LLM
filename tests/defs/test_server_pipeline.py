@@ -18,6 +18,7 @@ End-to-end tests for the experimental Python server (pybind11 runtime).
 Tests the full pipeline: build pybind extension -> load TRT engine via
 Python API -> run inference -> validate output.
 """
+import json
 import logging
 import os
 import shlex
@@ -366,6 +367,136 @@ print('SERVER_STREAMING_PASSED')
             pytest.fail(
                 f"Server streaming did not produce expected output. Output:\n{output}"
             )
+
+    def test_server_streaming_with_guided_decoding(
+            self, test_param: str, executable_files: Dict[str, str],
+            remote_config: Optional[RemoteConfig], test_logger: logging.Logger,
+            env_config: EnvironmentConfig) -> None:
+        """Streaming and guided decoding must hold together.
+
+        The mask is applied before sampling and chunks are emitted after, so nothing
+        unconstrained can reach the client -- but the two features share the per-slot
+        vectors that `performBatchEvict` compacts, and the error path writes a stream
+        terminal reason. This pins that: the text assembled from the deltas satisfies the
+        schema, and it really arrived as deltas rather than one final blob.
+        """
+        config = TestConfig.from_param_string(test_param, ModelType.LLM,
+                                              TaskType.INFERENCE, env_config)
+
+        engine_dir = config.get_llm_engine_dir()
+        test_logger.info("Streaming with guided decoding: engine=%s",
+                         engine_dir)
+
+        pybind_build_dir = os.path.join(env_config.build_dir, "pybind")
+        prompt = "Give me a person record with a name and an age."
+        schema = json.dumps(
+            {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string"
+                    },
+                    "age": {
+                        "type": "integer"
+                    },
+                },
+                "required": ["name", "age"],
+            },
+            sort_keys=True)
+
+        script = f"""\
+import sys, os, json, threading
+sys.path.insert(0, {pybind_build_dir!r})
+import importlib.util
+so_files = [f for f in os.listdir({pybind_build_dir!r}) if '_edgellm_runtime' in f and f.endswith('.so')]
+if not so_files:
+    raise RuntimeError('_edgellm_runtime.so not found in ' + {pybind_build_dir!r})
+spec = importlib.util.spec_from_file_location('_edgellm_runtime', os.path.join({pybind_build_dir!r}, so_files[0]))
+rt = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(rt)
+
+runtime = rt.LLMRuntime({engine_dir!r}, '', {{}})
+runtime.capture_decoding_cuda_graph()
+
+channel = rt.StreamChannel.create()
+channel.set_skip_special_tokens(True)
+
+msg = rt.Message()
+msg.role = 'user'
+msg.contents = [rt.MessageContent('text', {prompt!r})]
+req = rt.Request(messages=[msg])
+req.image_buffers = []
+req.guided_decoding = rt.GuidedDecodingParams(rt.GuideType.JSON_SCHEMA, {schema!r})
+
+request = rt.LLMGenerationRequest()
+request.requests = [req]
+request.stream_channels = [channel]
+request.temperature = 1.0
+request.top_p = 1.0
+request.top_k = 1
+request.max_generate_length = 128
+request.apply_chat_template = True
+request.add_generation_prompt = True
+request.enable_thinking = False
+request.disable_spec_decode = True
+
+worker = threading.Thread(target=lambda: runtime.handle_request(request), daemon=True)
+worker.start()
+
+chunks = []
+while True:
+    chunk = channel.wait_pop(timeout_ms=500)
+    if chunk is None:
+        if channel.is_finished() or channel.is_cancelled():
+            break
+        continue
+    chunks.append(chunk)
+    if chunk.finished:
+        break
+worker.join(timeout=30)
+
+text = ''.join(c.text for c in chunks)
+print(f'GUIDED_STREAM_CHUNKS={{len(chunks)}}')
+print(f'GUIDED_STREAM_TEXT={{text!r}}')
+print(f'GUIDED_STREAM_REASON={{channel.get_reason()}}')
+
+assert any(c.finished for c in chunks), 'no terminal chunk received'
+# More than one chunk is what distinguishes streaming from a single final emit; a
+# guided run that silently fell back to non-streaming would still satisfy the schema.
+assert len(chunks) > 1, f'expected deltas, got {{len(chunks)}} chunk(s)'
+
+document = json.loads(text)
+assert isinstance(document, dict), f'streamed text is not a JSON object: {{text!r}}'
+assert isinstance(document.get('name'), str), f'name must be a string: {{document!r}}'
+assert isinstance(document.get('age'), int), f'age must be an integer: {{document!r}}'
+
+print('SERVER_STREAMING_WITH_GUIDED_DECODING_PASSED')
+"""
+        script_escaped = shlex.quote(script)
+        cmd = ['bash', '-c', f'python3 -c {script_escaped}']
+
+        env_vars = None
+        if env_config.trt_package_dir:
+            env_vars = {
+                "LD_LIBRARY_PATH":
+                f"$LD_LIBRARY_PATH:{env_config.trt_package_dir}/lib"
+            }
+
+        with timer_context(
+                f"Streaming with guided decoding for {config.model_name}",
+                test_logger):
+            result = run_command(cmd=cmd,
+                                 remote_config=remote_config,
+                                 timeout=600,
+                                 logger=test_logger,
+                                 env_vars=env_vars)
+
+        output = result.get('output', '')
+        if not result['success']:
+            pytest.fail("Streaming with guided decoding failed: "
+                        f"{result.get('error', 'Unknown')}")
+        if 'SERVER_STREAMING_WITH_GUIDED_DECODING_PASSED' not in output:
+            pytest.fail(f"Streaming with guided decoding output:\n{output}")
 
     def test_server_inference_with_logprobs(
             self, test_param: str, executable_files: Dict[str, str],
@@ -1417,6 +1548,95 @@ print('HLAPI_GENERATE_WITH_LOGIT_BIAS_PASSED')
                 'output', ''):
             pytest.fail(
                 f"HLAPI logit_bias output:\n{result.get('output', '')}")
+
+    def test_hlapi_generate_with_guided_decoding(
+            self, test_param: str, executable_files: Dict[str, str],
+            remote_config: Optional[RemoteConfig], test_logger: logging.Logger,
+            env_config: EnvironmentConfig) -> None:
+        """Validate guided decoding end to end through the HLAPI.
+
+        Generation is constrained token by token, so the assertion is that the output
+        really satisfies the guide -- a quality metric would not catch a violation. Covers
+        the OpenAI-compatible `response_format` surface, the low-level `guided_decoding`
+        surface (which additionally reaches regex), and the pre-check that turns an
+        unenforceable schema keyword into a clean error instead of a silently wrong answer.
+        """
+        config = TestConfig.from_param_string(test_param, ModelType.LLM,
+                                              TaskType.INFERENCE, env_config)
+
+        test_logger.info("HLAPI guided decoding: model=%s", config.model_name)
+
+        setup = self._build_hlapi_env_setup(env_config.trt_package_dir or "")
+        llm_init = self._llm_init_script(config, env_config)
+
+        script = f"""\
+{setup}
+import json
+import re
+from experimental.server import LLM, SamplingParams
+
+{llm_init}
+
+def generate(prompt, **kwargs):
+    params = SamplingParams(temperature=0.0, max_tokens=96, **kwargs)
+    return llm.generate(prompt, params)[0].text
+
+schema = {{
+    'type': 'object',
+    'properties': {{'name': {{'type': 'string'}}, 'age': {{'type': 'integer'}}}},
+    'required': ['name', 'age'],
+}}
+
+text = generate('Give me a person record with a name and an age.',
+                guided_decoding=('json_schema', json.dumps(schema, sort_keys=True)))
+print(f'HLAPI_GUIDED_JSON_SCHEMA={{text!r}}')
+document = json.loads(text)
+assert isinstance(document, dict), f'expected a JSON object, got {{document!r}}'
+assert isinstance(document.get('name'), str), f'name must be a string: {{document!r}}'
+assert isinstance(document.get('age'), int), f'age must be an integer: {{document!r}}'
+
+pattern = '[a-z]+@[a-z]+\\.(com|org)'
+text = generate('What is an email address for support?',
+                guided_decoding=('regex', pattern))
+print(f'HLAPI_GUIDED_REGEX={{text!r}}')
+assert re.fullmatch(pattern, text), f'{{text!r}} does not match {{pattern!r}}'
+
+from experimental.server.runtime.engine import _import_runtime
+runtime = _import_runtime()
+params = runtime.GuidedDecodingParams(
+    runtime.GuideType.JSON_SCHEMA, json.dumps({{'type': 'integer', 'multipleOf': 5}}))
+valid, reason = runtime.validate_guided_decoding_params(params)
+print(f'HLAPI_GUIDED_PRECHECK={{valid}} {{reason!r}}')
+assert not valid and 'multipleOf' in reason, (
+    f'multipleOf should be rejected up front, got valid={{valid}} reason={{reason!r}}'
+)
+
+print('HLAPI_GENERATE_WITH_GUIDED_DECODING_PASSED')
+"""
+        script_escaped = shlex.quote(script)
+        python = self._hlapi_python(env_config, remote_config)
+        cmd = ['bash', '-c', f'{python} -c {script_escaped}']
+        env_vars = None
+        if env_config.trt_package_dir:
+            env_vars = {
+                "LD_LIBRARY_PATH":
+                f"$LD_LIBRARY_PATH:{env_config.trt_package_dir}/lib"
+            }
+
+        with timer_context(f"HLAPI guided decoding for {config.model_name}",
+                           test_logger):
+            result = run_command(cmd=cmd,
+                                 remote_config=remote_config,
+                                 timeout=900,
+                                 logger=test_logger,
+                                 env_vars=env_vars)
+        if not result['success']:
+            pytest.fail("HLAPI guided decoding failed: "
+                        f"{result.get('error', 'Unknown')}")
+        if 'HLAPI_GENERATE_WITH_GUIDED_DECODING_PASSED' not in result.get(
+                'output', ''):
+            pytest.fail(
+                f"HLAPI guided decoding output:\n{result.get('output', '')}")
 
     def test_hlapi_video_generate(self, test_param: str,
                                   executable_files: Dict[str, str],

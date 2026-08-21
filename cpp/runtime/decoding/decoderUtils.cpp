@@ -52,6 +52,19 @@ std::unique_ptr<EngineExecutor> loadDraftEngine(
     return draftExecutor;
 }
 
+void appendSampledTokens(DecodingInferenceContext& context, int32_t const* sampledTokenIds, int32_t activeBatchSize)
+{
+    for (int32_t i = 0; i < activeBatchSize; ++i)
+    {
+        if (context.finishedStates[i])
+        {
+            continue;
+        }
+        context.tokenIds[i].push_back(sampledTokenIds[i]);
+        context.currentGenerateLengths[i] += 1;
+    }
+}
+
 void appendAcceptedTokens(DecodingInferenceContext& context, Tensor& hostAcceptLengths, Tensor& hostAcceptedTokenIds,
     Tensor const& deviceAcceptLength, Tensor const& deviceAcceptedTokenIds, int32_t maxAcceptDepth,
     tokenizer::Tokenizer const& tokenizer, cudaStream_t stream)

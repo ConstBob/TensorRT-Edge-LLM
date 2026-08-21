@@ -33,6 +33,7 @@
 #include "profiling/metrics.h"
 #include "runtime/audioLoader.h"
 #include "runtime/audioUtils.h"
+#include "runtime/decoding/guidedDecoder.h"
 #include "runtime/imageUtils.h"
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
@@ -747,6 +748,39 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readwrite("formatted_system_prompt", &LLMGenerationRequest::FormattedRequest::formattedSystemPrompt)
         .def_readwrite("formatted_complete_request", &LLMGenerationRequest::FormattedRequest::formattedCompleteRequest);
 
+    py::enum_<GuideType>(m, "GuideType", "Grammar dialect carried by GuidedDecodingParams.")
+        .value("JSON_OBJECT", GuideType::kJsonObject)
+        .value("JSON_SCHEMA", GuideType::kJsonSchema)
+        .value("REGEX", GuideType::kRegex)
+        .value("EBNF", GuideType::kEbnf)
+        .value("STRUCTURAL_TAG", GuideType::kStructuralTag)
+        .value("CHOICE", GuideType::kChoice);
+
+    py::class_<GuidedDecodingParams>(m, "GuidedDecodingParams",
+        "Grammar constraint for one request. `guide` holds the schema / pattern / grammar / choice "
+        "list and is empty only for JSON_OBJECT.")
+        .def(py::init<>())
+        .def(py::init([](GuideType type, std::string guide) {
+            GuidedDecodingParams params;
+            params.type = type;
+            params.guide = std::move(guide);
+            return params;
+        }),
+            py::arg("type"), py::arg("guide") = std::string{})
+        .def_readwrite("type", &GuidedDecodingParams::type)
+        .def_readwrite("guide", &GuidedDecodingParams::guide);
+
+    m.def(
+        "validate_guided_decoding_params",
+        [](GuidedDecodingParams const& params) {
+            std::string failReason;
+            bool const valid = rt::validateGuidedDecodingParams(params, failReason);
+            return std::make_pair(valid, failReason);
+        },
+        py::arg("params"),
+        "Reject guides XGrammar accepts but does not enforce, and oversized ones. Returns "
+        "(is_valid, reason) so a server can answer 400 instead of failing the request later.");
+
     py::class_<LLMGenerationRequest::Request>(m, "Request")
         .def(py::init<>())
         .def(py::init([](std::vector<Message> const& messages) {
@@ -759,7 +793,8 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readwrite("image_buffers", &LLMGenerationRequest::Request::imageBuffers)
         .def_readwrite("audio_buffers", &LLMGenerationRequest::Request::audioBuffers)
         .def_readwrite("stop_strings", &LLMGenerationRequest::Request::stopStrings)
-        .def_readwrite("logit_bias", &LLMGenerationRequest::Request::logitBias);
+        .def_readwrite("logit_bias", &LLMGenerationRequest::Request::logitBias)
+        .def_readwrite("guided_decoding", &LLMGenerationRequest::Request::guidedDecoding);
 
     // ========================================================================
     // Streaming
@@ -991,7 +1026,8 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         [](std::vector<std::vector<Message>> const& batchMessages, float temperature, float topP, int64_t topK,
             int64_t maxGenerateLength, bool applyChatTemplate, bool addGenerationPrompt, bool enableThinking,
             std::string const& loraWeightsName, bool saveSystemPromptKvCache, bool disableSpecDecode,
-            std::unordered_map<int32_t, float> const& logitBias, int32_t numLogprobs) {
+            std::unordered_map<int32_t, float> const& logitBias, int32_t numLogprobs,
+            std::optional<GuidedDecodingParams> const& guidedDecoding) {
             LLMGenerationRequest request;
             request.temperature = temperature;
             request.topP = topP;
@@ -1010,6 +1046,7 @@ PYBIND11_MODULE(_edgellm_runtime, m)
                 LLMGenerationRequest::Request req;
                 req.messages = messages;
                 req.logitBias = logitBias;
+                req.guidedDecoding = guidedDecoding;
                 request.requests.push_back(std::move(req));
             }
             return request;
@@ -1019,5 +1056,6 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         py::arg("add_generation_prompt") = true, py::arg("enable_thinking") = false, py::arg("lora_weights_name") = "",
         py::arg("save_system_prompt_kv_cache") = false, py::arg("disable_spec_decode") = false,
         py::arg("logit_bias") = std::unordered_map<int32_t, float>{}, py::arg("num_logprobs") = 0,
+        py::arg("guided_decoding") = std::optional<GuidedDecodingParams>{},
         "Create a generation request from a batch of message lists.");
 }

@@ -505,6 +505,8 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
             "LLMRankRuntime::mHostPackedTokenIds");
         mHostSelectedTokenIds = rt::Tensor(
             {maxSamplingSize}, rt::DeviceType::kCPU, DataType::kINT32, "LLMRankRuntime::mHostSelectedTokenIds");
+        mHostOutputSpaceIds = rt::Tensor(
+            {maxSamplingSize}, rt::DeviceType::kCPU, DataType::kINT32, "LLMRankRuntime::mHostOutputSpaceIds");
         mHostReuseKVCacheLengths = rt::Tensor(
             {mMaxRuntimeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32, "LLMRankRuntime::mHostReuseKVCacheLengths");
 
@@ -541,7 +543,13 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
     }
 
     // -----------------------------------------------------------------------
-    // 12. Decoding strategies.
+    // 12. Guided decoding. Needs the tokenizer and the reduced-vocab map above.
+    // -----------------------------------------------------------------------
+    mGuidedDecoder.initialize(
+        mMaxRuntimeBatchSize, mDeployment.base.outputVocabSize, mTokenizer, mBaseVocabMappingTable, stream);
+
+    // -----------------------------------------------------------------------
+    // 13. Decoding strategies.
     // -----------------------------------------------------------------------
     buildDecodingRuntimeContext();
     mDecoderRegistry = std::make_unique<DecoderRegistry>(*mDecodingRuntimeContext,
@@ -549,7 +557,7 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
             std::move(draftWeights), stream});
 
     // -----------------------------------------------------------------------
-    // 13. Optional multimodal runners.
+    // 14. Optional multimodal runners.
     // -----------------------------------------------------------------------
     if (!multimodalEngineDir.empty())
     {
@@ -641,7 +649,7 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
     }
 
     // -----------------------------------------------------------------------
-    // 14. Shared execution context memory for all engines (base, optional
+    // 15. Shared execution context memory for all engines (base, optional
     //     draft, and optional vision/audio). All engines execute serially so
     //     they can share a single buffer sized to the max requirement.
     // -----------------------------------------------------------------------
@@ -744,11 +752,12 @@ void LLMRankRuntime::buildDecodingRuntimeContext()
     PreprocessResources preprocessResources{
         *mStepPreparer, *mEmbeddingPre, mEmbedding, mIdsInput, mDeepstack.get(), mGemma4Ple.get()};
     SamplingBuffers sampling{mSamplingWorkspace, mSamplingIndices, mSamplingScores, mBaseVocabMappingTable,
-        mHostPackedTokenIds, mHostSelectedTokenIds};
+        mHostPackedTokenIds, mHostSelectedTokenIds, mHostOutputSpaceIds};
     LogprobsBuffers logprobs{
         mDeviceLogprobsValues, mDeviceLogprobsIndices, mHostLogprobsValues, mHostLogprobsIndices, mGatheredLogits};
-    mDecodingRuntimeContext.reset(new DecodingRuntimeContext{mDeployment, mMaxRuntimeBatchSize, mCheckpointDir,
-        mDraftCheckpointDir, baseResources, preprocessResources, *mTokenizer, mLogitBias, sampling, logprobs});
+    mDecodingRuntimeContext.reset(
+        new DecodingRuntimeContext{mDeployment, mMaxRuntimeBatchSize, mCheckpointDir, mDraftCheckpointDir,
+            baseResources, preprocessResources, *mTokenizer, mLogitBias, mGuidedDecoder, sampling, logprobs});
 }
 
 void LLMRankRuntime::setActionNoiseSeed(int32_t seed) noexcept
@@ -1043,8 +1052,52 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
     context.diffusionMaxDenoisingSteps = request.diffusionMaxDenoisingSteps;
     context.outputThinkerEmbeddings = outputThinkerEmbeddings;
     context.onTokenGenerated = request.onTokenGenerated;
+    context.enableThinking = request.enableThinking;
+
+    // Reasoning markers, looked up once: -1 when the tokenizer has no such token.
+    int32_t const endOfChannelId = static_cast<int32_t>(mTokenizer->getTokenId("<channel|>"));
+    int32_t const endOfThinkId = static_cast<int32_t>(mTokenizer->getTokenId("</think>"));
+    int32_t const startOfChannelId = static_cast<int32_t>(mTokenizer->getTokenId("<|channel>"));
+    int32_t const startOfThinkId = static_cast<int32_t>(mTokenizer->getTokenId("<think>"));
+    std::vector<int32_t> const reasoningStartMarkers{startOfChannelId, startOfThinkId};
+    std::vector<int32_t> const reasoningEndMarkers{endOfChannelId, endOfThinkId};
 
     prepareLogitBias(mLogitBias, request, context);
+
+    // Compile each slot's grammar before any GPU work, so a failure marks just that slot.
+    context.hasGuidedDecoding = false;
+    if (hasGuidedDecoding(request))
+    {
+        // Seeded from the prompt rather than from `enableThinking`: the chat template decides
+        // whether the block is open, already closed, or absent, and only the prompt shows which.
+        context.guidedReasoningEnded.assign(static_cast<size_t>(activeBatchSize), 0);
+        for (int32_t i = 0; i < activeBatchSize; ++i)
+        {
+            context.guidedReasoningEnded[i] = static_cast<int8_t>(
+                reasoningClosedInPrompt(context.rawBatchedInputIds[i], reasoningStartMarkers, reasoningEndMarkers) ? 1
+                                                                                                                   : 0);
+        }
+
+        mGuidedDecoder.reset();
+        for (int32_t i = 0; i < activeBatchSize; ++i)
+        {
+            auto const& slotGuide = request.requests[i].guidedDecoding;
+            if (!slotGuide.has_value())
+            {
+                continue;
+            }
+            std::string failReason;
+            if (mGuidedDecoder.prepareSlot(i, *slotGuide, failReason))
+            {
+                context.hasGuidedDecoding = true;
+                continue;
+            }
+            LOG_ERROR("Request %d: failed to compile the %s guide: %s", i, guideTypeName(slotGuide->type),
+                failReason.c_str());
+            context.finishedStates[i] = 1;
+            context.slotStreams[i].terminalReason = FinishReason::kError;
+        }
+    }
 
     if (request.numLogprobs > static_cast<int32_t>(kMaxLogprobsK))
     {
@@ -1306,13 +1359,10 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
         trajFutureStartId = static_cast<int32_t>(mTokenizer->getTokenId("<|traj_future_start|>"));
     }
 
-    // Once thinking is complete (or the model never entered thinking),
-    // secondary EOS tokens terminate generation normally.
-    std::vector<int8_t> thinkingDone(context.activeBatchSize, 0);
-    int32_t const endOfChannelId = static_cast<int32_t>(mTokenizer->getTokenId("<channel|>"));
-    int32_t const endOfThinkId = static_cast<int32_t>(mTokenizer->getTokenId("</think>"));
-    int32_t const startOfChannelId = static_cast<int32_t>(mTokenizer->getTokenId("<|channel>"));
-    int32_t const startOfThinkId = static_cast<int32_t>(mTokenizer->getTokenId("<think>"));
+    // Per-slot tracking: once thinking is complete (end marker emitted or model
+    // never entered thinking), secondary EOS tokens terminate generation normally.
+    // Sized by context.initialize(); lives in the context so batch compaction reindexes it.
+    auto& thinkingDone = context.thinkingDone;
 
     auto updateThinkingDoneForToken = [&](int32_t batchIdx, int32_t tokenId) {
         if (!request.enableThinking || thinkingDone[batchIdx])
@@ -1332,7 +1382,7 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
     };
 
     auto updateThinkingDone = [&]() {
-        if (!request.enableThinking)
+        if (!request.enableThinking && !context.hasGuidedDecoding)
         {
             return;
         }
@@ -1341,6 +1391,18 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
             if (!context.tokenIds[i].empty())
             {
                 updateThinkingDoneForToken(i, context.tokenIds[i].back());
+            }
+            updateThinkingDoneForToken(i, context.tokenIds[i].back());
+
+            // Deliberately outside updateThinkingDoneForToken: that one returns early once
+            // `thinkingDone` latches, and the end marker would then never be observed.
+            if (context.hasGuidedDecoding)
+            {
+                int32_t const tokenId = context.tokenIds[i].back();
+                if (tokenId == endOfChannelId || tokenId == endOfThinkId)
+                {
+                    context.guidedReasoningEnded[i] = 1;
+                }
             }
         }
     };
@@ -1449,7 +1511,7 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
                 mSharedResources->cacheManagers[0]->getKVCacheLengths(), context.finishedStates,
                 context.batchIndexMapping, context.stream);
         }
-        bool const status = performBatchEvict(context, decodingStrategy, thinkingDone, managedRequest);
+        bool const status = performBatchEvict(context, decodingStrategy, managedRequest);
         if (status && hasActionRequest)
         {
             mActionKvBatchCollector->completeCapture();
@@ -1706,12 +1768,42 @@ bool LLMRankRuntime::validateRequestConfig(LLMGenerationRequest const& request)
             "build a standalone target engine for target-only inference.");
         return false;
     }
+    if (hasGuidedDecoding(request))
+    {
+        // Constraining spec decode means masking every draft-verification row from its own
+        // grammar state, which is not implemented yet.
+        if (mDeployment.specDecodeMode() != SpecDecodeMode::kNONE && !request.disableSpecDecode)
+        {
+            LOG_ERROR(
+                "guided_decoding is not supported together with speculative decoding yet. Set "
+                "disable_spec_decode on the request, or use a non-speculative engine.");
+            return false;
+        }
+        // Block diffusion denoises a whole canvas per step rather than appending one token, so
+        // it carries neither of the mask hooks. Rejecting beats accepting and ignoring the guide.
+        if (mDeployment.base.isDiffusionBackbone)
+        {
+            LOG_ERROR("guided_decoding is not supported by a block-diffusion engine yet.");
+            return false;
+        }
+    }
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
         if (request.requests[i].messages.empty())
         {
             LOG_ERROR("Request %d in batch is empty: no messages provided", i);
             return false;
+        }
+        if (request.requests[i].guidedDecoding.has_value())
+        {
+            // Batch-level, unlike a compile failure: an unsupported guide is a request
+            // configuration error, in the same class as an out-of-range logit_bias.
+            std::string failReason;
+            if (!validateGuidedDecodingParams(*request.requests[i].guidedDecoding, failReason))
+            {
+                LOG_ERROR("Request %d has an unsupported guided_decoding guide: %s", i, failReason.c_str());
+                return false;
+            }
         }
         auto const& logitBias = request.requests[i].logitBias;
         if (logitBias.size() > limits::security::kMaxLogitBiasTokens)
@@ -2455,6 +2547,14 @@ bool LLMRankRuntime::runBaseModelPrefill(
     }
     // GCOVR_EXCL_STOP
 
+    if (context.hasGuidedDecoding)
+    {
+        // Prefill emits one logits row per request. The matcher never consumes prompt tokens,
+        // so prompt chunking is irrelevant to it.
+        applyGuidedDecodingMask(
+            mGuidedDecoder, context, mPipelineIO->outputLogits, activeBatchSize, /*rowsPerSlot=*/1, context.stream);
+    }
+
     // Sampling from the prefill stage logits follows the same policy as vanilla decoding.
     // DSpark keeps non-greedy params; other speculative decoders are normalized to greedy
     // before decoding.
@@ -2471,6 +2571,15 @@ bool LLMRankRuntime::runBaseModelPrefill(
         constexpr int32_t kSAMPLING_TOP_K = 1;
         selectAllTopK(mPipelineIO->outputLogits, std::nullopt, mSamplingIndices, kSAMPLING_TOP_K, mSamplingWorkspace,
             context.stream);
+    }
+
+    // Matchers live in the output vocabulary, but the remap below rewrites mSamplingIndices
+    // into full token IDs, so capture them first. Rides the round's single sync.
+    if (context.hasGuidedDecoding)
+    {
+        check::check(mHostOutputSpaceIds.reshape({activeBatchSize}), "Tensor reshape failed");
+        CUDA_CHECK(cudaMemcpyAsync(mHostOutputSpaceIds.dataPointer<int32_t>(), mSamplingIndices.rawPointer(),
+            activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, context.stream));
     }
 
     // Apply vocabulary mapping if base model uses reduced vocabulary.
@@ -2516,13 +2625,13 @@ bool LLMRankRuntime::runBaseModelPrefill(
             context.currentGenerateLengths, hostSelectedTokenIdsData, activeBatchSize);
     }
 
-    for (int32_t i = 0; i < activeBatchSize; ++i)
+    decoder_utils::appendSampledTokens(context, hostSelectedTokenIdsData, activeBatchSize);
+
+    if (context.hasGuidedDecoding)
     {
-        if (!context.finishedStates[i])
-        {
-            context.tokenIds[i].push_back(hostSelectedTokenIdsData[i]);
-            context.currentGenerateLengths[i] += 1;
-        }
+        // Runs before updateThinkingDone(), which is what keeps `</think>` itself out of the
+        // grammar: on the step that emits it the slot still counts as thinking.
+        advanceGuidedDecoding(mGuidedDecoder, context, mHostOutputSpaceIds.dataPointer<int32_t>(), activeBatchSize);
     }
 
     if (context.numLogprobs > 0)
@@ -2951,8 +3060,8 @@ bool LLMRankRuntime::genAndSaveSystemPromptKVCache(
     return genAndSaveSystemPromptKVCache(tempContext, 0);
 }
 
-bool LLMRankRuntime::performBatchEvict(DecodingInferenceContext& context, DecodingStrategy& strategy,
-    std::vector<int8_t>& thinkingDone, ContextCacheRequest* contextCacheRequest)
+bool LLMRankRuntime::performBatchEvict(
+    DecodingInferenceContext& context, DecodingStrategy& strategy, ContextCacheRequest* contextCacheRequest)
 {
     // Check if any batch has finished
     bool hasFinishedBatch = false;
@@ -3106,10 +3215,12 @@ bool LLMRankRuntime::performBatchEvict(DecodingInferenceContext& context, Decodi
     }
 
     rt::compactVector(batchMapping, context.finishedStates);
-    if (contextCacheRequest != nullptr)
-    {
-        rt::compactVector(batchMapping, thinkingDone);
-    }
+    rt::compactVector(batchMapping, context.thinkingDone);
+    rt::compactVector(batchMapping, context.guidedReasoningEnded);
+    // Same slot numbering as the vectors above, so it must be reindexed at the same moment;
+    // skipping it migrates a constraint onto a different request.
+    mGuidedDecoder.compactSlots(batchMapping);
+    context.hasGuidedDecoding = mGuidedDecoder.hasAnyGrammar();
     rt::compactVector(batchMapping, context.currentGenerateLengths);
     rt::compactVector(batchMapping, context.tokenIds);
     rt::compactVector(batchMapping, context.systemPrompts);

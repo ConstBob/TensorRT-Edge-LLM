@@ -269,11 +269,13 @@ def _validate_submodules(repo_root: Path) -> Dict[str, str]:
     declared = _declared_submodule_revisions(repo_root)
     gitlinks = _gitlink_revisions(repo_root, declared)
     checked_out = _submodule_revisions(repo_root)
-    if set(declared) != set(checked_out):
+    # A recursive status also lists submodules of our submodules. Those are pinned by
+    # their own parent's gitlink, not by this .gitmodules, so only the paths declared
+    # here are ours to validate.
+    missing = sorted(set(declared) - set(checked_out))
+    if missing:
         raise RuntimeError(
-            "Submodule declaration/status drift: "
-            f"missing={sorted(set(declared) - set(checked_out))}, "
-            f"undeclared={sorted(set(checked_out) - set(declared))}.")
+            f"Submodule declaration/status drift: missing={missing}.")
     mismatches = {
         path: {
             "declared": declared[path],

@@ -26,6 +26,7 @@
 #include "profiling/timer.h"
 #include "runtime/debug/layerDebugger.h"
 #include "runtime/decoding/decoderUtils.h"
+#include "runtime/decoding/guidedDecoder.h"
 #include "runtime/decoding/logitBias.h"
 #include "sampler/sampling.h"
 
@@ -116,6 +117,14 @@ bool VanillaDecoder::decodeStep(DecodingInferenceContext& context)
     }
     // GCOVR_EXCL_STOP
 
+    if (context.hasGuidedDecoding)
+    {
+        // One logits row per active slot. Sits after the forward was enqueued, so the host-side
+        // mask fill overlaps it; the stream keeps the ordering.
+        applyGuidedDecodingMask(mRuntime.guidedDecoder, context, mRuntime.base.pipelineIO.outputLogits, activeBatchSize,
+            /*rowsPerSlot=*/1, context.stream);
+    }
+
     check::check(mRuntime.sampling.indices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
     if (shouldUseNonGreedySampling(context.temperature, context.topK, context.topP))
     {
@@ -129,6 +138,16 @@ bool VanillaDecoder::decodeStep(DecodingInferenceContext& context)
         constexpr int32_t kSAMPLING_TOP_K = 1;
         selectAllTopK(mRuntime.base.pipelineIO.outputLogits, std::nullopt, mRuntime.sampling.indices, kSAMPLING_TOP_K,
             mRuntime.sampling.workspace, context.stream);
+    }
+
+    // Capture the indices while still in the output vocabulary, the space the matchers work
+    // in. Rides the round's single sync below.
+    if (context.hasGuidedDecoding)
+    {
+        check::check(mRuntime.sampling.hostOutputSpaceIds.reshape({activeBatchSize}), "Tensor reshape failed");
+        CUDA_CHECK(cudaMemcpyAsync(mRuntime.sampling.hostOutputSpaceIds.dataPointer<int32_t>(),
+            mRuntime.sampling.indices.rawPointer(), activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost,
+            context.stream));
     }
 
     if (mRuntime.deployment.base.reducedVocabSize > 0)
@@ -175,10 +194,12 @@ bool VanillaDecoder::decodeStep(DecodingInferenceContext& context)
             context.currentGenerateLengths, hostSelectedTokenIdsData, activeBatchSize);
     }
 
-    for (int32_t i = 0; i < activeBatchSize; ++i)
+    decoder_utils::appendSampledTokens(context, hostSelectedTokenIdsData, activeBatchSize);
+
+    if (context.hasGuidedDecoding)
     {
-        context.tokenIds[i].push_back(hostSelectedTokenIdsData[i]);
-        context.currentGenerateLengths[i] += 1;
+        advanceGuidedDecoding(mRuntime.guidedDecoder, context,
+            mRuntime.sampling.hostOutputSpaceIds.dataPointer<int32_t>(), activeBatchSize);
     }
 
     if (context.numLogprobs > 0)

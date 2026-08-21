@@ -154,6 +154,7 @@ tests:
   - tests/python-unittests/test_anthropic_compat.py
   - tests/python-unittests/test_experimental_server_audio.py
   - tests/python-unittests/test_experimental_server_logit_bias.py
+  - tests/python-unittests/test_experimental_server_guided_decoding.py
 
   # Experimental Server Tool Calling Tests
   - tests/python-unittests/test_tool_chat_template.py::test_needs_tool_template

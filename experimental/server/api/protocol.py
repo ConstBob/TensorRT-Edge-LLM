@@ -70,6 +70,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     tool_choice: Optional[Union[str, Dict[str, Any]]] = None
     parallel_tool_calls: bool = True
     response_format: Optional[Dict[str, Any]] = None
+    guided_decoding: Optional[Dict[str, Any]] = None
     modalities: Optional[List[Literal["text", "audio"]]] = None
     audio: Optional[ChatAudioConfig] = None
     enable_thinking: bool = False

@@ -22,6 +22,7 @@ unnecessary abstraction layers.
 
 import json
 import os
+import re
 import subprocess
 from typing import Any, Dict, Optional
 
@@ -129,6 +130,102 @@ def _check_vlm_context_reuse_profile(
         raise RuntimeError(
             "VLM context cache profile failed expectations:\n  " +
             "\n  ".join(errors))
+
+
+def _check_guided_decoding_conformance(config: TestConfig) -> None:
+    """Require every guided response to satisfy the guide that produced it.
+
+    Guided decoding constrains generation token by token, so a violation is a real
+    regression rather than a quality dip and no accuracy metric would catch it. The
+    expectations are read back from the input fixture so the two cannot drift apart.
+
+    json_schema, json_object, regex and choice are checked against the guide itself. ebnf
+    cannot be validated without a grammar parser, and structural_tag only constrains text
+    once a trigger appears, so those two are checked for a clean finish plus, for
+    structural_tag, a well-formed tag whenever a trigger did fire; their grammar semantics
+    are covered by the unit tests.
+    """
+    with open(config.get_test_case_file(), encoding='utf-8') as input_file:
+        requests = json.load(input_file).get('requests', [])
+    with open(config.get_output_json_file(), encoding='utf-8') as output_file:
+        responses = json.load(output_file).get('responses', [])
+
+    if len(responses) != len(requests):
+        raise RuntimeError(
+            f"Expected {len(requests)} guided-decoding responses, got {len(responses)}."
+        )
+
+    json_types = {
+        'string': str,
+        'integer': int,
+        'number': (int, float),
+        'boolean': bool,
+        'array': list,
+        'object': dict,
+    }
+
+    for index, (request, response) in enumerate(zip(requests, responses)):
+        text = response.get('output_text', '')
+        guide = request.get('guided_decoding') or {}
+
+        # A grammar that fails to compile, or one that cannot be satisfied, ends the slot
+        # with `error`; every fixture here is expected to generate normally.
+        finish_reason = response.get('finish_reason')
+        if finish_reason == 'error':
+            raise RuntimeError(
+                f"Response {index} ended with finish_reason=error; text={text!r}"
+            )
+
+        # Hitting the generation budget leaves a valid prefix rather than a complete
+        # document, so only a run that reached EOS can be parsed as a whole.
+        if finish_reason == 'max-length':
+            continue
+
+        if 'json_schema' in guide or 'json_object' in guide:
+            try:
+                document = json.loads(text)
+            except ValueError as error:
+                raise RuntimeError(
+                    f"Response {index} is constrained to JSON but did not parse: {error}; "
+                    f"text={text!r}") from error
+            if not isinstance(document, dict):
+                raise RuntimeError(
+                    f"Response {index} must be a JSON object, got {type(document).__name__}."
+                )
+            schema = guide.get('json_schema', {})
+            for field in schema.get('required', []):
+                if field not in document:
+                    raise RuntimeError(
+                        f"Response {index} is missing required field {field!r}: {document!r}"
+                    )
+            for field, spec in schema.get('properties', {}).items():
+                expected = json_types.get(spec.get('type'))
+                if field in document and expected is not None and not isinstance(
+                        document[field], expected):
+                    raise RuntimeError(
+                        f"Response {index} field {field!r} should be {spec['type']}, "
+                        f"got {document[field]!r}")
+        elif 'regex' in guide:
+            if re.fullmatch(guide['regex'], text) is None:
+                raise RuntimeError(
+                    f"Response {index} does not match its regex {guide['regex']!r}: {text!r}"
+                )
+        elif 'choice' in guide:
+            if text not in guide['choice']:
+                raise RuntimeError(
+                    f"Response {index} is not one of its choices {guide['choice']!r}: "
+                    f"{text!r}")
+        elif 'structural_tag' in guide:
+            tag_format = guide['structural_tag'].get('format', {})
+            for tag in tag_format.get('tags', []):
+                if tag['begin'] in text and tag['end'] not in text:
+                    raise RuntimeError(
+                        f"Response {index} opened {tag['begin']!r} without closing "
+                        f"{tag['end']!r}: {text!r}")
+        elif 'ebnf' not in guide:
+            raise RuntimeError(
+                f"Request {index} of the guided-decoding fixture carries no guide."
+            )
 
 
 def _check_context_reuse_cold_hit_equivalence(config: TestConfig) -> None:
@@ -537,6 +634,8 @@ def execute_e2e_bench_test(
 
         # Merge metrics result into final result
         final_result.update(metrics_result)
+        if config.test_case == 'llm_guided_decoding':
+            _check_guided_decoding_conformance(config)
         if config.context_reuse:
             if config.test_case == 'llm_context_reuse':
                 _check_context_reuse_cold_hit_equivalence(config)
@@ -628,6 +727,8 @@ def execute_inference_test(
 
         # Merge metrics result into final result
         final_result.update(metrics_result)
+        if config.test_case == 'llm_guided_decoding':
+            _check_guided_decoding_conformance(config)
         if config.context_reuse:
             if config.test_case == 'llm_context_reuse':
                 _check_context_reuse_cold_hit_equivalence(config)

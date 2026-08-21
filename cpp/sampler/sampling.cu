@@ -839,6 +839,66 @@ void applyLogitBiasRepeatedRows(rt::Tensor& logits, rt::Tensor const& tokenIds, 
         rowsPerSlot);
 }
 
+//! One block per logits row. A set bit means the token is grammar-legal; every
+//! cleared bit is driven to kMaskedLogitValue so sampling can never pick it.
+__global__ void applyTokenBitmaskKernel(
+    float* logits, int32_t const* bitmask, int32_t const* rowNeedsMask, int32_t vocabSize, int32_t bitmaskStride)
+{
+    int32_t const rowId = static_cast<int32_t>(blockIdx.x);
+    // Unconstrained rows (no grammar, finished slot, or terminated matcher) cost
+    // one predictable branch and no memory traffic.
+    if (rowNeedsMask[rowId] == 0)
+    {
+        return;
+    }
+
+    float* rowLogits = logits + static_cast<int64_t>(rowId) * vocabSize;
+    int32_t const* rowMask = bitmask + static_cast<int64_t>(rowId) * bitmaskStride;
+
+    for (int32_t tokenId = static_cast<int32_t>(threadIdx.x); tokenId < vocabSize;
+        tokenId += static_cast<int32_t>(blockDim.x))
+    {
+        int32_t const word = rowMask[tokenId >> 5];
+        if (((word >> (tokenId & 31)) & 1) == 0)
+        {
+            rowLogits[tokenId] = kMaskedLogitValue;
+        }
+    }
+}
+
+void applyTokenBitmask(
+    rt::Tensor& logits, rt::Tensor const& bitmask, rt::Tensor const& rowNeedsMask, int32_t numRows, cudaStream_t stream)
+{
+    check::check(logits.getDeviceType() == rt::DeviceType::kGPU && bitmask.getDeviceType() == rt::DeviceType::kGPU
+            && rowNeedsMask.getDeviceType() == rt::DeviceType::kGPU,
+        "All token-bitmask tensors must be on GPU");
+    check::check(logits.getDataType() == nvinfer1::DataType::kFLOAT
+            && bitmask.getDataType() == nvinfer1::DataType::kINT32
+            && rowNeedsMask.getDataType() == nvinfer1::DataType::kINT32,
+        "Invalid token-bitmask tensor data types");
+
+    auto const logitsShape = logits.getShape();
+    auto const bitmaskShape = bitmask.getShape();
+    check::check(logitsShape.getNumDims() == 2 && bitmaskShape.getNumDims() == 2,
+        "Token bitmask requires 2D logits and 2D bitmask");
+    check::check(numRows >= 0 && numRows <= logitsShape[0], "Token bitmask row count exceeds logits rows");
+    check::check(numRows <= bitmaskShape[0], "Token bitmask row count exceeds bitmask rows");
+
+    int32_t const vocabSize = static_cast<int32_t>(logitsShape[1]);
+    int32_t const bitmaskStride = static_cast<int32_t>(bitmaskShape[1]);
+    check::check(bitmaskStride >= (vocabSize + 31) / 32, "Token bitmask is narrower than the logits vocabulary");
+    check::check(rowNeedsMask.getShape().volume() >= numRows, "Token bitmask row-flag tensor is too small");
+
+    if (numRows == 0 || vocabSize == 0)
+    {
+        return;
+    }
+
+    constexpr int32_t kBLOCK_SIZE = 256;
+    applyTokenBitmaskKernel<<<numRows, kBLOCK_SIZE, 0, stream>>>(logits.dataPointer<float>(),
+        bitmask.dataPointer<int32_t>(), rowNeedsMask.dataPointer<int32_t>(), vocabSize, bitmaskStride);
+}
+
 // Initialize ID values and offsets for top-p sampling
 __global__ void topPInitialize(
     int32_t* topPIdValBuf, int32_t* topPOffsetBuf, int32_t* beginTopPOffsetBuf, int32_t batchSize, int32_t vocabSize)

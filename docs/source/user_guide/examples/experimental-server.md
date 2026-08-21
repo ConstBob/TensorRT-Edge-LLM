@@ -193,9 +193,44 @@ from the native generation result; normal inference does not run a second
 tokenization pass.
 
 The request contract includes sampling, stop strings, log probabilities,
-`logit_bias`, tools, `parallel_tool_calls`, thinking, and per-request
-speculative disablement. Unsupported fields such as penalties, seed, and
-structured output are rejected rather than ignored. Only `n=1` is supported.
+`logit_bias`, tools, `parallel_tool_calls`, thinking, structured output, and
+per-request speculative disablement. Unsupported fields such as penalties and
+seed are rejected rather than ignored. Only `n=1` is supported.
+
+### Structured Output
+
+`response_format` constrains the reply to a JSON object or a JSON Schema:
+
+```bash
+curl -s http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "messages":[{"role":"user","content":"Give me a person record."}],
+    "response_format":{
+      "type":"json_schema",
+      "json_schema":{"name":"person","schema":{
+        "type":"object",
+        "properties":{"name":{"type":"string"},"age":{"type":"integer"}},
+        "required":["name","age"]}}}
+  }'
+```
+
+`response_format` covers `text`, `json_object`, and `json_schema` — the whole of
+the OpenAI specification. For `regex`, `ebnf`, `structural_tag`, and `choice`,
+use the low-level `guided_decoding` field, which takes the same shape as in a
+request file:
+
+```bash
+  -d '{
+    "messages":[{"role":"user","content":"Answer yes or no."}],
+    "guided_decoding":{"choice":["yes","no"]}
+  }'
+```
+
+Setting both surfaces on one request is rejected rather than one silently
+winning. Streaming works normally, and the assembled output satisfies the guide.
+A schema keyword that the backend accepts but cannot enforce is rejected with a
+400 naming the keyword. See [Guided Decoding](../features/guided-decoding.md).
 
 ### Tool Calls and Thinking
 
