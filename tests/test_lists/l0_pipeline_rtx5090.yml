@@ -7,10 +7,19 @@ tests:
   - tests/defs/test_builder_pipeline.py::test_build_and_run[Qwen3-1.7B-NVFP4-nvfp4-mxsl2048-mxbs1-mxil1024-llm_basic]
 
   # Keep few-layer numeric validation automatic while B100 jobs are manual.
-  # The Nemotron NVFP4 few-layer golden path is waived because HF cache
-  # construction fails on interleaved MLP layer types; full Nemotron engine
-  # build and inference coverage remains below.
+  # The hybrid cases need CuTe DSL, which this runner has: test_build_project
+  # passes -DENABLE_CUTE_DSL=ALL for x86 SM120+.
   - tests/defs/test_few_layer_validation.py::test_few_layer_validation[Qwen3-0.6B]
+  - tests/defs/test_few_layer_validation.py::test_few_layer_validation[NVIDIA-Nemotron-3-Nano-4B-NVFP4]
+  - tests/defs/test_few_layer_validation.py::test_few_layer_validation[Qwen3.5-0.8B]
+  # MoE case (~7.5 min: this one is dominated by loading and repacking the
+  # 256 experts of its first four layers).
+  - tests/defs/test_few_layer_validation.py::test_few_layer_validation[Qwen3.5-35B-A3B]
+  # The same Qwen3.5-0.8B checkpoint under the two modes whose whole contract is
+  # "produce what a vanilla full prefill would": MTP speculative decoding, and the
+  # managed context cache.
+  - tests/defs/test_few_layer_validation.py::test_few_layer_validation[Qwen3.5-0.8B-MTP]
+  - tests/defs/test_few_layer_validation.py::test_few_layer_validation[Qwen3.5-0.8B-ContextReuse]
 
   - tests/defs/test_llm_pipeline.py::test_engine_build[NVIDIA-Nemotron-3-Nano-4B-NVFP4-nvfp4-mxsl4096-mxbs2-mxil2048]
   - tests/defs/test_llm_pipeline.py::test_inference[NVIDIA-Nemotron-3-Nano-4B-NVFP4-nvfp4-mxsl4096-mxbs2-mxil2048-llm_basic]

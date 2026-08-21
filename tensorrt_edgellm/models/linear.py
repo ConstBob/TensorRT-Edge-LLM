@@ -105,6 +105,11 @@ class TPMode(str, Enum):
 class LinearBase(nn.Module):
     """Common base for quantized / TP-aware linear layers."""
 
+    # Overwritten per instance by :func:`make_linear` from
+    # ``QuantConfig.quantize_activations``. The class default keeps directly
+    # constructed layers on the checkpoint's own recipe.
+    quantize_activations: bool = True
+
     def tp_split_dim(self, attr: str) -> Optional[int]:
         """Axis to shard *attr* along under TP, or None if replicated.
 
@@ -227,13 +232,15 @@ class FP8Linear(LinearBase):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         _require_fp16_input(hidden_states, "FP8Linear")
-        # Activation: ONNX QuantizeLinear -> FP8 + DequantizeLinear -> FP16
-        hidden_states_q = fp8_quantize(hidden_states, self.input_scale)
-        hidden_states_dq = fp8_dequantize(hidden_states_q, self.input_scale)
+        if self.quantize_activations:
+            # ONNX QuantizeLinear -> FP8 + DequantizeLinear -> FP16
+            hidden_states = fp8_dequantize(
+                fp8_quantize(hidden_states, self.input_scale),
+                self.input_scale)
         # Weight: DQ FP8 -> FP16 (standard ONNX DequantizeLinear)
         w_fp16 = fp8_dequantize(self.weight, self.weight_scale)
         bias = self.bias.to(torch.float16) if self.bias is not None else None
-        return F.linear(hidden_states_dq, w_fp16, bias)
+        return F.linear(hidden_states, w_fp16, bias)
 
 
 # ---------------------------------------------------------------------------
@@ -277,8 +284,10 @@ class NVFP4LinearMethod(LinearMethodBase):
 
     def apply(self, module: "LinearBase", x: torch.Tensor) -> torch.Tensor:
         _require_fp16_input(x, type(module).__name__)
-        # Activation: DynQ + 2x trt::DQ -> float16 activations
-        x_dq = nvfp4_act_qdq(x, module.input_scale)
+        # Weight-only leaves the activation in fp16 and drops input_scale; the
+        # weight path is identical either way.
+        x_dq = nvfp4_act_qdq(
+            x, module.input_scale) if module.quantize_activations else x
         # Weight: 2xstandard-ONNX DQ -> w_dq (float16)
         w_dq = nvfp4_dequantize(module.weight, module.weight_scale,
                                 module.weight_scale_2, module.group_size)
@@ -289,6 +298,13 @@ class NVFP4LinearMethod(LinearMethodBase):
     def apply_linear_allreduce(self, module: "LinearBase",
                                x: torch.Tensor) -> torch.Tensor:
         _require_fp16_input(x, type(module).__name__)
+        if not module.quantize_activations:
+            # The fused plugin quantizes the activation internally, so weight-only
+            # cannot be expressed here; failing loudly beats a TP run that keeps
+            # W4A4 on its row-parallel linears alone.
+            raise NotImplementedError(
+                "--no-quantize-activations is not supported by "
+                "FusedNvfp4GemmAllReduce (row-parallel TP)")
         # Single op: TRT_FP4DynamicQuantize + DequantizeLinear +
         # FusedNvfp4GemmAllReducePlugin. Output is FP16, already AllReduced.
         out = fused_nvfp4_gemm_allreduce(
@@ -466,12 +482,13 @@ class MXFP8Linear(LinearBase):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         _require_fp16_input(hidden_states, "MXFP8Linear")
-        # Activation: DynQ + DQ -> float16
-        hidden_states_dq = mxfp8_act_qdq(hidden_states)
+        if self.quantize_activations:
+            hidden_states = mxfp8_act_qdq(
+                hidden_states)  # DynQ + DQ -> float16
         # Weight: DQ FP8+E8M0 -> float16
         w_dq = mxfp8_weight_dq(self.weight, self.weight_scale, self.block_size)
         bias = self.bias.to(torch.float16) if self.bias is not None else None
-        return F.linear(hidden_states_dq, w_dq, bias)
+        return F.linear(hidden_states, w_dq, bias)
 
 
 # ---------------------------------------------------------------------------
@@ -754,6 +771,7 @@ class INT8SQLinear(LinearBase):
 
         x_smooth = x16 * pre_quant_scale                      # Mul
         x_dq = QDQ(x_smooth, input_scale)                     # Q + DQ + Cast
+                                                              #   (W8A8 only)
         w_dq = DequantizeLinear(weight, weight_scale, axis=0)  # DQ + Cast
         output = F.linear(x_dq, w_dq)                         # MatMul
     """
@@ -781,15 +799,16 @@ class INT8SQLinear(LinearBase):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         _require_fp16_input(hidden_states, "INT8SQLinear")
-        # SmoothQuant activation smoothing (Mul in ONNX)
-        hidden_states_smooth = hidden_states * self.pre_quant_scale
-        # Activation QDQ: QuantizeLinear + DequantizeLinear (per-tensor INT8)
-        hidden_states_dq = int8_sq_act_qdq(hidden_states_smooth,
-                                           self.input_scale)
+        # SmoothQuant activation smoothing (Mul in ONNX). Applied in both regimes:
+        # the stored weight already carries the matching inverse scale.
+        hidden_states = hidden_states * self.pre_quant_scale
+        if self.quantize_activations:
+            # QuantizeLinear + DequantizeLinear (per-tensor INT8)
+            hidden_states = int8_sq_act_qdq(hidden_states, self.input_scale)
         # Weight dequantize: DequantizeLinear (per-channel, axis=0)
         w_dq = int8_sq_weight_dq(self.weight, self.weight_scale)
         bias = self.bias.to(torch.float16) if self.bias is not None else None
-        return F.linear(hidden_states_dq, w_dq, bias)
+        return F.linear(hidden_states, w_dq, bias)
 
 
 # ---------------------------------------------------------------------------
@@ -833,18 +852,21 @@ def make_linear(
     if quant_type == QUANT_NVFP4:
         method = NVFP4LinearMethod(group_size=config.quant.group_size)
         if config.tp_size == 1:
-            return ReplicatedLinear(in_features, out_features, bias,
-                                    torch.float16, config.mapping, method)
-        if tp_mode == TPMode.ROW:
-            return RowParallelLinear(in_features, out_features, bias,
+            layer = ReplicatedLinear(in_features, out_features, bias,
                                      torch.float16, config.mapping, method)
-        return ColumnParallelLinear(in_features,
-                                    out_features,
-                                    bias,
-                                    torch.float16,
-                                    config.mapping,
-                                    method,
-                                    tp_mode=tp_mode)
+        elif tp_mode == TPMode.ROW:
+            layer = RowParallelLinear(in_features, out_features, bias,
+                                      torch.float16, config.mapping, method)
+        else:
+            layer = ColumnParallelLinear(in_features,
+                                         out_features,
+                                         bias,
+                                         torch.float16,
+                                         config.mapping,
+                                         method,
+                                         tp_mode=tp_mode)
+        layer.quantize_activations = config.quant.quantize_activations
+        return layer
 
     if quant_type == QUANT_FP16:
         layer = FP16Linear(in_features, out_features, bias)
@@ -872,4 +894,5 @@ def make_linear(
 
     # Tag with TP sharding mode so the checkpoint loader can shard on assignment.
     layer.tp_mode = tp_mode if config.tp_size > 1 else TPMode.REPLICATED
+    layer.quantize_activations = config.quant.quantize_activations
     return layer

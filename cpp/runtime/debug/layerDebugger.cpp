@@ -16,6 +16,8 @@
  */
 
 #include "runtime/debug/layerDebugger.h"
+#include "common/pagedKvTypes.h"
+#include "runtime/state/kvPageTable.h"
 
 #include "common/checkMacros.h"
 #include "common/logger.h"
@@ -97,12 +99,12 @@ Tensor copyBatchPrefix(Tensor const& src, int32_t activeBatchSize, std::string c
 //! shaped [activeBatch, 2, kvHeads, capPadded, headDim] — the dump contract the comparison tool
 //! expects (matching HF's [B, heads, seq, dim] KV layout after the K/V split).
 //!
-//! The KV cache is stored as a paged NHD pool whose K and V halves are each a contiguous
-//! [maxBatch, capPadded, kvHeads, headDim] region (identity slot mapping while KV-cache reuse is
-//! off, which is the only mode the few-layer validation runs in). This stages each half's
-//! active-batch prefix to the host and transposes [seq, head, dim] -> [head, seq, dim] per slot.
-Tensor copyKVCacheAsHND(
-    HybridCacheManager& cacheManager, int32_t layer, int32_t activeBatchSize, std::string const& name)
+//! The KV cache is stored as a paged NHD pool of [numPages, kTOKENS_PER_PAGE, kvHeads, headDim].
+//! A slot's tokens are contiguous only while the page table is the identity, which context reuse
+//! breaks by handing a sequence pages that belong to an earlier request, so each slot is gathered
+//! page by page and transposed [seq, head, dim] -> [head, seq, dim].
+Tensor copyKVCacheAsHND(HybridCacheManager& cacheManager, KVPageTable const& pageTable, int32_t layer,
+    int32_t activeBatchSize, std::string const& name)
 {
     auto const [kView, vView] = cacheManager.getSeparateKVCache(layer);
     Coords const s = kView.getShape(); // [maxBatch, capPadded, kvHeads, headDim]
@@ -113,26 +115,45 @@ Tensor copyKVCacheAsHND(
     size_t const elemSize = utils::getTypeSize(dtype);
     size_t const slotBytes = static_cast<size_t>(cap) * heads * dim * elemSize;
     size_t const rowBytes = static_cast<size_t>(dim) * elemSize;
+    size_t const pageBytes = static_cast<size_t>(kTOKENS_PER_PAGE) * heads * dim * elemSize;
 
-    std::vector<std::byte> staging(2 * static_cast<size_t>(activeBatchSize) * slotBytes);
+    // The [maxBatch, capPadded, H, D] view is a reinterpretation of the page pool
+    // [numPages, kTOKENS_PER_PAGE, H, D]; a slot's tokens are contiguous only while the page table
+    // is the identity. Context reuse hands a sequence pages that belong to an earlier request, so
+    // gather each slot page by page instead of reading its slot-sized span. kPoolPtr / vPoolPtr
+    // already carry their half's offset, so the K page id indexes both.
+    int32_t const maxPagesPerSeq = pageTable.maxPagesPerSeq();
+    size_t const poolBytes = static_cast<size_t>(pageTable.numPages()) * pageBytes;
+    std::vector<std::byte> staging(2 * poolBytes);
     std::byte* const kStage = staging.data();
-    std::byte* const vStage = staging.data() + static_cast<size_t>(activeBatchSize) * slotBytes;
-    CUDA_CHECK(cudaMemcpy(kStage, kView.rawPointer(), activeBatchSize * slotBytes, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(vStage, vView.rawPointer(), activeBatchSize * slotBytes, cudaMemcpyDeviceToHost));
+    std::byte* const vStage = staging.data() + poolBytes;
+    CUDA_CHECK(cudaMemcpy(kStage, kView.rawPointer(), poolBytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(vStage, vView.rawPointer(), poolBytes, cudaMemcpyDeviceToHost));
 
     Tensor host({activeBatchSize, 2, heads, cap, dim}, DeviceType::kCPU, dtype, name);
     std::byte* const out = static_cast<std::byte*>(host.rawPointer());
+    std::memset(out, 0, static_cast<size_t>(activeBatchSize) * 2 * slotBytes);
     for (int64_t b = 0; b < activeBatchSize; ++b)
     {
-        for (int64_t kv = 0; kv < 2; ++kv)
+        int32_t const* const pages = pageTable.hostRow(static_cast<int32_t>(b));
+        for (int32_t lp = 0; lp < maxPagesPerSeq; ++lp)
         {
-            std::byte const* const slotSrc = (kv == 0 ? kStage : vStage) + b * slotBytes;
-            std::byte* const slotDst = out + (b * 2 + kv) * slotBytes;
-            for (int64_t t = 0; t < cap; ++t)
+            int32_t const page = pages[lp];
+            if (page < 0)
             {
-                for (int64_t h = 0; h < heads; ++h)
+                continue; // unused logical page; leave it zeroed
+            }
+            for (int64_t kv = 0; kv < 2; ++kv)
+            {
+                std::byte const* const src = (kv == 0 ? kStage : vStage) + static_cast<size_t>(page) * pageBytes;
+                std::byte* const slotDst = out + (b * 2 + kv) * slotBytes;
+                for (int64_t t = 0; t < kTOKENS_PER_PAGE; ++t)
                 {
-                    std::memcpy(slotDst + (h * cap + t) * rowBytes, slotSrc + (t * heads + h) * rowBytes, rowBytes);
+                    int64_t const token = static_cast<int64_t>(lp) * kTOKENS_PER_PAGE + t;
+                    for (int64_t h = 0; h < heads; ++h)
+                    {
+                        std::memcpy(slotDst + (h * cap + token) * rowBytes, src + (t * heads + h) * rowBytes, rowBytes);
+                    }
                 }
             }
         }
@@ -174,9 +195,9 @@ std::unique_ptr<LayerDebugger> LayerDebugger::fromEnv()
     return std::unique_ptr<LayerDebugger>(new LayerDebugger(std::move(layers), dirEnv, std::move(forcedTokens)));
 }
 
-void LayerDebugger::dumpRound(HybridCacheManager& cacheManager, Tensor const& logits,
-    std::vector<int32_t> const& validLengths, int32_t const* generatedTokenIds, int32_t activeBatchSize,
-    cudaStream_t stream)
+void LayerDebugger::dumpRound(HybridCacheManager& cacheManager, KVPageTable const& pageTable, Tensor const& logits,
+    std::vector<int32_t> const& validLengths, std::vector<int32_t> const& originalIndices,
+    int32_t const* generatedTokenIds, int32_t activeBatchSize, cudaStream_t stream)
 {
     // The KV cache / logits are produced asynchronously on this stream; synchronise
     // so the device-side data is final before we copy it out.
@@ -222,7 +243,7 @@ void LayerDebugger::dumpRound(HybridCacheManager& cacheManager, Tensor const& lo
         }
         // Attention: KV cache dumped as [activeBatch, 2, kvHeads, capPadded, headDim] (transposed
         // out of the NHD pool storage; capPadded >= maxSeqLen, the comparison tool slices).
-        mTensors.push_back(copyKVCacheAsHND(cacheManager, layer, activeBatchSize, lp + "kv"));
+        mTensors.push_back(copyKVCacheAsHND(cacheManager, pageTable, layer, activeBatchSize, lp + "kv"));
     }
 
     // ---- per-sequence valid lengths ----
@@ -232,7 +253,8 @@ void LayerDebugger::dumpRound(HybridCacheManager& cacheManager, Tensor const& lo
         int32_t* p = ctxLenHost.dataPointer<int32_t>();
         for (int32_t i = 0; i < activeBatchSize; ++i)
         {
-            p[i] = validLengths.at(i);
+            int32_t const row = originalRow(originalIndices, i);
+            p[i] = validLengths.at(i) + (row < static_cast<int32_t>(mReusedPrefix.size()) ? mReusedPrefix[row] : 0);
         }
         mTensors.push_back(std::move(ctxLenHost));
     }
@@ -301,23 +323,99 @@ std::vector<std::vector<int32_t>> LayerDebugger::readForcedTokensFromEnv()
     return forced;
 }
 
-void LayerDebugger::applyForcedTokens(
-    std::vector<int32_t> const& genLengths, int32_t* tokenIds, int32_t activeBatchSize)
+int32_t LayerDebugger::originalRow(std::vector<int32_t> const& originalIndices, int32_t slot)
+{
+    // The runtime compacts its per-slot vectors when a sequence finishes, so active slot `slot`
+    // stops being request row `slot` from that point on. Everything this class keys by sequence
+    // is keyed by the original row instead. An empty mapping means the caller has none to give,
+    // in which case the two still coincide.
+    return slot < static_cast<int32_t>(originalIndices.size()) ? originalIndices[slot] : slot;
+}
+
+int32_t LayerDebugger::forcedRowBase(int32_t activeBatchSize)
+{
+    // Rows are handed out across the whole run in request order: one request per shared-prefix
+    // prompt is how the context-reuse validation drives the runtime, and its golden batches the
+    // same prompts into consecutive rows.
+    static std::atomic<int32_t> sSequenceCounter{0};
+    if (mForcedRowBase < 0)
+    {
+        mForcedRowBase = sSequenceCounter.fetch_add(activeBatchSize);
+    }
+    return mForcedRowBase;
+}
+
+void LayerDebugger::applyForcedTokens(std::vector<int32_t> const& genLengths,
+    std::vector<int32_t> const& originalIndices, int32_t* tokenIds, int32_t activeBatchSize)
 {
     if (mForcedTokens.empty())
     {
         return;
     }
+    int32_t const rowBase = forcedRowBase(activeBatchSize);
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
         // The token produced this step is generated-token index genLengths[i] (0 at prefill).
         int32_t const idx = genLengths.at(i);
-        if (i < static_cast<int32_t>(mForcedTokens.size()) && idx >= 0
-            && idx < static_cast<int32_t>(mForcedTokens[i].size()))
+        int32_t const row = rowBase + originalRow(originalIndices, i);
+        if (row < static_cast<int32_t>(mForcedTokens.size()) && idx >= 0
+            && idx < static_cast<int32_t>(mForcedTokens[row].size()))
         {
-            tokenIds[i] = mForcedTokens.at(i).at(idx);
+            tokenIds[i] = mForcedTokens.at(row).at(idx);
         }
     }
+}
+
+void LayerDebugger::setReusedPrefixLengths(std::vector<int32_t> lengths)
+{
+    mReusedPrefix = std::move(lengths);
+}
+
+bool LayerDebugger::applyForcedAcceptance(std::vector<int32_t> const& genLengths,
+    std::vector<int32_t> const& originalIndices, int32_t* acceptLengths, int32_t* acceptedTokenIds,
+    std::vector<int32_t>& ownTokens, int32_t activeBatchSize, int32_t maxAcceptDepth)
+{
+    ownTokens.assign(activeBatchSize, -1);
+    if (mForcedTokens.empty())
+    {
+        return false;
+    }
+    bool trimmed = false;
+    int32_t const rowBase = forcedRowBase(activeBatchSize);
+    for (int32_t i = 0; i < activeBatchSize; ++i)
+    {
+        int32_t const row = rowBase + originalRow(originalIndices, i);
+        if (row >= static_cast<int32_t>(mForcedTokens.size()))
+        {
+            continue;
+        }
+        std::vector<int32_t> const& forced = mForcedTokens[row];
+        int32_t const genLen = genLengths.at(i);
+        int32_t const accepted = acceptLengths[i];
+        if (accepted > 0)
+        {
+            ownTokens[i] = acceptedTokenIds[i * maxAcceptDepth + accepted - 1];
+        }
+        for (int32_t j = 0; j < accepted; ++j)
+        {
+            int32_t const idx = genLen + j;
+            if (idx < 0 || idx >= static_cast<int32_t>(forced.size()))
+            {
+                break; // past the end of the golden's sequence -- leave the rest as sampled.
+            }
+            int32_t& token = acceptedTokenIds[i * maxAcceptDepth + j];
+            if (token == forced[idx])
+            {
+                continue;
+            }
+            ownTokens[i] = token;
+            token = forced[idx];
+            acceptLengths[i] = j + 1;
+            trimmed = true;
+            break;
+        }
+    }
+    return trimmed;
 }
 
 } // namespace rt

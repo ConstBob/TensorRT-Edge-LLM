@@ -43,6 +43,7 @@ def _build_args(args: argparse.Namespace, component: str):
         max_kv_cache_capacity=args.max_kv_cache_capacity,
         max_batch_size=args.max_batch_size,
         max_lora_rank=args.max_lora_rank,
+        num_decoder_layers=args.num_decoder_layer,
         max_verify_tree_size=_value_or_default(args.max_verify_tree_size, 60),
         max_draft_tree_size=_value_or_default(args.max_draft_tree_size, 60),
         tree_base=args.tree_base,
@@ -292,6 +293,12 @@ def _add_build_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-kv-cache-capacity", type=int, default=96)
     parser.add_argument("--max-batch-size", type=int, default=1)
     parser.add_argument("--max-lora-rank", type=int, default=0)
+    parser.add_argument(
+        "--num-decoder-layer",
+        type=int,
+        default=0,
+        help=("Build only the first N decoder layers (few-layer numeric "
+              "validation). 0 keeps the checkpoint's own layer count."))
     parser.add_argument("--max-verify-tree-size", type=int)
     parser.add_argument("--max-draft-tree-size", type=int)
     parser.add_argument(

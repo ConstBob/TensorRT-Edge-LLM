@@ -48,6 +48,33 @@ void appendAcceptedTokens(DecodingInferenceContext& context, Tensor& hostAcceptL
 void clampAcceptLengthsToRemainingGeneration(
     DecodingInferenceContext& context, Tensor& hostAcceptLengths, Tensor& deviceAcceptLength, cudaStream_t stream);
 
+// Few-layer numeric validation hooks for a speculative round. Both are no-ops unless the debug
+// environment variables are set (see runtime/debug/layerDebugger.h). A speculative round commits a
+// variable number of tokens per sequence, so neither can reuse the vanilla path: forcing has to
+// trim the acceptance instead of overwriting a single token, and the dump has to pick each
+// sequence's own bonus row out of the verify block.
+
+//! @brief Teacher-force this round's acceptance to the golden's tokens.
+//!
+//! Call after clampAcceptLengthsToRemainingGeneration() and *before* the KV-cache commit, since
+//! trimming the acceptance is what keeps a replaced token's stale cache entry out of the commit.
+//! @param ownTokens Out: per sequence, the token it would itself have committed at the slot that
+//!                  ends up last -- the divergence signal the dump records.
+void applyForcedAcceptance(DecodingInferenceContext& context, Tensor& hostAcceptLengths, Tensor& hostAcceptedTokenIds,
+    Tensor& deviceAcceptLength, Tensor& deviceAcceptedTokenIds, std::vector<int32_t>& ownTokens, int32_t maxAcceptDepth,
+    cudaStream_t stream);
+
+//! @brief Dump one speculative round's committed base state.
+//!
+//! Call after appendAcceptedTokens(), so the token list and the cache are both final.
+//! @param verifyLogits         Base verify logits [activeBatch, verifySize, vocab].
+//! @param acceptedTokenIndices Device [activeBatch, maxAcceptDepth] verify rows that were accepted.
+//! @param hostAcceptLengths    Host accept lengths, as written back by appendAcceptedTokens().
+//! @param ownTokens            From applyForcedAcceptance(); empty when forcing is off.
+void dumpSpecRound(DecodingInferenceContext& context, HybridCacheManager& cacheManager, KVPageTable const& pageTable,
+    Tensor const& verifyLogits, Tensor const& acceptedTokenIndices, Tensor const& hostAcceptLengths,
+    std::vector<int32_t> const& ownTokens, int32_t verifySize, int32_t maxAcceptDepth, cudaStream_t stream);
+
 // Logprobs collection is split into a device-side enqueue and a host-side collect so that
 // decoding keeps a single host<->device synchronization point per round: decoders call
 // enqueueLogprobsD2H() before their round synchronization (the token / accepted-token D2H

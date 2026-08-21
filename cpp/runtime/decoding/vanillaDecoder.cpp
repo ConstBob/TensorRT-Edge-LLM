@@ -166,13 +166,14 @@ bool VanillaDecoder::decodeStep(DecodingInferenceContext& context)
         {
             validLengths[i] = static_cast<int32_t>(context.tokenIds[i].size());
         }
-        context.layerDebugger->dumpRound(mRuntime.base.cacheManager, mRuntime.base.pipelineIO.outputLogits,
-            validLengths, hostSelectedTokenIdsData, activeBatchSize, context.stream);
+        context.layerDebugger->dumpRound(mRuntime.base.cacheManager, *mRuntime.base.sharedResources.kvPageTables[0],
+            mRuntime.base.pipelineIO.outputLogits, validLengths, context.batchIndexMapping, hostSelectedTokenIdsData,
+            activeBatchSize, context.stream);
 
         // Teacher-forcing — feed the golden's tokens instead of our own (no-op unless
         // EDGELLM_FORCE_TOKENS_FILE is set). After the dump, so the dump keeps our own sampled token.
         context.layerDebugger->applyForcedTokens(
-            context.currentGenerateLengths, hostSelectedTokenIdsData, activeBatchSize);
+            context.currentGenerateLengths, context.batchIndexMapping, hostSelectedTokenIdsData, activeBatchSize);
     }
 
     for (int32_t i = 0; i < activeBatchSize; ++i)

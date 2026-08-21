@@ -624,15 +624,25 @@ def _nvfp4_act_qdq_eager(hidden_states: torch.Tensor,
         torch.float8_e4m3fn).to(torch.float32)
     q_block_scale = torch.where(per_block_scale == 0,
                                 torch.ones_like(q_block_scale), q_block_scale)
-    block_scale = (q_block_scale * s2).clamp_min(
-        1e-20)  # effective dequant scale
+    block_scale = (q_block_scale * s2).clamp_min(1e-20)
+    # The engine quantizes against the fp32 scale above but dequantizes against an
+    # fp16 one: the exported graph casts global_scale to fp16 before the block-scale
+    # DQ (see dynamo_translations._nvfp4_act_qdq_translation). Keeping this in fp32
+    # leaves ~half the elements off by an ULP of the scale.
+    dq_scale = (q_block_scale.to(torch.float16) * s2.to(torch.float16)).to(
+        torch.float32).clamp_min(1e-20)
 
     # Round magnitude to the nearest E2M1 level (midpoints in _FP4_E2M1_BOUNDS).
     bounds = torch.tensor(_FP4_E2M1_BOUNDS, dtype=torch.float32, device=device)
     levels = torch.tensor(_FP4_E2M1_LEVELS, dtype=torch.float32, device=device)
     scaled = xb / block_scale
-    idx = torch.searchsorted(bounds, scaled.abs().contiguous())
-    deq = torch.sign(scaled) * levels[idx] * block_scale
+    magnitude = scaled.abs().contiguous()
+    idx = torch.searchsorted(bounds, magnitude)
+    # On a midpoint the candidate E2M1 codes are idx and idx+1; searchsorted picks
+    # idx (toward zero) while the converter keeps the even code.
+    on_midpoint = magnitude == bounds[idx.clamp(max=len(_FP4_E2M1_BOUNDS) - 1)]
+    idx = torch.where(on_midpoint & (idx % 2 == 1), idx + 1, idx)
+    deq = torch.sign(scaled) * levels[idx] * dq_scale
     return deq.reshape(*lead, last).to(orig_dtype)
 
 

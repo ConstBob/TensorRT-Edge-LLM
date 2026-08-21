@@ -701,6 +701,13 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
 
     decoder_utils::clampAcceptLengthsToRemainingGeneration(context, mHostAcceptLengths, mAcceptLength, context.stream);
 
+    // Few-layer-validation teacher forcing (no-op unless EDGELLM_FORCE_TOKENS_FILE is set). Must
+    // run before the KV-cache commit below: trimming the acceptance is what keeps a replaced
+    // token's stale cache entry from being committed.
+    std::vector<int32_t> ownTokens;
+    decoder_utils::applyForcedAcceptance(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
+        mAcceptedTokenIds, ownTokens, maxAcceptDepth, context.stream);
+
     for (auto const& group : kvHeadDimGroups)
     {
         kernel::eagleBaseCommitKVCache(mAcceptedTokenIndices, mAcceptLength, kvCacheLengths, group.deviceLayerInfos,
@@ -752,6 +759,11 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
 
     decoder_utils::appendAcceptedTokens(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
         mAcceptedTokenIds, maxAcceptDepth, mRuntime.tokenizer, context.stream);
+
+    // Few-layer-validation dump (no-op unless EDGELLM_DUMP_LOGITS_KVCACHE_* are set).
+    decoder_utils::dumpSpecRound(context, mRuntime.base.cacheManager, *mRuntime.base.sharedResources.kvPageTables[0],
+        mRuntime.base.pipelineIO.outputLogits, mAcceptedTokenIndices, mHostAcceptLengths, ownTokens,
+        mRuntime.deployment.specConfig->verifySize, maxAcceptDepth, context.stream);
 
     if (context.numLogprobs > 0)
     {

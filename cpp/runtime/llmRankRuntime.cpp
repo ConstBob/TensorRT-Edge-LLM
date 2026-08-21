@@ -2508,12 +2508,24 @@ bool LLMRankRuntime::runBaseModelPrefill(
         {
             validLengths[i] = static_cast<int32_t>(context.tokenIds[i].size());
         }
-        context.layerDebugger->dumpRound(*mSharedResources->cacheManagers[0], mPipelineIO->outputLogits, validLengths,
-            hostSelectedTokenIdsData, activeBatchSize, context.stream);
+        // Context reuse executes only the suffix after the cached prefix, so tokenIds counts
+        // fewer tokens than the cache holds; record the difference once for every later round.
+        // Keyed by original request row -- here they still coincide, since prefill runs before
+        // any sequence can finish and the batch can be compacted.
+        std::vector<int32_t> reusedPrefix(activeBatchSize);
+        for (int32_t i = 0; i < activeBatchSize; ++i)
+        {
+            reusedPrefix[i] = static_cast<int32_t>(context.rawBatchedInputIds[i].size()) - validLengths[i];
+        }
+        context.layerDebugger->setReusedPrefixLengths(std::move(reusedPrefix));
+
+        context.layerDebugger->dumpRound(*mSharedResources->cacheManagers[0], *mSharedResources->kvPageTables[0],
+            mPipelineIO->outputLogits, validLengths, context.batchIndexMapping, hostSelectedTokenIdsData,
+            activeBatchSize, context.stream);
 
         // Teacher-forcing: feed the golden tokens instead of sampled tokens when configured.
         context.layerDebugger->applyForcedTokens(
-            context.currentGenerateLengths, hostSelectedTokenIdsData, activeBatchSize);
+            context.currentGenerateLengths, context.batchIndexMapping, hostSelectedTokenIdsData, activeBatchSize);
     }
 
     for (int32_t i = 0; i < activeBatchSize; ++i)
