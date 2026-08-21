@@ -2439,6 +2439,8 @@ class TestConfig:
             f"{self.edgellm_data_dir}/updated_datasets/MMLU_zero_shot/mmlu_dataset.json",
             "mmlu_5":
             f"{self.edgellm_data_dir}/updated_datasets/MMLU_five_shot/mmlu_dataset.json",
+            "mmlu_5_lite":
+            f"{self.edgellm_data_dir}/updated_datasets/MMLU_five_shot-lite/mmlu_dataset.json",
             "mmlu_pro":
             f"{self.edgellm_data_dir}/updated_datasets/MMLU_Pro/mmlu_pro_dataset.json",
             "mmstar":
