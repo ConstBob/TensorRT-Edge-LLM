@@ -118,8 +118,5 @@ ReusePlan makeHybridMtpReusePlan(std::vector<HybridCheckpointCandidate> const& c
     std::vector<BlockHash> const& inputFullBlockHashes, int32_t inputTokenCount, int32_t pageSize,
     CacheRecordStore const& records, ContextCacheLookupPolicy lookupPolicy = ContextCacheLookupPolicy::kUseCache);
 
-//! Trim trailing reused pages from a vanilla reuse plan when media tokens span across the reuse boundary.
-void trimMediaBoundaryPages(ReusePlan& plan, Hash128 const* perPositionMediaHash, size_t tokenCount);
-
 } // namespace rt
 } // namespace trt_edgellm

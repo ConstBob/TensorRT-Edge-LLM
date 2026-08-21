@@ -18,7 +18,6 @@
 #include "runtime/state/contextCache/blockHash.h"
 #include "runtime/state/contextCache/contextCacheCoordinator.h"
 #include "runtime/state/contextCache/contextCacheDeployment.h"
-#include "runtime/state/contextCache/reusePlan.h"
 
 #include "common/checkMacros.h"
 #include "common/pagedKvTypes.h"
@@ -132,93 +131,6 @@ TEST(MediaAwareHashTests, MultiImageOrderMatters)
     BlockHash const hashAB = hashBlock(kCHAIN_ROOT, tokens.data(), tokens.size(), {}, mediaAB.data());
     BlockHash const hashBA = hashBlock(kCHAIN_ROOT, tokens.data(), tokens.size(), {}, mediaBA.data());
     EXPECT_NE(hashAB, hashBA);
-}
-
-// --- trimMediaBoundaryPages tests ---
-
-TEST(MediaAwareHashTests, MediaBoundaryTrimRemovesTrailingMediaPages)
-{
-    // Simulate a 3-page token sequence where media spans across the reuse boundary (page 1→2).
-    // The reuse plan covers pages [0,1]; suffix starts at page 2.
-    // Trim checks: lastReusedIsMedia (position 255) AND suffixStartsWithMedia (position 256).
-    int32_t const tokenCount = kPAGE_SIZE * 3;
-    Hash128 const imageA = makeMediaHash(0x6666);
-    std::vector<Hash128> mediaHash(tokenCount, Hash128{});
-
-    // Media tokens span across the reuse boundary: last 10 of page 1 and first 10 of page 2.
-    for (int i = kPAGE_SIZE * 2 - 10; i < kPAGE_SIZE * 2 + 10; ++i)
-    {
-        mediaHash[i] = imageA;
-    }
-
-    ReusePlan plan;
-    plan.kind = ReusePlanKind::kStandard;
-    plan.basePageBindings = {0, 1}; // Pages 0 and 1 matched.
-    plan.matchedBlockHashes = {BlockHash{1, 1}, BlockHash{2, 2}};
-    plan.reuseTokenLength = kPAGE_SIZE * 2;
-    plan.matchedTokenLength = kPAGE_SIZE * 2;
-    plan.demand.baseKvPages = 1;
-
-    trimMediaBoundaryPages(plan, mediaHash.data(), tokenCount);
-
-    // Page 1 trimmed because media crosses the boundary at position 256.
-    // After trimming page 1, new boundary is at 128; positions 127 and 128 are text → stops.
-    EXPECT_EQ(plan.basePageBindings.size(), 1U);
-    EXPECT_EQ(plan.matchedBlockHashes.size(), 1U);
-    EXPECT_EQ(plan.reuseTokenLength, kPAGE_SIZE);
-}
-
-TEST(MediaAwareHashTests, MediaBoundaryTrimNopWhenClean)
-{
-    // Media entirely within page 0, reuse boundary after page 0 is clean.
-    int32_t const tokenCount = kPAGE_SIZE * 2;
-    Hash128 const imageA = makeMediaHash(0x7777);
-    std::vector<Hash128> mediaHash(tokenCount, Hash128{});
-
-    // Media only in positions 5..15 of page 0.
-    for (int i = 5; i < 15; ++i)
-    {
-        mediaHash[i] = imageA;
-    }
-
-    ReusePlan plan;
-    plan.kind = ReusePlanKind::kStandard;
-    plan.basePageBindings = {0};
-    plan.matchedBlockHashes = {BlockHash{1, 1}};
-    plan.reuseTokenLength = kPAGE_SIZE;
-    plan.matchedTokenLength = kPAGE_SIZE;
-    plan.demand.baseKvPages = 1;
-
-    trimMediaBoundaryPages(plan, mediaHash.data(), tokenCount);
-
-    // No trimming: page boundary (position 128) is text on both sides.
-    EXPECT_EQ(plan.basePageBindings.size(), 1U);
-    EXPECT_EQ(plan.reuseTokenLength, kPAGE_SIZE);
-}
-
-TEST(MediaAwareHashTests, MediaBoundaryTrimAllPagesIfAllMedia)
-{
-    // Every position is a media token; every boundary is contaminated.
-    // Use 4 pages of input but only 3 pages in reuse plan so there's always a suffix.
-    int32_t const tokenCount = kPAGE_SIZE * 4;
-    Hash128 const imageA = makeMediaHash(0x8888);
-    std::vector<Hash128> mediaHash(tokenCount, imageA);
-
-    ReusePlan plan;
-    plan.kind = ReusePlanKind::kStandard;
-    plan.basePageBindings = {0, 1, 2};
-    plan.matchedBlockHashes = {BlockHash{1, 1}, BlockHash{2, 2}, BlockHash{3, 3}};
-    plan.reuseTokenLength = kPAGE_SIZE * 3;
-    plan.matchedTokenLength = kPAGE_SIZE * 3;
-    plan.demand.baseKvPages = 1;
-
-    trimMediaBoundaryPages(plan, mediaHash.data(), tokenCount);
-
-    // All pages trimmed because every boundary has media on both sides.
-    EXPECT_TRUE(plan.basePageBindings.empty());
-    EXPECT_TRUE(plan.matchedBlockHashes.empty());
-    EXPECT_EQ(plan.reuseTokenLength, 0);
-    EXPECT_EQ(plan.kind, ReusePlanKind::kNoReusablePrefix);
 }
 
 // --- Coordinator-level media-aware tests (requires GPU) ---

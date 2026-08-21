@@ -1322,3 +1322,96 @@ TEST_F(EmbeddingLookupTest, MultimodalOptionalInputs)
             << "GPU and CPU results don't match for " << tc.name << " multimodal lookup";
     }
 }
+
+// Test generateMultimodalIndices GPU kernel without per-row offsets (legacy global accumulation)
+TEST_F(EmbeddingLookupTest, GenerateMultimodalIndicesGlobalAccumulation)
+{
+    int32_t constexpr kImageTok = 50;
+    int32_t constexpr kAudioTok = 99;
+    int64_t constexpr batchSize = 2;
+    int64_t constexpr seqLen = 4;
+
+    // batch 0: [text, image, image, text]  -> image indices 0, 1
+    // batch 1: [text, image, text, audio]  -> image index 2 (global), audio index 0
+    std::vector<int32_t> inputIds = {10, kImageTok, kImageTok, 20, 30, kImageTok, 40, kAudioTok};
+
+    rt::Tensor inputIdsTensor({batchSize, seqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor indicesTensor({batchSize, seqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice(inputIdsTensor, inputIds);
+
+    kernel::generateMultimodalIndices(inputIdsTensor, indicesTensor, kImageTok, kAudioTok, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    auto result = copyDeviceToHost<int32_t>(indicesTensor);
+    // Without per-row offsets, image counter accumulates globally: 0, 1, 2
+    std::vector<int32_t> expected = {0, 0, 1, 0, 0, 2, 0, 0};
+    EXPECT_EQ(result, expected);
+}
+
+// Test generateMultimodalIndices GPU kernel with per-row offsets (bug 6627733 fix)
+TEST_F(EmbeddingLookupTest, GenerateMultimodalIndicesPerRowOffsets)
+{
+    int32_t constexpr kImageTok = 50;
+    int32_t constexpr kAudioTok = 99;
+    int64_t constexpr batchSize = 2;
+    int64_t constexpr seqLen = 4;
+
+    // batch 0: [text, image, image, text]  -> image indices starting at offset 3: 3, 4
+    // batch 1: [text, image, text, audio]  -> image index starting at offset 7: 7; audio starting at 2: 2
+    std::vector<int32_t> inputIds = {10, kImageTok, kImageTok, 20, 30, kImageTok, 40, kAudioTok};
+    std::vector<int32_t> imageOffsets = {3, 7};
+    std::vector<int32_t> audioOffsets = {0, 2};
+
+    rt::Tensor inputIdsTensor({batchSize, seqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor indicesTensor({batchSize, seqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor imageOffsetTensor({batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor audioOffsetTensor({batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+
+    copyHostToDevice(inputIdsTensor, inputIds);
+    copyHostToDevice(imageOffsetTensor, imageOffsets);
+    copyHostToDevice(audioOffsetTensor, audioOffsets);
+
+    kernel::generateMultimodalIndices(inputIdsTensor, indicesTensor, kImageTok, kAudioTok, stream,
+        imageOffsetTensor.dataPointer<int32_t>(), audioOffsetTensor.dataPointer<int32_t>());
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    auto result = copyDeviceToHost<int32_t>(indicesTensor);
+    // batch 0: text=0, image=3, image=4, text=0
+    // batch 1: text=0, image=7, text=0, audio=2
+    std::vector<int32_t> expected = {0, 3, 4, 0, 0, 7, 0, 2};
+    EXPECT_EQ(result, expected);
+}
+
+// Test that per-row offsets correctly handle context-reuse scenario (bug 6627733)
+// When batch_size=2 and context cache skips a prefix containing image tokens,
+// each row must start indexing at the number of image tokens already consumed by its prefix.
+TEST_F(EmbeddingLookupTest, GenerateMultimodalIndicesContextReuseScenario)
+{
+    int32_t constexpr kImageTok = 50;
+    int64_t constexpr batchSize = 2;
+    int64_t constexpr seqLen = 3;
+
+    // Simulates suffix-only tokens after context cache reuse:
+    // Row 0 prefix had 10 image tokens (skipped), suffix has 2 more image tokens
+    // Row 1 prefix had 5 image tokens (skipped), suffix has 1 more image token
+    // Without the fix, both rows would start at 0, causing row 1 to read row 0's embeddings.
+    std::vector<int32_t> inputIds = {kImageTok, kImageTok, 20, kImageTok, 30, 40};
+    std::vector<int32_t> imageOffsets = {10, 5}; // cumulative tokens consumed by prefix
+
+    rt::Tensor inputIdsTensor({batchSize, seqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor indicesTensor({batchSize, seqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor imageOffsetTensor({batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+
+    copyHostToDevice(inputIdsTensor, inputIds);
+    copyHostToDevice(imageOffsetTensor, imageOffsets);
+
+    kernel::generateMultimodalIndices(
+        inputIdsTensor, indicesTensor, kImageTok, std::nullopt, stream, imageOffsetTensor.dataPointer<int32_t>());
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    auto result = copyDeviceToHost<int32_t>(indicesTensor);
+    // Row 0: image=10, image=11, text=0
+    // Row 1: image=5, text=0, text=0
+    std::vector<int32_t> expected = {10, 11, 0, 5, 0, 0};
+    EXPECT_EQ(result, expected);
+}
