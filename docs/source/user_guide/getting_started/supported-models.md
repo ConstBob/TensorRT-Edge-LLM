@@ -132,6 +132,7 @@ The model class names were checked against the installed `transformers==5.9.0` p
 - [Qwen/Qwen3.5-27B](https://huggingface.co/Qwen/Qwen3.5-27B)
 - [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B)
 - [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)
+- [RadixArk/Qwen3.8-27B-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4)
 - [Qwen/Qwen3.5-35B-A3B-GPTQ-Int4](https://huggingface.co/Qwen/Qwen3.5-35B-A3B-GPTQ-Int4), [nvidia/Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4)
 
 </details>
