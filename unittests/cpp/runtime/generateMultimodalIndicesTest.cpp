@@ -136,3 +136,15 @@ TEST(LLMRuntimeUtils, ClampMaxGenerateLengthForKVCapacityMixedBatch)
 {
     EXPECT_EQ(rt::clampMaxGenerateLengthForKVCapacity({100, 180, 150}, 90, 256, 20), 56);
 }
+
+TEST(LLMRuntimeUtils, ClampMaxGenerateLengthForKVCapacityReservesFullDiffusionCanvas)
+{
+    int32_t constexpr kPromptLength = 186;
+    int32_t constexpr kCanvasLength = 256;
+
+    // Without the canvas reservation, a one-token generation would incorrectly be admitted.
+    EXPECT_EQ(rt::clampMaxGenerateLengthForKVCapacity({kPromptLength}, 1, 442, 0), 1);
+    // Block diffusion must reserve every canvas position before entering denoise.
+    EXPECT_EQ(rt::clampMaxGenerateLengthForKVCapacity({kPromptLength}, 1, 442, kCanvasLength), 0);
+    EXPECT_EQ(rt::clampMaxGenerateLengthForKVCapacity({kPromptLength}, 1, 443, kCanvasLength), 1);
+}
