@@ -511,6 +511,8 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
         // Pre-allocate multimodal indices tensor (used for audio/vision embedding lookup).
         mMultimodalIndices = rt::Tensor({mMaxRuntimeBatchSize, maxInputLength}, rt::DeviceType::kGPU, DataType::kINT32,
             "LLMRankRuntime::mMultimodalIndices");
+        mHostMultimodalIndices = rt::Tensor({mMaxRuntimeBatchSize, maxInputLength}, rt::DeviceType::kCPU,
+            DataType::kINT32, "LLMRankRuntime::mHostMultimodalIndices");
 
         if (mLogprobsMaxBatchDim > 0)
         {
@@ -2390,7 +2392,117 @@ bool LLMRankRuntime::runBaseModelPrefill(
 
     // Embedding lookup (text / vision / audio-multimodal) into mPipelineIO->inputsEmbeds;
     // deepstack slots are populated from features or zero-filled depending on the request.
-    mEmbeddingPre->embed(mIdsInput, context.visualEmbeddings, context.audioEmbeddings, *mPipelineIO, context.stream);
+    //
+    // When context-cache reuse is active, tokenIds are the suffix (prefix tokens are served from KV cache).
+    // The ViT output concatenates ALL batch elements' embeddings sequentially, so per-row offsets are needed
+    // to index past earlier sequences' embeddings that were consumed by the cached prefix.
+    //
+    // Multimodal indices are computed on CPU from the host-side packed token IDs (still available in
+    // mHostPackedTokenIds) and uploaded once. This avoids a single-threaded GPU kernel launch plus
+    // separate H2D copies for per-batch base offsets.
+    rt::OptionalInputTensor precomputedIndices = std::nullopt;
+    if (context.visualEmbeddings.has_value() || context.audioEmbeddings.has_value())
+    {
+        int32_t const imageTokenId = mDeployment.base.imageTokenId;
+        int32_t const audioTokenId = mDeployment.base.audioTokenId;
+
+        check::check(mMultimodalIndices.reshape({activeBatchSize, inputIdsLength}), "Tensor reshape failed");
+        check::check(mHostMultimodalIndices.reshape({activeBatchSize, inputIdsLength}), "Tensor reshape failed");
+        int32_t* hostIndices = mHostMultimodalIndices.dataPointer<int32_t>();
+
+        if (contextCacheRequest != nullptr)
+        {
+            int32_t cumulativeImageTokens = 0;
+            int32_t cumulativeAudioTokens = 0;
+            for (int32_t i = 0; i < activeBatchSize; ++i)
+            {
+                auto const& fullSeq = context.rawBatchedInputIds[i];
+                int32_t const prefixLen = static_cast<int32_t>(fullSeq.size()) - context.effectivePrefillLengths[i];
+                int32_t prefixImageCount = 0;
+                int32_t prefixAudioCount = 0;
+                for (int32_t p = 0; p < prefixLen; ++p)
+                {
+                    if (fullSeq[p] == imageTokenId)
+                    {
+                        ++prefixImageCount;
+                    }
+                    else if (fullSeq[p] == audioTokenId)
+                    {
+                        ++prefixAudioCount;
+                    }
+                }
+                int32_t const rowImageBase = cumulativeImageTokens + prefixImageCount;
+                int32_t const rowAudioBase = cumulativeAudioTokens + prefixAudioCount;
+
+                // Generate indices for this row from the packed host token IDs.
+                int32_t rowImageIdx = rowImageBase;
+                int32_t rowAudioIdx = rowAudioBase;
+                int32_t const* rowTokens = hostPackedTokenIdsData + static_cast<int64_t>(i) * inputIdsLength;
+                int32_t* rowIndices = hostIndices + static_cast<int64_t>(i) * inputIdsLength;
+                for (int32_t col = 0; col < inputIdsLength; ++col)
+                {
+                    int32_t const tok = rowTokens[col];
+                    if (imageTokenId >= 0 && tok == imageTokenId)
+                    {
+                        rowIndices[col] = rowImageIdx++;
+                    }
+                    else if (audioTokenId >= 0 && tok == audioTokenId)
+                    {
+                        rowIndices[col] = rowAudioIdx++;
+                    }
+                    else
+                    {
+                        rowIndices[col] = 0;
+                    }
+                }
+
+                for (size_t p = 0; p < fullSeq.size(); ++p)
+                {
+                    if (fullSeq[p] == imageTokenId)
+                    {
+                        ++cumulativeImageTokens;
+                    }
+                    else if (fullSeq[p] == audioTokenId)
+                    {
+                        ++cumulativeAudioTokens;
+                    }
+                }
+            }
+        }
+        else
+        {
+            int32_t imageIndex = 0;
+            int32_t audioIndex = 0;
+            for (int32_t i = 0; i < activeBatchSize; ++i)
+            {
+                int32_t const* rowTokens = hostPackedTokenIdsData + static_cast<int64_t>(i) * inputIdsLength;
+                int32_t* rowIndices = hostIndices + static_cast<int64_t>(i) * inputIdsLength;
+                for (int32_t col = 0; col < inputIdsLength; ++col)
+                {
+                    int32_t const tok = rowTokens[col];
+                    if (imageTokenId >= 0 && tok == imageTokenId)
+                    {
+                        rowIndices[col] = imageIndex++;
+                    }
+                    else if (audioTokenId >= 0 && tok == audioTokenId)
+                    {
+                        rowIndices[col] = audioIndex++;
+                    }
+                    else
+                    {
+                        rowIndices[col] = 0;
+                    }
+                }
+            }
+        }
+
+        CUDA_CHECK(cudaMemcpyAsync(mMultimodalIndices.rawPointer(), hostIndices,
+            static_cast<size_t>(activeBatchSize) * inputIdsLength * sizeof(int32_t), cudaMemcpyHostToDevice,
+            context.stream));
+        precomputedIndices = rt::OptionalInputTensor{mMultimodalIndices};
+    }
+    mEmbeddingPre->embed(
+        mIdsInput, context.visualEmbeddings, context.audioEmbeddings, *mPipelineIO, context.stream, precomputedIndices);
     mEmbeddingPre->prepareDeepstack(mIdsInput, context.deepstackFeatures, *mPipelineIO, context.stream);
     if (mGemma4Ple)
     {

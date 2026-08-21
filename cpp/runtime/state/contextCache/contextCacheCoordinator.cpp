@@ -243,50 +243,6 @@ private:
 
 } // namespace
 
-void trimMediaBoundaryPages(ReusePlan& plan, Hash128 const* perPositionMediaHash, size_t tokenCount)
-{
-    if (perPositionMediaHash == nullptr || plan.basePageBindings.empty())
-    {
-        return;
-    }
-
-    int32_t const pageSize = kTOKENS_PER_PAGE;
-    Hash128 const kZERO{};
-
-    while (!plan.basePageBindings.empty())
-    {
-        int32_t const reuseLen = static_cast<int32_t>(plan.basePageBindings.size()) * pageSize;
-        bool const suffixStartsWithMedia
-            = static_cast<size_t>(reuseLen) < tokenCount && perPositionMediaHash[reuseLen] != kZERO;
-        bool const lastReusedIsMedia = reuseLen > 0 && perPositionMediaHash[reuseLen - 1] != kZERO;
-
-        if (suffixStartsWithMedia && lastReusedIsMedia)
-        {
-            plan.basePageBindings.pop_back();
-            plan.matchedBlockHashes.pop_back();
-        }
-        else
-        {
-            break;
-        }
-    }
-
-    int64_t const reusablePageCount = static_cast<int64_t>(plan.basePageBindings.size());
-    int64_t const totalInputPages
-        = (static_cast<int64_t>(tokenCount) + static_cast<int64_t>(pageSize) - 1) / static_cast<int64_t>(pageSize);
-    plan.reuseTokenLength = static_cast<int32_t>(reusablePageCount * static_cast<int64_t>(pageSize));
-    plan.matchedTokenLength = plan.reuseTokenLength;
-    plan.demand.baseKvPages = static_cast<int32_t>(totalInputPages - reusablePageCount);
-    if (plan.basePageBindings.empty())
-    {
-        plan.kind = ReusePlanKind::kNoReusablePrefix;
-    }
-    else
-    {
-        plan.kind = ReusePlanKind::kStandard;
-    }
-}
-
 struct ContextCacheCoordinator::RequestHandle::Impl
 {
     struct RequestSlotToken
@@ -1030,7 +986,6 @@ ContextCacheCoordinator::AcquireSequenceResult ContextCacheCoordinator::acquireS
                     admission.tokenIds.data(), candidateLength, hashes, admission.keyExtras, mediaHashPtr)});
         }
     }
-    bool const isSpecOnly = speculativeRequest && !mProfile.isHybrid();
     auto makePlan = [&](ContextCacheLookupPolicy policy) {
         if (speculativeRequest && mProfile.isHybrid())
         {
@@ -1061,19 +1016,6 @@ ContextCacheCoordinator::AcquireSequenceResult ContextCacheCoordinator::acquireS
         static_cast<int32_t>(plan.basePageBindings.size()), plan.matchedTokenLength, hashes.size(),
         admission.perPositionMediaHash.empty() ? "empty" : "present");
 
-    // Speculative page bindings are a coherent base+draft path. Media-aware speculative requests reach this planner
-    // with a bypass policy, so only vanilla/hybrid cache hits need base-only boundary trimming here.
-    if (!isSpecOnly && !admission.perPositionMediaHash.empty() && plan.reuseTokenLength > 0)
-    {
-        int32_t const preTrimPages = static_cast<int32_t>(plan.basePageBindings.size());
-        trimMediaBoundaryPages(plan, admission.perPositionMediaHash.data(), admission.tokenIds.size());
-        int32_t const postTrimPages = static_cast<int32_t>(plan.basePageBindings.size());
-        if (preTrimPages != postTrimPages)
-        {
-            LOG_INFO("Context cache media trim: %d matched pages -> %d reusable pages (trimmed %d)", preTrimPages,
-                postTrimPages, preTrimPages - postTrimPages);
-        }
-    }
     requireKvPageCoverage(plan, basePages, draftPages);
     AcquireResult acquired = mManager.acquire(std::move(plan));
     bool const cacheDerivedPlan
