@@ -29,22 +29,26 @@ TENSORMAPS_PER_BLOCK = 3
 
 
 def get_max_active_clusters(family: str) -> int:
-    """Return a conservative persistent grid size for one kernel family."""
+    """Return a trace-time seed for the runtime persistent grid argument.
+
+    The exported wrapper receives the deployment GPU's persistent block count
+    at runtime, so this value only establishes the AOT argument type.  Do not
+    use ``HardwareInfo.get_max_active_clusters`` here: its occupancy probe
+    launches a helper kernel on the build GPU and fails when cross-compiling a
+    CTA-cluster target (for example SM100 or SM110) on a pre-Blackwell GPU.
+
+    Every FP16 MoE variant currently uses a ``(1, 1)`` cluster shape.  The
+    local SM count is therefore a positive, architecture-independent seed;
+    it is not baked into the deployed launch configuration.
+    """
+    if family not in ("ampere", "blackwell", "blackwell_geforce"):
+        raise ValueError(f"Unsupported f16_moe family: {family}")
+
     import cutlass
 
     hardware_info = cutlass.utils.HardwareInfo()
-    if family == "ampere":
-        # Ampere does not support CTA clusters; querying cluster occupancy
-        # returns CUDA_ERROR_INVALID_CLUSTER_SIZE. The grouped scheduler uses
-        # an ordinary one-CTA-per-SM persistent grid on this family.
-        return min(MAX_NUM_EXPERTS,
-                   hardware_info.get_device_multiprocessor_count())
-    if family not in ("blackwell", "blackwell_geforce"):
-        raise ValueError(f"Unsupported f16_moe family: {family}")
-    return min(
-        MAX_NUM_EXPERTS,
-        hardware_info.get_max_active_clusters(1),
-    )
+    return min(MAX_NUM_EXPERTS,
+               hardware_info.get_device_multiprocessor_count())
 
 
 def make_ptr(data_type, value: int, assumed_align: int | None = None):
