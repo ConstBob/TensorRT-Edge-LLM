@@ -28,6 +28,8 @@ Kernel groups:
   nvfp4_moe        — split FC1/FC2 NVFP4 MoE (currently SM110/Thor only)
   nvfp4_a16_blackwell_gemm — SM110 dense NVFP4-weight FP16/BF16 GEMM
   nvfp4_fused_moe  — End-to-end NvFP4 fused MoE (Blackwell GeForce)
+  layernorm        — homogeneous FP16/BF16 LayerNorm for benchmarked hidden sizes
+                     plus odd-H correctness coverage
   rmsnorm          — FP16/BF16 RMSNorm for production hidden sizes
 
 Usage (run from the repo root):
@@ -96,14 +98,19 @@ class KernelVariant:
     Attributes:
         name:          Unique identifier — used as --file_name / --function_prefix.
         group:         Logical group ("gdn", "fmha", "f16_moe",
-                       "nvfp4_fused_moe", "nvfp4_moe", "rmsnorm", "ssd",
-                       "nvfp4_a16_blackwell_gemm", or "gemm").
+                       "layernorm", "nvfp4_fused_moe", "nvfp4_moe",
+                       "rmsnorm", "ssd", "nvfp4_a16_blackwell_gemm", or
+                       "gemm").
                        cmake sets CUTE_DSL_<GROUP>_ENABLED for integrated groups.
         supported_sms: Explicit SM whitelist. With --kernels ALL, only variants whose
                        supported_sms contains the detected/requested SM are compiled.
         script:        Kernel script path relative to kernelSrcs/.
         script_args:   Args forwarded verbatim after --output_dir/--file_name/--function_prefix.
                        GDN variants MUST include "--export_only" here.
+        wants_target_sm: Append "--target_sm <sm>" when building the command.
+                       KERNEL_VARIANTS is a module-level constant, so the
+                       resolved target SM is not available when the variant is
+                       constructed and cannot be baked into script_args.
 
     """
     name: str
@@ -111,6 +118,7 @@ class KernelVariant:
     supported_sms: list[int]
     script: str
     script_args: list[str] = field(default_factory=list)
+    wants_target_sm: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +140,8 @@ class KernelVariant:
 #   nvfp4_moe        — split FC1/FC2 NVFP4 MoE (currently SM110/Thor only)
 #   nvfp4_a16_blackwell_gemm — SM110 dense W4A16 TCGen5 GEMM (FP16/BF16)
 #   nvfp4_fused_moe  — End-to-end NvFP4 fused MoE (Blackwell GeForce)
+#   layernorm        — homogeneous FP16/BF16 LayerNorm for benchmarked hidden sizes
+#                      plus odd-H correctness coverage
 #   rmsnorm          — FP16/BF16 RMSNorm for production hidden sizes
 # ---------------------------------------------------------------------------
 KERNEL_VARIANTS = [
@@ -1649,6 +1659,28 @@ KERNEL_VARIANTS = [
 ]
 
 
+# LayerNorm is specialized by homogeneous storage dtype and hidden size. The
+# flattened row count and epsilon remain runtime arguments in each AOT ABI.
+_LAYERNORM_SUPPORTED_SMS = [80, 86, 87, 90, 100, 101, 110, 120, 121]
+_LAYERNORM_HIDDEN_SIZES = [4096, 4097, 5120, 7168, 8192]
+for _layernorm_dtype in ("fp16", "bf16"):
+    for _layernorm_hidden_size in _LAYERNORM_HIDDEN_SIZES:
+        KERNEL_VARIANTS.append(
+            KernelVariant(
+                name=f"layernorm_{_layernorm_dtype}_h{_layernorm_hidden_size}",
+                group="layernorm",
+                supported_sms=_LAYERNORM_SUPPORTED_SMS,
+                script="layernorm_cutedsl/layernorm.py",
+                script_args=[
+                    "--dtype", _layernorm_dtype,
+                    "--hidden_size", str(_layernorm_hidden_size),
+                    "--export_only",
+                ],
+                wants_target_sm=True,
+            )
+        )
+
+
 # RMSNorm is specialized by storage dtype, hidden size, and weight-before-cast
 # mode. The row count and epsilon remain runtime arguments in each AOT ABI.
 _RMSNORM_SUPPORTED_SMS = [80, 86, 87, 90, 100, 101, 110, 120, 121]
@@ -2189,7 +2221,7 @@ def check_dependencies(sm=None, selected_groups=None, cuda_ver=None):
 # ---------------------------------------------------------------------------
 
 
-def _compile_command(variant, staging_dir, compile_gpu_arch, host_target):
+def _compile_command(variant, staging_dir, compile_gpu_arch, host_target, sm):
     script = _SCRIPT_DIR / variant.script
     if compile_gpu_arch or host_target:
         cmd = [
@@ -2210,6 +2242,11 @@ def _compile_command(variant, staging_dir, compile_gpu_arch, host_target):
             "--file_name", variant.name,
             "--function_prefix", variant.name]
     cmd += variant.script_args
+    if variant.wants_target_sm:
+        # The kernel script cannot resolve this itself: CUTE_DSL_ARCH is unset
+        # for every target in build_cutedsl_tarballs.sh's matrix, so a device
+        # query inside the script would report the build host's GPU.
+        cmd += ["--target_sm", str(sm)]
     return cmd
 
 
@@ -2218,7 +2255,8 @@ def _compile_one(variant, staging_dir, verbose, sm, compile_gpu_arch, host_targe
 
     Returns (name, ok, elapsed_secs, error_msg).
     """
-    cmd = _compile_command(variant, staging_dir, compile_gpu_arch, host_target)
+    cmd = _compile_command(variant, staging_dir, compile_gpu_arch, host_target,
+                           sm)
 
     t0 = time.monotonic()
     result = subprocess.run(
@@ -2730,7 +2768,7 @@ def main():
         default="ALL",
         help="Which kernels to build: ALL (default), a group name "
              "(fmha | gdn | f16_moe | nvfp4_moe | "
-             "nvfp4_a16_blackwell_gemm | nvfp4_fused_moe | rmsnorm | ssd | gemm | "
+             "nvfp4_a16_blackwell_gemm | nvfp4_fused_moe | layernorm | rmsnorm | ssd | gemm | "
              "int4_fp16_gemm), or a comma-separated list "
              "of group names. "
              "Variants whose supported_sms does not include the target SM are skipped.",

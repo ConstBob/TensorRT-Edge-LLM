@@ -15,6 +15,7 @@
 """Tests for lightweight helpers in ``kernelSrcs/build_cutedsl.py``."""
 
 import argparse
+import ast
 import importlib.util
 import os
 import re
@@ -69,6 +70,9 @@ _FMHA_V2_SPECIAL_VARIANTS = {
 }
 _FMHA_V2_VARIANTS = (_FMHA_V2_DENSE_VARIANTS | _FMHA_V2_PAGED_VARIANTS
                      | _FMHA_V2_SPECIAL_VARIANTS)
+_LAYERNORM_SUPPORTED_SMS = [80, 86, 87, 90, 100, 101, 110, 120, 121]
+_LAYERNORM_HIDDEN_SIZES = {4096, 4097, 5120, 7168, 8192}
+_LAYERNORM_DTYPES = {"fp16", "bf16"}
 _RMSNORM_SUPPORTED_SMS = [80, 86, 87, 90, 100, 101, 110, 120, 121]
 _RMSNORM_HIDDEN_SIZES = {4096, 5120, 7168, 8192}
 _RMSNORM_DTYPES = {"fp16", "bf16"}
@@ -432,6 +436,85 @@ def test_rmsnorm_registry_has_all_compile_time_variants(sm):
 def test_rmsnorm_registry_rejects_unqualified_sms(sm):
     with pytest.raises(ValueError, match="No variants"):
         build_cutedsl.select_variants(sm, "rmsnorm")
+
+
+@pytest.mark.parametrize("sm", _LAYERNORM_SUPPORTED_SMS)
+def test_layernorm_registry_has_all_compile_time_variants(sm):
+    variants = build_cutedsl.select_variants(sm, "layernorm")
+
+    assert len(
+        variants) == len(_LAYERNORM_DTYPES) * len(_LAYERNORM_HIDDEN_SIZES)
+    assert all(variant.group == "layernorm" for variant in variants)
+    assert all(variant.supported_sms == _LAYERNORM_SUPPORTED_SMS
+               for variant in variants)
+    assert all(variant.script == "layernorm_cutedsl/layernorm.py"
+               for variant in variants)
+
+    configurations = set()
+    for variant in variants:
+        dtype = variant.script_args[variant.script_args.index("--dtype") + 1]
+        hidden_size = int(
+            variant.script_args[variant.script_args.index("--hidden_size") +
+                                1])
+        configurations.add((dtype, hidden_size))
+        assert variant.name == f"layernorm_{dtype}_h{hidden_size}"
+        assert "--export_only" in variant.script_args
+        assert "--enable_pdl" not in variant.script_args
+
+    assert configurations == {(dtype, hidden_size)
+                              for dtype in _LAYERNORM_DTYPES
+                              for hidden_size in _LAYERNORM_HIDDEN_SIZES}
+
+
+@pytest.mark.parametrize("sm", [89, 103])
+def test_layernorm_registry_rejects_unqualified_sms(sm):
+    with pytest.raises(ValueError, match="No variants"):
+        build_cutedsl.select_variants(sm, "layernorm")
+
+
+@pytest.mark.parametrize("sm", _LAYERNORM_SUPPORTED_SMS)
+def test_layernorm_compile_command_carries_the_target_sm(sm):
+    """Every LayerNorm export is told which board it is being built for.
+
+    CUTE_DSL_ARCH is unset for every target in build_cutedsl_tarballs.sh's
+    matrix, so a device query inside the kernel script would resolve the build
+    host's GPU instead of the target's and silently pick the wrong schedule.
+    """
+    for variant in build_cutedsl.select_variants(sm, "layernorm"):
+        command = build_cutedsl._compile_command(variant, Path("/tmp/staging"),
+                                                 f"sm_{sm}a", "linux-aarch64",
+                                                 sm)
+
+        assert "--target_sm" in command
+        assert command[command.index("--target_sm") + 1] == str(sm)
+
+
+def test_only_layernorm_variants_request_the_target_sm():
+    """No other kernel script is handed a flag its argparse would reject."""
+    offenders = sorted(
+        variant.name for variant in build_cutedsl.KERNEL_VARIANTS
+        if variant.wants_target_sm and variant.group != "layernorm")
+
+    assert offenders == []
+
+
+def test_layernorm_source_pins_flashinfer_and_keeps_odd_h_masked():
+    source = (_REPO_ROOT / "kernelSrcs" / "layernorm_cutedsl" /
+              "layernorm.py").read_text()
+    module = ast.parse(source)
+    source_hidden_sizes = next(
+        ast.literal_eval(node.value) for node in module.body
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name)
+            and target.id == "SUPPORTED_HIDDEN_SIZES"
+            for target in node.targets))
+
+    assert "d7f2c64647585b641590e309c75974519dea17db" in source
+    assert set(source_hidden_sizes) == _LAYERNORM_HIDDEN_SIZES
+    assert set(
+        build_cutedsl._LAYERNORM_HIDDEN_SIZES) == _LAYERNORM_HIDDEN_SIZES
+    assert "if column >= hidden_size:" in source
+    assert "layernorm_kernel(output, x, gamma, beta, rows, eps, False, stream)" in source
 
 
 def test_fmha_v2_per_variant_compile_definitions_are_absent():
