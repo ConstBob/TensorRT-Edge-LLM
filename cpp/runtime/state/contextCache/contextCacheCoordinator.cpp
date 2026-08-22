@@ -1533,10 +1533,10 @@ void ContextCacheCoordinator::validateFullyCommittedDecodeAdvances(RequestHandle
     {
         auto const& sequence = request.sequences[slot];
         auto const& delta = advances[slot];
-        int64_t const expectedCommittedStateLength = static_cast<int64_t>(sequence.committedStateLength)
-            + static_cast<int64_t>(delta.acceptedTokenCount);
-        int64_t const expectedTokenCount = static_cast<int64_t>(sequence.tokenIds.size())
-            + static_cast<int64_t>(delta.acceptedTokenCount);
+        int64_t const expectedCommittedStateLength
+            = static_cast<int64_t>(sequence.committedStateLength) + static_cast<int64_t>(delta.acceptedTokenCount);
+        int64_t const expectedTokenCount
+            = static_cast<int64_t>(sequence.tokenIds.size()) + static_cast<int64_t>(delta.acceptedTokenCount);
         ELLM_CHECK(delta.acceptedTokenCount > 0 && expectedCommittedStateLength <= std::numeric_limits<int32_t>::max()
                 && delta.committedStateLength == expectedCommittedStateLength
                 && expectedTokenCount == expectedCommittedStateLength,
