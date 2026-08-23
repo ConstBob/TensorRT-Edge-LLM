@@ -359,6 +359,32 @@ def _nvfp4_a16_gemm_translation(
     )
 
 
+_NVFP4_A16_BLACKWELL_IO_T = OnnxUnion[onnxscript.FLOAT16, onnxscript.BFLOAT16]
+
+
+@script()
+def _nvfp4_a16_blackwell_gemm_translation(
+    activation: _NVFP4_A16_BLACKWELL_IO_T,
+    qweights: onnxscript.INT8,
+    block_scales: onnxscript.INT8,
+    global_scale: onnxscript.FLOAT,
+    gemm_n: int,
+    gemm_k: int,
+) -> _NVFP4_A16_BLACKWELL_IO_T:
+    """Emit the dedicated SM110 dense NVFP4-A16 plugin contract."""
+    return _trt_edgellm.Nvfp4A16BlackwellGemmPlugin(
+        activation,
+        qweights,
+        block_scales,
+        global_scale,
+        gemm_n=gemm_n,
+        gemm_k=gemm_k,
+        max_m=0,
+        layout=1,
+        backend=0,
+    )
+
+
 @script()
 def _int8_sq_act_qdq_translation(
     hidden_states: onnxscript.FLOAT16,
@@ -1360,6 +1386,8 @@ def build_custom_translation_table() -> dict:
         _qkv_concat_translation,
         torch.ops.trt.nvfp4_a16_gemm.default:
         _nvfp4_a16_gemm_translation,
+        torch.ops.trt.nvfp4_a16_blackwell_gemm.default:
+        _nvfp4_a16_blackwell_gemm_translation,
         torch.ops.trt.int8_sq_act_qdq.default:
         _int8_sq_act_qdq_translation,
         torch.ops.trt.int8_sq_weight_dq.default:

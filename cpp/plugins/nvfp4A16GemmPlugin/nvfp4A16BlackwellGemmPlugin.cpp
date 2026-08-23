@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "nvfp4A16GemmPluginV2.h"
+#include "nvfp4A16BlackwellGemmPlugin.h"
 #include "nvfp4A16BlackwellDispatchPolicy.h"
 
 #include "common/cudaUtils.h"
@@ -46,8 +46,8 @@ namespace plugins
 namespace
 {
 
-constexpr char const* kPluginName{"Nvfp4A16GemmPlugin"};
-constexpr char const* kPluginVersion{"2"};
+constexpr char const* kPluginName{"Nvfp4A16BlackwellGemmPlugin"};
+constexpr char const* kPluginVersion{"1"};
 
 constexpr int32_t kInActivation{0};
 constexpr int32_t kInQWeights{1};
@@ -99,7 +99,7 @@ Nvfp4A16BlackwellGemvDataType toGemvType(DataType type)
     {
         return Nvfp4A16BlackwellGemvDataType::kBF16;
     }
-    throw std::invalid_argument("Nvfp4A16GemmPluginV2: activation must be FP16 or BF16");
+    throw std::invalid_argument("Nvfp4A16BlackwellGemmPlugin: activation must be FP16 or BF16");
 }
 
 Nvfp4A16BlackwellGemvJitKey makeGemvJitKey(int32_t smVersion, int32_t n, int32_t k, DataType type)
@@ -118,7 +118,7 @@ kernels::Nvfp4A16BlackwellDtype toTcgenType(DataType type)
     {
         return kernels::Nvfp4A16BlackwellDtype::kBf16;
     }
-    throw std::invalid_argument("Nvfp4A16GemmPluginV2: activation must be FP16 or BF16");
+    throw std::invalid_argument("Nvfp4A16BlackwellGemmPlugin: activation must be FP16 or BF16");
 }
 
 Nvfp4A16BlackwellDispatchDtype toDispatchType(DataType type) noexcept
@@ -158,12 +158,12 @@ bool isAligned(void const* pointer, size_t alignment) noexcept
 
 } // namespace
 
-PluginFieldCollection Nvfp4A16GemmPluginV2Creator::mFieldCollection{};
-std::vector<PluginField> Nvfp4A16GemmPluginV2Creator::mPluginAttributes;
+PluginFieldCollection Nvfp4A16BlackwellGemmPluginCreator::mFieldCollection{};
+std::vector<PluginField> Nvfp4A16BlackwellGemmPluginCreator::mPluginAttributes;
 
-REGISTER_TENSORRT_PLUGIN(Nvfp4A16GemmPluginV2Creator);
+REGISTER_TENSORRT_PLUGIN(Nvfp4A16BlackwellGemmPluginCreator);
 
-Nvfp4A16GemmPluginV2::Nvfp4A16GemmPluginV2(
+Nvfp4A16BlackwellGemmPlugin::Nvfp4A16BlackwellGemmPlugin(
     std::string const& name, int32_t gemmN, int32_t gemmK, int32_t maxM, int32_t layout, int32_t backend)
     : mLayerName(name)
     , mGemmN(gemmN)
@@ -176,12 +176,12 @@ Nvfp4A16GemmPluginV2::Nvfp4A16GemmPluginV2(
     validateAttributes();
 }
 
-Nvfp4A16GemmPluginV2::Nvfp4A16GemmPluginV2(std::string const& name, PluginFieldCollection const* fc)
+Nvfp4A16BlackwellGemmPlugin::Nvfp4A16BlackwellGemmPlugin(std::string const& name, PluginFieldCollection const* fc)
     : mLayerName(name)
 {
     if (fc == nullptr || fc->fields == nullptr || fc->nbFields <= 0)
     {
-        throw std::invalid_argument("Nvfp4A16GemmPluginV2: plugin field collection must not be empty");
+        throw std::invalid_argument("Nvfp4A16BlackwellGemmPlugin: plugin field collection must not be empty");
     }
 
     std::array<bool, kNbFields> fieldsSeen{};
@@ -189,11 +189,11 @@ Nvfp4A16GemmPluginV2::Nvfp4A16GemmPluginV2(std::string const& name, PluginFieldC
     auto readIntField = [&fieldsSeen](PluginField const& field, int32_t index) {
         if (field.data == nullptr || field.type != PluginFieldType::kINT32 || field.length != 1)
         {
-            throw std::invalid_argument("Nvfp4A16GemmPluginV2: attributes must be scalar INT32 fields");
+            throw std::invalid_argument("Nvfp4A16BlackwellGemmPlugin: attributes must be scalar INT32 fields");
         }
         if (fieldsSeen[index])
         {
-            throw std::invalid_argument("Nvfp4A16GemmPluginV2: duplicate plugin attribute");
+            throw std::invalid_argument("Nvfp4A16BlackwellGemmPlugin: duplicate plugin attribute");
         }
         fieldsSeen[index] = true;
         return *static_cast<int32_t const*>(field.data);
@@ -204,7 +204,7 @@ Nvfp4A16GemmPluginV2::Nvfp4A16GemmPluginV2(std::string const& name, PluginFieldC
         PluginField const& field = fc->fields[i];
         if (field.name == nullptr)
         {
-            throw std::invalid_argument("Nvfp4A16GemmPluginV2: plugin attribute name must not be null");
+            throw std::invalid_argument("Nvfp4A16BlackwellGemmPlugin: plugin attribute name must not be null");
         }
         std::string const fieldName(field.name);
         if (fieldName == "gemm_n")
@@ -231,11 +231,12 @@ Nvfp4A16GemmPluginV2::Nvfp4A16GemmPluginV2(std::string const& name, PluginFieldC
         {
             if (gemvJitBundleSeen)
             {
-                throw std::invalid_argument("Nvfp4A16GemmPluginV2: duplicate gemv_jit_bundle attribute");
+                throw std::invalid_argument("Nvfp4A16BlackwellGemmPlugin: duplicate gemv_jit_bundle attribute");
             }
             if (field.data == nullptr || field.type != PluginFieldType::kCHAR || field.length <= 0)
             {
-                throw std::invalid_argument("Nvfp4A16GemmPluginV2: gemv_jit_bundle must be a nonempty CHAR field");
+                throw std::invalid_argument(
+                    "Nvfp4A16BlackwellGemmPlugin: gemv_jit_bundle must be a nonempty CHAR field");
             }
             gemvJitBundleSeen = true;
             auto const* bytes = static_cast<uint8_t const*>(field.data);
@@ -243,14 +244,14 @@ Nvfp4A16GemmPluginV2::Nvfp4A16GemmPluginV2(std::string const& name, PluginFieldC
         }
         else
         {
-            throw std::invalid_argument("Nvfp4A16GemmPluginV2: unknown plugin attribute " + fieldName);
+            throw std::invalid_argument("Nvfp4A16BlackwellGemmPlugin: unknown plugin attribute " + fieldName);
         }
     }
 
     if (!fieldsSeen[kFieldGemmN] || !fieldsSeen[kFieldGemmK] || !fieldsSeen[kFieldLayout] || !fieldsSeen[kFieldBackend])
     {
         throw std::invalid_argument(
-            "Nvfp4A16GemmPluginV2: gemm_n, gemm_k, layout, and backend attributes are required");
+            "Nvfp4A16BlackwellGemmPlugin: gemm_n, gemm_k, layout, and backend attributes are required");
     }
     mProfileDerivedMaxM = mMaxM == 0;
     validateAttributes();
@@ -260,33 +261,33 @@ Nvfp4A16GemmPluginV2::Nvfp4A16GemmPluginV2(std::string const& name, PluginFieldC
     }
 }
 
-void Nvfp4A16GemmPluginV2::validateAttributes() const
+void Nvfp4A16BlackwellGemmPlugin::validateAttributes() const
 {
     if (mLayout != kLayoutBlackwellN128K64V1)
     {
-        throw std::invalid_argument("Nvfp4A16GemmPluginV2: layout must be BLACKWELL_N128_K64_V1 (1)");
+        throw std::invalid_argument("Nvfp4A16BlackwellGemmPlugin: layout must be BLACKWELL_N128_K64_V1 (1)");
     }
     if (!nvfp4_a16_blackwell::isSupportedProblemShape(mGemmN, mGemmK))
     {
         throw std::invalid_argument(
-            "Nvfp4A16GemmPluginV2: N must be a positive int32 multiple of 128 and K must "
+            "Nvfp4A16BlackwellGemmPlugin: N must be a positive int32 multiple of 128 and K must "
             "be a positive int32 multiple of 64");
     }
     if (mMaxM < 0)
     {
-        throw std::invalid_argument("Nvfp4A16GemmPluginV2: max_m must be nonnegative (0 means profile-derived)");
+        throw std::invalid_argument("Nvfp4A16BlackwellGemmPlugin: max_m must be nonnegative (0 means profile-derived)");
     }
     if (mMaxM > 0 && !nvfp4_a16_blackwell::isTmaRepresentableProblem(mMaxM, mGemmN, mGemmK))
     {
-        throw std::invalid_argument("Nvfp4A16GemmPluginV2: max_m/N/K cannot be represented by the TMA layouts");
+        throw std::invalid_argument("Nvfp4A16BlackwellGemmPlugin: max_m/N/K cannot be represented by the TMA layouts");
     }
     if (mBackend < kBackendDefault || mBackend > kBackendTcgen05)
     {
-        throw std::invalid_argument("Nvfp4A16GemmPluginV2: backend must be auto (0), gemv (1), or tcgen05 (2)");
+        throw std::invalid_argument("Nvfp4A16BlackwellGemmPlugin: backend must be auto (0), gemv (1), or tcgen05 (2)");
     }
 }
 
-Nvfp4A16BlackwellGemvJitKey Nvfp4A16GemmPluginV2::getGemvJitKey(DataType type) const
+Nvfp4A16BlackwellGemvJitKey Nvfp4A16BlackwellGemmPlugin::getGemvJitKey(DataType type) const
 {
     // configurePlugin() and runtime deserialization validate the actual GPU.
     // Keep enqueue/onShapeChange free of CUDA runtime device queries so graph
@@ -294,19 +295,20 @@ Nvfp4A16BlackwellGemvJitKey Nvfp4A16GemmPluginV2::getGemvJitKey(DataType type) c
     return makeGemvJitKey(nvfp4_a16_blackwell::kTargetSm, mGemmN, mGemmK, type);
 }
 
-void Nvfp4A16GemmPluginV2::compileGemvJitBundle(DataType type)
+void Nvfp4A16BlackwellGemmPlugin::compileGemvJitBundle(DataType type)
 {
     Nvfp4A16BlackwellGemvJitKey const key = getGemvJitKey(type);
     if (!canCompileNvfp4A16BlackwellGemvJitKernel(key))
     {
-        throw std::invalid_argument("Nvfp4A16GemmPluginV2: JIT GEMV does not support the configured SM/shape/dtype");
+        throw std::invalid_argument(
+            "Nvfp4A16BlackwellGemmPlugin: JIT GEMV does not support the configured SM/shape/dtype");
     }
     if (!mGemvJitBundle.empty())
     {
         if (!(mGemvJitKernel.key == key))
         {
             throw std::invalid_argument(
-                "Nvfp4A16GemmPluginV2: one plugin instance cannot use multiple GEMV JIT semantic keys");
+                "Nvfp4A16BlackwellGemmPlugin: one plugin instance cannot use multiple GEMV JIT semantic keys");
         }
         return;
     }
@@ -314,28 +316,28 @@ void Nvfp4A16GemmPluginV2::compileGemvJitBundle(DataType type)
     mGemvJitBundle = serializeNvfp4A16BlackwellGemvJitKernel(mGemvJitKernel);
 }
 
-bool Nvfp4A16GemmPluginV2::hasSerializedGemvJitBundle() const noexcept
+bool Nvfp4A16BlackwellGemmPlugin::hasSerializedGemvJitBundle() const noexcept
 {
     return !mGemvJitBundle.empty();
 }
 
-void Nvfp4A16GemmPluginV2::loadSerializedGemvJitBundle()
+void Nvfp4A16BlackwellGemmPlugin::loadSerializedGemvJitBundle()
 {
     if (mGemvJitBundle.empty() || mGemvJitKernel.cubin.empty())
     {
-        throw std::invalid_argument("Nvfp4A16GemmPluginV2: runtime GEMV requires a serialized JIT bundle");
+        throw std::invalid_argument("Nvfp4A16BlackwellGemmPlugin: runtime GEMV requires a serialized JIT bundle");
     }
     Nvfp4A16BlackwellGemvJitKey const& key = mGemvJitKernel.key;
     if (key.sm != getSMVersion() || key.layout != static_cast<uint32_t>(mLayout) || key.n != mGemmN || key.k != mGemmK
         || key.sourceAbi != kNVFP4_A16_BLACKWELL_GEMV_SOURCE_ABI)
     {
         throw std::invalid_argument(
-            "Nvfp4A16GemmPluginV2: serialized GEMV JIT key does not match the runtime SM/layout/shape");
+            "Nvfp4A16BlackwellGemmPlugin: serialized GEMV JIT key does not match the runtime SM/layout/shape");
     }
     mGemvJitRunner.load(mGemvJitKernel);
 }
 
-IPluginCapability* Nvfp4A16GemmPluginV2::getCapabilityInterface(PluginCapabilityType type) noexcept
+IPluginCapability* Nvfp4A16BlackwellGemmPlugin::getCapabilityInterface(PluginCapabilityType type) noexcept
 {
     if (type == PluginCapabilityType::kBUILD)
     {
@@ -348,11 +350,12 @@ IPluginCapability* Nvfp4A16GemmPluginV2::getCapabilityInterface(PluginCapability
     return static_cast<IPluginV3OneCore*>(this);
 }
 
-IPluginV3* Nvfp4A16GemmPluginV2::clone() noexcept
+IPluginV3* Nvfp4A16BlackwellGemmPlugin::clone() noexcept
 {
     try
     {
-        auto plugin = std::make_unique<Nvfp4A16GemmPluginV2>(mLayerName, mGemmN, mGemmK, mMaxM, mLayout, mBackend);
+        auto plugin
+            = std::make_unique<Nvfp4A16BlackwellGemmPlugin>(mLayerName, mGemmN, mGemmK, mMaxM, mLayout, mBackend);
         plugin->mProfileDerivedMaxM = mProfileDerivedMaxM;
         plugin->mConfiguredNeedsGemv = mConfiguredNeedsGemv;
         plugin->mGemvJitKernel = mGemvJitKernel;
@@ -372,37 +375,37 @@ IPluginV3* Nvfp4A16GemmPluginV2::clone() noexcept
     }
     catch (std::exception const& error)
     {
-        LOG_ERROR("Failed to clone Nvfp4A16GemmPluginV2: %s", error.what());
+        LOG_ERROR("Failed to clone Nvfp4A16BlackwellGemmPlugin: %s", error.what());
         return nullptr;
     }
 }
 
-char const* Nvfp4A16GemmPluginV2::getPluginName() const noexcept
+char const* Nvfp4A16BlackwellGemmPlugin::getPluginName() const noexcept
 {
     return kPluginName;
 }
 
-char const* Nvfp4A16GemmPluginV2::getPluginVersion() const noexcept
+char const* Nvfp4A16BlackwellGemmPlugin::getPluginVersion() const noexcept
 {
     return kPluginVersion;
 }
 
-char const* Nvfp4A16GemmPluginV2::getPluginNamespace() const noexcept
+char const* Nvfp4A16BlackwellGemmPlugin::getPluginNamespace() const noexcept
 {
     return mNamespace.c_str();
 }
 
-void Nvfp4A16GemmPluginV2::setPluginNamespace(char const* pluginNamespace) noexcept
+void Nvfp4A16BlackwellGemmPlugin::setPluginNamespace(char const* pluginNamespace) noexcept
 {
     mNamespace = pluginNamespace == nullptr ? "" : pluginNamespace;
 }
 
-int32_t Nvfp4A16GemmPluginV2::getNbOutputs() const noexcept
+int32_t Nvfp4A16BlackwellGemmPlugin::getNbOutputs() const noexcept
 {
     return 1;
 }
 
-int32_t Nvfp4A16GemmPluginV2::getOutputDataTypes(
+int32_t Nvfp4A16BlackwellGemmPlugin::getOutputDataTypes(
     DataType* outputTypes, int32_t nbOutputs, DataType const* inputTypes, int32_t nbInputs) const noexcept
 {
     if (outputTypes == nullptr || inputTypes == nullptr || nbOutputs != 1 || nbInputs != kNbInputs
@@ -414,8 +417,9 @@ int32_t Nvfp4A16GemmPluginV2::getOutputDataTypes(
     return 0;
 }
 
-int32_t Nvfp4A16GemmPluginV2::getOutputShapes(DimsExprs const* inputs, int32_t nbInputs, DimsExprs const* shapeInputs,
-    int32_t nbShapeInputs, DimsExprs* outputs, int32_t nbOutputs, IExprBuilder& exprBuilder) noexcept
+int32_t Nvfp4A16BlackwellGemmPlugin::getOutputShapes(DimsExprs const* inputs, int32_t nbInputs,
+    DimsExprs const* shapeInputs, int32_t nbShapeInputs, DimsExprs* outputs, int32_t nbOutputs,
+    IExprBuilder& exprBuilder) noexcept
 {
     (void) shapeInputs;
     (void) nbShapeInputs;
@@ -430,7 +434,7 @@ int32_t Nvfp4A16GemmPluginV2::getOutputShapes(DimsExprs const* inputs, int32_t n
     return 0;
 }
 
-bool Nvfp4A16GemmPluginV2::validateTensorDesc(int32_t pos, PluginTensorDesc const& desc) const noexcept
+bool Nvfp4A16BlackwellGemmPlugin::validateTensorDesc(int32_t pos, PluginTensorDesc const& desc) const noexcept
 {
     if (desc.format != TensorFormat::kLINEAR)
     {
@@ -451,7 +455,7 @@ bool Nvfp4A16GemmPluginV2::validateTensorDesc(int32_t pos, PluginTensorDesc cons
     }
 }
 
-bool Nvfp4A16GemmPluginV2::supportsFormatCombination(
+bool Nvfp4A16BlackwellGemmPlugin::supportsFormatCombination(
     int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
     if (inOut == nullptr || nbInputs != kNbInputs || nbOutputs != 1 || pos < 0 || pos > kOutOutput
@@ -462,7 +466,7 @@ bool Nvfp4A16GemmPluginV2::supportsFormatCombination(
     return pos != kOutOutput || inOut[pos].desc.type == inOut[kInActivation].desc.type;
 }
 
-int32_t Nvfp4A16GemmPluginV2::configurePlugin(
+int32_t Nvfp4A16BlackwellGemmPlugin::configurePlugin(
     DynamicPluginTensorDesc const* in, int32_t nbInputs, DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept
 {
     try
@@ -475,20 +479,20 @@ int32_t Nvfp4A16GemmPluginV2::configurePlugin(
         {
             if (!validateTensorDesc(pos, in[pos].desc))
             {
-                LOG_ERROR("Nvfp4A16GemmPluginV2: invalid input descriptor at position %d", pos);
+                LOG_ERROR("Nvfp4A16BlackwellGemmPlugin: invalid input descriptor at position %d", pos);
                 return -1;
             }
         }
         if (!validateTensorDesc(kOutOutput, out[0].desc) || out[0].desc.type != in[kInActivation].desc.type)
         {
-            LOG_ERROR("Nvfp4A16GemmPluginV2: output shape and dtype must follow the activation");
+            LOG_ERROR("Nvfp4A16BlackwellGemmPlugin: output shape and dtype must follow the activation");
             return -1;
         }
 
         int32_t const smVersion = getSMVersion();
         if (smVersion != nvfp4_a16_blackwell::kTargetSm)
         {
-            LOG_ERROR("Nvfp4A16GemmPluginV2: BLACKWELL_N128_K64_V1 requires SM110, got SM%d", smVersion);
+            LOG_ERROR("Nvfp4A16BlackwellGemmPlugin: BLACKWELL_N128_K64_V1 requires SM110, got SM%d", smVersion);
             return -1;
         }
 
@@ -499,7 +503,7 @@ int32_t Nvfp4A16GemmPluginV2::configurePlugin(
                 || getTokenCount(profileDims[1]) != getTokenCount(profileDims[2])))
         {
             LOG_ERROR(
-                "Nvfp4A16GemmPluginV2: forced GEMV requires a static M profile because only M={1,2,4,8,16} "
+                "Nvfp4A16BlackwellGemmPlugin: forced GEMV requires a static M profile because only M={1,2,4,8,16} "
                 "specializations exist");
             return -1;
         }
@@ -509,7 +513,7 @@ int32_t Nvfp4A16GemmPluginV2::configurePlugin(
             if (m <= 0 || dims.d[2] != mGemmK || !nvfp4_a16_blackwell::isTmaRepresentableProblem(m, mGemmN, mGemmK))
             {
                 LOG_ERROR(
-                    "Nvfp4A16GemmPluginV2: profile M/N/K must be positive, match gemm_k, and be TMA "
+                    "Nvfp4A16BlackwellGemmPlugin: profile M/N/K must be positive, match gemm_k, and be TMA "
                     "representable");
                 return -1;
             }
@@ -520,12 +524,12 @@ int32_t Nvfp4A16GemmPluginV2::configurePlugin(
         int32_t const profileMaxM = getTokenCount(in[kInActivation].max);
         if (profileMinM > profileOptM || profileOptM > profileMaxM)
         {
-            LOG_ERROR("Nvfp4A16GemmPluginV2: profile M bounds must satisfy min <= opt <= max");
+            LOG_ERROR("Nvfp4A16BlackwellGemmPlugin: profile M bounds must satisfy min <= opt <= max");
             return -1;
         }
         if (!mProfileDerivedMaxM && profileMaxM > mMaxM)
         {
-            LOG_ERROR("Nvfp4A16GemmPluginV2: profile maximum M=%d exceeds max_m=%d", profileMaxM, mMaxM);
+            LOG_ERROR("Nvfp4A16BlackwellGemmPlugin: profile maximum M=%d exceeds max_m=%d", profileMaxM, mMaxM);
             return -1;
         }
 
@@ -537,8 +541,8 @@ int32_t Nvfp4A16GemmPluginV2::configurePlugin(
             int32_t const gemvM = mBackend == kBackendGemv ? profileMinM : 1;
             if (!useGemv(mBackend, gemvM, mGemmN, mGemmK, type))
             {
-                LOG_ERROR("Nvfp4A16GemmPluginV2: GEMV has no M=%d N=%d K=%d dtype=%d variant", gemvM, mGemmN, mGemmK,
-                    static_cast<int32_t>(type));
+                LOG_ERROR("Nvfp4A16BlackwellGemmPlugin: GEMV has no M=%d N=%d K=%d dtype=%d variant", gemvM, mGemmN,
+                    mGemmK, static_cast<int32_t>(type));
                 return -1;
             }
         }
@@ -559,7 +563,7 @@ int32_t Nvfp4A16GemmPluginV2::configurePlugin(
             {
                 auto const tile = kernels::Nvfp4A16BlackwellGemmRunner::selectTokenTile(m);
                 LOG_ERROR(
-                    "Nvfp4A16GemmPluginV2: no TCGen05 AOT variant for token tile %d (M=%d) N=%d K=%d "
+                    "Nvfp4A16BlackwellGemmPlugin: no TCGen05 AOT variant for token tile %d (M=%d) N=%d K=%d "
                     "dtype=%d",
                     static_cast<int32_t>(tile), m, mGemmN, mGemmK, static_cast<int32_t>(type));
                 return -1;
@@ -583,12 +587,12 @@ int32_t Nvfp4A16GemmPluginV2::configurePlugin(
     }
     catch (std::exception const& error)
     {
-        LOG_ERROR("Nvfp4A16GemmPluginV2 configurePlugin failed: %s", error.what());
+        LOG_ERROR("Nvfp4A16BlackwellGemmPlugin configurePlugin failed: %s", error.what());
         return -1;
     }
 }
 
-size_t Nvfp4A16GemmPluginV2::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
+size_t Nvfp4A16BlackwellGemmPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
     DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept
 {
     (void) outputs;
@@ -618,7 +622,7 @@ size_t Nvfp4A16GemmPluginV2::getWorkspaceSize(DynamicPluginTensorDesc const* inp
     return maxBytes;
 }
 
-int32_t Nvfp4A16GemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
+int32_t Nvfp4A16BlackwellGemmPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
     void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
     try
@@ -643,7 +647,8 @@ int32_t Nvfp4A16GemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, PluginT
             || !isAligned(inputs[kInGlobalScale], alignof(float)))
         {
             LOG_ERROR(
-                "Nvfp4A16GemmPluginV2: packed weights/scales do not satisfy the Blackwell kernel alignment contract");
+                "Nvfp4A16BlackwellGemmPlugin: packed weights/scales do not satisfy the Blackwell kernel alignment "
+                "contract");
             return -1;
         }
 
@@ -652,25 +657,25 @@ int32_t Nvfp4A16GemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, PluginT
         if (m <= 0 || m > mMaxM || !nvfp4_a16_blackwell::isTmaRepresentableProblem(m, mGemmN, mGemmK)
             || outputDesc[0].dims.d[0] != activationDims.d[0] || outputDesc[0].dims.d[1] != activationDims.d[1])
         {
-            LOG_ERROR("Nvfp4A16GemmPluginV2: invalid runtime M or output shape");
+            LOG_ERROR("Nvfp4A16BlackwellGemmPlugin: invalid runtime M or output shape");
             return -1;
         }
 
         DataType const type = inputDesc[kInActivation].type;
         if (useGemv(mBackend, m, mGemmN, mGemmK, type))
         {
-            NVTX_SCOPED_RANGE(nvtx_gemv, "Nvfp4A16GemmPluginV2::gemv", nvtx_colors::GREEN);
+            NVTX_SCOPED_RANGE(nvtx_gemv, "Nvfp4A16BlackwellGemmPlugin::gemv", nvtx_colors::GREEN);
             int32_t const splitK = getDispatch(mBackend, m, mGemmN, mGemmK, type).splitK;
             Nvfp4A16BlackwellGemvJitKey const expectedKey = getGemvJitKey(type);
             if (!mGemvJitRunner.isLoaded() || !(mGemvJitRunner.getKey() == expectedKey))
             {
-                LOG_ERROR("Nvfp4A16GemmPluginV2: selected GEMV JIT module was not loaded before enqueue");
+                LOG_ERROR("Nvfp4A16BlackwellGemmPlugin: selected GEMV JIT module was not loaded before enqueue");
                 return -1;
             }
             size_t const workspaceSize = getNvfp4A16BlackwellGemvJitWorkspaceSize(expectedKey, m, splitK);
             if (workspaceSize > 0 && workspace == nullptr)
             {
-                LOG_ERROR("Nvfp4A16GemmPluginV2: GEMV split-K workspace is null");
+                LOG_ERROR("Nvfp4A16BlackwellGemmPlugin: GEMV split-K workspace is null");
                 return -1;
             }
             mGemvJitRunner.launch(inputs[kInActivation], static_cast<uint8_t const*>(inputs[kInQWeights]),
@@ -680,11 +685,11 @@ int32_t Nvfp4A16GemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, PluginT
         }
         if (mBackend == kBackendGemv)
         {
-            LOG_ERROR("Nvfp4A16GemmPluginV2: forced GEMV does not support runtime M=%d", m);
+            LOG_ERROR("Nvfp4A16BlackwellGemmPlugin: forced GEMV does not support runtime M=%d", m);
             return -1;
         }
 
-        NVTX_SCOPED_RANGE(nvtx_tcgen, "Nvfp4A16GemmPluginV2::tcgen05", nvtx_colors::BLUE);
+        NVTX_SCOPED_RANGE(nvtx_tcgen, "Nvfp4A16BlackwellGemmPlugin::tcgen05", nvtx_colors::BLUE);
         kernels::Nvfp4A16BlackwellGemmParams const params{inputs[kInActivation], inputs[kInQWeights],
             inputs[kInBlockScales], static_cast<float const*>(inputs[kInGlobalScale]), outputs[0], m, mGemmN, mGemmK,
             toTcgenType(type)};
@@ -693,19 +698,19 @@ int32_t Nvfp4A16GemmPluginV2::enqueue(PluginTensorDesc const* inputDesc, PluginT
             = kernels::Nvfp4A16BlackwellGemmRunner::run(params, workspace, workspaceSize, stream);
         if (runError != cudaSuccess)
         {
-            LOG_ERROR("Nvfp4A16GemmPluginV2: TCGen05 launch failed: %s", cudaGetErrorString(runError));
+            LOG_ERROR("Nvfp4A16BlackwellGemmPlugin: TCGen05 launch failed: %s", cudaGetErrorString(runError));
             return -1;
         }
         return 0;
     }
     catch (std::exception const& error)
     {
-        LOG_ERROR("Nvfp4A16GemmPluginV2 enqueue failed: %s", error.what());
+        LOG_ERROR("Nvfp4A16BlackwellGemmPlugin enqueue failed: %s", error.what());
         return -1;
     }
 }
 
-int32_t Nvfp4A16GemmPluginV2::onShapeChange(
+int32_t Nvfp4A16BlackwellGemmPlugin::onShapeChange(
     PluginTensorDesc const* in, int32_t nbInputs, PluginTensorDesc const* out, int32_t nbOutputs) noexcept
 {
     if (in == nullptr || out == nullptr || nbInputs != kNbInputs || nbOutputs != 1)
@@ -728,7 +733,7 @@ int32_t Nvfp4A16GemmPluginV2::onShapeChange(
     bool const gemv = useGemv(mBackend, m, mGemmN, mGemmK, in[kInActivation].type);
     if (mBackend == kBackendGemv && !gemv)
     {
-        LOG_ERROR("Nvfp4A16GemmPluginV2: forced GEMV does not support runtime M=%d", m);
+        LOG_ERROR("Nvfp4A16BlackwellGemmPlugin: forced GEMV does not support runtime M=%d", m);
         return -1;
     }
     if (gemv)
@@ -738,13 +743,13 @@ int32_t Nvfp4A16GemmPluginV2::onShapeChange(
             Nvfp4A16BlackwellGemvJitKey const expectedKey = getGemvJitKey(in[kInActivation].type);
             if (!mGemvJitRunner.isLoaded() || !(mGemvJitRunner.getKey() == expectedKey))
             {
-                LOG_ERROR("Nvfp4A16GemmPluginV2: selected GEMV JIT module was not preloaded");
+                LOG_ERROR("Nvfp4A16BlackwellGemmPlugin: selected GEMV JIT module was not preloaded");
                 return -1;
             }
         }
         catch (std::exception const& error)
         {
-            LOG_ERROR("Nvfp4A16GemmPluginV2: GEMV JIT validation failed: %s", error.what());
+            LOG_ERROR("Nvfp4A16BlackwellGemmPlugin: GEMV JIT validation failed: %s", error.what());
             return -1;
         }
     }
@@ -754,7 +759,7 @@ int32_t Nvfp4A16GemmPluginV2::onShapeChange(
             toTcgenType(in[kInActivation].type), m, mGemmN, mGemmK, nullptr);
         if (error != cudaSuccess)
         {
-            LOG_ERROR("Nvfp4A16GemmPluginV2: selected TCGen05 module initialization failed for M=%d: %s", m,
+            LOG_ERROR("Nvfp4A16BlackwellGemmPlugin: selected TCGen05 module initialization failed for M=%d: %s", m,
                 cudaGetErrorString(error));
             return -1;
         }
@@ -762,18 +767,18 @@ int32_t Nvfp4A16GemmPluginV2::onShapeChange(
     return 0;
 }
 
-IPluginV3* Nvfp4A16GemmPluginV2::attachToContext(IPluginResourceContext* context) noexcept
+IPluginV3* Nvfp4A16BlackwellGemmPlugin::attachToContext(IPluginResourceContext* context) noexcept
 {
     (void) context;
     return clone();
 }
 
-PluginFieldCollection const* Nvfp4A16GemmPluginV2::getFieldsToSerialize() noexcept
+PluginFieldCollection const* Nvfp4A16BlackwellGemmPlugin::getFieldsToSerialize() noexcept
 {
     if ((mConfiguredNeedsGemv && mGemvJitBundle.empty())
         || mGemvJitBundle.size() > static_cast<size_t>(std::numeric_limits<int32_t>::max()))
     {
-        LOG_ERROR("Nvfp4A16GemmPluginV2: required GEMV JIT bundle is missing or oversized");
+        LOG_ERROR("Nvfp4A16BlackwellGemmPlugin: required GEMV JIT bundle is missing or oversized");
         return nullptr;
     }
     mDataToSerialize.clear();
@@ -792,7 +797,7 @@ PluginFieldCollection const* Nvfp4A16GemmPluginV2::getFieldsToSerialize() noexce
     return &mFCToSerialize;
 }
 
-Nvfp4A16GemmPluginV2Creator::Nvfp4A16GemmPluginV2Creator()
+Nvfp4A16BlackwellGemmPluginCreator::Nvfp4A16BlackwellGemmPluginCreator()
 {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
@@ -807,42 +812,43 @@ Nvfp4A16GemmPluginV2Creator::Nvfp4A16GemmPluginV2Creator()
     mFieldCollection.fields = mPluginAttributes.data();
 }
 
-char const* Nvfp4A16GemmPluginV2Creator::getPluginName() const noexcept
+char const* Nvfp4A16BlackwellGemmPluginCreator::getPluginName() const noexcept
 {
     return kPluginName;
 }
 
-char const* Nvfp4A16GemmPluginV2Creator::getPluginVersion() const noexcept
+char const* Nvfp4A16BlackwellGemmPluginCreator::getPluginVersion() const noexcept
 {
     return kPluginVersion;
 }
 
-PluginFieldCollection const* Nvfp4A16GemmPluginV2Creator::getFieldNames() noexcept
+PluginFieldCollection const* Nvfp4A16BlackwellGemmPluginCreator::getFieldNames() noexcept
 {
     return &mFieldCollection;
 }
 
-char const* Nvfp4A16GemmPluginV2Creator::getPluginNamespace() const noexcept
+char const* Nvfp4A16BlackwellGemmPluginCreator::getPluginNamespace() const noexcept
 {
     return mNamespace.c_str();
 }
 
-void Nvfp4A16GemmPluginV2Creator::setPluginNamespace(char const* pluginNamespace) noexcept
+void Nvfp4A16BlackwellGemmPluginCreator::setPluginNamespace(char const* pluginNamespace) noexcept
 {
     mNamespace = pluginNamespace == nullptr ? "" : pluginNamespace;
 }
 
-IPluginV3* Nvfp4A16GemmPluginV2Creator::createPlugin(
+IPluginV3* Nvfp4A16BlackwellGemmPluginCreator::createPlugin(
     char const* name, PluginFieldCollection const* fc, TensorRTPhase phase) noexcept
 {
     try
     {
-        auto plugin = std::make_unique<Nvfp4A16GemmPluginV2>(name == nullptr ? kPluginName : name, fc);
+        auto plugin = std::make_unique<Nvfp4A16BlackwellGemmPlugin>(name == nullptr ? kPluginName : name, fc);
         if (phase == TensorRTPhase::kBUILD)
         {
             if (plugin->hasSerializedGemvJitBundle())
             {
-                throw std::invalid_argument("Nvfp4A16GemmPluginV2: BUILD phase must not receive gemv_jit_bundle");
+                throw std::invalid_argument(
+                    "Nvfp4A16BlackwellGemmPlugin: BUILD phase must not receive gemv_jit_bundle");
             }
         }
         else if (plugin->hasSerializedGemvJitBundle())
@@ -854,7 +860,7 @@ IPluginV3* Nvfp4A16GemmPluginV2Creator::createPlugin(
     }
     catch (std::exception const& error)
     {
-        LOG_ERROR("Failed to create Nvfp4A16GemmPluginV2: %s", error.what());
+        LOG_ERROR("Failed to create Nvfp4A16BlackwellGemmPlugin: %s", error.what());
         return nullptr;
     }
 }

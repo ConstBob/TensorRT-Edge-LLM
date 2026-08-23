@@ -32,20 +32,20 @@ namespace plugins
 {
 
 //! SM110-only dense NVFP4-A16 plugin using one common tiled weight layout for decode and prefill.
-class Nvfp4A16GemmPluginV2 : public nvinfer1::IPluginV3,
-                             public nvinfer1::IPluginV3OneCore,
-                             public nvinfer1::IPluginV3OneBuild,
-                             public nvinfer1::IPluginV3OneRuntime
+class Nvfp4A16BlackwellGemmPlugin : public nvinfer1::IPluginV3,
+                                    public nvinfer1::IPluginV3OneCore,
+                                    public nvinfer1::IPluginV3OneBuild,
+                                    public nvinfer1::IPluginV3OneRuntime
 {
 public:
-    Nvfp4A16GemmPluginV2(
+    Nvfp4A16BlackwellGemmPlugin(
         std::string const& name, int32_t gemmN, int32_t gemmK, int32_t maxM, int32_t layout, int32_t backend);
-    Nvfp4A16GemmPluginV2(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
+    Nvfp4A16BlackwellGemmPlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
 
-    Nvfp4A16GemmPluginV2() = delete;
-    Nvfp4A16GemmPluginV2(Nvfp4A16GemmPluginV2 const&) = delete;
-    Nvfp4A16GemmPluginV2& operator=(Nvfp4A16GemmPluginV2 const&) = delete;
-    ~Nvfp4A16GemmPluginV2() noexcept override = default;
+    Nvfp4A16BlackwellGemmPlugin() = delete;
+    Nvfp4A16BlackwellGemmPlugin(Nvfp4A16BlackwellGemmPlugin const&) = delete;
+    Nvfp4A16BlackwellGemmPlugin& operator=(Nvfp4A16BlackwellGemmPlugin const&) = delete;
+    ~Nvfp4A16BlackwellGemmPlugin() noexcept override = default;
 
     nvinfer1::IPluginCapability* getCapabilityInterface(nvinfer1::PluginCapabilityType type) noexcept override;
     nvinfer1::IPluginV3* clone() noexcept override;
@@ -100,12 +100,12 @@ private:
     nvinfer1::PluginFieldCollection mFCToSerialize{};
 };
 
-//! Creator registered as Nvfp4A16GemmPlugin version 2; version 1 remains the Marlin implementation.
-class Nvfp4A16GemmPluginV2Creator : public nvinfer1::IPluginCreatorV3One
+//! Creator registered under the dedicated ``Nvfp4A16BlackwellGemmPlugin`` identity.
+class Nvfp4A16BlackwellGemmPluginCreator : public nvinfer1::IPluginCreatorV3One
 {
 public:
-    Nvfp4A16GemmPluginV2Creator();
-    ~Nvfp4A16GemmPluginV2Creator() override = default;
+    Nvfp4A16BlackwellGemmPluginCreator();
+    ~Nvfp4A16BlackwellGemmPluginCreator() override = default;
 
     char const* getPluginName() const noexcept override;
     char const* getPluginVersion() const noexcept override;

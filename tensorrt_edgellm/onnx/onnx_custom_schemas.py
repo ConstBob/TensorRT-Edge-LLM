@@ -811,6 +811,86 @@ _nvfp4_a16_gemm_schema = OpSchema(
 )
 
 # ---------------------------------------------------------------------------
+# trt_edgellm::Nvfp4A16BlackwellGemmPlugin (SM110 dense NVFP4-A16 GEMM)
+# ---------------------------------------------------------------------------
+
+_nvfp4_a16_blackwell_gemm_schema = OpSchema(
+    name="Nvfp4A16BlackwellGemmPlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc=("TensorRT SM110 dense NVFP4 (W4A16) GEMM plugin using the "
+         "BLACKWELL_N128_K64_V1 weight layout."),
+    inputs=[
+        OpSchema.FormalParameter(
+            name="activation",
+            description="FP16/BF16 activation [B, S, gemm_k]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="qweights",
+            description=("Packed E2M1 codes [gemm_n/128, gemm_k/64, "
+                         "128, 32]"),
+            type_str="tensor(int8)",
+        ),
+        OpSchema.FormalParameter(
+            name="block_scales",
+            description=("Raw E4M3 K16 scale bytes [gemm_n/128, gemm_k/64, "
+                         "128, 4]"),
+            type_str="tensor(int8)",
+        ),
+        OpSchema.FormalParameter(
+            name="global_scale",
+            description="Checkpoint FP32 per-tensor multiplier [1]",
+            type_str="tensor(float)",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="output",
+            description="FP16/BF16 output [B, S, gemm_n]",
+            type_str="T",
+        ),
+    ],
+    type_constraints=[
+        ("T", ["tensor(float16)",
+               "tensor(bfloat16)"], "Activation and output dtype."),
+    ],
+    attributes=[
+        OpSchema.Attribute(
+            name="gemm_n",
+            type=OpSchema.AttrType.INT,
+            description="Padded output feature dimension",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="gemm_k",
+            type=OpSchema.AttrType.INT,
+            description="Input feature dimension",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="max_m",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Profile token capacity for workspace sizing (0 == auto)",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="layout",
+            type=OpSchema.AttrType.INT,
+            description="Weight ABI; 1 means BLACKWELL_N128_K64_V1.",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="backend",
+            type=OpSchema.AttrType.INT,
+            description="Dispatch backend; 0 means production auto.",
+            required=True,
+        ),
+    ],
+)
+
+# ---------------------------------------------------------------------------
 # trt_edgellm::causal_conv1d, update_ssm_state
 # ---------------------------------------------------------------------------
 
@@ -1882,6 +1962,7 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _qkv_concat_schema,
     _int4_groupwise_gemm_v2_schema,
     _nvfp4_a16_gemm_schema,
+    _nvfp4_a16_blackwell_gemm_schema,
     _causal_conv1d_schema,
     _update_ssm_state_schema,
     _rotary_embedding_schema,
