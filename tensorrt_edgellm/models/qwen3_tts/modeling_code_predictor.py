@@ -45,7 +45,7 @@ import torch.nn.functional as F
 
 from ..default.modeling_default import (_BATCH_SIZE, _MAX_POS, _PAST_LEN,
                                         _SEQ_LEN, CausalLM, OnnxSpec)
-from ..linear import TPMode, make_linear
+from ..linear import FP16Linear, TPMode, make_linear
 from ..ops import KV_PAGE_SIZE
 
 logger = logging.getLogger(__name__)
@@ -64,9 +64,9 @@ class CodePredictorMLP(nn.Module):
     (via a Cast on the weight, constant-folded by TRT) preserves
     precision end-to-end.
 
-    The FP8_CP recipe excludes ``down_proj`` from FP8 quantization so
-    the down_proj Linear is always FP16Linear whether or not the rest of
-    the CP is quantized — this same forward path is safe in both modes.
+    Every CP recipe excludes ``down_proj`` (see ``_CP_LINEAR_EXCLUDES``) so
+    the down_proj Linear is always FP16Linear whatever the rest of the CP
+    runs at — this same forward path is then safe in fp16, fp8 and nvfp4.
     """
 
     def __init__(self, config, layer_idx: int) -> None:
@@ -87,6 +87,13 @@ class CodePredictorMLP(nn.Module):
                                      config.hidden_size,
                                      module_name=f"{prefix}.down_proj",
                                      tp_mode=TPMode.ROW)
+        # forward() reads down_proj.weight as a plain float tensor; a quantized
+        # class keeps a packed buffer there and would cast to garbage silently.
+        if not isinstance(self.down_proj, FP16Linear):
+            raise ValueError(
+                f"CodePredictor {prefix}.down_proj resolved to "
+                f"{type(self.down_proj).__name__}; the FP32 matmul needs an "
+                "unquantized weight. Keep down_proj excluded from CP quant.")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         out_dtype = hidden_states.dtype

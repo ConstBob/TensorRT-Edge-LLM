@@ -2686,12 +2686,13 @@ def _sub_llm_has_quantized_weights(model_dir: str, key_prefix: str) -> bool:
 
 def _maybe_stage_hf_quant_config(model_dir: str, tmp_dir: str, key_prefix: str,
                                  key_remap) -> bool:
-    """Rewrite ``hf_quant_config.json``'s ``exclude_modules`` for a sub-LLM.
+    """Rewrite ``hf_quant_config.json`` for a sub-LLM.
 
-    Drops patterns that belong to other sub-LLMs (don't start with
-    *key_prefix*), strips the prefix from surviving patterns, applies
-    *key_remap*, and skips the file entirely when the whole sub-LLM is
-    excluded (glob becomes ``*``).
+    Drops ``exclude_modules`` patterns that belong to other sub-LLMs (don't
+    start with *key_prefix*), strips the prefix from surviving patterns,
+    applies *key_remap*, and skips the file entirely when the whole sub-LLM is
+    excluded (glob becomes ``*``). ``quantized_layers`` (MIXED_PRECISION
+    checkpoints) gets the same treatment.
     """
     hf_qc_src = os.path.join(model_dir, "hf_quant_config.json")
     if not os.path.isfile(hf_qc_src):
@@ -2737,6 +2738,35 @@ def _maybe_stage_hf_quant_config(model_dir: str, tmp_dir: str, key_prefix: str,
     if "*" in new_excl:
         return True  # entire sub-LLM unquantized → skip sidecar entirely
     hf_qc.setdefault("quantization", {})["exclude_modules"] = new_excl
+
+    # MIXED_PRECISION checkpoints (``--cp_quantization nvfp4`` produces one)
+    # carry per-layer entries instead of a global algo, and need the same
+    # prefix strip: an unstripped key misses in ``layer_overrides``, so the
+    # Linear falls back to FP16 and is then handed a packed FP4 weight.
+    layers = hf_qc["quantization"].get("quantized_layers")
+    if layers is not None:
+        new_layers = {}
+        for name, entry in layers.items():
+            if name.startswith(key_prefix):
+                short = name[len(key_prefix):]
+            elif name.startswith(stripped_prefix):
+                short = name[len(stripped_prefix):].lstrip(".")
+            else:
+                continue  # belongs to a different sub-LLM
+            # ModelOpt labels a *disabled* quantizer by its configured
+            # num_bits, so excluded submodules still appear here (the CP's 15
+            # lm_heads come out W4A16_NVFP4 with plain FP16 weights).
+            if not _sub_llm_has_quantized_weights(model_dir, f"{name}."):
+                continue
+            if key_remap is not None and short:
+                short = key_remap(short)
+                if short is None:
+                    continue
+            new_layers[short] = entry
+        if not new_layers:
+            return True  # nothing in this sub-LLM is actually quantized
+        hf_qc["quantization"]["quantized_layers"] = new_layers
+
     with open(os.path.join(tmp_dir, "hf_quant_config.json"), "w") as f:
         json.dump(hf_qc, f)
     return False
