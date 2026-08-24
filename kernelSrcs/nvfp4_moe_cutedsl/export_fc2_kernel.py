@@ -116,6 +116,7 @@ def export_fc2(args: argparse.Namespace) -> tuple[str, str]:
         tile_size: cutlass.Constexpr,
         scaling_vector_size: cutlass.Constexpr,
         max_active_clusters: cutlass.Int32,
+        enable_pdl: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         return kernel.wrapper(
@@ -140,6 +141,7 @@ def export_fc2(args: argparse.Namespace) -> tuple[str, str]:
             tile_size,
             scaling_vector_size,
             max_active_clusters,
+            enable_pdl,
             stream,
         )
 
@@ -156,6 +158,7 @@ def export_fc2(args: argparse.Namespace) -> tuple[str, str]:
         tile_size=M_TILE_SIZE,
         scaling_vector_size=SF_VEC_SIZE,
         max_active_clusters=get_max_active_clusters(cluster_shape_mn),
+        enable_pdl=cutlass.Int32(1),
         stream=stream,
     )
 

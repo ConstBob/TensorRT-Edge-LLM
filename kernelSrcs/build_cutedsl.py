@@ -2469,7 +2469,6 @@ _METADATA_COMPAT_KEYS = (
     "cutlass_dsl_version",
 )
 
-
 def _load_existing_metadata(metadata_path: Path):
     """Return the parsed existing metadata.json, or None if absent/unreadable."""
     try:

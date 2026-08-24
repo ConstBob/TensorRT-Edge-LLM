@@ -48,12 +48,12 @@ def export_fc1(args: argparse.Namespace) -> tuple[str, str]:
     cp.cuda.Device(0).use()
 
     activation_type = resolve_activation_type(args.activation)
-    is_swiglu = args.activation == "swiglu"
+    is_gated = args.activation in ("swiglu", "geglu")
     dummy_orig_m = args.dummy_tokens
     dummy_m = M_TILE_SIZE * args.dummy_experts
     dummy_k = args.dummy_hidden_size
-    dummy_n = args.dummy_intermediate_size * 2 if is_swiglu else args.dummy_intermediate_size
-    dummy_intermediate = dummy_n // 2 if is_swiglu else dummy_n
+    dummy_n = args.dummy_intermediate_size * 2 if is_gated else args.dummy_intermediate_size
+    dummy_intermediate = dummy_n // 2 if is_gated else dummy_n
     cluster_shape_mn = (1, 1)
     mma_tiler_mn = (M_TILE_SIZE, args.mma_tiler_n)
 
@@ -64,6 +64,7 @@ def export_fc1(args: argparse.Namespace) -> tuple[str, str]:
     b_sf = allocate(atom_scale_bytes(dummy_n, dummy_k, args.dummy_experts), cp.uint8, buffers)
     c = allocate((dummy_m, dummy_intermediate // 2), cp.uint8, buffers)
     c_sf = allocate(atom_scale_bytes(dummy_m, dummy_intermediate), cp.uint8, buffers)
+    output = allocate((dummy_orig_m, dummy_k), cp.float16, buffers)
     alpha = allocate((args.dummy_experts,), cp.float32, buffers)
     tile_group = allocate((dummy_m // M_TILE_SIZE,), cp.int32, buffers)
     tile_limit = allocate((dummy_m // M_TILE_SIZE,), cp.int32, buffers)
@@ -72,13 +73,16 @@ def export_fc1(args: argparse.Namespace) -> tuple[str, str]:
     input_global_scale = allocate((args.dummy_experts,), cp.float32, buffers)
     down_input_scale = allocate((args.dummy_experts,), cp.float32, buffers)
 
-    ptrs = (
+    input_ptrs = (
         make_ptr(cutlass.Float4E2M1FN, a.data.ptr, assumed_align=32),
         make_ptr(cutlass.Float4E2M1FN, b.data.ptr, assumed_align=32),
         make_ptr(cutlass.Float8E4M3FN, a_sf.data.ptr, assumed_align=16),
         make_ptr(cutlass.Float8E4M3FN, b_sf.data.ptr, assumed_align=16),
         make_ptr(cutlass.Float4E2M1FN, c.data.ptr, assumed_align=32),
         make_ptr(cutlass.Float8E4M3FN, c_sf.data.ptr, assumed_align=16),
+    )
+    output_ptr = make_ptr(cutlass.Float16, output.data.ptr, assumed_align=16)
+    trailing_ptrs = (
         make_ptr(cutlass.Float32, alpha.data.ptr, assumed_align=16),
         make_ptr(cutlass.Float32, input_global_scale.data.ptr, assumed_align=16),
         make_ptr(cutlass.Float32, down_input_scale.data.ptr, assumed_align=16),
@@ -108,6 +112,9 @@ def export_fc1(args: argparse.Namespace) -> tuple[str, str]:
         b_sf_ptr: cute.Pointer,
         c_ptr: cute.Pointer,
         c_sf_ptr: cute.Pointer,
+        output_ptr: cute.Pointer,
+        output_elements: cutlass.Int64,
+        fuse_output_zero: cutlass.Int32,
         alpha_ptr: cute.Pointer,
         input_global_scale_ptr: cute.Pointer,
         down_input_scale_ptr: cute.Pointer,
@@ -123,6 +130,7 @@ def export_fc1(args: argparse.Namespace) -> tuple[str, str]:
         tile_size: cutlass.Constexpr,
         scaling_vector_size: cutlass.Constexpr,
         max_active_clusters: cutlass.Int32,
+        enable_pdl: cutlass.Int32,
         stream: cuda.CUstream,
         activation_type: cutlass.Constexpr,
     ):
@@ -133,6 +141,9 @@ def export_fc1(args: argparse.Namespace) -> tuple[str, str]:
             (b_sf_ptr,),
             c_ptr,
             c_sf_ptr,
+            output_ptr,
+            output_elements,
+            fuse_output_zero,
             (alpha_ptr,),
             input_global_scale_ptr,
             down_input_scale_ptr,
@@ -148,13 +159,18 @@ def export_fc1(args: argparse.Namespace) -> tuple[str, str]:
             tile_size,
             scaling_vector_size,
             max_active_clusters,
+            enable_pdl,
             stream,
             activation_type=activation_type,
         )
 
     compiled = cute.compile(
         single_b_wrapper,
-        *ptrs,
+        *input_ptrs,
+        output_ptr,
+        dummy_orig_m * dummy_k,
+        cutlass.Int32(1),
+        *trailing_ptrs,
         dummy_orig_m,
         dummy_m,
         dummy_n,
@@ -164,6 +180,7 @@ def export_fc1(args: argparse.Namespace) -> tuple[str, str]:
         tile_size=M_TILE_SIZE,
         scaling_vector_size=SF_VEC_SIZE,
         max_active_clusters=get_max_active_clusters(cluster_shape_mn),
+        enable_pdl=cutlass.Int32(1),
         stream=stream,
         activation_type=activation_type,
     )

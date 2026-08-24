@@ -39,6 +39,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <limits>
@@ -132,6 +134,19 @@ int32_t computeProfileMaxRoutedRows(int64_t maxNumTokens, int32_t topK)
     int64_t const routed = maxNumTokens * static_cast<int64_t>(topK);
     int64_t const capped = std::min(routed, static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
     return static_cast<int32_t>(std::max<int64_t>(1, capped));
+}
+
+//! PDL is enabled by default for the NVFP4 MoE CuTe DSL path. Set
+//! EDGELLM_ENABLE_PDL=0 before the first enqueue to retain an explicit
+//! production A/B and recovery switch. The generated AOT wrapper receives the
+//! resolved value per launch; the runner applies its own toolchain/SM gate.
+bool requestNvfp4MoePdl()
+{
+    static bool const enabled = []() {
+        char const* const value = std::getenv("EDGELLM_ENABLE_PDL");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
 }
 #endif // CUTE_DSL_NVFP4_MOE_ENABLED
 } // namespace
@@ -877,6 +892,7 @@ int32_t Nvfp4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorD
         p.downInputScale = static_cast<float const*>(inputs[kIN_DOWN_INPUT_SCALE]);
         p.output = outputs[0];
         p.activationType = mActivationType;
+        p.enablePdl = requestNvfp4MoePdl();
 
         CuteDslNvfp4MoeSm110Runner runner;
         int32_t const rc = runner.run(p, runnerScratch, stream);
