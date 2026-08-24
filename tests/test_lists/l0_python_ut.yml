@@ -128,6 +128,13 @@ tests:
   # FP16 MoE plugin tests (softmax + sigmoid-group-topk routing)
   - tests/python-unittests/test_fp16_moe_plugin.py::test_fp16_moe_decode_and_prefill_dynamic_engine
 
+  # LayerNorm plugin tests
+  - tests/python-unittests/test_layernorm_plugin.py
+  - tests/python-unittests/test_layernorm_kernel_config.py
+
+  # CuTe DSL build-registry helpers (CPU only)
+  - tests/python-unittests/test_build_cutedsl_helpers.py
+
   # ViT attention plugin tests
   - tests/python-unittests/test_vit_attention_plugin.py::test_ragged_prefill_batch_sizes
   - tests/python-unittests/test_vit_attention_plugin.py::test_window_partition

@@ -32,6 +32,7 @@
 #              Blackwell overlay when the artifact has it (default)
 #   gdn      — enable only the GDN group
 #   f16_moe  — enable the target-specific homogeneous-FP16 MoE group
+#   layernorm — enable the homogeneous FP16/BF16 LayerNorm group
 #   fmha;gdn — semicolon-separated list of groups (CMake list syntax)
 #
 # Usage:
@@ -48,6 +49,7 @@
 #   CUTE_DSL_GDN_ENABLED   — set when the gdn group is active
 #   CUTE_DSL_F16_MOE_ENABLED — set when the f16_moe group is active
 #   CUTE_DSL_SSD_ENABLED   — set when the ssd group is active
+#   CUTE_DSL_LAYERNORM_ENABLED — set when the layernorm group is active
 #   CUTE_DSL_RMSNORM_ENABLED — set when the rmsnorm group is active
 #   CUTE_DSL_NVFP4_A16_BLACKWELL_GEMM_ENABLED — set when the SM110 dense W4A16
 #                                                GEMM group is active
@@ -59,7 +61,7 @@ set(ENABLE_CUTE_DSL
     "fmha"
     CACHE
       STRING
-      "CuTe DSL kernels: OFF, ALL, or semicolon-separated group list (fmha;gdn;rmsnorm)"
+      "CuTe DSL kernels: OFF, ALL, or semicolon-separated group list (fmha;gdn;layernorm;rmsnorm)"
 )
 
 set(CUTE_DSL_ARTIFACT_TAG
@@ -442,9 +444,11 @@ function(cute_dsl_setup)
     endforeach()
   endif()
 
-  # The FP16 MoE and RMSNorm runners link one exact-SM artifact. Parse the
-  # artifact SM for their compile-time guards.
-  if("f16_moe" IN_LIST _active_groups OR "rmsnorm" IN_LIST _active_groups)
+  # The FP16 MoE, LayerNorm, and RMSNorm runners link one exact-SM artifact.
+  # Parse the artifact SM for their compile-time guards.
+  if("f16_moe" IN_LIST _active_groups
+     OR "layernorm" IN_LIST _active_groups
+     OR "rmsnorm" IN_LIST _active_groups)
     if(NOT _meta_gpu_arch_err AND _meta_gpu_arch MATCHES "^sm_([0-9]+)$")
       set(_meta_sm "${CMAKE_MATCH_1}")
     else()
@@ -471,7 +475,9 @@ function(cute_dsl_setup)
 
   # The optimized Blackwell FMHA kernels are generated for SM100, SM101 and
   # SM110 only.
-  if(NOT _meta_gpu_arch_err AND _meta_gpu_arch MATCHES "^sm_(100|101|110)$")
+  if(NOT _meta_gpu_arch_err
+     AND _meta_gpu_arch MATCHES "^sm_(100|101|110)$"
+     AND "fmha" IN_LIST _active_groups)
     foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
       target_compile_definitions(${_tgt}
                                  PRIVATE "CUTE_DSL_FMHA_BLACKWELL_ENABLED")
@@ -547,6 +553,12 @@ function(cute_dsl_setup)
     foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
       target_compile_definitions(
         ${_tgt} PRIVATE "CUTE_DSL_RMSNORM_ARTIFACT_SM=${_meta_sm}")
+    endforeach()
+  endif()
+  if("layernorm" IN_LIST _active_groups)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_LAYERNORM_ARTIFACT_SM=${_meta_sm}")
     endforeach()
   endif()
 
