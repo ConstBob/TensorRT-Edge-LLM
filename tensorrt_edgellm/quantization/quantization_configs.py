@@ -42,7 +42,7 @@ _BACKBONE_CFG_MAP = {
 _LM_HEAD_METHODS = ("fp8", "int4_awq", "nvfp4", "mxfp8")
 _VISUAL_METHODS = ("fp8", )
 _AUDIO_METHODS = ("fp8", )
-_CP_METHODS = ("fp8", )
+_CP_METHODS = ("fp8", "nvfp4")
 
 # Visual submodule prefixes across HuggingFace VLM families (Qwen-VL ``visual``,
 # InternVL ``vision_tower`` / ``multi_modal_projector`` / ``vision_model`` /
@@ -76,7 +76,14 @@ _CP_PATTERNS = tuple(f"*{p}.*" for p in _CP_PREFIXES)
 # (each codebook sees 1/15 of calib signal, amax undertrained).
 # talker_projection runs as an fp16 sidecar GEMM in the C++ runtime, so
 # quantizing it only adds error without any kernel to use the FP8 weights.
+# All three stay excluded under nvfp4 too — down_proj additionally because
+# ``CodePredictorMLP`` reads its weight directly for the FP32 matmul.
 _CP_LINEAR_EXCLUDES = ("lm_head", "down_proj", "talker_projection")
+
+# Per-codebook embedding tables: the runtime gathers rows, there is no GEMM to
+# use quantized weights, and the sidecar extractor would write the packed
+# [vocab, hidden/2] buffer straight out for the gather to misread.
+_CP_EMBEDDING_EXCLUDES = ("codec_embedding", )
 
 # CP attention BMM quantizers (mixed-precision KV rejected by ONNX export).
 _CP_BMM_EXCLUDES = ("q_bmm", "k_bmm", "v_bmm")
@@ -129,15 +136,29 @@ def _disable_entries(patterns) -> List[QuantCfgEntry]:
 
 
 def _cp_entries(method: str) -> List[QuantCfgEntry]:
-    """CodePredictor override: per-channel FP8 weight (axis=0) + per-tensor
-    static input, minus the down_proj / lm_head / q,k,v-bmm submodules. Explicit
-    (not derived) because the per-channel weight axis differs from the backbone.
-    Disables come after the enables so the excludes win."""
+    """CodePredictor override, minus the down_proj / lm_head /
+    talker_projection / q,k,v-bmm submodules. Explicit (not derived) because
+    the FP8 weight axis differs from the backbone's. Disables come after the
+    enables so the excludes win.
+
+    ``fp8`` is per-channel weight (axis=0) + per-tensor static input.
+    ``nvfp4`` is per-16-element block weight and input with FP8 E4M3 block
+    scales, matching ``NVFP4LinearMethod`` in models/linear.py."""
     if method not in _CP_METHODS:
         raise ValueError(f"Unsupported cp_quantization: {method}. "
                          f"Choose from: {list(_CP_METHODS)}")
-    weight_cfg = {"num_bits": (4, 3), "axis": 0}
-    input_cfg = {"num_bits": (4, 3), "axis": None}
+    if method == "nvfp4":
+        weight_cfg = input_cfg = {
+            "num_bits": (2, 1),
+            "block_sizes": {
+                -1: 16,
+                "type": "dynamic",
+                "scale_bits": (4, 3)
+            },
+        }
+    else:
+        weight_cfg = {"num_bits": (4, 3), "axis": 0}
+        input_cfg = {"num_bits": (4, 3), "axis": None}
     out: List[QuantCfgEntry] = []
     for prefix in _CP_PREFIXES:
         out.append({
@@ -151,7 +172,7 @@ def _cp_entries(method: str) -> List[QuantCfgEntry]:
             "enable": True,
         })
     for prefix in _CP_PREFIXES:
-        for sub in _CP_LINEAR_EXCLUDES:
+        for sub in _CP_LINEAR_EXCLUDES + _CP_EMBEDDING_EXCLUDES:
             out.append({
                 "quantizer_name": f"*{prefix}*{sub}*weight_quantizer",
                 "enable": False,

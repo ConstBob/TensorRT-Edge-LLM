@@ -12,7 +12,7 @@ prompt contract from `tts_model_type` in the engine configuration.
 | Component | Precision | Notes |
 |---|---|---|
 | Talker | FP16 | Quantized Talker checkpoints are not supported for Qwen3-TTS yet |
-| CodePredictor | FP16, **FP8** | Quantize with `tensorrt-edgellm-quantize ... --cp_quantization fp8`; `down_proj`, LM heads, and KV-cache BMM remain FP16 |
+| CodePredictor | FP16, **FP8**, **NVFP4** | Quantize with `tensorrt-edgellm-quantize ... --cp_quantization {fp8,nvfp4}`; `down_proj`, LM heads, codec embeddings, and KV-cache BMM remain FP16. NVFP4 only pays off on bandwidth-limited parts |
 | Code2Wav | FP16 | |
 | Clone encoders (Base) | FP16 build from FP32 ONNX | x-vector cosine 1.0 / codes 100% vs reference at FP16 |
 

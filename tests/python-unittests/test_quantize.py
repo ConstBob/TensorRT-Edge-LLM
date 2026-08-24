@@ -402,6 +402,21 @@ def test_omni_mixed_all_modalities():
     assert not _wq(model.talker.code2wav.fc1)[0], "Code2Wav always off"
 
 
+def test_code_predictor_nvfp4():
+    """``cp_quantization=nvfp4``: block-quantized CP body, with down_proj and
+    the codec embedding tables left alone."""
+    model = _MultiModalModel(with_talker=True)
+    mtq.quantize(model,
+                 build_quant_config("fp8", cp_quantization="nvfp4"),
+                 forward_loop=_calib_hidden)
+    cp = model.talker.code_predictor
+    assert _wq(cp.q_proj)[0], "CodePredictor body quantized"
+    assert cp.q_proj.weight_quantizer.block_sizes[-1] == 16, \
+        "CodePredictor weight is block-quantized (block size 16)"
+    assert not _wq(cp.down_proj)[0], "CodePredictor down_proj excluded"
+    assert not _wq(model.talker.code2wav.fc1)[0], "Code2Wav always off"
+
+
 def test_code_predictor_quantization():
     """cp_quantization on its own: the CodePredictor is quantized per-channel
     (down_proj excluded, Code2Wav off), and stays untouched when not requested."""
@@ -643,7 +658,7 @@ def test_quantize_and_export_hf_checkpoint():
     },
     {
         "quantization": "fp8",
-        "cp_quantization": "nvfp4"
+        "cp_quantization": "bogus"
     },
 ])
 def test_unsupported_methods_raise(kwargs):

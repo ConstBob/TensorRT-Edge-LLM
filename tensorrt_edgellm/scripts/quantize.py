@@ -87,13 +87,13 @@ def _add_common_args(parser):
     parser.add_argument(
         "--cp_quantization",
         default=None,
-        choices=["fp8"],
+        choices=["fp8", "nvfp4"],
         help=("Quantize the Talker CodePredictor "
-              "(talker.code_predictor.*) of Qwen3-Omni, Qwen3-TTS, or "
-              "Qwen3-Omni Next (qwen3_omni_next, dense and MoE).  Only fp8 "
-              "is exposed today; down_proj and the per-codebook lm_heads "
-              "are kept unquantized (see FP8_CP in "
-              "quantization_configs.py).  When unset CP stays at fp16."),
+              "(talker.code_predictor.*) of Qwen3-Omni or Qwen3-TTS, dense "
+              "and MoE.  down_proj, the per-codebook lm_heads and "
+              "talker_projection are kept unquantized in both modes (see "
+              "_cp_entries in quantization_configs.py).  When unset CP stays "
+              "at fp16."),
     )
     parser.add_argument("--kv_cache_quantization",
                         default=None,

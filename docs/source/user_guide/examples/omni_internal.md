@@ -64,7 +64,7 @@ experts from the quant config.
 | `--quantization int4_awq` | ✅ validated (AWQ→Marlin MoE repack) | ❌ (use external GPTQ) | ✅ validated |
 | INT4 GPTQ (external gptqmodel) | — | ✅ validated | — |
 | `--visual_quantization fp8` / `--audio_quantization fp8` | ✅ | ✅ | ✅ validated (rides the joint calib pass; see FP8 encoder note below) |
-| `--cp_quantization fp8` | ✅ | ✅ | ✅ CP-only pass (see Next specifics below) |
+| `--cp_quantization {fp8,nvfp4}` | ✅ CP-only pass | ✅ CP-only pass | ✅ CP-only pass (see Next specifics below) |
 | `--num_samples` / `--text_dataset` | ✅ | ✅ | ✅ |
 | `--lm_head_quantization` / `--kv_cache_quantization` | ✅ | ✅ | ✅ |
 
@@ -139,34 +139,45 @@ expert plugin) and on Next (dense Marlin path from the Qwen3-Omni Next bring-up)
 For the `qwen3_omni` dense variant, INT4 goes through the external GPTQ
 flow below.
 
-### Optional: CodePredictor FP8 (MoE / dense)
+### Optional: CodePredictor FP8 / NVFP4 (MoE / dense)
 
-`--cp_quantization fp8` composes with any backbone choice above (CP is
-the same dense 5-layer decoder in both). It opts the CP body Linears
-(q/k/v/o + gate/up) into FP8; `down_proj`, the 15 lm_heads, and CP
-KV-cache BMMs stay FP16 (see `FP8_CP` in `quantization_configs.py` for
-the sensitivity rationale). The driver appends a dedicated Thinker →
-Talker → `cp.generate` drive (`qwen3_cp_calibration_loop`, 64 text
-samples) to the joint forward loop — the multimodal pass alone never
-reaches CP, so without the drive every CP input_quantizer would keep an
-uninitialised amax.
+`--cp_quantization` opts the CP body Linears (q/k/v/o + gate/up) into
+`fp8` (per-channel weight + per-tensor static input) or `nvfp4`
+(per-16-element block weight and input, FP8 E4M3 block scales). Both keep
+`down_proj`, the 15 lm_heads, `talker_projection`, the codec embedding
+tables, and the CP KV-cache BMMs at FP16 — see `_cp_entries` in
+`quantization_configs.py` for the per-exclusion rationale. The driver
+appends a dedicated Thinker → Talker → `cp.generate` drive
+(`qwen3_cp_calibration_loop`, 64 text samples) to the forward loop — the
+multimodal pass alone never reaches CP, so without the drive every CP
+input_quantizer would keep an uninitialised amax.
+
+The flag is a **CP-only pass**: it runs without `--quantization` (the
+joint combination is rejected on every Qwen3-Omni variant). It skips the expensive multimodal calibration
+and runs just the CP drive; export the `code_predictor` component from
+its output and take every other component from the backbone-quantized
+checkpoint.
 
 ```bash
 tensorrt-edgellm-quantize llm \
-    --model_dir   $HF_ROOT \
-    --output_dir  $QUANT_ROOT \
-    --quantization nvfp4 \
-    --cp_quantization fp8
+    --model_dir  $HF_ROOT \
+    --output_dir $QUANT_ROOT/cp_quant \
+    --cp_quantization nvfp4 \
+    --text_dataset cnn_dailymail
+
+tensorrt-edgellm-export \
+    --components code_predictor \
+    $QUANT_ROOT/cp_quant $ONNX
 ```
 
-A CP-only pass (`--cp_quantization fp8` without `--quantization`) is also
-supported for reusing an existing backbone-quantized checkpoint: it skips
-the expensive multimodal calibration entirely and runs just the CP drive;
-export the `code_predictor` component from its output via
-`tensorrt-edgellm-export --components code_predictor`. Note the CP-only
-route does NOT apply to the external-GPTQ dense checkpoint (already
-quantized ⇒ the ModelOpt pass is skipped); CP FP8 for that flow would
-need the CP-only pass on the original BF16 root.
+`nvfp4` is a bandwidth trade rather than a free win — it pays off on
+bandwidth-limited targets and can cost time elsewhere, with TTS WER
+unchanged either way. Benchmark both against FP16 on the target part.
+
+Note the CP-only route does NOT apply to the external-GPTQ dense
+checkpoint (already quantized ⇒ the ModelOpt pass is skipped); CP
+quantization for that flow needs the CP-only pass on the original BF16
+root.
 
 On `qwen3_omni_next` only the **CP-only pass** is supported
 (`--cp_quantization fp8` without `--quantization`; the joint combination
