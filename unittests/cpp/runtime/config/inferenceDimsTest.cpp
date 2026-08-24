@@ -39,6 +39,7 @@ InferenceDims makeValid()
         /*.startIndexLen=*/2,
         /*.specVerifyPhaseLen=*/0,
         /*.skipSoftmaxScaleLen=*/0,
+        /*.swaKVCacheModeLen=*/0,
     };
 }
 
@@ -56,6 +57,7 @@ std::vector<int64_t InferenceDims::*> allReferenced()
         &InferenceDims::startIndexLen,
         &InferenceDims::specVerifyPhaseLen,
         &InferenceDims::skipSoftmaxScaleLen,
+        &InferenceDims::swaKVCacheModeLen,
     };
 }
 
@@ -78,6 +80,7 @@ TEST(InferenceDimsTest, DimNameKnownMembers)
     EXPECT_EQ(dimName(&InferenceDims::startIndexLen), "start_index_len");
     EXPECT_EQ(dimName(&InferenceDims::specVerifyPhaseLen), "spec_verify_phase_len");
     EXPECT_EQ(dimName(&InferenceDims::skipSoftmaxScaleLen), "skip_softmax_scale_len");
+    EXPECT_EQ(dimName(&InferenceDims::swaKVCacheModeLen), "swa_kv_cache_mode_len");
 }
 
 TEST(InferenceDimsTest, DimNameUnknownReturnsEmpty)
@@ -104,6 +107,7 @@ TEST(InferenceDimsTest, ToStringContainsAllFields)
     EXPECT_NE(s.find("context_mask_selector_len=0"), std::string::npos) << s;
     EXPECT_NE(s.find("start_index_len=2"), std::string::npos) << s;
     EXPECT_NE(s.find("spec_verify_phase_len=0"), std::string::npos) << s;
+    EXPECT_NE(s.find("swa_kv_cache_mode_len=0"), std::string::npos) << s;
 }
 
 // ---------------------------------------------------------------------------
@@ -221,4 +225,20 @@ TEST(InferenceDimsTest, FirstInvalidMemberSpecVerifyPhaseLenNegativeFails)
     d.specVerifyPhaseLen = -1;
     auto const refs = allReferenced();
     EXPECT_EQ(firstInvalidMember(d, refs), &InferenceDims::specVerifyPhaseLen);
+}
+
+TEST(InferenceDimsTest, FirstInvalidMemberSwaKVCacheModeLenZeroIsValid)
+{
+    InferenceDims d = makeValid();
+    d.swaKVCacheModeLen = 0;
+    auto const refs = allReferenced();
+    EXPECT_EQ(firstInvalidMember(d, refs), nullptr);
+}
+
+TEST(InferenceDimsTest, FirstInvalidMemberSwaKVCacheModeLenNegativeFails)
+{
+    InferenceDims d = makeValid();
+    d.swaKVCacheModeLen = -1;
+    auto const refs = allReferenced();
+    EXPECT_EQ(firstInvalidMember(d, refs), &InferenceDims::swaKVCacheModeLen);
 }

@@ -43,8 +43,8 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
     config.contextCacheConfig = contextCacheConfig;
     config.checkpointDir = checkpointDir;
     config.draftCheckpointDir = draftCheckpointDir;
-    auto artifacts = std::make_unique<ModelArtifacts>(
-        ModelArtifacts::loadFromEngineDir(engineDir, draftingConfig, checkpointDir, draftCheckpointDir, stream));
+    auto artifacts = std::make_unique<ModelArtifacts>(ModelArtifacts::loadFromEngineDir(
+        engineDir, draftingConfig, checkpointDir, draftCheckpointDir, contextCacheConfig.enabled, stream));
     initializeCoordinator(engineDir, multimodalEngineDir, loraWeightsMap, std::move(config), std::move(artifacts));
 }
 
@@ -58,8 +58,8 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
     config.ownsLocalStreams = false;
     config.contextCacheConfig = contextCacheConfig;
     config.checkpointDir = checkpointDir;
-    auto artifacts = std::make_unique<ModelArtifacts>(
-        ModelArtifacts::loadFromEngineDir(engineDir, std::nullopt, checkpointDir, "", stream));
+    auto artifacts = std::make_unique<ModelArtifacts>(ModelArtifacts::loadFromEngineDir(
+        engineDir, std::nullopt, checkpointDir, "", contextCacheConfig.enabled, stream));
     initializeCoordinator(engineDir, multimodalEngineDir, loraWeightsMap, std::move(config), std::move(artifacts));
 }
 

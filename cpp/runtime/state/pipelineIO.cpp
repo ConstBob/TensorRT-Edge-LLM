@@ -204,6 +204,18 @@ static void buildTensorMapImpl(TensorMap& map, PipelineIO& io, SharedResources& 
                 = (!cfg.kvSharingDonors.empty() && localAttnIdx < static_cast<int32_t>(cfg.kvSharingDonors.size()))
                 ? cfg.kvSharingDonors[localAttnIdx]
                 : -1;
+            if (donorIdx >= 0)
+            {
+                check::check(donorIdx < kvMgr.numLayers(),
+                    "buildTensorMap: KV sharing donor index is outside the cache manager.");
+                KVLayerConfig const& consumerConfig = kvMgr.getLayerConfig(localAttnIdx);
+                KVLayerConfig const& donorConfig = kvMgr.getLayerConfig(donorIdx);
+                check::check(consumerConfig.numKVHeads == donorConfig.numKVHeads
+                        && consumerConfig.headDim == donorConfig.headDim,
+                    "buildTensorMap: KV sharing consumer and donor pool dimensions must match.");
+                check::check(cfg.getKVPoolPagesForLayer(consumerConfig) == cfg.getKVPoolPagesForLayer(donorConfig),
+                    "buildTensorMap: KV sharing consumer and donor must use the same active cache policy.");
+            }
 
             // Plugin (combined KV): bind to donor's pool if shared, else own pool.
             auto& combinedKV
@@ -265,9 +277,28 @@ static void buildTensorMapImpl(TensorMap& map, PipelineIO& io, SharedResources& 
     // per-step rebind.
     map.set(binding_names::kKVCacheStartIndex, cacheMgr.getKVCacheLengths());
 
-    // kv_page_table: one stable-address table per cache manager. It remains identity-mapped on the legacy path and is
-    // updated in place by the context-cache coordinator.
+    // The full table is always present. Bounded mode uses the independent sparse SWA namespace;
+    // full mode aliases the SWA binding to the ordinary table so context reuse follows the existing
+    // full-cache lifecycle. The shape-only mode input selects the matching plugin path.
     map.set(binding_names::kKVPageTable, res.kvPageTables[kvCacheIndex]->kernelView());
+    if (cfg.supportsBoundedSwaKVCache())
+    {
+        KVPageTable* const swaPageTable = res.getSwaKVPageTable(kvCacheIndex);
+        if (cfg.usesBoundedSwaKVCache())
+        {
+            check::check(
+                swaPageTable != nullptr, "buildTensorMap: bounded SWA mode requires an independent sparse page table.");
+            map.set(binding_names::kSwaKVPageTable, swaPageTable->kernelView());
+        }
+        else
+        {
+            check::check(swaPageTable == nullptr,
+                "buildTensorMap: full SWA mode must not allocate an independent sparse page table.");
+            map.set(binding_names::kSwaKVPageTable, res.kvPageTables[kvCacheIndex]->kernelView());
+        }
+        check::check(!res.swaKVCacheMode.isEmpty(), "buildTensorMap: SWA mode backing storage is missing.");
+        map.set(binding_names::kSwaKVCacheMode, res.swaKVCacheMode);
+    }
 
     // Deepstack: initial bind is the shared zero buffer (sized large enough
     // to cover the worst-case non-prefill shape). DeepstackBinding (owned by

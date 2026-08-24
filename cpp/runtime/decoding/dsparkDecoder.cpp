@@ -566,6 +566,7 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
         /*.startIndexLen=*/activeBatchSize,
         /*.specVerifyPhaseLen=*/0,
         /*.skipSoftmaxScaleLen=*/0,
+        /*.swaKVCacheModeLen=*/0,
     };
 
     cudaGetLastError();
@@ -1108,6 +1109,7 @@ bool DSparkDecoder::captureCudaGraphs(cudaStream_t stream)
                 /*.startIndexLen=*/batchSize,
                 /*.specVerifyPhaseLen=*/0,
                 /*.skipSoftmaxScaleLen=*/0,
+                /*.swaKVCacheModeLen=*/0,
             };
 
             if (mDraftExecutor->prepare(kDecodeProfile, draftDims, mDraftTensorMap, stream))
@@ -1255,7 +1257,7 @@ bool DSparkDecoder::runSystemPromptPrefill(DecodingInferenceContext& context)
     check::check(mDraftHiddenStates.reshape({activeBatchSize, proposalLen, mDraftHiddenSize}), "Tensor reshape failed");
     int32_t const draftKVCapacity = mRuntime.deployment.draft->maxKVCacheCapacity;
     InferenceDims const draftDims{activeBatchSize, proposalLen, draftKVCapacity, prefillLen, proposalLen, 1,
-        static_cast<int64_t>(pmLen), 0, activeBatchSize, 0, 0};
+        static_cast<int64_t>(pmLen), 0, activeBatchSize, 0, 0, 0};
 
     cudaGetLastError();
     bool ok = mDraftExecutor->prepare(kPrefillProfile, draftDims, mDraftTensorMap, context.stream);

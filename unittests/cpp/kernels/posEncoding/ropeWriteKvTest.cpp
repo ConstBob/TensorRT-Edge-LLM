@@ -997,6 +997,111 @@ TEST(RopePackedRaggedPrefill, SkipsPaddingBeforePagedWrite)
     }
 }
 
+TEST(RopePackedSharedKV, ProducesScratchWithoutWritingCache)
+{
+    cudaStream_t stream{nullptr};
+    int32_t constexpr batchSize = 1;
+    int32_t constexpr qSeqLen = 17;
+    int32_t constexpr numQHeads = 4;
+    int32_t constexpr numKVHeads = 2;
+    int32_t constexpr headDim = 64;
+    int32_t constexpr combinedHeads = numQHeads + 2 * numKVHeads;
+    int32_t constexpr maxPagesPerSeq = 1;
+    int32_t constexpr numPages = 1;
+
+    rt::Tensor cosSinCacheTensor(
+        rt::Coords{1, rt::kTOKENS_PER_PAGE, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    initializeNormalRopeCosSin(
+        cosSinCacheTensor.dataPointer<float>(), 10000.0F, 1.0F, 1.0F, headDim, rt::kTOKENS_PER_PAGE, stream);
+
+    std::vector<half> packedInput(static_cast<size_t>(batchSize) * qSeqLen * combinedHeads * headDim);
+    uniformFloatInitialization(packedInput);
+    rt::Tensor packedTensor(
+        rt::Coords{batchSize, qSeqLen, combinedHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    copyHostToDevice(packedTensor, packedInput);
+
+    rt::Tensor qWritingTensor(
+        rt::Coords{batchSize, qSeqLen, numQHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor qReadOnlyTensor(
+        rt::Coords{batchSize, qSeqLen, numQHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor qOnlyTensor(
+        rt::Coords{batchSize, qSeqLen, numQHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor kWritingTensor(
+        rt::Coords{batchSize, qSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor kReadOnlyTensor(
+        rt::Coords{batchSize, qSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor vWritingTensor(
+        rt::Coords{batchSize, qSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor vReadOnlyTensor(
+        rt::Coords{batchSize, qSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    half const sentinel = __float2half(777.0F);
+    std::vector<half> kvCacheInit(
+        static_cast<size_t>(2 * numPages) * rt::kTOKENS_PER_PAGE * numKVHeads * headDim, sentinel);
+    rt::Tensor writingCacheTensor(rt::Coords{2, numPages, rt::kTOKENS_PER_PAGE, numKVHeads, headDim},
+        rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor readOnlyCacheTensor(rt::Coords{2, numPages, rt::kTOKENS_PER_PAGE, numKVHeads, headDim},
+        rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor qOnlyCacheTensor(rt::Coords{2, numPages, rt::kTOKENS_PER_PAGE, numKVHeads, headDim},
+        rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    copyHostToDevice(writingCacheTensor, kvCacheInit);
+    copyHostToDevice(readOnlyCacheTensor, kvCacheInit);
+    copyHostToDevice(qOnlyCacheTensor, kvCacheInit);
+
+    rt::Tensor pageTableTensor(
+        rt::Coords{batchSize, 2, maxPagesPerSeq}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice(pageTableTensor, std::vector<int32_t>{0, 1});
+
+    launchApplyRopeFromPackedToSplit(cosSinCacheTensor, std::nullopt, std::nullopt, packedTensor, qWritingTensor,
+        writingCacheTensor, 1.0F, 1.0F, stream, pageTableTensor.dataPointer<int32_t>(), maxPagesPerSeq,
+        kWritingTensor.rawPointer(), vWritingTensor.rawPointer());
+    launchApplyRopeFromPackedToSplit(cosSinCacheTensor, std::nullopt, std::nullopt, packedTensor, qReadOnlyTensor,
+        readOnlyCacheTensor, 1.0F, 1.0F, stream, pageTableTensor.dataPointer<int32_t>(), maxPagesPerSeq,
+        kReadOnlyTensor.rawPointer(), vReadOnlyTensor.rawPointer(), nullptr, 1.0F, nullptr, nullptr, 1e-6F,
+        std::nullopt, false);
+    launchApplyRopeFromPackedToSplit(cosSinCacheTensor, std::nullopt, std::nullopt, packedTensor, qOnlyTensor,
+        qOnlyCacheTensor, 1.0F, 1.0F, stream, pageTableTensor.dataPointer<int32_t>(), maxPagesPerSeq, nullptr, nullptr,
+        nullptr, 1.0F, nullptr, nullptr, 1e-6F, std::nullopt, false);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+
+    auto const qWriting = copyDeviceToHost<half>(qWritingTensor);
+    auto const qReadOnly = copyDeviceToHost<half>(qReadOnlyTensor);
+    auto const qOnly = copyDeviceToHost<half>(qOnlyTensor);
+    auto const kWriting = copyDeviceToHost<half>(kWritingTensor);
+    auto const kReadOnly = copyDeviceToHost<half>(kReadOnlyTensor);
+    auto const vWriting = copyDeviceToHost<half>(vWritingTensor);
+    auto const vReadOnly = copyDeviceToHost<half>(vReadOnlyTensor);
+    ASSERT_EQ(qReadOnly.size(), qWriting.size());
+    ASSERT_EQ(qOnly.size(), qWriting.size());
+    ASSERT_EQ(kReadOnly.size(), kWriting.size());
+    ASSERT_EQ(vReadOnly.size(), vWriting.size());
+    for (size_t index = 0; index < qReadOnly.size(); ++index)
+    {
+        EXPECT_EQ(__half2float(qReadOnly[index]), __half2float(qWriting[index]));
+        EXPECT_EQ(__half2float(qOnly[index]), __half2float(qWriting[index]));
+    }
+    for (size_t index = 0; index < kReadOnly.size(); ++index)
+    {
+        EXPECT_EQ(__half2float(kReadOnly[index]), __half2float(kWriting[index]));
+    }
+    for (size_t index = 0; index < vReadOnly.size(); ++index)
+    {
+        EXPECT_EQ(__half2float(vReadOnly[index]), __half2float(vWriting[index]));
+    }
+
+    auto const cacheReadOnly = copyDeviceToHost<half>(readOnlyCacheTensor);
+    for (half const value : cacheReadOnly)
+    {
+        EXPECT_EQ(__half2float(value), 777.0F);
+    }
+    auto const cacheQOnly = copyDeviceToHost<half>(qOnlyCacheTensor);
+    for (half const value : cacheQOnly)
+    {
+        EXPECT_EQ(__half2float(value), 777.0F);
+    }
+}
+
 TEST(RopePackedFusedNorm, Accuracy)
 {
     // Power-of-2 lane count baseline (headDim=128 -> 16 lanes, no ghosts); odd seq len for

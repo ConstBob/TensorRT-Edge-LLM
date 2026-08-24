@@ -1459,7 +1459,11 @@ int main(int argc, char** argv)
             /*.attnMaskSeqLen=*/args.blockSize,
             /*.ropeBatch=*/1,
             /*.packedMaskLen=*/static_cast<int64_t>(divUp(args.blockSize, 32)),
+            /*.contextMaskSelectorLen=*/0,
             /*.startIndexLen=*/B,
+            /*.specVerifyPhaseLen=*/0,
+            /*.skipSoftmaxScaleLen=*/0,
+            /*.swaKVCacheModeLen=*/0,
         };
 
         resetState = [&]() {
@@ -1513,7 +1517,11 @@ int main(int argc, char** argv)
             /*.attnMaskSeqLen=*/args.blockSize,
             /*.ropeBatch=*/1,
             /*.packedMaskLen=*/static_cast<int64_t>(divUp(args.blockSize, 32)),
+            /*.contextMaskSelectorLen=*/0,
             /*.startIndexLen=*/B,
+            /*.specVerifyPhaseLen=*/0,
+            /*.skipSoftmaxScaleLen=*/0,
+            /*.swaKVCacheModeLen=*/0,
         };
 
         resetState = [&]() {

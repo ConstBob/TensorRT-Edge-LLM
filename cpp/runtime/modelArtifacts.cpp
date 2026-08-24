@@ -160,7 +160,7 @@ std::unique_ptr<tokenizer::Tokenizer> loadTokenizer(
 
 ModelArtifacts ModelArtifacts::loadFromEngineDir(std::filesystem::path const& engineDir,
     std::optional<SpecDecodeDraftingConfig> const& draftingConfig, std::filesystem::path const& checkpointDir,
-    std::filesystem::path const& draftCheckpointDir, cudaStream_t stream)
+    std::filesystem::path const& draftCheckpointDir, bool contextReuseEnabled, cudaStream_t stream)
 {
     ModelArtifacts artifacts;
     artifacts.checkpointDir = checkpointDir;
@@ -186,6 +186,9 @@ ModelArtifacts ModelArtifacts::loadFromEngineDir(std::filesystem::path const& en
         : std::nullopt;
 
     artifacts.deployment = createDeploymentConfig(baseConfigPath, draftConfigPath, draftingConfig);
+    // EngineExecutor captures the active KV-pool geometry in its tensor registry.
+    // Select the immutable runtime policy before constructing that registry.
+    artifacts.deployment.selectSwaKVCacheMode(contextReuseEnabled);
     if (draftingConfig.has_value() && artifacts.deployment.specDecodeMode() == SpecDecodeMode::kMTP)
     {
         ELLM_CHECK(artifacts.draftCheckpointDir.empty(),

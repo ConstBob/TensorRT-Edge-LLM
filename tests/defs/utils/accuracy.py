@@ -46,7 +46,7 @@ def check_accuracy_with_dataset(output_json_file,
     # Datasets that use ROUGE score (with "reference" field)
     ROUGE_DATASETS = [
         "gsm8k", "gsm8k_10", "mmstar", "llm_basic", "llm_lora",
-        "llm_context_reuse", "vlm_basic", "vlm_lora"
+        "llm_context_reuse", "llm_sliding_window", "vlm_basic", "vlm_lora"
     ]
 
     # Datasets that use correctness/accuracy (with "answer" field)
@@ -75,6 +75,7 @@ def check_accuracy_with_dataset(output_json_file,
         "llm_basic": (0.25, 0.20),
         "llm_lora": (0.25, 0.20),
         "llm_context_reuse": (0.25, 0.20),
+        "llm_sliding_window": (0.25, 0.20),
         "vlm_basic": (0.25, 0.20),
         "vlm_lora": (0.25, 0.20),
     }

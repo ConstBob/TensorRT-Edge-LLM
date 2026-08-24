@@ -67,10 +67,11 @@ public:
     //! \param[in] slidingWindowSize Sliding window size (-1 = no sliding window)
     //! \param[in] qkvScales Optional [q, k, v] FP8 dequant scales (required when enableFp8KVCache)
     //! \param[in] attentionScale Optional absolute QK^T multiplier; defaults to 1/sqrt(headSize)
+    //! \param[in] supportsBoundedKVCache Whether the engine supports runtime-selectable bounded O(W) KV storage
     AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
         int32_t supportsSpecDecode, int32_t enableFp8KVCache, int32_t enableVisionBlockAttention,
-        int32_t enableContextMaskSelector, int32_t slidingWindowSize = -1, std::vector<float> const& qkvScales = {},
-        std::optional<float> attentionScale = std::nullopt);
+        int32_t enableContextMaskSelector, bool supportsBoundedKVCache = false, int32_t slidingWindowSize = -1,
+        std::vector<float> const& qkvScales = {}, std::optional<float> attentionScale = std::nullopt);
     AttentionPlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
 
     AttentionPlugin() = delete;
@@ -207,6 +208,10 @@ protected:
     //! Sliding window size for attention (-1 = no sliding window, >0 = window size)
     int32_t mSlidingWindowSize = -1;
 
+    //! Whether this layer can use a sparse logical page table backed by an O(W) physical pool. The runtime shape
+    //! of swa_kv_cache_mode selects bounded or full storage for the engine instance.
+    bool mSupportsBoundedKVCache{false};
+
     //! Skip-softmax (BLASST) calibrated scale factor S (0 = disabled); see
     //! computeSkipSoftmaxThreshold.
     float mSkipSoftmaxScaleFactor{};
@@ -219,7 +224,6 @@ protected:
     //! Serialized form of mXqaJitKernels. Held as a member because getFieldsToSerialize
     //! hands TensorRT a pointer into it.
     std::vector<uint8_t> mXqaJitBlob;
-
     //! Whether FMHA context kernels are available for this configuration.
     bool mCanImplementFMHA{true};
 
@@ -233,6 +237,8 @@ protected:
     //! kernel for runtime-selected non-causal DiffusionGemma denoise attention.
     bool mCanImplementPaddingFMHA{false};
 
+    //! INT32 representation of mSupportsBoundedKVCache kept alive for TensorRT plugin serialization.
+    int32_t mSupportsBoundedKVCacheToSerialize{};
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFCToSerialize{};
 };

@@ -1091,8 +1091,8 @@ def _export_llm(model_dir: str,
             logger.exception("[LLM] Failed to load checkpoint")
             raise SystemExit(1) from exc
 
-        # CLI override of the skip-softmax (BLASST) scale factor: None = flag not given (keep the config value); an explicit 0.0
-        # disables skip-softmax even when config.json carries a positive S.
+        # None keeps the config value; an explicit 0.0 disables skip-softmax
+        # even when config.json carries a positive scale.
         if skip_softmax_scale_factor is not None:
             n_patched = 0
             for module in model.modules():

@@ -16,7 +16,6 @@
  */
 
 #include "builder/llmBuilder.h"
-
 #include "common/pagedKvTypes.h"
 
 #include <gtest/gtest.h>
@@ -101,4 +100,70 @@ TEST(LLMBuilderConfigTest, MinimumActivePagesRejectNarrowingOverflow)
     config.maxKVCacheCapacity = rt::kMAX_KV_CACHE_CAPACITY;
 
     EXPECT_THROW(config.resolvedKVPoolPages(), std::runtime_error);
+}
+
+TEST(LLMBuilderConfigTest, ZeroSwaPageBudgetAutoSizesAndPersists)
+{
+    builder::LLMBuilderConfig config;
+    config.maxBatchSize = 3;
+    int32_t const expectedPages
+        = static_cast<int32_t>(rt::computeMinimumSwaPoolPages(config.maxBatchSize, /*slidingWindowCapacity=*/257));
+
+    EXPECT_EQ(config.resolveNumSwaPages(/*slidingWindowCapacity=*/257), expectedPages);
+    EXPECT_EQ(config.numSwaPages, expectedPages);
+
+    Json const json = config.toJson();
+    EXPECT_EQ(json.at("num_swa_pages").get<int64_t>(), expectedPages);
+
+    builder::LLMBuilderConfig const restored = builder::LLMBuilderConfig::fromJson(json);
+    EXPECT_EQ(restored.numSwaPages, config.numSwaPages);
+}
+
+TEST(LLMBuilderConfigTest, ExplicitSwaPageBudgetStillValidatesActivePrivateFloor)
+{
+    builder::LLMBuilderConfig config;
+    config.maxBatchSize = 2;
+    int32_t const minimumPages
+        = static_cast<int32_t>(rt::computeMinimumSwaPoolPages(/*maxBatchSize=*/2, /*slidingWindowCapacity=*/129));
+
+    config.numSwaPages = minimumPages;
+    EXPECT_EQ(config.resolveNumSwaPages(/*slidingWindowCapacity=*/129), minimumPages);
+
+    config.numSwaPages = minimumPages - 1;
+    EXPECT_THROW(config.resolveNumSwaPages(/*slidingWindowCapacity=*/129), std::invalid_argument);
+}
+
+TEST(LLMBuilderConfigTest, SwaCapableProfileOptimizesForBoundedAndCoversFullPages)
+{
+    LLMBuilderConfig config;
+    config.maxBatchSize = 1;
+    config.maxKVCacheCapacity = 8192;
+    constexpr int32_t kWINDOW_SIZE = 129;
+    int32_t const boundedPages = config.resolveNumSwaPages(kWINDOW_SIZE);
+    int64_t const fullPages = config.resolvedKVPoolPages();
+    ASSERT_LT(boundedPages, fullPages);
+
+    EXPECT_EQ(
+        config.resolveKVPoolPageProfile(kWINDOW_SIZE), (std::array<int64_t, 3>{boundedPages, boundedPages, fullPages}));
+    EXPECT_EQ(config.resolveKVPoolPageProfile(/*kvCacheCapacity=*/0),
+        (std::array<int64_t, 3>{fullPages, fullPages, fullPages}));
+}
+
+TEST(LLMBuilderConfigTest, SwaCapableProfileOptimizesForFullWhenBoundedDoesNotSaveMemory)
+{
+    LLMBuilderConfig config;
+    config.maxBatchSize = 1;
+    config.maxKVCacheCapacity = 256;
+    constexpr int32_t kWINDOW_SIZE = 129;
+    int32_t const boundedPages = config.resolveNumSwaPages(kWINDOW_SIZE);
+    int64_t const fullPages = config.resolvedKVPoolPages();
+    ASSERT_GT(boundedPages, fullPages);
+
+    EXPECT_EQ(
+        config.resolveKVPoolPageProfile(kWINDOW_SIZE), (std::array<int64_t, 3>{fullPages, fullPages, boundedPages}));
+
+    config.maxKVCacheCapacity = static_cast<int64_t>(boundedPages) * rt::kTOKENS_PER_PAGE;
+    EXPECT_EQ(config.resolvedKVPoolPages(), boundedPages);
+    EXPECT_EQ(config.resolveKVPoolPageProfile(kWINDOW_SIZE),
+        (std::array<int64_t, 3>{boundedPages, boundedPages, boundedPages}));
 }

@@ -21,10 +21,13 @@
 #include "common/pagedKvTypes.h"
 
 #include <NvInfer.h>
+#include <algorithm>
+#include <array>
 #include <filesystem>
 #include <limits>
 #include <nlohmann/json.hpp>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 
 using Json = nlohmann::json;
@@ -80,6 +83,48 @@ struct LLMBuilderConfig
 
     int64_t tpSize{1}; //!< Tensor parallel size
     int64_t tpRank{0}; //!< Tensor parallel rank
+    //! Total K-page budget for the independent SWA pool (0 = auto-size when reduced markers are present).
+    int64_t numSwaPages{0};
+
+    //! Resolve and store the positive SWA page budget once SWA capability markers are known.
+    //! A zero configured value selects the bounded builder default; runtime config does not use this auto mode.
+    int32_t resolveNumSwaPages(int32_t slidingWindowCapacity)
+    {
+        if (maxBatchSize <= 0 || maxBatchSize > std::numeric_limits<int32_t>::max() || numSwaPages < 0
+            || numSwaPages > std::numeric_limits<int32_t>::max())
+        {
+            throw std::invalid_argument(
+                "builder SWA page sizing requires positive int32 maxBatchSize and "
+                "non-negative int32 numSwaPages");
+        }
+        int64_t const minimumPages = rt::computeMinimumSwaPoolPages(maxBatchSize, slidingWindowCapacity);
+        ELLM_CHECK(minimumPages <= std::numeric_limits<int32_t>::max(),
+            "LLMBuilderConfig: minimum SWA page budget exceeds int32 range.");
+        if (numSwaPages != 0 && numSwaPages < minimumPages)
+        {
+            throw std::invalid_argument(
+                "LLMBuilderConfig: numSwaPages must cover every active slot's private SWA pages");
+        }
+        int32_t const resolvedPages = static_cast<int32_t>(numSwaPages == 0 ? minimumPages : numSwaPages);
+        numSwaPages = resolvedPages;
+        return resolvedPages;
+    }
+
+    //! Resolve the min/opt/max page dimension for one KV-cache input profile.
+    //! SWA-capable layers optimize for the smaller storage policy while the profile covers both page counts.
+    std::array<int64_t, 3> resolveKVPoolPageProfile(int32_t kvCacheCapacity) const
+    {
+        int64_t const fullPages = resolvedKVPoolPages();
+        if (!rt::isReducedKvCacheCapacity(kvCacheCapacity, static_cast<int32_t>(maxKVCacheCapacity)))
+        {
+            return {fullPages, fullPages, fullPages};
+        }
+        ELLM_CHECK(numSwaPages > 0 && numSwaPages <= std::numeric_limits<int32_t>::max(),
+            "LLMBuilderConfig: SWA-capable KV profiles require a resolved positive numSwaPages value.");
+        int32_t const boundedPages = static_cast<int32_t>(numSwaPages);
+        int64_t const smallerPages = std::min<int64_t>(boundedPages, fullPages);
+        return {smallerPages, smallerPages, std::max<int64_t>(boundedPages, fullPages)};
+    }
 
     //! Convert configuration to JSON format for serialization.
     //! @return JSON object containing all configuration parameters
@@ -94,6 +139,10 @@ struct LLMBuilderConfig
         json["max_kv_cache_capacity"] = maxKVCacheCapacity;
         json["max_kv_pool_pages"] = resolvedKVPoolPages();
         json["tp_size"] = tpSize;
+        if (numSwaPages > 0)
+        {
+            json["num_swa_pages"] = numSwaPages;
+        }
         // Only include speculative-decoding limits for the engine role that owns them.
         if (specBase)
         {
@@ -149,6 +198,10 @@ struct LLMBuilderConfig
         {
             config.maxKVPoolPages = json["max_kv_pool_pages"];
         }
+        if (json.contains("num_swa_pages"))
+        {
+            config.numSwaPages = json["num_swa_pages"];
+        }
         if (json.contains("max_verify_tree_size"))
         {
             config.maxVerifyTreeSize = json["max_verify_tree_size"];
@@ -179,6 +232,7 @@ struct LLMBuilderConfig
         oss << "  maxKVPoolPages: " << resolvedKVPoolPages() << "\n";
         oss << "  tpSize: " << tpSize << "\n";
         oss << "  tpRank: " << tpRank << "\n";
+        oss << "  numSwaPages: " << numSwaPages << "\n";
         // Only show speculative-decoding limits for the engine role that owns them.
         if (specBase)
         {
@@ -441,17 +495,18 @@ private:
     bool copyExternalWeightFiles();
 
     // Model dimensions extracted from config.json
-    int64_t mHiddenSize{0};                   //!< Hidden size of the model
-    int64_t mNumKVHeads{0};                   //!< Number of key-value heads
-    int64_t mHeadSize{0};                     //!< Size of each attention head
-    int64_t mRotaryDim{0};                    //!< Dimension for rotary position embeddings
-    int64_t mSlidingRotaryDim{0};             //!< Dimension for sliding-attention rotary embeddings
-    int64_t mFullRotaryDim{0};                //!< Dimension for full-attention rotary embeddings
-    int32_t mNbKVCacheInputs{0};              //!< Number of KV cache inputs (layers)
-    std::vector<int64_t> mPerLayerHeadSize;   //!< Per-layer head size (for heterogeneous models like Gemma4)
-    std::vector<int64_t> mPerLayerNumKVHeads; //!< Per-layer KV head count (for heterogeneous models like Gemma4)
-    int32_t mTargetModelOutputHiddenDim{0};   //!< Target output hidden dimension
-    int32_t mNumDeepstackFeatures{0};         //!< Number of deepstack features (for Qwen3VL)
+    int64_t mHiddenSize{0};                        //!< Hidden size of the model
+    int64_t mNumKVHeads{0};                        //!< Number of key-value heads
+    int64_t mHeadSize{0};                          //!< Size of each attention head
+    int64_t mRotaryDim{0};                         //!< Dimension for rotary position embeddings
+    int64_t mSlidingRotaryDim{0};                  //!< Dimension for sliding-attention rotary embeddings
+    int64_t mFullRotaryDim{0};                     //!< Dimension for full-attention rotary embeddings
+    int32_t mNbKVCacheInputs{0};                   //!< Number of KV cache inputs (layers)
+    std::vector<int64_t> mPerLayerHeadSize;        //!< Per-layer head size (for heterogeneous models like Gemma4)
+    std::vector<int64_t> mPerLayerNumKVHeads;      //!< Per-layer KV head count (for heterogeneous models like Gemma4)
+    std::vector<int32_t> mPerLayerKVCacheCapacity; //!< 0 = full-only, otherwise SWA-capable window W
+    int32_t mTargetModelOutputHiddenDim{0};        //!< Target output hidden dimension
+    int32_t mNumDeepstackFeatures{0};              //!< Number of deepstack features (for Qwen3VL)
     // TODO: Use better mechanism to organize model configuration.
     int32_t mNumLinearAttnLayers{0};    //!< Number of recurrent layers (Mamba/GDN/linear-attention)
     int32_t mRecurrentStateNumHeads{0}; //!< Number of recurrent state heads

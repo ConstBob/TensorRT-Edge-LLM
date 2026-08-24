@@ -74,6 +74,13 @@ tests:
   - tests/python-unittests/test_sliding_window_attention_plugin.py::test_sliding_window_prefill_head256
   - tests/python-unittests/test_sliding_window_attention_plugin.py::test_sliding_window_prefill_head512
   - tests/python-unittests/test_sliding_window_attention_plugin.py::test_sliding_window_decode
+  - tests/python-unittests/test_sliding_window_attention_plugin.py::test_bounded_swa_ragged_prefill_scrambled_page_table
+  - tests/python-unittests/test_sliding_window_attention_plugin.py::test_bounded_swa_decode_scrambled_page_table
+  - tests/python-unittests/test_sliding_window_attention_plugin.py::test_bounded_swa_long_normal_prefill_with_sparse_page_table
+  - tests/python-unittests/test_sliding_window_attention_plugin.py::test_bounded_swa_shared_kv_long_chunk_uses_current_donor_kv
+  - tests/python-unittests/test_sliding_window_attention_plugin.py::test_swa_capable_full_cache_decode_scrambled_page_table
+  - tests/python-unittests/test_attention_plugin.py::test_head512_vision_chunked_prefill_rejected
+  - tests/python-unittests/test_attention_plugin.py::test_head512_shared_vision_prefill_reads_donor_cache
 
   # Mamba selective-state-update (update_ssm_state) plugin tests
   - tests/python-unittests/test_mamba_plugin.py::test_decode

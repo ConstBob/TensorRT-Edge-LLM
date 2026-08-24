@@ -75,14 +75,53 @@ void allocateZeroBuffer(SharedResources& res, int64_t bytes)
     CUDA_CHECK(cudaMemset(res.zeroBuffer.rawPointer(), 0, res.zeroBuffer.getMemoryCapacity()));
 }
 
-//! Build the initially identity-mapped page table sized from `kv`.
+//! Build the initial full-capacity identity table. Context reuse may replace rows after admission.
 std::unique_ptr<KVPageTable> makeIdentityPageTable(KVCacheManager const& kv, cudaStream_t stream)
 {
-    auto table
-        = std::make_unique<KVPageTable>(kv.getConfig().maxBatchSize, pagesPerSlot(kv.maxCapPadded()), kv.numPages());
+    auto table = std::make_unique<KVPageTable>(
+        kv.getConfig().maxBatchSize, computeMaxPagesPerSeq(kv.getConfig().maxSequenceLength), kv.numPages());
     table->setIdentity();
     table->upload(stream);
     return table;
+}
+
+//! Build an independent sparse SWA table with full logical width and the SWA pool's bounded ID space.
+std::unique_ptr<KVPageTable> makeSwaPageTable(KVCacheManager const& kv, cudaStream_t stream)
+{
+    if (!kv.hasReducedKVCache())
+    {
+        return nullptr;
+    }
+
+    int32_t swaNumPages = 0;
+    for (int32_t layerIdx = 0; layerIdx < kv.numLayers(); ++layerIdx)
+    {
+        if (isReducedKvCacheCapacity(kv.getLayerConfig(layerIdx).kvCacheCapacity, kv.getConfig().maxSequenceLength))
+        {
+            swaNumPages = kv.numPages(layerIdx);
+            break;
+        }
+    }
+    check::check(swaNumPages > 0, "SharedResources: reduced KV manager has no SWA pool.");
+
+    auto table = std::make_unique<KVPageTable>(kv.getConfig().maxBatchSize,
+        computeMaxPagesPerSeq(kv.getConfig().maxSequenceLength), swaNumPages, KVPageTable::Mode::kSparseWindow);
+    // Leave logical entries unused until the runtime SWA cache manager admits a request.
+    table->upload(stream);
+    return table;
+}
+
+void appendPageTables(SharedResources& resources, KVCacheManager const& kv, cudaStream_t stream)
+{
+    resources.kvPageTables.push_back(makeIdentityPageTable(kv, stream));
+    resources.swaKVPageTables.push_back(makeSwaPageTable(kv, stream));
+}
+
+bool hasReducedKVLayer(LLMEngineConfig const& cfg)
+{
+    return std::any_of(cfg.kvLayerConfigs.begin(), cfg.kvLayerConfigs.end(), [&](KVLayerConfig const& layerConfig) {
+        return isReducedKvCacheCapacity(layerConfig.kvCacheCapacity, cfg.maxKVCacheCapacity);
+    });
 }
 
 std::unique_ptr<SharedResources> SharedResources::createForLLM(
@@ -100,6 +139,8 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
         /*.layerConfigs=*/cfg.kvLayerConfigs,
         /*.kvCacheType=*/cfg.kvCacheDtype,
         /*.numPages=*/cfg.kvPoolPages,
+        /*.numSwaPages=*/cfg.numSwaPages,
+        /*.useBoundedSwaKVCache=*/cfg.usesBoundedSwaKVCache(),
     };
     rt::MambaCacheManager::Config mambaCfg{
         /*.numRecurrentLayers=*/cfg.numLinearAttnLayers,
@@ -122,8 +163,7 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
         /*.maxBatchSize=*/cfg.maxSupportedBatchSize,
     };
     resources->cacheManagers.push_back(std::make_unique<HybridCacheManager>(hybridCfg, stream));
-    resources->kvPageTables.push_back(
-        makeIdentityPageTable(resources->cacheManagers.back()->getKVCacheManager(), stream));
+    appendPageTables(*resources, resources->cacheManagers.back()->getKVCacheManager(), stream);
 
     // RoPE cache
     // For MRope, the cache is stored in PipelineIO (initialized below).
@@ -179,6 +219,11 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
         int64_t const zeroBufferBytes = std::max(deepstackSize, static_cast<int64_t>(256));
         allocateZeroBuffer(*resources, zeroBufferBytes);
     }
+    if (cfg.supportsBoundedSwaKVCache())
+    {
+        resources->swaKVCacheMode
+            = Tensor({1}, DeviceType::kGPU, nvinfer1::DataType::kINT8, "SharedResources::swaKVCacheMode");
+    }
 
     return resources;
 }
@@ -191,6 +236,10 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
         bundle.draft.has_value(), "SharedResources::createForSpecDecode requires DeploymentConfig.draft to be set");
     check::check(bundle.specConfig.has_value(),
         "SharedResources::createForSpecDecode requires DeploymentConfig.specConfig to be set");
+    check::check(!hasReducedKVLayer(bundle.base),
+        "SharedResources::createForSpecDecode does not support SWA-capable KV configuration on the base engine.");
+    check::check(!bundle.draft.has_value() || !hasReducedKVLayer(*bundle.draft),
+        "SharedResources::createForSpecDecode does not support SWA-capable KV configuration on the draft engine.");
 
     auto resources = std::make_unique<SharedResources>();
 
@@ -208,6 +257,8 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.layerConfigs=*/bundle.base.kvLayerConfigs,
             /*.kvCacheType=*/bundle.base.kvCacheDtype,
             /*.numPages=*/bundle.base.kvPoolPages,
+            /*.numSwaPages=*/bundle.base.numSwaPages,
+            /*.useBoundedSwaKVCache=*/bundle.base.usesBoundedSwaKVCache(),
         };
         rt::MambaCacheManager::Config mambaCfg{
             /*.numRecurrentLayers=*/bundle.base.numLinearAttnLayers,
@@ -230,8 +281,7 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.maxBatchSize=*/bundle.base.maxSupportedBatchSize,
         };
         resources->cacheManagers.push_back(std::make_unique<HybridCacheManager>(hybridCfg, stream));
-        resources->kvPageTables.push_back(
-            makeIdentityPageTable(resources->cacheManagers.back()->getKVCacheManager(), stream));
+        appendPageTables(*resources, resources->cacheManagers.back()->getKVCacheManager(), stream);
     }
 
     // Draft hybrid cache manager (index 1). Gemma4 MTP assistant reads the
@@ -250,6 +300,8 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.layerConfigs=*/bundle.draft->kvLayerConfigs,
             /*.kvCacheType=*/bundle.draft->kvCacheDtype,
             /*.numPages=*/bundle.draft->kvPoolPages,
+            /*.numSwaPages=*/bundle.draft->numSwaPages,
+            /*.useBoundedSwaKVCache=*/bundle.draft->usesBoundedSwaKVCache(),
         };
         rt::MambaCacheManager::Config mambaCfg{
             /*.numRecurrentLayers=*/0,
@@ -270,8 +322,7 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.maxBatchSize=*/bundle.draft->maxSupportedBatchSize,
         };
         resources->cacheManagers.push_back(std::make_unique<HybridCacheManager>(hybridCfg, stream));
-        resources->kvPageTables.push_back(
-            makeIdentityPageTable(resources->cacheManagers.back()->getKVCacheManager(), stream));
+        appendPageTables(*resources, resources->cacheManagers.back()->getKVCacheManager(), stream);
     }
 
     // RoPE cache (shared — base and draft use same RoPE config)

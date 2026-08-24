@@ -529,6 +529,10 @@ def build_runtime_llm_config_dict(
             },
         })
 
+    attention_layer_types = (getattr(config, "attention_layer_types", [])
+                             if str(config.model_type).startswith("gemma4")
+                             else [])
+
     # Heterogeneous head dimensions (e.g. Gemma4: sliding=256, global=512)
     if config.global_head_dim and config.global_head_dim != config.head_dim:
         out["global_head_dim"] = config.global_head_dim
@@ -540,29 +544,6 @@ def build_runtime_llm_config_dict(
                 and config.num_global_key_value_heads
                 != config.num_key_value_heads):
             out["num_global_key_value_heads"] = config.num_global_key_value_heads
-        out["layer_types"] = config.layer_types
-        # Emit kv_layer_configs so C++ runtime sizes per-layer KV cache correctly.
-        # The C++ parser expects "attention"/"mamba" strings in layer_types when
-        # kv_layer_configs is present, so emit a normalised copy.
-        norm_lt: list = []
-        kv_cfgs: list = []
-        full_attention_kv_heads = (config.num_global_key_value_heads
-                                   if use_global_kv_heads else
-                                   config.num_key_value_heads)
-        for lt in config.layer_types:
-            norm_lt.append("attention")  # all layers are attention in Gemma4
-            if lt == "full_attention":
-                kv_cfgs.append({
-                    "num_kv_heads": full_attention_kv_heads,
-                    "head_dim": config.global_head_dim
-                })
-            else:
-                kv_cfgs.append({
-                    "num_kv_heads": config.num_key_value_heads,
-                    "head_dim": config.head_dim
-                })
-        out["layer_types"] = norm_lt
-        out["kv_layer_configs"] = kv_cfgs
         # Per-layer-type RoPE: extract global attention RoPE parameters from
         # rope_scaling.full_attention (Gemma4: theta=1000000, prf=0.25).
         full_attn_rope = (rope_scaling or {}).get("full_attention", {})
@@ -654,11 +635,19 @@ def build_runtime_llm_config_dict(
     # Emit canonical per-layer config consumed by the C++ HybridCacheManager.
     # Only attention and linear-attention layers carry KV/recurrent state and
     # must appear in the per-layer routing table. MLP/MoE layers are skipped.
+    # Pure-attention Gemma4 models also need this table when sliding layers use
+    # a different cache capacity.
     _emit_kv_table = config.layer_types and (
-        config.is_hybrid or config.num_attn_layers != config.num_hidden_layers)
+        config.is_hybrid or config.num_attn_layers != config.num_hidden_layers
+        or attention_layer_types)
     if _emit_kv_table:
         from ..config import (_VALID_ATTENTION_LAYER_TYPES, LAYER_ATTN,
                               LAYER_GDN, LAYER_MAMBA)
+
+        gemma4_kv_layer_config = None
+        if attention_layer_types:
+            from ..models.gemma4.modeling_gemma4_text import \
+                _gemma4_kv_layer_config as gemma4_kv_layer_config
 
         # ``config.layer_types`` normalizes recurrent layers to LAYER_GDN /
         # LAYER_MAMBA, but attention layers keep their raw HF type (e.g.
@@ -672,21 +661,14 @@ def build_runtime_llm_config_dict(
         for layer_idx, lt in enumerate(config.layer_types):
             if lt in attention_types:
                 normalized_layer_types.append("attention")
-                num_kv_heads = config.num_key_value_heads
-                head_dim = config.head_dim
-                if (str(config.model_type).startswith("gemma4")
-                        and config.attention_layer_types):
-                    attention_type = config.attention_layer_types[layer_idx]
-                    if attention_type == "full_attention":
-                        if config.global_head_dim:
-                            head_dim = config.global_head_dim
-                        if (config.attention_k_eq_v
-                                and config.num_global_key_value_heads):
-                            num_kv_heads = config.num_global_key_value_heads
-                kv_layer_configs.append({
-                    "num_kv_heads": num_kv_heads,
-                    "head_dim": head_dim,
-                })
+                if gemma4_kv_layer_config is not None:
+                    layer_config = gemma4_kv_layer_config(config, layer_idx)
+                else:
+                    layer_config = {
+                        "num_kv_heads": config.num_key_value_heads,
+                        "head_dim": config.head_dim,
+                    }
+                kv_layer_configs.append(layer_config)
             elif lt in (LAYER_MAMBA, LAYER_GDN):
                 normalized_layer_types.append("mamba")
                 kv_layer_configs.append(None)

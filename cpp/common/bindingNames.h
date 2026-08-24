@@ -210,6 +210,24 @@ inline constexpr char const* kKVCacheStartIndex = "kvcache_start_index";
 inline constexpr char const* kKVPageTable = "kv_page_table";
 
 /*!
+ * @brief SWA KV page-table tensor
+ *
+ * The logical width is identical to kKVPageTable. Bounded mode uses an independent
+ * SWA physical ID space; full mode aliases this binding to kKVPageTable.
+ *
+ * Shape: [batch_size, 2, max_pages_per_seq] (INT32)
+ */
+inline constexpr char const* kSwaKVPageTable = "swa_kv_page_table";
+
+/*!
+ * @brief Runtime SWA KV-storage mode selector
+ *
+ * This is a shape-only input. Shape [1] selects bounded O(W) SWA storage;
+ * shape [0] selects ordinary full KV storage. The payload is never read.
+ */
+inline constexpr char const* kSwaKVCacheMode = "swa_kv_cache_mode";
+
+/*!
  * @brief Past key-value cache tensor template - use with layer index formatting
  *
  * Template: "past_key_values_{layer_idx}"

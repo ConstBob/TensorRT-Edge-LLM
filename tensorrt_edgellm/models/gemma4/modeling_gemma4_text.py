@@ -124,6 +124,56 @@ def _kv_cache_dims_for_layer(config: ModelConfig,
             _head_dim_for_attention_type(config, attention_type))
 
 
+def _gemma4_uses_swa_kv_cache(config: ModelConfig) -> bool:
+    """Return whether this Gemma4 export supports bounded SWA pools."""
+    if (int(getattr(config, "sliding_window_size", -1)) <= 0
+            or "sliding_attention" not in getattr(
+                config, "attention_layer_types", [])):
+        return False
+
+    quant = getattr(config, "quant", None)
+    if getattr(quant, "kv_cache_quant", None) == "fp8":
+        return False
+
+    spec_flags = (
+        "eagle_base",
+        "is_eagle3_draft",
+        "mtp_base",
+        "is_mtp_draft",
+        "mtp_tree_base",
+        "dflash_base",
+        "dflash_tree_base",
+        "is_dflash_draft",
+        "jetspec_base",
+        "jetspec_tree_base",
+        "is_jetspec_draft",
+        "dspark_base",
+        "is_dspark_draft",
+        "gemma4_mtp_base",
+        "gemma4_mtp_draft",
+        "shares_target_kv",
+    )
+    return not any(bool(getattr(config, flag, False)) for flag in spec_flags)
+
+
+def _gemma4_uses_swa_pool(config: ModelConfig, layer_idx: int) -> bool:
+    """Return whether one Gemma4 layer binds the bounded-capable SWA pool."""
+    return (_gemma4_uses_swa_kv_cache(config) and _attention_type_for_layer(
+        config, layer_idx) == "sliding_attention")
+
+
+def _gemma4_kv_layer_config(config: ModelConfig, layer_idx: int) -> dict:
+    """Return the runtime KV metadata for one Gemma4 attention layer."""
+    num_kv_heads, head_dim = _kv_cache_dims_for_layer(config, layer_idx)
+    layer_config = {
+        "num_kv_heads": num_kv_heads,
+        "head_dim": head_dim,
+    }
+    if _gemma4_uses_swa_pool(config, layer_idx):
+        layer_config["kv_cache_capacity"] = config.sliding_window_size
+    return layer_config
+
+
 def _mlp_intermediate_size_for_layer(config: ModelConfig,
                                      layer_idx: int) -> int:
     """Return Gemma4's per-layer MLP width."""
@@ -216,6 +266,7 @@ def _make_gemma4_flat_wrapper(model: nn.Module,
                               Na: int,
                               num_ple_inputs: int,
                               use_dual_rope: bool = False,
+                              use_swa_kv_cache: bool = False,
                               eagle_base: bool = False,
                               vision_block_attention: bool = False,
                               emit_hidden_states: bool = False) -> nn.Module:
@@ -232,10 +283,10 @@ def _make_gemma4_flat_wrapper(model: nn.Module,
         ]
     else:
         param_names += ["rope_rotary_cos_sin"]
-    param_names += [
-        "context_lengths", "kvcache_start_index", "kv_page_table",
-        "last_token_ids"
-    ]
+    param_names += ["context_lengths", "kvcache_start_index", "kv_page_table"]
+    if use_swa_kv_cache:
+        param_names += ["swa_kv_page_table", "swa_kv_cache_mode"]
+    param_names += ["last_token_ids"]
     if vision_block_attention:
         param_names += ["vision_block_ids"]
     if eagle_base:
@@ -252,6 +303,9 @@ def _make_gemma4_flat_wrapper(model: nn.Module,
                     if eagle_base else "")
     vision_kwargs = (", vision_block_ids=vision_block_ids"
                      if vision_block_attention else "")
+    swa_kwargs = (", swa_kv_page_table=swa_kv_page_table"
+                  ", swa_kv_cache_mode=swa_kv_cache_mode"
+                  if use_swa_kv_cache else "")
     if use_dual_rope:
         rope_arg = "None"
         rope_kwargs = (
@@ -267,16 +321,17 @@ def _make_gemma4_flat_wrapper(model: nn.Module,
             f"        inputs_embeds, {past_kv_tuple}, {rope_arg}, "
             f"context_lengths, kvcache_start_index, kv_page_table, "
             f"last_token_ids"
-            f"{eagle_kwargs}{vision_kwargs}{ple_kwarg}{rope_kwargs})\n"
+            f"{eagle_kwargs}{vision_kwargs}{swa_kwargs}{ple_kwarg}{rope_kwargs})\n"
             f"    return (logits, hidden_states) + tuple(present_key_values)\n"
         )
     else:
-        body = (f"    logits, present_key_values = self._model(\n"
-                f"        inputs_embeds, {past_kv_tuple}, {rope_arg}, "
-                f"context_lengths, kvcache_start_index, kv_page_table, "
-                f"last_token_ids"
-                f"{eagle_kwargs}{vision_kwargs}{ple_kwarg}{rope_kwargs})\n"
-                f"    return (logits,) + tuple(present_key_values)\n")
+        body = (
+            f"    logits, present_key_values = self._model(\n"
+            f"        inputs_embeds, {past_kv_tuple}, {rope_arg}, "
+            f"context_lengths, kvcache_start_index, kv_page_table, "
+            f"last_token_ids"
+            f"{eagle_kwargs}{vision_kwargs}{swa_kwargs}{ple_kwarg}{rope_kwargs})\n"
+            f"    return (logits,) + tuple(present_key_values)\n")
 
     src = "def _forward(self, {}):\n{}".format(", ".join(param_names), body)
     globs: dict = {}
@@ -300,41 +355,6 @@ def _resolve_hidden_activation(
     raise ValueError(
         f"Unsupported hidden_activation for Gemma4 PLE gate: {activation_name!r}"
     )
-
-
-def _compute_kv_donor_indices(config: ModelConfig) -> dict:
-    """Compute the KV donor layer index for each KV-shared layer.
-
-    Returns a dict mapping shared layer_idx -> donor layer_idx.
-    Donor is the last non-shared layer of the same type (sliding/full).
-    """
-    num_kv_shared = getattr(config, "num_kv_shared_layers", 0)
-    if num_kv_shared <= 0:
-        return {}
-    n = config.num_hidden_layers
-    first_shared = n - num_kv_shared
-    layer_types = (list(config.attention_layer_types)
-                   if config.attention_layer_types else [])
-
-    # Find last non-shared layer of each type
-    prev_layers = layer_types[:first_shared]
-    donors: dict = {}
-    for lt in set(prev_layers):
-        donors[lt] = first_shared - 1 - prev_layers[::-1].index(lt)
-
-    result: dict = {}
-    for i in range(first_shared, n):
-        if i >= len(layer_types):
-            raise ValueError(
-                f"Layer index {i} exceeds attention_layer_types length "
-                f"({len(layer_types)}). Check num_hidden_layers vs "
-                f"attention_layer_types in config.")
-        lt = layer_types[i]
-        if lt not in donors:
-            raise ValueError(f"KV-shared layer {i} has type '{lt}' with no "
-                             f"non-shared donor layer of the same type.")
-        result[i] = donors[lt]
-    return result
 
 
 class Gemma4RMSNorm(RMSNorm):
@@ -475,6 +495,7 @@ class Gemma4Attention(Attention):
         self.sliding_window_size = (config.sliding_window_size
                                     if self.attention_type
                                     == "sliding_attention" else -1)
+        self.use_swa_pool = _gemma4_uses_swa_pool(config, layer_idx)
 
     def forward(
         self,
@@ -488,16 +509,24 @@ class Gemma4Attention(Attention):
         attention_pos_id: torch.Tensor | None = None,
         vision_block_ids: torch.Tensor | None = None,
         context_mask_selector: torch.Tensor | None = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        swa_kv_page_table: torch.Tensor | None = None,
+        swa_kv_cache_mode: torch.Tensor | None = None,
+        shared_key_value: Tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]
+               | None]:
         batch_size, seq_len, _ = hidden_states.shape
 
         query_states = self.q_proj(hidden_states)
 
         if self.is_kv_shared:
-            # Shared-KV layer (enable_kv_shared=1): qkv carries Q only; K/V come
-            # from the donor layer's cache (past_key_value).
-            key_states = None
-            value_states = None
+            # Bounded SWA consumers carry the donor's current K/V transiently so
+            # prefill remains correct when the current chunk is larger than the
+            # resident window. Other shared-KV paths read only the donor cache.
+            if self.use_swa_pool and shared_key_value is not None:
+                key_states, value_states = shared_key_value
+            else:
+                key_states = None
+                value_states = None
         else:
             key_states = self.k_proj(hidden_states)
             if self.attention_k_eq_v:
@@ -533,6 +562,14 @@ class Gemma4Attention(Attention):
             raise ValueError(
                 "Gemma4 vision block attention and tree attention are mutually exclusive."
             )
+        uses_bounded_swa = self.use_swa_pool and not enable_tree
+        layer_page_table = kv_page_table
+        if self.use_swa_pool and not enable_tree:
+            if swa_kv_page_table is None:
+                raise ValueError(
+                    "SWA-capable Gemma4 layers require swa_kv_page_table.")
+            layer_page_table = swa_kv_page_table
+
         kwargs: dict = {
             "num_q_heads": self.num_heads,
             "num_kv_heads": self.num_kv_heads,
@@ -551,16 +588,24 @@ class Gemma4Attention(Attention):
             kwargs["attention_mask"] = attention_mask
             kwargs["attention_pos_id"] = attention_pos_id
         elif enable_vision_block:
-            # AttentionPlugin input slot 7 is shared with the tree mask.  The
-            # static plugin attribute selects its [B,S] block-ID semantics.
+            # The optional attention-mask input carries vision block IDs;
+            # the static plugin attribute disambiguates its semantics.
             kwargs["attention_mask"] = vision_block_ids
         kwargs["qkv_scales"] = getattr(self, "_qkv_scales_float",
                                        [1.0, 1.0, 1.0])
+        if uses_bounded_swa:
+            if swa_kv_cache_mode is None:
+                raise ValueError(
+                    "Bounded-capable Gemma4 SWA layers require swa_kv_cache_mode."
+                )
+            kwargs["swa_kv_cache_mode"] = swa_kv_cache_mode
 
-        # Packed QKV input: Q-only for shared-KV layers, Q+K+V otherwise.
+        if self.is_kv_shared:
+            kwargs["enable_kv_shared"] = 1
+        # Bounded shared-KV consumers append the donor's current K/V. This is a
+        # transient graph value, not persistent KV-cache storage.
         if key_states is None:
             qkv = query_states
-            kwargs["enable_kv_shared"] = 1
         else:
             qkv = torch.cat([query_states, key_states, value_states], dim=-1)
         attn_output, present_key_value = attention_plugin(
@@ -569,12 +614,14 @@ class Gemma4Attention(Attention):
             context_lengths,
             rope_rotary_cos_sin,
             kvcache_start_index,
-            kv_page_table,
+            layer_page_table,
             **kwargs,
         )
         attn_output = attn_output.reshape(batch_size, seq_len,
                                           self.num_heads * self.head_dim)
-        return self.o_proj(attn_output), present_key_value
+        current_key_value = (None if self.is_kv_shared else
+                             (key_states, value_states))
+        return self.o_proj(attn_output), present_key_value, current_key_value
 
 
 class Gemma4MLP(MLP):
@@ -1207,20 +1254,27 @@ class Gemma4DecoderLayer(DecoderLayer):
         context_mask_selector: torch.Tensor | None = None,
         per_layer_input: torch.Tensor | None = None,
         phase_is_encoder: torch.Tensor | None = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        swa_kv_page_table: torch.Tensor | None = None,
+        swa_kv_cache_mode: torch.Tensor | None = None,
+        shared_key_value: Tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]
+               | None]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states, present_key_value = self.self_attn(
+        hidden_states, present_key_value, current_key_value = self.self_attn(
             hidden_states,
             past_key_value,
             rope_rotary_cos_sin,
             context_lengths,
             kvcache_start_index,
             kv_page_table,
+            swa_kv_page_table=swa_kv_page_table,
+            swa_kv_cache_mode=swa_kv_cache_mode,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
             vision_block_ids=vision_block_ids,
             context_mask_selector=context_mask_selector,
+            shared_key_value=shared_key_value,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
@@ -1253,7 +1307,7 @@ class Gemma4DecoderLayer(DecoderLayer):
         hidden_states = hidden_states * self._layer_scalar(
             phase_is_encoder, hidden_states)
 
-        return hidden_states, present_key_value
+        return hidden_states, present_key_value, current_key_value
 
 
 class Gemma4Transformer(nn.Module):
@@ -1272,6 +1326,13 @@ class Gemma4Transformer(nn.Module):
             Gemma4DecoderLayer(config, layer_idx=i)
             for i in range(config.num_hidden_layers)
         ])
+        donor_indices = _compute_kv_donor_indices(config)
+        self.swa_kv_donor_indices = {
+            consumer: donor
+            for consumer, donor in donor_indices.items()
+            if _gemma4_uses_swa_pool(config, consumer)
+        }
+        self.swa_kv_donor_layers = set(self.swa_kv_donor_indices.values())
         self.norm = Gemma4RMSNorm(config.hidden_size, config.rms_norm_eps)
 
         if self.ple_enabled:
@@ -1384,11 +1445,15 @@ class Gemma4Transformer(nn.Module):
         ple_token_embeds: Tuple[torch.Tensor, ...] = (),
         rope_rotary_cos_sin_sliding: torch.Tensor | None = None,
         rope_rotary_cos_sin_full: torch.Tensor | None = None,
+        swa_kv_page_table: torch.Tensor | None = None,
+        swa_kv_cache_mode: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, Tuple, Tuple | None]:
         hidden_states = inputs_embeds
         projected_per_layer_inputs = self._project_per_layer_inputs(
             inputs_embeds)
         present_key_values_list: List[torch.Tensor] = []
+        current_swa_key_values: dict[int, Tuple[torch.Tensor,
+                                                torch.Tensor]] = {}
         all_hidden_states: list = []
         target_hidden_list: list = []
         target_layer_set = set(target_layer_ids or [])
@@ -1405,21 +1470,39 @@ class Gemma4Transformer(nn.Module):
             )
             per_layer_input = self._combine_per_layer_input(
                 projected_per_layer_inputs, ple_token_embeds, layer_index)
-            hidden_states, next_key_value = layer(
+            shared_key_value = None
+            if layer_index in self.swa_kv_donor_indices:
+                donor_index = self.swa_kv_donor_indices[layer_index]
+                if donor_index not in current_swa_key_values:
+                    raise ValueError(
+                        "Gemma4 SWA shared-KV consumer is missing its current donor K/V: "
+                        f"consumer={layer_index}, donor={donor_index}.")
+                shared_key_value = current_swa_key_values[donor_index]
+
+            hidden_states, next_key_value, current_key_value = layer(
                 hidden_states,
                 past_key_values[layer_index],
                 layer_rope_rotary_cos_sin,
                 context_lengths,
                 kvcache_start_index,
                 kv_page_table,
+                swa_kv_page_table=swa_kv_page_table,
+                swa_kv_cache_mode=swa_kv_cache_mode,
                 attention_mask=attention_mask,
                 attention_pos_id=attention_pos_id,
                 vision_block_ids=vision_block_ids,
                 context_mask_selector=context_mask_selector,
                 per_layer_input=per_layer_input,
                 phase_is_encoder=phase_is_encoder,
+                shared_key_value=shared_key_value,
             )
             present_key_values_list.append(next_key_value)
+            if layer_index in self.swa_kv_donor_layers:
+                if current_key_value is None:
+                    raise ValueError(
+                        f"Gemma4 SWA donor layer {layer_index} did not produce current K/V."
+                    )
+                current_swa_key_values[layer_index] = current_key_value
 
             if layer_index in target_layer_set:
                 target_hidden_list.append(hidden_states)
@@ -1471,8 +1554,10 @@ class Gemma4ForCausalLM(CausalLM):
                                or target_hidden_base)
         vision_block_attention = bool(config.use_vision_bidirectional_attention
                                       ) and not tree_attention_base
+        use_swa_kv_cache = _gemma4_uses_swa_kv_cache(config)
         if (not self.ple_enabled and not config.use_dual_rope
-                and not vision_block_attention and not tree_attention_base):
+                and not vision_block_attention and not tree_attention_base
+                and not use_swa_kv_cache):
             return super().onnx_export_spec()
 
         Na = config.num_hidden_layers
@@ -1573,12 +1658,23 @@ class Gemma4ForCausalLM(CausalLM):
                                      dtype=torch.int64,
                                      device=device)
 
-        args = args + (context_lengths, kvcache_start_index, kv_page_table,
-                       last_token_ids)
+        args = args + (context_lengths, kvcache_start_index, kv_page_table)
         input_names = input_names + [
-            "context_lengths", "kvcache_start_index", "kv_page_table",
-            "last_token_ids"
+            "context_lengths", "kvcache_start_index", "kv_page_table"
         ]
+        if use_swa_kv_cache:
+            swa_kv_page_table = torch.zeros(batch_size,
+                                            2,
+                                            1,
+                                            dtype=torch.int32,
+                                            device=device)
+            swa_kv_cache_mode = torch.zeros(1, dtype=torch.int8, device=device)
+            args = args + (swa_kv_page_table, swa_kv_cache_mode)
+            input_names = input_names + [
+                "swa_kv_page_table", "swa_kv_cache_mode"
+            ]
+        args = args + (last_token_ids, )
+        input_names = input_names + ["last_token_ids"]
         if vision_block_attention:
             vision_block_ids = torch.full((batch_size, seq_len),
                                           -1,
@@ -1600,21 +1696,39 @@ class Gemma4ForCausalLM(CausalLM):
         page_batch = torch.export.Dim("page_batch", min=1, max=256)
         max_pages = torch.export.Dim("max_pages_per_seq", min=1, max=32768)
         num_pages = torch.export.Dim("num_pages", min=1, max=1048576)
+        swa_page_batch = (torch.export.Dim("swa_page_batch", min=1, max=256)
+                          if use_swa_kv_cache else None)
+        swa_max_pages = (torch.export.Dim(
+            "swa_max_pages_per_seq", min=1, max=32768)
+                         if use_swa_kv_cache else None)
+        num_swa_pages = (torch.export.Dim("num_swa_pages", min=1, max=1048576)
+                         if use_swa_kv_cache else None)
 
         num_selected = torch.export.Dim(
             "num_selected", min=1, max=256) if tree_attention_base else None
         all_shapes: list = [{0: batch, 1: seq}]
         for _ in range(num_ple_inputs):
             all_shapes.append({0: batch, 1: seq})
-        for _ in range(Na):
+        for layer_idx in range(Na):
+            pool_pages = (num_swa_pages if _gemma4_uses_swa_pool(
+                config, layer_idx) else num_pages)
             all_shapes.append({1:
-                               num_pages})  # past_key_values_i (pool-shaped)
+                               pool_pages})  # past_key_values_i (pool-shaped)
         all_shapes.append({0: rope_batch, 1: pos})
         if config.use_dual_rope:
             all_shapes.append({0: rope_batch, 1: pos})
         all_shapes.append({0: batch})
         all_shapes.append({0: kv_batch})
         all_shapes.append({0: page_batch, 2: max_pages})  # kv_page_table
+        if use_swa_kv_cache:
+            all_shapes.append({
+                0: swa_page_batch,
+                2: swa_max_pages
+            })  # swa_kv_page_table
+            # torch.export specializes dimensions of size 0 or 1. Export the
+            # sample as static length 1; the ONNX normalization pass restores
+            # this shape-only input to a symbolic dimension for runtime 0/1.
+            all_shapes.append({})  # swa_kv_cache_mode
         if tree_attention_base:
             all_shapes.append({0: batch, 1: num_selected})
         else:
@@ -1646,6 +1760,7 @@ class Gemma4ForCausalLM(CausalLM):
             Na,
             num_ple_inputs=num_ple_inputs,
             use_dual_rope=config.use_dual_rope,
+            use_swa_kv_cache=use_swa_kv_cache,
             eagle_base=tree_attention_base,
             vision_block_attention=vision_block_attention,
             emit_hidden_states=(self.emit_hidden_states
@@ -1673,6 +1788,8 @@ class Gemma4ForCausalLM(CausalLM):
         ple_token_embeds: Tuple[torch.Tensor, ...] = (),
         rope_rotary_cos_sin_sliding: torch.Tensor | None = None,
         rope_rotary_cos_sin_full: torch.Tensor | None = None,
+        swa_kv_page_table: torch.Tensor | None = None,
+        swa_kv_cache_mode: torch.Tensor | None = None,
     ) -> Tuple:
         eagle_base = self.config.eagle_base
         gemma4_mtp_base = self.config.gemma4_mtp_base
@@ -1699,6 +1816,8 @@ class Gemma4ForCausalLM(CausalLM):
             context_lengths,
             kvcache_start_index,
             kv_page_table,
+            swa_kv_page_table=swa_kv_page_table,
+            swa_kv_cache_mode=swa_kv_cache_mode,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
             vision_block_ids=vision_block_ids,

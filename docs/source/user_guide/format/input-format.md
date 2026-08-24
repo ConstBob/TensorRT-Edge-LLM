@@ -66,6 +66,9 @@ This guide describes the input JSON format for the LLM inference tool. The forma
 - **`lora_name`** (optional): LoRA adapter name from `available_lora_weights`
 - **`save_system_prompt_kv_cache`** (optional): Legacy compatibility field for
   exact system-prompt caching. New deployments should use KV cache reuse.
+  Bounded Gemma4 SWA storage does not preserve the complete contiguous history
+  required by this legacy snapshot API, so the request continues without
+  saving a snapshot.
 - **`disable_spec_decode`** (optional, default: false): Disable EAGLE speculative decoding for this request even if draft engine is loaded
 - **`logit_bias`** (optional): Request-specific sparse logit-bias map. When set, it overrides the top-level `logit_bias` default for this request.
 - **`num_logprobs`** (optional): Overrides the top-level `num_logprobs` default for this request. Applied batch-uniformly (like `disable_spec_decode`): the batch computes at the maximum value requested by any request in it.
