@@ -309,6 +309,7 @@ class Config:
     download_hf_checkpoint: bool = False
     export_onnx: bool = False
     no_trt_containers: bool = False
+    generate_cutedsl_native: bool = False
     edge_llm_cache_root: Path | None = None
     run_workspace_root: PurePosixPath | None = None
     model_cases: tuple[ModelCase, ...] = _DEFAULT_MODEL_CASES
@@ -325,6 +326,9 @@ class Config:
             raise ValueError("compute capability must use major.minor format")
         native_x86 = (self.no_trt_containers
                       and self.architecture is Arch.X86_64)
+        if self.generate_cutedsl_native and not self.no_trt_containers:
+            raise ValueError(
+                "--generate-cutedsl-native requires --no-trt-containers")
         if native_x86 and self.cuda_root is None:
             raise ValueError(
                 "--cuda-root is required for x86 --no-trt-containers")
@@ -602,6 +606,29 @@ def _cleanup(remote: Any, path: PurePosixPath, logger: Any) -> None:
 # TODO(devtoolkit): add a CodeManager no_container option that builds source
 # artifacts through CommandManager, exposes each component build command, runs
 # E2E commands on the host, and emits the same runtime setup environment.
+def _native_cutedsl_command(config: Config, architecture: Arch,
+                            cuda_version: str) -> list[str]:
+    """Return commands that generate the one CuTe DSL artifact this build uses.
+
+    The native path cannot start the Edge CuTe DSL builder container. Reuse its
+    entrypoint instead so the package versions and artifact validation remain
+    owned by the Edge source tree.
+    """
+    artifact_cuda_major = cuda_version.split(".", maxsplit=1)[0]
+    artifact_arch = "x86_64" if architecture is Arch.X86_64 else "aarch64"
+    artifact_tag = f"sm_{config.compute_capability.replace('.', '')}"
+    artifact_matrix = f"{artifact_arch}:{artifact_tag}:{artifact_cuda_major}"
+    return [
+        f"export CUTE_DSL_MATRIX={shlex.quote(artifact_matrix)}",
+        f"export CUTE_DSL_JOBS={shlex.quote(str(config.jobs))}",
+        "export CUTE_DSL_OUTPUT_DIR=" +
+        shlex.quote(str(config.local_root / "cutedsl-output")),
+        "export CUTE_DSL_VENV_ROOT=" +
+        shlex.quote(str(config.local_root / "cutedsl-venvs")),
+        "bash kernelSrcs/build_cutedsl_tarballs.sh",
+    ]
+
+
 def _native_build_command(config: Config, target: ArtifactTarget) -> str:
     build = target.build
     if not build.repo_path or not build.build_dir or not build.trt_package_dir:
@@ -632,6 +659,8 @@ def _native_build_command(config: Config, target: ArtifactTarget) -> str:
     else:
         cuda_version = target.platform.cuda_version or arch.default_cuda_version
         cuda_setup = []
+    cutedsl_setup = (_native_cutedsl_command(config, arch, cuda_version)
+                     if config.generate_cutedsl_native else [])
     configure = [
         "cmake",
         build.repo_path,
@@ -646,7 +675,7 @@ def _native_build_command(config: Config, target: ArtifactTarget) -> str:
         *build.make_args
     ]
     return "\n".join([
-        "set -euo pipefail", *cuda_setup,
+        "set -euo pipefail", *cuda_setup, *cutedsl_setup,
         f"mkdir -p {shlex.quote(build.build_dir)}",
         f"cd {shlex.quote(build.build_dir)}",
         shlex.join(configure),
@@ -1149,6 +1178,12 @@ def _parser() -> argparse.ArgumentParser:
         help="run the EdgeLLM build and E2E tests without TRT containers",
     )
     parser.add_argument(
+        "--generate-cutedsl-native",
+        action="store_true",
+        help=("generate the required CuTe DSL artifact on the build host "
+              "before a no-container EdgeLLM build"),
+    )
+    parser.add_argument(
         "--cuda-root",
         type=PurePosixPath,
         help=("CUDA toolkit root on the build host; required for x86 "
@@ -1258,6 +1293,7 @@ def _config(args: argparse.Namespace) -> Config:
         download_hf_checkpoint=args.download_hf_checkpoint,
         export_onnx=args.export_onnx,
         no_trt_containers=args.no_trt_containers,
+        generate_cutedsl_native=args.generate_cutedsl_native,
         edge_llm_cache_root=(Path(cache_dir) if cache_dir else None),
         run_workspace_root=(PurePosixPath(workspace_root)
                             if workspace_root is not None else None),
