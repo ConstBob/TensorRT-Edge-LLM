@@ -971,6 +971,52 @@ def _(q, k, v):
 
 
 # ---------------------------------------------------------------------------
+# Dense NVFP4-A16 export target selector
+# ---------------------------------------------------------------------------
+
+_NVFP4_A16_BLACKWELL_TARGET_SM = 110
+_NVFP4_A16_EXPORT_TARGET_SM: Optional[int] = None
+_NVFP4_A16_TARGET_LOGGED = False
+
+
+def set_nvfp4_a16_export_target_sm(target_sm: Optional[int]) -> None:
+    """Select the dense NVFP4-A16 plugin from an explicit export target.
+
+    ``SM110`` selects ``Nvfp4A16BlackwellGemmPlugin`` and its
+    ``BLACKWELL_N128_K64_V1`` layout. Every other target, including an omitted
+    target, preserves the ``Nvfp4A16GemmPlugin`` Marlin contract. The selector
+    intentionally never probes the export host GPU so an x86 cross-export is
+    deterministic.
+    """
+    if target_sm is not None and (not isinstance(target_sm, int) or isinstance(
+            target_sm, bool) or target_sm <= 0):
+        raise ValueError("target_sm must be a positive integer or None")
+    global _NVFP4_A16_EXPORT_TARGET_SM, _NVFP4_A16_TARGET_LOGGED
+    _NVFP4_A16_EXPORT_TARGET_SM = target_sm
+    _NVFP4_A16_TARGET_LOGGED = False
+
+
+def nvfp4_a16_export_target_sm() -> Optional[int]:
+    """Return the explicitly configured dense NVFP4-A16 export SM."""
+    return _NVFP4_A16_EXPORT_TARGET_SM
+
+
+def use_blackwell_nvfp4_a16_gemm() -> bool:
+    """Whether dense NVFP4-A16 linears should use the SM110 plugin."""
+    use_blackwell = (
+        _NVFP4_A16_EXPORT_TARGET_SM == _NVFP4_A16_BLACKWELL_TARGET_SM)
+    global _NVFP4_A16_TARGET_LOGGED
+    if not _NVFP4_A16_TARGET_LOGGED:
+        _NVFP4_A16_TARGET_LOGGED = True
+        target = (f"SM{_NVFP4_A16_EXPORT_TARGET_SM}" if
+                  _NVFP4_A16_EXPORT_TARGET_SM is not None else "unspecified")
+        backend = ("Nvfp4A16BlackwellGemmPlugin (BLACKWELL_N128_K64_V1)"
+                   if use_blackwell else "Nvfp4A16GemmPlugin (Marlin)")
+        logger.info("Dense NVFP4-A16 export target %s: %s", target, backend)
+    return use_blackwell
+
+
+# ---------------------------------------------------------------------------
 # Custom op: trt::nvfp4_a16_gemm  (dense FP16-A / NVFP4-W4 Marlin GEMM)
 #
 # Inputs are already in Marlin-packed layout (see
@@ -1001,6 +1047,43 @@ def nvfp4_a16_gemm(
 
 
 @nvfp4_a16_gemm.register_fake
+def _(activation, qweights, block_scales, global_scale, gemm_n, gemm_k):
+    *leading, _ = activation.shape
+    return torch.empty(*leading,
+                       gemm_n,
+                       dtype=activation.dtype,
+                       device=activation.device)
+
+
+# ---------------------------------------------------------------------------
+# Custom op: trt::nvfp4_a16_blackwell_gemm
+#
+# SM110-only dense FP16/BF16-A / NVFP4-W4 GEMM. The checkpoint-provided
+# ModelOpt buffers are repacked to the opaque BLACKWELL_N128_K64_V1 ABI:
+# qweights [N/128,K/64,128,32], block scales [N/128,K/64,128,4], and the
+# unmodified FP32 per-tensor multiplier. The ONNX translation preserves the
+# dedicated ``trt_edgellm::Nvfp4A16BlackwellGemmPlugin`` identity.
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt::nvfp4_a16_blackwell_gemm", mutates_args=())
+def nvfp4_a16_blackwell_gemm(
+    activation: torch.Tensor,  # [*, gemm_k] float16/bfloat16
+    qweights: torch.Tensor,  # [gemm_n//128, gemm_k//64, 128, 32] int8
+    block_scales: torch.Tensor,  # [gemm_n//128, gemm_k//64, 128, 4] int8
+    global_scale: torch.Tensor,  # [1] float32
+    gemm_n: int,
+    gemm_k: int,
+) -> torch.Tensor:
+    """Stub for the SM110 dense NVFP4-A16 Blackwell plugin."""
+    *leading, _ = activation.shape
+    return torch.zeros(*leading,
+                       gemm_n,
+                       dtype=activation.dtype,
+                       device=activation.device)
+
+
+@nvfp4_a16_blackwell_gemm.register_fake
 def _(activation, qweights, block_scales, global_scale, gemm_n, gemm_k):
     *leading, _ = activation.shape
     return torch.empty(*leading,

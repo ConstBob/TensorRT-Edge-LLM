@@ -78,7 +78,8 @@ from ..config import (_is_diffusion_gemma_model_type,
 from ..external_weights import (EXTERNAL_WEIGHT_CHOICES,
                                 EXTERNAL_WEIGHT_NVFP4_MOE,
                                 resolve_externalize_weights)
-from ..models.ops import set_int4_gemm_plugin_version
+from ..models.ops import (set_int4_gemm_plugin_version,
+                          set_nvfp4_a16_export_target_sm)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -4072,6 +4073,20 @@ def main() -> None:
               "Int4GroupwiseGemmPlugin with AWQ-swizzled weights."),
     )
     p.add_argument(
+        "--target-sm",
+        "--target_sm",
+        dest="target_sm",
+        type=int,
+        default=None,
+        metavar="SM",
+        help=("Explicit GPU compute capability for target-specific ONNX ABI "
+              "selection (for example 110 for Thor). Dense NVFP4-A16 selects "
+              "Nvfp4A16BlackwellGemmPlugin / BLACKWELL_N128_K64_V1 only for "
+              "SM110; an omitted or non-SM110 target preserves the Marlin "
+              "Nvfp4A16GemmPlugin. Selection never depends on the GPU "
+              "installed on the export host."),
+    )
+    p.add_argument(
         "--quantization",
         default=None,
         choices=["int4_awq", "nvfp4"],
@@ -4097,6 +4112,8 @@ def main() -> None:
 
     # Select the INT4 GEMM plugin backend before any weight repack / op emission.
     set_int4_gemm_plugin_version(args.int4_gemm_plugin_version)
+    # Dense NVFP4-A16 repacking and ONNX emission read the same explicit target.
+    set_nvfp4_a16_export_target_sm(args.target_sm)
     # Applies to every QuantConfig parsed from here on (backbone and drafts).
     set_default_quantize_activations(args.quantize_activations)
 

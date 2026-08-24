@@ -29,7 +29,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from ..models.ops import int4_gemm_plugin_version
+from ..models.ops import int4_gemm_plugin_version, use_blackwell_nvfp4_a16_gemm
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,7 @@ __all__ = [
     "repack_gptq_to_plugin",
     "decode_modelopt_nvfp4",
     "unpack_nvfp4_codes",
+    "repack_nvfp4_a16_blackwell_linear",
     "repack_nvfp4_a16_marlin_linear",
     "repack_nvfp4_a16_marlin_moe_experts",
     "repack_nvfp4_a16_marlin_gated_moe_experts",
@@ -372,7 +373,7 @@ def apply_all_repacking(model: nn.Module) -> None:
     _cast_modelopt_awq_prepacked(model)
     _cast_fp8_linear_scales(model)
     _cast_nvfp4_weights(model)
-    _repack_nvfp4_a16_marlin_linears(model)
+    _repack_nvfp4_a16_linears(model)
 
 
 def _cast_modelopt_awq_prepacked(model: nn.Module) -> None:
@@ -441,16 +442,18 @@ def _cast_modelopt_awq_prepacked(model: nn.Module) -> None:
                 torch.float16)
 
 
-def _repack_nvfp4_a16_marlin_linears(model: nn.Module) -> None:
-    """Transform NVFP4A16MarlinLinear checkpoint buffers into Marlin layout.
+def _repack_nvfp4_a16_linears(model: nn.Module) -> None:
+    """Transform dense NVFP4-A16 checkpoint buffers for the export target.
 
     Replaces the raw ModelOpt ``weight`` / ``weight_scale`` / ``weight_scale_2``
     buffers with the plugin buffers ``qweight`` / ``block_scales`` /
-    ``global_scale`` and records ``n_padded`` for the forward slice.
+    ``global_scale`` and records ``n_padded`` for the forward slice. Explicit
+    SM110 exports use ``BLACKWELL_N128_K64_V1``; all other targets retain the
+    Marlin layout. Routed MoE experts remain on their separate Marlin path.
     """
-    from ..models.linear import NVFP4A16MarlinLinear  # local import
+    from ..models.linear import NVFP4A16Linear  # local import
     for module in model.modules():
-        if not isinstance(module, NVFP4A16MarlinLinear):
+        if not isinstance(module, NVFP4A16Linear):
             continue
         # Routed MoE experts are stacked into the MoE plugin at export time
         # (repack_nvfp4_a16_marlin_moe_experts), so leave their raw buffers.
@@ -460,21 +463,31 @@ def _repack_nvfp4_a16_marlin_linears(model: nn.Module) -> None:
         ws = module._buffers.get("weight_scale")
         wg = module._buffers.get("weight_scale_2")
         if wp is None:
-            logger.warning(
-                "NVFP4A16MarlinLinear missing weight; skipping repack")
+            logger.warning("NVFP4A16Linear missing weight; skipping repack")
             continue
         if wp.dtype in (torch.float16, torch.bfloat16, torch.float32):
             logger.warning(
-                "NVFP4A16MarlinLinear has dense %s weight; refusing to "
+                "NVFP4A16Linear has dense %s weight; refusing to "
                 "quantize in-export. Checkpoint must provide packed NVFP4 "
                 "(uint8 weight + e4m3 scales). Skipping repack.", wp.dtype)
             continue
         if ws is None or wg is None:
-            logger.warning("NVFP4A16MarlinLinear missing packed buffers; "
+            logger.warning("NVFP4A16Linear missing packed buffers; "
                            "skipping repack")
             continue
-        qweight, block_scales, global_scale, _, n_padded = (
-            repack_nvfp4_a16_marlin_linear(wp, ws, wg, pad_n_to=128))
+        use_blackwell = getattr(module, "_use_blackwell_gemm", None)
+        expected_use_blackwell = use_blackwell_nvfp4_a16_gemm()
+        if use_blackwell != expected_use_blackwell:
+            raise ValueError(
+                "NVFP4A16Linear plugin route changed between model "
+                f"construction ({use_blackwell}) and repacking "
+                f"({expected_use_blackwell})")
+        if use_blackwell:
+            qweight, block_scales, global_scale, _, n_padded = (
+                repack_nvfp4_a16_blackwell_linear(wp, ws, wg, pad_n_to=128))
+        else:
+            qweight, block_scales, global_scale, _, n_padded = (
+                repack_nvfp4_a16_marlin_linear(wp, ws, wg, pad_n_to=128))
         # Drop the raw checkpoint buffers and install the plugin buffers.
         for name in ("weight", "weight_scale", "weight_scale_2"):
             module._buffers.pop(name, None)
@@ -972,6 +985,86 @@ def repack_nvfp4_a16_marlin_linear(
     global_scale = torch.tensor([g * mult],
                                 dtype=torch.float64).to(torch.float16)
 
+    return qweights, block_scales, global_scale, n_logical, n_padded
+
+
+def repack_nvfp4_a16_blackwell_linear(
+    weight_packed: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_scale_2: torch.Tensor,
+    pad_n_to: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Repack ModelOpt NVFP4 weights into ``BLACKWELL_N128_K64_V1``.
+
+    The Blackwell GEMM and GEMV kernels share one opaque physical layout. Each
+    contiguous tile holds 128 output rows by 64 input columns: 32 packed FP4
+    bytes and four raw E4M3 K16 scales per output row. ModelOpt already stores
+    adjacent K codes in the required low/high nibble order, so the conversion
+    is a tile reshape and permutation with no numeric transformation.
+
+    Unlike Marlin, the Blackwell plugin consumes the checkpoint's FP32
+    per-tensor multiplier directly; it must not be multiplied by the Marlin
+    skip-flop factor.
+
+    Returns:
+      qweights:     ``[N_pad/128, K/64, 128, 32]`` int8
+      block_scales: ``[N_pad/128, K/64, 128, 4]`` int8
+      global_scale: ``[1]`` float32
+      n_logical:    original N
+      n_padded:     N rounded up to ``pad_n_to``
+    """
+    if pad_n_to <= 0 or pad_n_to % 128 != 0:
+        raise ValueError("pad_n_to must be a positive multiple of 128")
+
+    wp = weight_packed
+    if wp.dtype == torch.int8:
+        wp = wp.view(torch.uint8)
+    if wp.dtype != torch.uint8 or wp.ndim != 2:
+        raise TypeError(
+            "weight_packed must be a rank-2 uint8/int8 ModelOpt tensor")
+
+    n_logical, k_half = wp.shape
+    k = k_half * 2
+    if k <= 0 or k % 64 != 0:
+        raise ValueError(f"K={k} must be a positive multiple of 64")
+
+    ws = weight_scale
+    if ws.dtype == torch.float8_e4m3fn:
+        ws_i8 = ws.view(torch.int8)
+    elif ws.dtype in (torch.int8, torch.uint8):
+        ws_i8 = ws.view(torch.int8)
+    else:
+        raise TypeError(f"unexpected weight_scale dtype {ws.dtype}")
+    expected_scale_shape = (n_logical, k // _NVFP4_GROUP_SIZE)
+    if tuple(ws_i8.shape) != expected_scale_shape:
+        raise ValueError(f"weight_scale shape {tuple(ws_i8.shape)} != "
+                         f"{expected_scale_shape}")
+
+    n_padded = ((n_logical + pad_n_to - 1) // pad_n_to) * pad_n_to
+    if n_padded != n_logical:
+        wp_padded = torch.zeros((n_padded, k_half),
+                                dtype=torch.uint8,
+                                device=wp.device)
+        wp_padded[:n_logical].copy_(wp)
+        wp = wp_padded
+        ws_padded = torch.zeros((n_padded, k // _NVFP4_GROUP_SIZE),
+                                dtype=torch.int8,
+                                device=ws_i8.device)
+        ws_padded[:n_logical].copy_(ws_i8)
+        ws_i8 = ws_padded
+
+    n_tiles = n_padded // 128
+    k_tiles = k // 64
+    qweights = (wp.reshape(n_tiles, 128, k_tiles,
+                           32).permute(0, 2, 1,
+                                       3).contiguous().view(torch.int8))
+    block_scales = (ws_i8.reshape(n_tiles, 128, k_tiles,
+                                  4).permute(0, 2, 1, 3).contiguous())
+
+    if weight_scale_2.numel() != 1:
+        raise ValueError("weight_scale_2 must contain exactly one value")
+    global_scale = weight_scale_2.detach().reshape(1).to(
+        dtype=torch.float32).contiguous()
     return qweights, block_scales, global_scale, n_logical, n_padded
 
 
