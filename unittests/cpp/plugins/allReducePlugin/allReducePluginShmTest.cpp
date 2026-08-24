@@ -129,20 +129,11 @@ struct RankOutcome
     std::string failure{};
 };
 
-std::string sessionName(char const* suffix)
-{
-    char name[128];
-    std::snprintf(name, sizeof(name), "/edgellm_ut_ar_%s_%d", suffix, static_cast<int>(getpid()));
-    return std::string(name);
-}
-
 //! Drive one rank of a TP=2 AllReduce through the plugin. Every rank contributes
 //! rank + 1, so a correct reduction leaves 3 in every element.
-void runRank(int32_t rank, std::string const& shmName, int64_t elementThreshold, ThreadBarrier& barrier,
-    RankOutcome& outcome) noexcept
+void runRank(int32_t rank, ShmAllReduceState* state, ThreadBarrier& barrier, RankOutcome& outcome) noexcept
 {
     auto const dataType = nvinfer1::DataType::kHALF;
-    ShmAllReduceState* state{nullptr};
     UnregisterShmPathFn const unregisterPath = unregisterShmPathSymbol();
     bool registered = false;
 
@@ -157,13 +148,6 @@ void runRank(int32_t rank, std::string const& shmName, int64_t elementThreshold,
         if (cudaSetDevice(rank) != cudaSuccess)
         {
             throw std::runtime_error("cudaSetDevice failed");
-        }
-
-        state = shmAllReduceInit(
-            kTpSize, kMaxElements, elementThreshold, kDefaultShmFp8SmallPathElementThreshold, shmName.c_str());
-        if (state == nullptr)
-        {
-            throw std::runtime_error("shmAllReduceInit failed");
         }
 
         barrier.wait();
@@ -238,10 +222,6 @@ void runRank(int32_t rank, std::string const& shmName, int64_t elementThreshold,
     {
         unregisterPath(state, rank, rank);
     }
-    if (state != nullptr)
-    {
-        shmAllReduceDestroy(state);
-    }
 }
 
 void expectReducedOutputs(std::vector<RankOutcome> const& outcomes)
@@ -258,21 +238,34 @@ void expectReducedOutputs(std::vector<RankOutcome> const& outcomes)
     }
 }
 
-void runBothRanks(std::string const& shmName, int64_t elementThreshold, std::vector<RankOutcome>& outcomes)
+//! Allocate one SHM state on the main thread and share it with both ranks, which
+//! is the ownership shape shmAllReduceTests.cu uses.
+bool runBothRanks(int64_t elementThreshold, std::vector<RankOutcome>& outcomes)
 {
+    if (cudaSetDevice(0) != cudaSuccess)
+    {
+        return false;
+    }
+    ShmAllReduceState* state
+        = shmAllReduceInit(kTpSize, kMaxElements, elementThreshold, kDefaultShmFp8SmallPathElementThreshold);
+    if (state == nullptr)
+    {
+        return false;
+    }
+
     ThreadBarrier barrier(kTpSize);
     std::vector<std::thread> workers;
     workers.reserve(kTpSize);
     for (int32_t rank = 0; rank < kTpSize; ++rank)
     {
-        workers.emplace_back([rank, &shmName, elementThreshold, &barrier, &outcomes] {
-            runRank(rank, shmName, elementThreshold, barrier, outcomes[rank]);
-        });
+        workers.emplace_back([rank, state, &barrier, &outcomes] { runRank(rank, state, barrier, outcomes[rank]); });
     }
     for (auto& worker : workers)
     {
         worker.join();
     }
+    shmAllReduceDestroy(state);
+    return true;
 }
 
 } // namespace
@@ -323,7 +316,7 @@ TEST(AllReducePluginShmTest, SumsAcrossTwoRanks)
     ASSERT_NE(loadPluginLibrary(), nullptr) << "Failed to load " << pluginLibraryPath() << ": " << dlerror();
 
     std::vector<RankOutcome> outcomes(kTpSize);
-    runBothRanks(sessionName("shm"), /*elementThreshold=*/0, outcomes);
+    ASSERT_TRUE(runBothRanks(0, outcomes)) << "shmAllReduceInit failed";
     expectReducedOutputs(outcomes);
 }
 
@@ -355,6 +348,6 @@ TEST(AllReducePluginShmTest, FallsBackToNcclAboveThreshold)
     static_assert(kNumElements > kSmallThreshold, "The payload must exceed the SHM threshold");
 
     std::vector<RankOutcome> outcomes(kTpSize);
-    runBothRanks(sessionName("fallback"), kSmallThreshold, outcomes);
+    ASSERT_TRUE(runBothRanks(kSmallThreshold, outcomes)) << "shmAllReduceInit failed";
     expectReducedOutputs(outcomes);
 }

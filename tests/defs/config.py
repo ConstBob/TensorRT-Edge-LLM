@@ -1255,7 +1255,7 @@ class TestConfig:
 
                 # {$edge-llm-internal-release begin}
                 if self.tp_size > 1 and self.allreduce_backend is None:
-                    self.allreduce_backend = "shm"
+                    self.allreduce_backend = "nccl"
                 # {$edge-llm-internal-release end}
                 if self.lora is None:
                     self.lora = self.max_lora_rank > 0

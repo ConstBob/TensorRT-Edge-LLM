@@ -44,6 +44,7 @@
       "examples/llm/llm_inference.cpp",
       "tests/defs/config.py",
       "tests/defs/utils/command_generation.py",
+      "tests/test_lists/l0_pipeline_super_thor.yml",
       "unittests/cpp/runtime/multiDevice/parallelConfigTest.cpp"
     ],
     "forbidden_patterns": [

@@ -72,6 +72,8 @@ l0_local_spark_build_and_test:
 l0_super_thor:
   stage: l0_test
   needs:
+    - job: l0_checkpoint_export
+      artifacts: false
     - job: build_cutedsl_docker_matrix
       artifacts: true
   tags:
@@ -82,6 +84,9 @@ l0_super_thor:
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_pipeline_super_thor
     EDGELLM_NCCL_SO_PATH: "$EDGE_LLM_CACHE_DIR/nccl/tegra-thor/lib/libnccl.so.2.29.2"
+    L0_JOB_WRITES_ENGINES: "1"
+    ENABLE_MULTI_DEVICE: "ON"
+    ENABLE_MULTI_DEVICE_MPI: "ON"
     NCCL_CUMEM_ENABLE: "0"
     NCCL_IB_DISABLE: "1"
     NCCL_MNNVL_ENABLE: "0"
@@ -98,15 +103,17 @@ l0_super_thor:
         echo "Tensor-parallel tests need 2 GPUs, found ${gpu_count:-0}"
         exit 1
       fi
+    - command -v mpirun >/dev/null || { echo "mpirun not found, required by the mdmpi cases"; exit 1; }
     - if [ ! -d "$TRT_PACKAGE_DIR" ]; then echo "TensorRT package not found at $TRT_PACKAGE_DIR"; exit 1; fi
     - if [ ! -f "$EDGELLM_NCCL_SO_PATH" ]; then echo "Thor NCCL not found at $EDGELLM_NCCL_SO_PATH"; exit 1; fi
     - export PATH=/usr/local/cuda/bin:$PATH
     - export LD_LIBRARY_PATH="$TRT_PACKAGE_DIR/lib:$(dirname "$EDGELLM_NCCL_SO_PATH"):${LD_LIBRARY_PATH:-}"
     - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
-    - mkdir -p "$TEST_LOG_DIR" "$CI_PROJECT_DIR/.ci-reports"
+    - mkdir -p "$TEST_LOG_DIR" "$ENGINE_DIR" "$CI_PROJECT_DIR/.ci-reports"
     - chmod -R 777 "$TEST_LOG_DIR"
     - python3 -m venv venv && source venv/bin/activate
     - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install pytest dependencies" -- pip3 install -r tests/requirements.txt
+    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install accuracy dependencies" -- pip3 install -r examples/accuracy/requirements.txt
     - echo "Running pipeline tests with pytest. Time:$(date)"
     - python3 -m pytest tests/ --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml="$CI_PROJECT_DIR/.ci-reports/test_report_$PRIORITY.xml"
     - echo "HTML report saved to $TEST_LOG_DIR; JUnit report saved to $CI_PROJECT_DIR/.ci-reports"

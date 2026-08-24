@@ -30,7 +30,7 @@ cpp/kernels/multiDeviceKernels/shmAllReduce.cu
 cpp/kernels/multiDeviceKernels/shmAllReduce.h
 cpp/runtime/multiDevice/backends/shm/
 unittests/cpp/plugins/allReducePlugin/allReducePluginShmTest.cpp
-unittests/shmAllReduceTests.cu
+unittests/cpp/kernels/multiDeviceKernels/shmAllReduceTests.cu
 
 # Local/generated artifacts that must not leak into release staging.
 build/
