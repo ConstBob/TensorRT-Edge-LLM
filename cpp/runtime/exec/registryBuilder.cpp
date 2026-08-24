@@ -31,18 +31,18 @@ namespace rt
 // `InferenceDims`, so the set of dims exists by construction of the type.
 
 //! Page count for paged-pool KV-cache bindings
-//! [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim]. A single fixed value per engine
-//! (not resized per inference step), matching the serialized builder profile and
-//! KVCacheManager::numPages() (see sharedResources.cpp).
+//! [2, numPages_i, kTOKENS_PER_PAGE, numKVHeads, headDim]. Full-only layers use the serialized
+//! full-pool count. SWA-capable layers use either their bounded physical count or the full-pool
+//! count according to the runtime-selected storage policy.
 constexpr int32_t kTokensPerPage = rt::kTOKENS_PER_PAGE;
 
-static int32_t computeNumPages(LLMEngineConfig const& cfg)
+static int32_t computeNumPages(LLMEngineConfig const& cfg, KVLayerConfig const& layerConfig)
 {
     int64_t const minimumActivePages = rt::computeMinimumKvPoolPages(cfg.maxSupportedBatchSize, cfg.maxKVCacheCapacity);
     ELLM_CHECK(cfg.kvPoolPages >= minimumActivePages && cfg.kvPoolPages <= rt::kMAX_KV_POOL_PAGES,
         "KV pool page count (" + std::to_string(cfg.kvPoolPages) + ") is outside [" + std::to_string(minimumActivePages)
             + ", " + std::to_string(rt::kMAX_KV_POOL_PAGES) + "].");
-    return cfg.kvPoolPages;
+    return cfg.getKVPoolPagesForLayer(layerConfig);
 }
 
 void addRopeTensorSpecs(TensorRegistry& reg, LLMEngineConfig const& cfg)
@@ -150,6 +150,14 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
         {sym(&InferenceDims::startIndexLen)}});
 
     addKVPageTableSpec(reg, cfg);
+    if (cfg.supportsBoundedSwaKVCache())
+    {
+        int32_t const maxPagesPerSeq = rt::computeMaxPagesPerSeq(cfg.maxKVCacheCapacity);
+        reg.addTensor({binding_names::kSwaKVPageTable, TensorIO::kInput, nvinfer1::DataType::kINT32,
+            {sym(&InferenceDims::batch), fixed(2), fixed(maxPagesPerSeq)}});
+        reg.addTensor({binding_names::kSwaKVCacheMode, TensorIO::kInput, nvinfer1::DataType::kINT8,
+            {sym(&InferenceDims::swaKVCacheModeLen)}});
+    }
 
     if (cfg.useVisionBidirectionalAttention)
     {
@@ -187,8 +195,8 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
                 reg.addTensor({std::string(tmpl) + "_" + std::to_string(localAttnIdx), io, cfg.kvCacheDtype, shape});
             };
             // Plugin: paged pool, 5D [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim].
-            // numPages is fixed for the life of this engine context (see computeNumPages).
-            int32_t const numPages = computeNumPages(cfg);
+            // numPages is fixed per layer for the life of this engine context.
+            int32_t const numPages = computeNumPages(cfg, lc);
             std::vector<ShapeDim> const shape{
                 fixed(2), fixed(numPages), fixed(kTokensPerPage), fixed(lc.numKVHeads), fixed(lc.headDim)};
             addKVCacheTensor(binding_names::kPastKeyValuesTemplate, TensorIO::kInput, shape);
@@ -418,7 +426,7 @@ TensorRegistry buildRegistryForSpecDecodeDraft(DeploymentConfig const& bundle)
             // Plugin: paged pool, 5D [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim] — same
             // contract as the base LLM engine (see buildRegistryForLLM); EAGLE/MTP drafts share the
             // AttentionPlugin binding via KVCacheManager's paged-pool view.
-            int32_t const numPages = computeNumPages(cfg);
+            int32_t const numPages = computeNumPages(cfg, lc);
             std::vector<ShapeDim> const shape{
                 fixed(2), fixed(numPages), fixed(kTokensPerPage), fixed(lc.numKVHeads), fixed(lc.headDim)};
             auto addKVCacheTensor = [&](char const* tmpl, TensorIO io) {
@@ -561,7 +569,7 @@ TensorRegistry buildRegistryForGemma4MTPDraft(DeploymentConfig const& bundle)
         // expected shape is the target pool contract [2, numPages, kTOKENS_PER_PAGE,
         // numKVHeads, headDim] with the target's runtime-chosen numPages.
         auto const& targetKV = bundle.base.kvLayerConfigs[entry.targetAttentionLayerIdx];
-        int32_t const targetNumPages = computeNumPages(bundle.base);
+        int32_t const targetNumPages = computeNumPages(bundle.base, targetKV);
         std::vector<ShapeDim> const shape{fixed(2), fixed(targetNumPages), fixed(kTokensPerPage),
             fixed(targetKV.numKVHeads), fixed(targetKV.headDim)};
         reg.addTensor({binding_names::formatKVCacheName(entry.assistantLayerIdx, /*isPast=*/true), TensorIO::kInput,

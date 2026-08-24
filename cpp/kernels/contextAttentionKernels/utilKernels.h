@@ -68,5 +68,25 @@ void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor con
     rt::Tensor& cuQSeqLens, rt::Tensor& cuKVSeqLens, rt::Tensor& kvCacheEndIdxs,
     rt::OptionalOutputTensor paddedCuKVSeqLens, int32_t const runtimeSeqLen, cudaStream_t stream);
 
+//! \brief Compute sequence metadata for paged SWA chunked prefill.
+//!
+//! The temporary KV source contains the previous resident window followed by the current chunk. The KV prefix sums
+//! therefore use `min(kvCacheStartIndices[b], slidingWindowSize) + inputSeqLen[b]`. `kvCacheEndIdxs` uses the padded
+//! runtime sequence length so the generic RoPE/write kernel assigns position `start + tokenOffset` to every row.
+//! `paddedCuKVSeqLens` uses the same resident prefix plus `runtimeSeqLen`, which preserves the causal offset when
+//! ragged chunks are padded to the maximum query length.
+void calSWAChunkedPrefillMetadata(rt::Tensor const& inputSeqLen, rt::Tensor const& kvCacheStartIndices,
+    rt::Tensor& cuQSeqLens, rt::Tensor& cuKVSeqLens, rt::Tensor& kvCacheEndIdxs, rt::Tensor& paddedCuKVSeqLens,
+    int32_t runtimeSeqLen, int32_t slidingWindowSize, cudaStream_t stream);
+
+//! \brief Assemble split FP16 K/V for SWA chunked prefill from a paged resident window plus the current chunk.
+//!
+//! For each batch row, logical tokens `[start - min(start, W), start)` are gathered through `swaPageTable`; newly
+//! roped K/V from the current chunk are appended directly. The outputs have shape `[B, W + S, Hkv, D]`, are padded
+//! with zeros, and are consumed with cu-seqlens from calSWAChunkedPrefillMetadata(). The persistent pool remains
+//! bounded independently of the maximum sequence length.
+void assemblePagedSWAChunkedPrefillFMHAKV(rt::Tensor const& swaPool, rt::Tensor const& swaPageTable,
+    rt::Tensor const& k, rt::Tensor const& v, rt::Tensor const& inputSeqLen, rt::Tensor const& kvCacheStartIndices,
+    rt::Tensor& kWorkspace, rt::Tensor& vWorkspace, int32_t slidingWindowSize, cudaStream_t stream);
 } // namespace kernel
 } // namespace trt_edgellm

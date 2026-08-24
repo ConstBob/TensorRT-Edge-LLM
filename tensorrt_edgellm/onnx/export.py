@@ -235,9 +235,10 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
     """Strip disabled optional inputs from AttentionPlugin ONNX nodes.
 
     The onnxscript translation always emits the full optional layout:
-    q/k norm gammas, context-mask selector, and tree/vision mask inputs. The
-    C++ plugin expects those optional groups compacted in that relative order,
-    with disabled groups removed from the ONNX node input list.
+    q/k norm gammas, context-mask selector, tree/vision mask inputs, and runtime
+    shape selectors. The C++ plugin expects those optional groups compacted in
+    that relative order, with disabled groups removed from the ONNX node input
+    list.
     """
     _NUM_REQUIRED = 6
     _GAMMA_POSITIONS = (6, 7)
@@ -245,9 +246,24 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
     _ATTENTION_MASK_POSITION = 9
     _ATTENTION_POS_ID_POSITION = 10
     _SKIP_SCALE_POSITION = 11
+    _SWA_KV_CACHE_MODE_POSITION = 12
     model = onnx.load(onnx_path, load_external_data=False)
     changed = 0
+    mode_shape_changed = False
     dropped_gamma_tensors: set = set()
+    for graph_input in model.graph.input:
+        if graph_input.name != "swa_kv_cache_mode":
+            continue
+        tensor_type = graph_input.type.tensor_type
+        if tensor_type.elem_type != onnx.TensorProto.INT8:
+            raise ValueError("swa_kv_cache_mode must be an INT8 tensor")
+        if len(tensor_type.shape.dim) != 1:
+            raise ValueError("swa_kv_cache_mode must be a 1-D tensor")
+        mode_dim = tensor_type.shape.dim[0]
+        if mode_dim.dim_param != "swa_kv_cache_mode_len":
+            mode_dim.ClearField("dim_value")
+            mode_dim.dim_param = "swa_kv_cache_mode_len"
+            mode_shape_changed = True
     for node in model.graph.node:
         if node.op_type != "AttentionPlugin":
             continue
@@ -301,11 +317,33 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
             skip_input = get_input(_SKIP_SCALE_POSITION)
             if skip_input:
                 new_inputs.append(skip_input)
-        if new_inputs == inputs:
-            continue
-        del node.input[:]
-        node.input.extend(new_inputs)
-        changed += 1
+        # The final shape-only policy input is the single source of truth for
+        # bounded SWA capability. Materialize the corresponding TensorRT plugin
+        # field only after optional inputs have been normalized.
+        swa_mode_input = get_input(_SWA_KV_CACHE_MODE_POSITION)
+        supports_bounded_attr = next(
+            (a
+             for a in node.attribute if a.name == "supports_bounded_kv_cache"),
+            None,
+        )
+        node_changed = False
+        if swa_mode_input:
+            new_inputs.append(swa_mode_input)
+            if supports_bounded_attr is None:
+                node.attribute.append(
+                    onnx.helper.make_attribute("supports_bounded_kv_cache", 1))
+                node_changed = True
+            elif supports_bounded_attr.i != 1:
+                supports_bounded_attr.i = 1
+                node_changed = True
+        elif supports_bounded_attr is not None:
+            node.attribute.remove(supports_bounded_attr)
+            node_changed = True
+        if new_inputs != inputs:
+            del node.input[:]
+            node.input.extend(new_inputs)
+            node_changed = True
+        changed += int(node_changed)
 
     # Prune the gamma Constant/Cast chains that no longer feed any node.
     if dropped_gamma_tensors:
@@ -333,11 +371,13 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
             if init.name in dropped_gamma_tensors and init.name not in consumed:
                 model.graph.initializer.remove(init)
 
-    if not changed:
+    if not changed and not mode_shape_changed:
         return
     logger.info(
-        "TRT fix: normalized optional inputs on %d AttentionPlugin node(s)",
+        "TRT fix: normalized optional inputs on %d AttentionPlugin node(s)%s",
         changed,
+        " and restored the dynamic SWA mode shape"
+        if mode_shape_changed else "",
     )
     data_file = os.path.basename(onnx_path) + ".data"
     onnx.save_model(

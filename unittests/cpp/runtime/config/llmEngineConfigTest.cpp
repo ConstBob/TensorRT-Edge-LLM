@@ -18,7 +18,10 @@
 #include "runtime/config/llmEngineConfig.h"
 
 #include "common/pagedKvTypes.h"
+#include "common/specDecodeConfigUtils.h"
 #include "testUtils.h"
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -106,6 +109,24 @@ protected:
     }
 };
 
+TEST(SpecDecodeConfigUtilsTest, DetectsLegacyTopLevelAndBuilderFlags)
+{
+    constexpr std::array<char const*, 16> kTOP_LEVEL_FLAGS{"eagle_base", "is_eagle3_draft", "mtp_base", "is_mtp_draft",
+        "mtp_tree_base", "dflash_base", "dflash_tree_base", "is_dflash_draft", "jetspec_base", "jetspec_tree_base",
+        "is_jetspec_draft", "dspark_base", "is_dspark_draft", "gemma4_mtp_base", "gemma4_mtp_draft",
+        "shares_target_kv"};
+    for (char const* flag : kTOP_LEVEL_FLAGS)
+    {
+        SCOPED_TRACE(flag);
+        EXPECT_TRUE(configRevealsSpecDecode(Json{{flag, true}}));
+    }
+
+    EXPECT_TRUE(configRevealsSpecDecode(Json{{"builder_config", Json{{"spec_base", true}}}}));
+    EXPECT_TRUE(configRevealsSpecDecode(Json{{"builder_config", Json{{"spec_draft", true}}}}));
+    EXPECT_FALSE(configRevealsSpecDecode(Json::object()));
+    EXPECT_FALSE(configRevealsSpecDecode(Json{{"builder_config", false}}));
+}
+
 TEST_F(LLMEngineConfigTest, ParseMinimalConfig)
 {
     Json const json = makeMinimalConfig();
@@ -124,11 +145,75 @@ TEST_F(LLMEngineConfigTest, ParseMinimalConfig)
     EXPECT_EQ(cfg.maxSupportedInputLength, 128);
     EXPECT_EQ(cfg.maxKVCacheCapacity, 256);
     EXPECT_EQ(cfg.kvPoolPages, 4);
+    EXPECT_EQ(cfg.numSwaPages, 0);
     EXPECT_EQ(cfg.maxSupportedLoraRank, 0);
     EXPECT_FALSE(cfg.isSpecDecodeBase);
     EXPECT_EQ(cfg.maxVerifyTreeSize, 0);
     EXPECT_EQ(cfg.maxDraftTreeSize, 0);
     EXPECT_EQ(cfg.kvCacheDtype, nvinfer1::DataType::kHALF);
+}
+
+TEST_F(LLMEngineConfigTest, ResolvesIndependentFullAndSwaPoolPagesPerLayer)
+{
+    LLMEngineConfig config;
+    config.maxSupportedBatchSize = 2;
+    config.maxKVCacheCapacity = 1024;
+    config.kvPoolPages
+        = static_cast<int32_t>(computeMinimumKvPoolPages(config.maxSupportedBatchSize, config.maxKVCacheCapacity)) + 7;
+    constexpr int32_t kWINDOW_SIZE = 129;
+    config.numSwaPages = static_cast<int32_t>(computeMinimumSwaPoolPages(config.maxSupportedBatchSize, kWINDOW_SIZE));
+    KVLayerConfig const swaLayer{8, 128, kWINDOW_SIZE};
+    config.kvLayerConfigs = {KVLayerConfig{8, 128}, swaLayer};
+
+    EXPECT_EQ(config.getKVPoolPagesForLayer(KVLayerConfig{8, 128}), config.kvPoolPages);
+    EXPECT_EQ(config.getKVPoolPagesForLayer(swaLayer), config.numSwaPages);
+
+    EXPECT_TRUE(config.supportsBoundedSwaKVCache());
+    EXPECT_TRUE(config.usesBoundedSwaKVCache());
+    EXPECT_EQ(config.getSwaKVCacheModeInputLength(), 1);
+    EXPECT_EQ(config.getKVPoolPageProfileForLayer(swaLayer),
+        (std::array<int32_t, 3>{config.numSwaPages, config.numSwaPages, config.kvPoolPages}));
+
+    config.setSwaKVCacheMode(SwaKVCacheMode::kFull);
+    EXPECT_TRUE(config.supportsBoundedSwaKVCache());
+    EXPECT_FALSE(config.usesBoundedSwaKVCache());
+    EXPECT_EQ(config.getSwaKVCacheModeInputLength(), 0);
+    EXPECT_EQ(config.getKVPoolPagesForLayer(swaLayer), config.kvPoolPages);
+    EXPECT_EQ(swaLayer.kvCacheCapacity, kWINDOW_SIZE);
+
+    config.maxKVCacheCapacity = 512;
+    config.kvPoolPages
+        = static_cast<int32_t>(computeMinimumKvPoolPages(config.maxSupportedBatchSize, config.maxKVCacheCapacity));
+    ASSERT_GT(config.numSwaPages, config.kvPoolPages);
+    EXPECT_EQ(config.getKVPoolPageProfileForLayer(swaLayer),
+        (std::array<int32_t, 3>{config.kvPoolPages, config.kvPoolPages, config.numSwaPages}));
+}
+
+TEST_F(LLMEngineConfigTest, EveryInferenceRecipeCarriesTheActiveSwaModeLength)
+{
+    LLMEngineConfig config;
+    config.maxSupportedBatchSize = 2;
+    config.maxKVCacheCapacity = 1024;
+    config.kvPoolPages
+        = static_cast<int32_t>(computeMinimumKvPoolPages(config.maxSupportedBatchSize, config.maxKVCacheCapacity));
+    config.numSwaPages
+        = static_cast<int32_t>(computeMinimumSwaPoolPages(config.maxSupportedBatchSize, /*slidingWindowCapacity=*/129));
+    config.kvLayerConfigs = {KVLayerConfig{8, 128, 129}};
+
+    auto expectModeLength = [&](int64_t expected) {
+        EXPECT_EQ(config.prefillDims(/*batch=*/2, /*seqLen=*/16, /*kvCacheAllEmpty=*/true).swaKVCacheModeLen, expected);
+        EXPECT_EQ(config.decodeDims(/*batch=*/2).swaKVCacheModeLen, expected);
+        EXPECT_EQ(config.denoiseDims(/*batch=*/2, /*canvasLen=*/16).swaKVCacheModeLen, expected);
+        EXPECT_EQ(config.diffusionCommitDims(/*batch=*/2, /*commitLen=*/4).swaKVCacheModeLen, expected);
+        EXPECT_EQ(config.specVerifyDims(/*batch=*/2, /*verifySize=*/4).swaKVCacheModeLen, expected);
+        EXPECT_EQ(config.proposalDims(/*batch=*/2, /*proposalSize=*/4, /*draftTopK=*/1).swaKVCacheModeLen, expected);
+        EXPECT_EQ(config.acceptDims(/*batch=*/2, /*acceptLen=*/2).swaKVCacheModeLen, expected);
+        EXPECT_EQ(config.resetDims().swaKVCacheModeLen, expected);
+    };
+
+    expectModeLength(1);
+    config.setSwaKVCacheMode(SwaKVCacheMode::kFull);
+    expectModeLength(0);
 }
 
 TEST_F(LLMEngineConfigTest, ParseEagleBaseConditioningMetadata)
@@ -361,6 +446,7 @@ TEST_F(LLMEngineConfigTest, SpecDecodeMaxProposalSizes)
     json["engine_role"] = "base";
     json["builder_config"]["spec_base"] = true;
     json["builder_config"]["max_verify_tree_size"] = 16;
+    json["builder_config"]["num_swa_pages"] = 64; // Unused fallback budget must not enable SWA.
     // `max_draft_tree_size` is a draft-engine property and is not written
     // into base_config.json by the builder — intentionally omitted here.
     auto const path = writeJsonToTempFile(json);
@@ -369,6 +455,9 @@ TEST_F(LLMEngineConfigTest, SpecDecodeMaxProposalSizes)
     EXPECT_TRUE(cfg.isSpecDecodeBase);
     EXPECT_EQ(cfg.maxVerifyTreeSize, 16);
     EXPECT_EQ(cfg.maxDraftTreeSize, 0); // Base side leaves this at the default.
+    EXPECT_EQ(cfg.numSwaPages, 64);
+    EXPECT_TRUE(std::all_of(cfg.kvLayerConfigs.begin(), cfg.kvLayerConfigs.end(),
+        [](KVLayerConfig const& layer) { return layer.kvCacheCapacity == 0; }));
     // baseOutputHiddenDim = hiddenSize * 3 = 768 * 3 = 2304; computed at DeploymentConfig level
     EXPECT_EQ(cfg.hiddenSize * 3, 2304);
 }
@@ -585,8 +674,106 @@ TEST_F(LLMEngineConfigTest, ParsesCanonicalLayerTypes)
     ASSERT_EQ(cfg.kvLayerConfigs.size(), 2u);
     EXPECT_EQ(cfg.kvLayerConfigs[0].numKVHeads, 8);
     EXPECT_EQ(cfg.kvLayerConfigs[0].headDim, 64);
+    EXPECT_EQ(cfg.kvLayerConfigs[0].kvCacheCapacity, 0);
     EXPECT_EQ(cfg.kvLayerConfigs[1].numKVHeads, 4);
     EXPECT_EQ(cfg.kvLayerConfigs[1].headDim, 128);
+    EXPECT_EQ(cfg.kvLayerConfigs[1].kvCacheCapacity, 0);
+}
+
+TEST_F(LLMEngineConfigTest, ParsesPerLayerKVCacheCapacityMarkers)
+{
+    Json json = makeMinimalConfig();
+    json["num_hidden_layers"] = 4;
+    json["builder_config"]["num_swa_pages"] = 64;
+    json["layer_types"] = {"attention", "attention", "attention", "attention"};
+    json["kv_layer_configs"] = Json::array({
+        Json{{"num_kv_heads", 4}, {"head_dim", 64}},
+        Json{{"num_kv_heads", 4}, {"head_dim", 64}, {"kv_cache_capacity", 0}},
+        Json{{"num_kv_heads", 4}, {"head_dim", 64}, {"kv_cache_capacity", 128}},
+        Json{{"num_kv_heads", 4}, {"head_dim", 64}, {"kv_cache_capacity", 256}},
+    });
+    auto const path = writeJsonToTempFile(json);
+
+    LLMEngineConfig cfg = parseEngineConfig(path);
+    ASSERT_EQ(cfg.kvLayerConfigs.size(), 4u);
+    EXPECT_EQ(cfg.numSwaPages, 64);
+    EXPECT_EQ(cfg.kvLayerConfigs[0].kvCacheCapacity, 0);   // Missing marker remains compatibility-full.
+    EXPECT_EQ(cfg.kvLayerConfigs[1].kvCacheCapacity, 0);   // Explicit zero is also full.
+    EXPECT_EQ(cfg.kvLayerConfigs[2].kvCacheCapacity, 128); // Dedicated SWA window.
+    EXPECT_EQ(cfg.kvLayerConfigs[3].kvCacheCapacity, 256); // Explicit engine capacity is full.
+    EXPECT_TRUE(cfg.usesBoundedSwaKVCache());
+
+    cfg.setSwaKVCacheMode(SwaKVCacheMode::kFull);
+    EXPECT_FALSE(cfg.usesBoundedSwaKVCache());
+    EXPECT_EQ(cfg.kvLayerConfigs[2].kvCacheCapacity, 128); // Runtime policy never erases serialized capability.
+}
+
+TEST_F(LLMEngineConfigTest, RejectsMixedReducedKVCacheCapacities)
+{
+    Json json = makeMinimalConfig();
+    json["num_hidden_layers"] = 2;
+    json["builder_config"]["num_swa_pages"] = 64;
+    json["layer_types"] = {"attention", "attention"};
+    json["kv_layer_configs"] = Json::array({
+        Json{{"num_kv_heads", 4}, {"head_dim", 64}, {"kv_cache_capacity", 64}},
+        Json{{"num_kv_heads", 4}, {"head_dim", 64}, {"kv_cache_capacity", 128}},
+    });
+    auto const path = writeJsonToTempFile(json);
+    EXPECT_THROW(parseEngineConfig(path), std::runtime_error);
+}
+
+TEST_F(LLMEngineConfigTest, RejectsReducedKVCacheCapacityForFp8)
+{
+    Json json = makeMinimalConfig();
+    json["num_hidden_layers"] = 1;
+    json["kv_cache_dtype"] = "fp8";
+    json["builder_config"]["num_swa_pages"] = 64;
+    json["layer_types"] = {"attention"};
+    json["kv_layer_configs"] = Json::array({Json{{"num_kv_heads", 4}, {"head_dim", 64}, {"kv_cache_capacity", 128}}});
+    auto const path = writeJsonToTempFile(json);
+    EXPECT_THROW(parseEngineConfig(path), std::runtime_error);
+}
+
+TEST_F(LLMEngineConfigTest, RejectsReducedKVCacheCapacityWhenSpecFlagIsSet)
+{
+    Json json = makeMinimalConfig();
+    json["num_hidden_layers"] = 1;
+    json["builder_config"]["spec_base"] = true;
+    json["builder_config"]["num_swa_pages"] = 64;
+    json["layer_types"] = {"attention"};
+    json["kv_layer_configs"] = Json::array({Json{{"num_kv_heads", 4}, {"head_dim", 64}, {"kv_cache_capacity", 128}}});
+    auto const path = writeJsonToTempFile(json);
+    EXPECT_THROW(parseEngineConfig(path), std::runtime_error);
+}
+
+TEST_F(LLMEngineConfigTest, ReducedKVCacheCapacityRequiresConfiguredSwaPages)
+{
+    Json json = makeMinimalConfig();
+    json["num_hidden_layers"] = 1;
+    json["layer_types"] = {"attention"};
+    json["kv_layer_configs"] = Json::array({Json{{"num_kv_heads", 4}, {"head_dim", 64}, {"kv_cache_capacity", 128}}});
+
+    auto path = writeJsonToTempFile(json);
+    EXPECT_THROW(parseEngineConfig(path), std::runtime_error);
+
+    json["builder_config"]["num_swa_pages"]
+        = computeMinimumSwaPoolPages(/*maxBatchSize=*/2, /*slidingWindowCapacity=*/128) - 1;
+    path = writeJsonToTempFile(json);
+    EXPECT_THROW(parseEngineConfig(path), std::runtime_error);
+}
+
+TEST_F(LLMEngineConfigTest, Fp8FallbackWithoutMarkerDoesNotEnableReducedPool)
+{
+    Json json = makeMinimalConfig();
+    json["kv_cache_dtype"] = "fp8";
+    json["builder_config"]["num_swa_pages"] = 64;
+    auto const path = writeJsonToTempFile(json);
+
+    LLMEngineConfig const cfg = parseEngineConfig(path);
+    EXPECT_EQ(cfg.numSwaPages, 64);
+    ASSERT_FALSE(cfg.kvLayerConfigs.empty());
+    EXPECT_TRUE(std::all_of(cfg.kvLayerConfigs.begin(), cfg.kvLayerConfigs.end(),
+        [](KVLayerConfig const& layer) { return !isReducedKvCacheCapacity(layer.kvCacheCapacity, 256); }));
 }
 
 TEST_F(LLMEngineConfigTest, FallbackBuildsLayerTypesFromScalarsPureAttention)
@@ -615,6 +802,7 @@ TEST_F(LLMEngineConfigTest, FallbackBuildsLayerTypesFromScalarsPureAttention)
     {
         EXPECT_EQ(lc.numKVHeads, 8);
         EXPECT_EQ(lc.headDim, 64);
+        EXPECT_EQ(lc.kvCacheCapacity, 0);
     }
 }
 

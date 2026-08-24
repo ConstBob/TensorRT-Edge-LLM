@@ -38,7 +38,7 @@ namespace rt
 //! `proposalDims`, `acceptDims`, `resetDims`). Direct construction (aggregate
 //! or designated initializers) is supported for unit tests.
 //!
-//! The ten fields are the complete set of symbolic dims used by LLM, DiffusionGemma, and SpecDecode
+//! These fields are the complete set of symbolic dims used by LLM, DiffusionGemma, and SpecDecode
 //! draft engines. Fixed-shape tensor dims do not appear here.
 struct InferenceDims
 {
@@ -76,6 +76,9 @@ struct InferenceDims
     //! calibrated default. Like the phase marker, the plugin reads this
     //! shape, never the payload.
     int64_t skipSoftmaxScaleLen;
+    //! Shape length for `swa_kv_cache_mode`. One selects bounded SWA storage;
+    //! zero selects ordinary full KV storage. The plugin reads only the shape.
+    int64_t swaKVCacheModeLen;
 };
 
 //! Tripwires: if `InferenceDims` gains, loses, or reorders a field, these asserts fire
@@ -85,7 +88,7 @@ struct InferenceDims
 //! change the meaning of every positional aggregate init). Note: these do NOT catch
 //! "short" aggregate inits (omitting trailing fields) — the policy is that production
 //! construction goes through recipe methods, which always set every field.
-static_assert(sizeof(InferenceDims) == 11 * sizeof(int64_t),
+static_assert(sizeof(InferenceDims) == 12 * sizeof(int64_t),
     "InferenceDims layout changed: update kDimNames, toString(), kZeroAllowedMembers, and every recipe "
     "method in LLMEngineConfig (prefillDims / decodeDims / denoiseDims / diffusionCommitDims / "
     "specVerifyDims / proposalDims / acceptDims / resetDims).");
@@ -104,6 +107,8 @@ static_assert(
     offsetof(InferenceDims, specVerifyPhaseLen) == 9 * sizeof(int64_t), "InferenceDims::specVerifyPhaseLen reordered");
 static_assert(offsetof(InferenceDims, skipSoftmaxScaleLen) == 10 * sizeof(int64_t),
     "InferenceDims::skipSoftmaxScaleLen reordered");
+static_assert(
+    offsetof(InferenceDims, swaKVCacheModeLen) == 11 * sizeof(int64_t), "InferenceDims::swaKVCacheModeLen reordered");
 
 namespace detail
 {
@@ -129,17 +134,19 @@ inline constexpr std::array<std::pair<int64_t InferenceDims::*, std::string_view
         {&InferenceDims::startIndexLen, "start_index_len"},
         {&InferenceDims::specVerifyPhaseLen, "spec_verify_phase_len"},
         {&InferenceDims::skipSoftmaxScaleLen, "skip_softmax_scale_len"},
+        {&InferenceDims::swaKVCacheModeLen, "swa_kv_cache_mode_len"},
     }};
 
 //! Members where `0` is a legitimate engine-meaningful value (not a recipe
 //! bypass). `firstInvalidMember` excludes these from the `> 0` positivity
 //! check. Keep this set as small as possible — default validation should be
 //! strict, and most dims (batch, seqLen, kvLen, etc.) must be > 0.
-inline constexpr std::array<int64_t InferenceDims::*, 4> kZeroAllowedMembers{
+inline constexpr std::array<int64_t InferenceDims::*, 5> kZeroAllowedMembers{
     &InferenceDims::contextMaskSelectorLen,
     &InferenceDims::startIndexLen,
     &InferenceDims::specVerifyPhaseLen,
     &InferenceDims::skipSoftmaxScaleLen,
+    &InferenceDims::swaKVCacheModeLen,
 };
 } // namespace detail
 

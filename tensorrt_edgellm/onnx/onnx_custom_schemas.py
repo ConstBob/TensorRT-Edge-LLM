@@ -131,6 +131,15 @@ _attention_plugin_schema = OpSchema(
             type_str="tensor(int8)",
             param_option=OpSchema.FormalParameterOption.Optional,
         ),
+        OpSchema.FormalParameter(
+            name="swa_kv_cache_mode",
+            description=(
+                "Shape-only runtime SWA storage selector (optional): 1-D INT8 "
+                "dummy whose length is 1 for bounded O(W) storage or 0 for "
+                "full storage; data is never read."),
+            type_str="tensor(int8)",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
     ],
     outputs=[
         OpSchema.FormalParameter(
@@ -209,6 +218,15 @@ _attention_plugin_schema = OpSchema(
             type=OpSchema.AttrType.INT,
             description=
             "Sliding window size for attention (-1 = none, >0 = window size).",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="supports_bounded_kv_cache",
+            type=OpSchema.AttrType.INT,
+            description=(
+                "Whether this attention layer supports bounded KV storage "
+                "(0(false), 1(true)); runtime mode selects bounded or full "
+                "storage."),
             required=False,
         ),
         OpSchema.Attribute(

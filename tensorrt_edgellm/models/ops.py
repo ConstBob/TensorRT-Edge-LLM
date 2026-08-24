@@ -113,13 +113,17 @@ def attention_plugin(
     rms_norm_eps: float = 1e-6,
     # Default 0 so torch.export strips the kwarg for non-qk_norm models.
     enable_qk_norm: int = 0,
-    # Whether this layer reads K/V from a donated (shared) cache: the packed input
-    # carries Q only. Default 0 so torch.export strips the kwarg for normal layers.
+    # Whether this layer reads K/V from a donated (shared) cache. Ordinary full-cache
+    # and spec layers carry Q only. Runtime-selectable SWA consumers also carry the
+    # current donor K/V for bounded prefill. Default 0 for normal layers.
     enable_kv_shared: int = 0,
     # Runtime skip-softmax override carrier: 1-D INT8 dummy whose LENGTH encodes the
     # runtime scale-factor override (0 = keep the engine default). Default None so
     # torch.export strips it for models that do not wire the runtime knob.
     skip_softmax_scale: Optional[torch.Tensor] = None,
+    # Shape-only runtime policy selector for bounded-capable SWA layers. A
+    # length of 1 selects bounded O(W) storage; length 0 selects full storage.
+    swa_kv_cache_mode: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Unified stub for AttentionPlugin covering all feature combinations.
 
@@ -172,7 +176,13 @@ def attention_plugin(
     ``qkv`` is the PACKED projection output ``[B, S, (Hq + 2*Hkv) * D]``
     (Q/K/V concatenated on the last dim — either a single fused QKV GEMM
     output or ``torch.cat`` of the three separate projections), or
-    ``[B, S, Hq * D]`` (Q only) for shared-KV layers (``enable_kv_shared=1``).
+    ``[B, S, Hq * D]`` (Q only) for ordinary shared-KV layers, or
+    ``[B, S, (Hq + 2*Hkv) * D]`` when a bounded SWA consumer also carries the
+    donor's current K/V transiently. Shared layers never write the donor cache.
+
+    The presence of the shape-only ``swa_kv_cache_mode`` final optional input
+    advertises bounded-storage capability. Its length selects bounded O(W) or
+    full storage at runtime.
 
     The TRT AttentionPlugin kernel returns a 4-D tensor
     ``[batch, seq_len, num_q_heads, head_size]``.
@@ -218,6 +228,7 @@ def _(
     enable_qk_norm=0,
     enable_kv_shared=0,
     skip_softmax_scale=None,
+    swa_kv_cache_mode=None,
 ):
     batch_size, seq_len, _ = qkv.shape
     return (torch.empty(batch_size,

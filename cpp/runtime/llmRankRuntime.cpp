@@ -33,11 +33,12 @@
 #include "multimodal/qwen2/qwenViTRunner.h"
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
-#include "runtime/contextCacheRequest.h"
 #include "runtime/debug/layerDebugger.h"
 #include "runtime/decoding/decoderRegistry.h"
 #include "runtime/decoding/decoderUtils.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/managedKVCacheRequest.h"
+#include "runtime/state/boundedSwaKVPageManager.h"
 #include "runtime/state/contextCache/blockHash.h"
 #include "runtime/state/contextCache/contextCacheCoordinator.h"
 #include "sampler/sampling.h"
@@ -201,6 +202,11 @@ LLMRankRuntime::~LLMRankRuntime()
         LOG_ERROR("Context-cache shutdown could not prove stream quiescence.");
         std::terminate();
     }
+    if (mBoundedSwaKVPageManager != nullptr && mBoundedSwaKVPageManager->shutdown() != SwaKVCacheStatus::kOk)
+    {
+        LOG_ERROR("SWA KV-cache shutdown could not prove stream quiescence.");
+        std::terminate();
+    }
 }
 
 void LLMRankRuntime::initializeFromEngineDir(std::string const& engineDir, std::string const& multimodalEngineDir,
@@ -252,6 +258,9 @@ void LLMRankRuntime::initializeFromEngineDir(std::string const& engineDir, std::
 
     artifacts.deployment
         = createDeploymentConfig(baseConfigPath, draftConfigPath, draftingConfig, globalRank, worldSize);
+    // EngineExecutor captures the active KV-pool geometry in its tensor registry.
+    // Select the immutable runtime policy before constructing that registry.
+    artifacts.deployment.selectSwaKVCacheMode(contextCacheConfig.enabled);
     if (draftingConfig.has_value() && artifacts.deployment.specDecodeMode() == SpecDecodeMode::kMTP)
     {
         ELLM_CHECK(artifacts.draftCheckpointDir.empty(),
@@ -346,6 +355,16 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
     auto pleEmbedding = std::move(artifacts.pleEmbedding);
     auto vocabMap = std::move(artifacts.vocabMap);
 
+    // The same engine uses bounded SWA pages when they save memory and its full KV profile otherwise or for reuse.
+    mDeployment.selectSwaKVCacheMode(contextCacheConfig.enabled);
+    if (mDeployment.base.supportsBoundedSwaKVCache())
+    {
+        LOG_INFO("SWA KV cache storage mode: %s (context reuse %s, bounded pages %d, full pages %d).",
+            mDeployment.base.usesBoundedSwaKVCache() ? "bounded" : "full",
+            contextCacheConfig.enabled ? "enabled" : "disabled", mDeployment.base.numSwaPages,
+            mDeployment.base.kvPoolPages);
+    }
+    bool const needsBoundedSwaPageManager = mDeployment.base.usesBoundedSwaKVCache();
     ELLM_CHECK(mBaseExecutor != nullptr, "Model artifacts require a base engine executor.");
     std::optional<ContextCacheDeploymentProfile> contextCacheDeploymentProfile;
     if (contextCacheConfig.enabled)
@@ -647,6 +666,15 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
             mBoundaryFoldMaxRows = math::cast<int32_t>(bhShape[1]);
         }
     }
+    else if (needsBoundedSwaPageManager)
+    {
+        ELLM_CHECK(mSharedResources->cacheManagers.size() == 1 && mSharedResources->kvPageTables.size() == 1,
+            "Bounded SWA supports one vanilla base cache");
+        KVPageTable* const swaPageTable = mSharedResources->getSwaKVPageTable(0);
+        ELLM_CHECK(swaPageTable != nullptr, "Bounded SWA requires an independent sparse page table");
+        mBoundedSwaKVPageManager = std::make_unique<BoundedSwaKVPageManager>(
+            *mSharedResources->cacheManagers[0], *mSharedResources->kvPageTables[0], *swaPageTable, stream);
+    }
 
     // -----------------------------------------------------------------------
     // 15. Shared execution context memory for all engines (base, optional
@@ -922,7 +950,7 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
 
     if (mContextCache != nullptr && request.saveSystemPromptKVCache)
     {
-        LOG_ERROR("Legacy system-prompt KV-cache capture cannot be combined with the context-cache manager.");
+        LOG_ERROR("Legacy system-prompt KV-cache capture cannot be combined with context reuse.");
         return false;
     }
 
@@ -1180,23 +1208,24 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
         mediaTokenIds.push_back(mDeployment.base.audioTokenId);
     }
 
-    std::optional<ContextCacheRequest> contextCacheRequest;
-    if (mContextCache != nullptr)
+    std::optional<ManagedKVCacheRequest> managedKVCacheRequest;
+    if (mContextCache != nullptr || mBoundedSwaKVPageManager != nullptr)
     {
-        std::optional<ContextCacheRequest> admitted = ContextCacheRequest::begin(
-            *mContextCache, request, context, decodingStrategy.isSpeculative(), kvHeadroom, mediaTokenIds);
+        std::optional<ManagedKVCacheRequest> admitted
+            = ManagedKVCacheRequest::begin(mContextCache.get(), mBoundedSwaKVPageManager.get(), request, context,
+                decodingStrategy.isSpeculative(), kvHeadroom, mediaTokenIds);
         if (!admitted.has_value())
         {
             return false;
         }
-        contextCacheRequest.emplace(std::move(*admitted));
+        managedKVCacheRequest.emplace(std::move(*admitted));
     }
-    ContextCacheRequest* const managedRequest = contextCacheRequest.has_value() ? &*contextCacheRequest : nullptr;
+    ManagedKVCacheRequest* const managedRequest = managedKVCacheRequest.has_value() ? &*managedKVCacheRequest : nullptr;
 
     // Conduct the preparation work to handle a new set of sequences, including inputIds packing, input/output tensor
     // preparation, reset the KVCache state, and apply reused prefix KVCache if available.
     std::vector<int32_t> const* const contextCachePrefillStarts
-        = managedRequest != nullptr ? &managedRequest->prefillStarts() : nullptr;
+        = managedRequest != nullptr ? managedRequest->prefillStarts() : nullptr;
     if (!setUpForPrefillExecution(context, decodingStrategy, contextCachePrefillStarts))
     {
         LOG_ERROR("Prefill execution setup failed. This request cannot be handled.");
@@ -1260,7 +1289,7 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
     // Hybrid+MTP endpoint reuse recomputes the successor-dependent boundary draft slot from a saved base hidden state,
     // so a checkpoint reuses across turns regardless of the token that follows it. Enabled only when the request looks
     // up or publishes state (not a bypass request) and the deployment is MTP over a hybrid base.
-    bool const requestCacheEnabled = contextCacheRequest.has_value()
+    bool const requestCacheEnabled = managedRequest != nullptr && managedRequest->hasContextReuse()
         && request.contextCacheLookupPolicy != ContextCacheLookupPolicy::kBypass && !request.generateAudio
         && !context.outputThinkerEmbeddings;
     bool const hybridMtpContextReuse = shouldUseHybridMtpEndpointReuse(
@@ -1284,7 +1313,7 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
     {
         context.hybridMtpEndpointReuse = true;
         context.contextCacheReplayTailLength = request.contextCacheReplayTailLength;
-        prefillStatus = runHybridMtpPrefill(context, decodingStrategy, *contextCacheRequest);
+        prefillStatus = runHybridMtpPrefill(context, decodingStrategy, *managedRequest);
     }
     else
     {
@@ -2163,7 +2192,7 @@ bool LLMRankRuntime::multiModalRuntimePreprocess(
 }
 
 bool LLMRankRuntime::runHybridMtpPrefill(
-    DecodingInferenceContext& context, DecodingStrategy& strategy, ContextCacheRequest& contextCacheRequest)
+    DecodingInferenceContext& context, DecodingStrategy& strategy, ManagedKVCacheRequest& managedKVCacheRequest)
 {
     // Adapted from reference llmInferenceRuntime.cpp::runHybridMtpPrefill (:2515-2702). The reference reads
     // context.sequenceCacheStates + mHybridSnapshotStorage directly; on this target the cache lifecycle is owned by the
@@ -2172,7 +2201,7 @@ bool LLMRankRuntime::runHybridMtpPrefill(
     // the reference, because the coordinator is only reachable from the runtime side (not from MTPDecoder).
     ELLM_CHECK(context.activeBatchSize == 1, "Hybrid MTP endpoint prefill requires one combined cache sequence");
 
-    int32_t const reuseLength = contextCacheRequest.reuseTokenLength(0);
+    int32_t const reuseLength = managedKVCacheRequest.reuseTokenLength(0);
     int32_t const inputLength = math::cast<int32_t>(context.rawBatchedInputIds[0].size());
     int32_t const replayTailLength = context.contextCacheReplayTailLength;
     int32_t const suffixLenOrig = context.effectivePrefillLengths[0];
@@ -2207,7 +2236,7 @@ bool LLMRankRuntime::runHybridMtpPrefill(
         CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(mPipelineIO->baseHiddenStates.rawPointer()) + rowBytes,
             mBoundaryFoldScratch.rawPointer(), static_cast<size_t>(chunkLength) * rowBytes, cudaMemcpyDeviceToDevice,
             context.stream));
-        return contextCacheRequest.restoreHybridMtpBoundaryHidden(0, mPipelineIO->baseHiddenStates, 0);
+        return managedKVCacheRequest.restoreHybridMtpBoundaryHidden(0, mPipelineIO->baseHiddenStates, 0);
     };
 
     // The generation-prompt tail is volatile when the chat template appends tokens that the next turn's render of the
@@ -2228,7 +2257,7 @@ bool LLMRankRuntime::runHybridMtpPrefill(
         // Chunk 1: base prefill of the predecessor [0, predecessorLength), no sampling.
         context.tokenIds[0].assign(completeSuffix.begin(), replayBegin);
         context.effectivePrefillLengths[0] = predecessorChunkLength;
-        if (!runBaseModelPrefill(context, /*contextCacheRequest=*/nullptr, /*sampleOutput=*/false))
+        if (!runBaseModelPrefill(context, /*managedKVCacheRequest=*/nullptr, /*sampleOutput=*/false))
         {
             return false;
         }
@@ -2240,7 +2269,7 @@ bool LLMRankRuntime::runHybridMtpPrefill(
         {
             return false;
         }
-        if (!contextCacheRequest.publishHybridMtpEndpoint(
+        if (!managedKVCacheRequest.publishHybridMtpEndpoint(
                 0, predecessorLength, mPipelineIO->baseHiddenStates, context.effectivePrefillLengths[0] - 1))
         {
             return false;
@@ -2249,7 +2278,7 @@ bool LLMRankRuntime::runHybridMtpPrefill(
         // Chunk 2: replay the volatile tail [predecessorLength, inputLength) with sampling, then restore bookkeeping.
         context.tokenIds[0].assign(replayBegin, completeSuffix.end());
         context.effectivePrefillLengths[0] = replayTailLength;
-        if (!runBaseModelPrefill(context, /*contextCacheRequest=*/nullptr, /*sampleOutput=*/true))
+        if (!runBaseModelPrefill(context, /*managedKVCacheRequest=*/nullptr, /*sampleOutput=*/true))
         {
             return false;
         }
@@ -2276,7 +2305,7 @@ bool LLMRankRuntime::runHybridMtpPrefill(
         // Chunk 1: base prefill of the predecessor [reuseLength, predecessorLength), no sampling.
         context.tokenIds[0].assign(completeSuffix.begin(), replayBegin);
         context.effectivePrefillLengths[0] = predecessorChunkLength;
-        if (!runBaseModelPrefill(context, /*contextCacheRequest=*/nullptr, /*sampleOutput=*/false))
+        if (!runBaseModelPrefill(context, /*managedKVCacheRequest=*/nullptr, /*sampleOutput=*/false))
         {
             return false;
         }
@@ -2296,7 +2325,7 @@ bool LLMRankRuntime::runHybridMtpPrefill(
         {
             return false;
         }
-        if (!contextCacheRequest.publishHybridMtpEndpoint(
+        if (!managedKVCacheRequest.publishHybridMtpEndpoint(
                 0, predecessorLength, mPipelineIO->baseHiddenStates, context.effectivePrefillLengths[0] - 1))
         {
             return false;
@@ -2307,7 +2336,7 @@ bool LLMRankRuntime::runHybridMtpPrefill(
         // Chunk 2: replay the volatile tail [predecessorLength, inputLength) with sampling, then restore bookkeeping.
         context.tokenIds[0].assign(replayBegin, completeSuffix.end());
         context.effectivePrefillLengths[0] = replayTailLength;
-        if (!runBaseModelPrefill(context, /*contextCacheRequest=*/nullptr, /*sampleOutput=*/true))
+        if (!runBaseModelPrefill(context, /*managedKVCacheRequest=*/nullptr, /*sampleOutput=*/true))
         {
             return false;
         }
@@ -2324,7 +2353,7 @@ bool LLMRankRuntime::runHybridMtpPrefill(
 
     // Base prefill of the suffix (the full prompt when cold). Reuses base KV [0, reuseLength) and samples the first
     // output token, appending it to tokenIds (ref :2646).
-    if (!runBaseModelPrefill(context, /*contextCacheRequest=*/nullptr, /*sampleOutput=*/true))
+    if (!runBaseModelPrefill(context, /*managedKVCacheRequest=*/nullptr, /*sampleOutput=*/true))
     {
         return false;
     }
@@ -2336,7 +2365,7 @@ bool LLMRankRuntime::runHybridMtpPrefill(
         {
             return false;
         }
-        if (!contextCacheRequest.publishHybridMtpEndpoint(
+        if (!managedKVCacheRequest.publishHybridMtpEndpoint(
                 0, inputLength, mPipelineIO->baseHiddenStates, context.effectivePrefillLengths[0] - 1))
         {
             return false;
@@ -2369,7 +2398,7 @@ bool LLMRankRuntime::runHybridMtpPrefill(
     }
     // Publish while effectivePrefillLengths still reflects the folded prefill (the boundary-hidden capture reads the
     // last shifted row), then restore the suffix-only execution bookkeeping for the decode loop.
-    if (!contextCacheRequest.publishHybridMtpEndpoint(
+    if (!managedKVCacheRequest.publishHybridMtpEndpoint(
             0, inputLength, mPipelineIO->baseHiddenStates, context.effectivePrefillLengths[0] - 1))
     {
         return false;
@@ -2380,7 +2409,7 @@ bool LLMRankRuntime::runHybridMtpPrefill(
 }
 
 bool LLMRankRuntime::runBaseModelPrefill(
-    DecodingInferenceContext& context, ContextCacheRequest* contextCacheRequest, bool sampleOutput)
+    DecodingInferenceContext& context, ManagedKVCacheRequest* managedKVCacheRequest, bool sampleOutput)
 {
     TIME_STAGE(metrics::StageNames::kLLM_PREFILL, context.stream);
     NVTX_SCOPED_RANGE(nvtx_base_prefill,
@@ -2511,6 +2540,13 @@ bool LLMRankRuntime::runBaseModelPrefill(
         }
     }
 
+    // Bounded SWA admission reserves pages by batch size, but its sparse mappings must use the final executed lengths.
+    // Visual pruning can shorten those lengths after embeddings are assembled, so bind the window only now.
+    if (managedKVCacheRequest != nullptr && !managedKVCacheRequest->prepareSwaPrefill(context.effectivePrefillLengths))
+    {
+        return false;
+    }
+
     // Dispatch per-step sequence prep (context lengths H2D, selectTokenIndices).
     mStepPreparer->prepare(
         InferencePhase::kPrefill, activeBatchSize, *mSharedResources->cacheManagers[0], *mPipelineIO, context.stream);
@@ -2528,7 +2564,7 @@ bool LLMRankRuntime::runBaseModelPrefill(
         "Failed to prepare base model for prefill step.");
     check::check(mBaseExecutor->execute(context.stream), "Failed to execute base model for prefill step.");
     mSharedResources->cacheManagers[0]->commitSequenceLength(mPipelineIO->contextLengths, context.stream);
-    if (contextCacheRequest != nullptr && !contextCacheRequest->enqueuePrefillCaptures())
+    if (managedKVCacheRequest != nullptr && !managedKVCacheRequest->enqueuePrefillCaptures())
     {
         return false;
     }
@@ -2923,6 +2959,13 @@ bool LLMRankRuntime::setUpForPrefillExecution(DecodingInferenceContext& context,
 
 bool LLMRankRuntime::genAndSaveSystemPromptKVCache(DecodingInferenceContext& context, int32_t genAndSaveBatchIdx)
 {
+    if (mDeployment.base.usesBoundedSwaKVCache())
+    {
+        LOG_WARNING(
+            "Legacy system-prompt KV-cache capture is unavailable with bounded SWA storage. Use context reuse "
+            "instead when prompt reuse is required.");
+        return false;
+    }
     if (mContextCache != nullptr)
     {
         LOG_ERROR("Legacy system-prompt KV-cache capture cannot be combined with the context-cache manager.");
@@ -3076,7 +3119,7 @@ bool LLMRankRuntime::genAndSaveSystemPromptKVCache(
 }
 
 bool LLMRankRuntime::performBatchEvict(
-    DecodingInferenceContext& context, DecodingStrategy& strategy, ContextCacheRequest* contextCacheRequest)
+    DecodingInferenceContext& context, DecodingStrategy& strategy, ManagedKVCacheRequest* managedKVCacheRequest)
 {
     // Check if any batch has finished
     bool hasFinishedBatch = false;
@@ -3134,10 +3177,10 @@ bool LLMRankRuntime::performBatchEvict(
         }()
             .c_str());
 
-    bool const managedContextCache = contextCacheRequest != nullptr;
-    if (managedContextCache)
+    bool const managedKVCache = managedKVCacheRequest != nullptr;
+    if (managedKVCache)
     {
-        if (!contextCacheRequest->beginBatchCompaction(batchMapping, newActiveBatch, mDeviceBatchMapping))
+        if (!managedKVCacheRequest->beginBatchCompaction(batchMapping, newActiveBatch, mDeviceBatchMapping))
         {
             return false;
         }
@@ -3180,9 +3223,9 @@ bool LLMRankRuntime::performBatchEvict(
 
     // Consume the existing eviction synchronization. Managed paging moves page-table rows and slot state only;
     // physical KV pages remain in place.
-    if (managedContextCache)
+    if (managedKVCache)
     {
-        if (!contextCacheRequest->completeBatchCompaction())
+        if (!managedKVCacheRequest->completeBatchCompaction())
         {
             return false;
         }

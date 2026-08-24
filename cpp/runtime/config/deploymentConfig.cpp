@@ -243,6 +243,21 @@ int32_t resolveDFlashBlockSize(
 
 } // namespace
 
+void DeploymentConfig::selectSwaKVCacheMode(bool contextReuseEnabled) noexcept
+{
+    auto selectMode = [contextReuseEnabled](LLMEngineConfig& config) {
+        bool const boundedSavesMemory = config.supportsBoundedSwaKVCache() && config.numSwaPages < config.kvPoolPages;
+        config.setSwaKVCacheMode(
+            !contextReuseEnabled && boundedSavesMemory ? SwaKVCacheMode::kBounded : SwaKVCacheMode::kFull);
+    };
+
+    selectMode(base);
+    if (draft.has_value())
+    {
+        selectMode(*draft);
+    }
+}
+
 int32_t DeploymentConfig::maxRuntimeBatchSize() const
 {
     // When base and draft engines were built with different max batch sizes, fall

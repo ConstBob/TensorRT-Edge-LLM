@@ -45,7 +45,8 @@ std::string toString(InferenceDims const& dims)
        << ", rope_batch=" << dims.ropeBatch << ", packed_mask_len=" << dims.packedMaskLen
        << ", context_mask_selector_len=" << dims.contextMaskSelectorLen << ", start_index_len=" << dims.startIndexLen
        << ", spec_verify_phase_len=" << dims.specVerifyPhaseLen
-       << ", skip_softmax_scale_len=" << dims.skipSoftmaxScaleLen << "}";
+       << ", skip_softmax_scale_len=" << dims.skipSoftmaxScaleLen
+       << ", swa_kv_cache_mode_len=" << dims.swaKVCacheModeLen << "}";
     return ss.str();
 }
 

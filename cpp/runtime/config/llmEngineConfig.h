@@ -23,6 +23,7 @@
 #include "runtime/llmRuntimeUtils.h"
 
 #include <NvInferRuntime.h>
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -46,6 +47,13 @@ enum class SpecDecodeMode : int32_t
     kJetSpec,
     kGemma4MTP,
     kDSpark,
+};
+
+//! Runtime storage policy for engines carrying bounded-SWA capability metadata.
+enum class SwaKVCacheMode : int32_t
+{
+    kFull,
+    kBounded,
 };
 
 char const* specDecodeModeName(SpecDecodeMode mode) noexcept;
@@ -77,10 +85,15 @@ struct LLMEngineConfig
     int32_t maxKVCacheCapacity{};        //!< Maximum KV cache capacity (sequence length)
     int64_t skipSoftmaxScaleOverride{0}; //!< skip-softmax scale-factor override (0 = disabled)
     int32_t kvPoolPages{};               //!< Exact physical K-page count serialized in KV binding shapes
-    int32_t rotaryDim{};                 //!< Rotary embedding dimension
-    int32_t numDecoderLayers{};          //!< Total decoder layers (attention + linear)
-    int32_t vocabSize{};                 //!< Full vocabulary size
-    int32_t reducedVocabSize{0};         //!< 0 = no vocab reduction
+    //! Total physical K-page budget for the independent SWA pool. Zero means
+    //! no reduced pool; reduced markers require a positive persisted value with bounded publication headroom.
+    int32_t numSwaPages{};
+    //! Runtime-only storage selection. The exported per-layer capacity markers remain unchanged.
+    SwaKVCacheMode swaKVCacheMode{SwaKVCacheMode::kBounded};
+    int32_t rotaryDim{};         //!< Rotary embedding dimension
+    int32_t numDecoderLayers{};  //!< Total decoder layers (attention + linear)
+    int32_t vocabSize{};         //!< Full vocabulary size
+    int32_t reducedVocabSize{0}; //!< 0 = no vocab reduction
     int32_t diffusionCanvasLength{0};
     int32_t diffusionMaxDenoisingSteps{0};
     int32_t diffusionSelfConditioningSize{0};
@@ -226,6 +239,27 @@ struct LLMEngineConfig
     //! layer at that LOCAL index (the donor's cache is bound to this layer's KV input).
     //! Used for Gemma4's KV sharing where the last N layers reuse a donor's cache.
     std::vector<int32_t> kvSharingDonors{};
+
+    //! Whether exported layer metadata declares bounded SWA storage capability.
+    bool supportsBoundedSwaKVCache() const;
+
+    //! Whether this runtime instance actively uses bounded SWA storage.
+    bool usesBoundedSwaKVCache() const;
+
+    //! Select the runtime storage policy without changing exported capability metadata.
+    void setSwaKVCacheMode(SwaKVCacheMode mode) noexcept;
+
+    //! Shape-only mode input length: 1 for bounded storage and 0 for full storage.
+    int32_t getSwaKVCacheModeInputLength() const;
+
+    //! Bounded-capable profile page count for one layer, independent of the active runtime policy.
+    int32_t getBoundedKVPoolPagesForLayer(KVLayerConfig const& layerConfig) const;
+
+    //! Static engine profile selectors: min, smaller-policy opt, and max across bounded and full page counts.
+    std::array<int32_t, 3> getKVPoolPageProfileForLayer(KVLayerConfig const& layerConfig) const;
+
+    //! Active physical page count for one layer's KV pool binding.
+    int32_t getKVPoolPagesForLayer(KVLayerConfig const& layerConfig) const;
 
     // ------------------------------------------------------------------
     // InferenceDims recipe methods

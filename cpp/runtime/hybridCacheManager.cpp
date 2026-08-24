@@ -84,6 +84,11 @@ HybridCacheManager::HybridCacheManager(Config const& config, cudaStream_t stream
         for (int32_t i = 0; i < mKVCache.numLayers(); ++i)
         {
             auto const& lc = mKVCache.getLayerConfig(i);
+            if (mKVCache.hasReducedKVCache()
+                && isReducedKvCacheCapacity(lc.kvCacheCapacity, mConfig.kvConfig.maxSequenceLength))
+            {
+                continue;
+            }
             auto it = headDimToGroupIdx.find(lc.headDim);
             if (it == headDimToGroupIdx.end())
             {
@@ -98,11 +103,11 @@ HybridCacheManager::HybridCacheManager(Config const& config, cudaStream_t stream
             group.maxKVHeads = std::max(group.maxKVHeads, lc.numKVHeads);
             group.numLayers++;
 
-            // The active-slot K/V views use capPadded tokens per row.
+            // Dense batched-copy operations only include full-capacity layers.
             kernel::KVLayerInfo info{};
             info.data = mKVCache.kPoolPtr(i);
             info.numKVHeads = lc.numKVHeads;
-            info.maxSeqLen = mKVCache.maxCapPadded();
+            info.maxSeqLen = mKVCache.maxCapPadded(i);
             group.hostInfos.push_back(info);
         }
 
@@ -349,8 +354,12 @@ bool HybridCacheManager::getKVCacheAllEmpty() const noexcept
 void HybridCacheManager::compactBatch(
     rt::Tensor const& batchMapping, int32_t oldBatch, int32_t newBatch, cudaStream_t stream)
 {
-    // Active-slot K/V views have [maxBatch, capPadded, H, D] shape. Compaction moves only each
-    // survivor's live prefix while the identity page table retains row == slot.
+    check::check(!mKVCache.hasReducedKVCache(),
+        "HybridCacheManager::compactBatch cannot compact a reduced SWA pool; use the page-table-backed runtime "
+        "adapter path.");
+
+    // Compaction moves only each full-capacity layer's live prefix. Reduced pools are maintained by
+    // their page table and never participate in this dense active-slot operation.
     for (auto const& group : mHeadDimGroups)
     {
         auto const* layerInfos = static_cast<kernel::KVLayerInfo const*>(group.deviceLayerInfos.rawPointer());
@@ -399,6 +408,8 @@ void HybridCacheManager::compactBatchSlotState(
 std::vector<rt::Tensor> HybridCacheManager::captureKVCache(
     int32_t batchIdx, int32_t sequenceLength, cudaStream_t stream)
 {
+    check::check(
+        !mKVCache.hasReducedKVCache(), "HybridCacheManager::captureKVCache does not support sparse SWA page mappings.");
     // The batched save/restore kernels only instantiate the `half` template today — match main's
     // contract of throwing loudly on unsupported dtypes instead of silently corrupting.
     check::check(mConfig.kvConfig.kvCacheType == nvinfer1::DataType::kHALF,
@@ -450,6 +461,8 @@ std::vector<rt::Tensor> HybridCacheManager::captureKVCache(
 
 void HybridCacheManager::restoreKVCache(std::vector<rt::Tensor> const& saved, int32_t batchIdx, cudaStream_t stream)
 {
+    check::check(
+        !mKVCache.hasReducedKVCache(), "HybridCacheManager::restoreKVCache does not support sparse SWA page mappings.");
     // See captureKVCache for the dtype contract.
     check::check(mConfig.kvConfig.kvCacheType == nvinfer1::DataType::kHALF,
         "HybridCacheManager::restoreKVCache currently only supports kHALF KV cache; "

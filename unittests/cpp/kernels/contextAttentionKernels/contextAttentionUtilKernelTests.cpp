@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,9 +16,11 @@
  */
 
 #include "common/checkMacros.h"
+#include "common/pagedKvTypes.h"
 #include "common/tensor.h"
 #include "kernels/contextAttentionKernels/utilKernels.h"
 #include "testUtils.h"
+#include <algorithm>
 #include <gtest/gtest.h>
 
 using namespace trt_edgellm;
@@ -163,6 +165,153 @@ TEST(UtilKernelTest, seqLens_chunkedPrefillVaryingLengths)
         .expectedKvCacheEndIdxs = {150, 50},
         .expectedPaddedCuKVSeqLens = {0, 150, 200},
     });
+}
+
+TEST(UtilKernelTest, swaChunkedPrefillMetadataClampsResidentWindow)
+{
+    int32_t constexpr batchSize = 3;
+    int32_t constexpr runtimeSeqLen = 64;
+    int32_t constexpr slidingWindowSize = 128;
+    std::vector<int32_t> const inputSeqLen{64, 32, 16};
+    std::vector<int32_t> const startIndices{0, 100, 300};
+
+    rt::Tensor inputSeqLenTensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor startIndicesTensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor cuQSeqLensTensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor cuKVSeqLensTensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor endIndicesTensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor paddedCuKVSeqLensTensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+    copyHostToDevice(inputSeqLenTensor, inputSeqLen);
+    copyHostToDevice(startIndicesTensor, startIndices);
+
+    cudaStream_t stream{nullptr};
+    kernel::calSWAChunkedPrefillMetadata(inputSeqLenTensor, startIndicesTensor, cuQSeqLensTensor, cuKVSeqLensTensor,
+        endIndicesTensor, paddedCuKVSeqLensTensor, runtimeSeqLen, slidingWindowSize, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    EXPECT_EQ(copyDeviceToHost<int32_t>(cuQSeqLensTensor), (std::vector<int32_t>{0, 64, 96, 112}));
+    EXPECT_EQ(copyDeviceToHost<int32_t>(cuKVSeqLensTensor), (std::vector<int32_t>{0, 64, 196, 340}));
+    EXPECT_EQ(copyDeviceToHost<int32_t>(endIndicesTensor), (std::vector<int32_t>{64, 164, 364}));
+    EXPECT_EQ(copyDeviceToHost<int32_t>(paddedCuKVSeqLensTensor), (std::vector<int32_t>{0, 64, 228, 420}));
+}
+
+TEST(UtilKernelTest, pagedSwaChunkedPrefillAssemblesSparseScrambledWindow)
+{
+    int32_t constexpr batchSize = 2;
+    int32_t constexpr numKVHeads = 1;
+    int32_t constexpr headDim = 2;
+    int32_t constexpr slidingWindowSize = 150;
+    int32_t constexpr qSeqLen = 4;
+    int32_t constexpr workspaceSeqLen = slidingWindowSize + qSeqLen;
+    int32_t constexpr maxPagesPerSeq = 4;
+    int32_t constexpr numPages = 6;
+    int32_t constexpr kPoolVBias = 512;
+    int32_t constexpr kInputKBias = 1024;
+    int32_t constexpr kInputVBias = 1536;
+    int32_t constexpr kBatchStride = 128;
+    int32_t constexpr kTokenStride = headDim;
+    std::vector<int32_t> const inputSeqLen{4, 2};
+    std::vector<int32_t> const startIndices{200, 20};
+
+    std::vector<int32_t> pageTable(static_cast<size_t>(batchSize) * 2 * maxPagesPerSeq, rt::kUNUSED_PAGE_ENTRY);
+    auto mapPage = [&](int32_t batch, int32_t logicalPage, int32_t physicalPage) {
+        pageTable[(batch * 2) * maxPagesPerSeq + logicalPage] = physicalPage;
+        pageTable[(batch * 2 + 1) * maxPagesPerSeq + logicalPage] = physicalPage + numPages;
+    };
+    mapPage(/*batch=*/0, /*logicalPage=*/0, /*physicalPage=*/3);
+    mapPage(/*batch=*/0, /*logicalPage=*/1, /*physicalPage=*/1);
+    mapPage(/*batch=*/1, /*logicalPage=*/0, /*physicalPage=*/4);
+
+    size_t const pageElements = static_cast<size_t>(rt::kTOKENS_PER_PAGE) * numKVHeads * headDim;
+    std::vector<half> pool(static_cast<size_t>(2) * numPages * pageElements, __float2half(0.0F));
+    auto fillLogicalPage = [&](int32_t logicalPage, int32_t physicalPage) {
+        for (int32_t token = 0; token < rt::kTOKENS_PER_PAGE; ++token)
+        {
+            int32_t const logicalToken = logicalPage * rt::kTOKENS_PER_PAGE + token;
+            for (int32_t dim = 0; dim < headDim; ++dim)
+            {
+                size_t const offset = static_cast<size_t>(token) * headDim + dim;
+                pool[static_cast<size_t>(physicalPage) * pageElements + offset]
+                    = __float2half(static_cast<float>(logicalToken * kTokenStride + dim));
+                pool[static_cast<size_t>(physicalPage + numPages) * pageElements + offset]
+                    = __float2half(static_cast<float>(kPoolVBias + logicalToken * kTokenStride + dim));
+            }
+        }
+    };
+    fillLogicalPage(/*logicalPage=*/0, /*physicalPage=*/3);
+    fillLogicalPage(/*logicalPage=*/1, /*physicalPage=*/1);
+    fillLogicalPage(/*logicalPage=*/0, /*physicalPage=*/4);
+
+    std::vector<half> kInput(static_cast<size_t>(batchSize) * qSeqLen * numKVHeads * headDim);
+    std::vector<half> vInput(kInput.size());
+    for (int32_t batch = 0; batch < batchSize; ++batch)
+    {
+        for (int32_t token = 0; token < qSeqLen; ++token)
+        {
+            for (int32_t dim = 0; dim < headDim; ++dim)
+            {
+                size_t const offset = (static_cast<size_t>(batch) * qSeqLen + token) * headDim + dim;
+                kInput[offset]
+                    = __float2half(static_cast<float>(kInputKBias + batch * kBatchStride + token * kTokenStride + dim));
+                vInput[offset]
+                    = __float2half(static_cast<float>(kInputVBias + batch * kBatchStride + token * kTokenStride + dim));
+            }
+        }
+    }
+
+    rt::Tensor poolTensor(
+        {2, numPages, rt::kTOKENS_PER_PAGE, numKVHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor pageTableTensor({batchSize, 2, maxPagesPerSeq}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor kInputTensor({batchSize, qSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor vInputTensor({batchSize, qSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor inputSeqLenTensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor startIndicesTensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor kWorkspaceTensor(
+        {batchSize, workspaceSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor vWorkspaceTensor(
+        {batchSize, workspaceSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    copyHostToDevice(poolTensor, pool);
+    copyHostToDevice(pageTableTensor, pageTable);
+    copyHostToDevice(kInputTensor, kInput);
+    copyHostToDevice(vInputTensor, vInput);
+    copyHostToDevice(inputSeqLenTensor, inputSeqLen);
+    copyHostToDevice(startIndicesTensor, startIndices);
+
+    cudaStream_t stream{nullptr};
+    kernel::assemblePagedSWAChunkedPrefillFMHAKV(poolTensor, pageTableTensor, kInputTensor, vInputTensor,
+        inputSeqLenTensor, startIndicesTensor, kWorkspaceTensor, vWorkspaceTensor, slidingWindowSize, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    auto const kOutput = copyDeviceToHost<half>(kWorkspaceTensor);
+    auto const vOutput = copyDeviceToHost<half>(vWorkspaceTensor);
+
+    for (int32_t batch = 0; batch < batchSize; ++batch)
+    {
+        int32_t const oldResidentLen = std::min(startIndices[batch], slidingWindowSize);
+        for (int32_t workspaceToken = 0; workspaceToken < workspaceSeqLen; ++workspaceToken)
+        {
+            for (int32_t dim = 0; dim < headDim; ++dim)
+            {
+                size_t const outputOffset
+                    = (static_cast<size_t>(batch) * workspaceSeqLen + workspaceToken) * headDim + dim;
+                float expectedK = 0.0F;
+                float expectedV = 0.0F;
+                if (workspaceToken < oldResidentLen)
+                {
+                    int32_t const logicalToken = startIndices[batch] - oldResidentLen + workspaceToken;
+                    expectedK = static_cast<float>(logicalToken * kTokenStride + dim);
+                    expectedV = static_cast<float>(kPoolVBias + logicalToken * kTokenStride + dim);
+                }
+                else if (workspaceToken - oldResidentLen < inputSeqLen[batch])
+                {
+                    int32_t const newToken = workspaceToken - oldResidentLen;
+                    expectedK = static_cast<float>(kInputKBias + batch * kBatchStride + newToken * kTokenStride + dim);
+                    expectedV = static_cast<float>(kInputVBias + batch * kBatchStride + newToken * kTokenStride + dim);
+                }
+                EXPECT_FLOAT_EQ(__half2float(kOutput[outputOffset]), expectedK);
+                EXPECT_FLOAT_EQ(__half2float(vOutput[outputOffset]), expectedV);
+            }
+        }
+    }
 }
 
 // launchBuildVisionBlockRanges: image-run intervals expand per position; text and

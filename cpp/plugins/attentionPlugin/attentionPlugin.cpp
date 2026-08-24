@@ -88,6 +88,8 @@ bool isFp8KVCacheSupportedSM(int32_t smVersion)
 //   [context_mask_selector]             when enable_context_mask_selector
 //   [attention_mask, attention_pos_id]  when enable_tree_attention
 //   [vision_block_ids]                  when enable_vision_block_attention
+//   [skip_softmax_scale]                when skip-softmax has a calibrated default
+//   [swa_kv_cache_mode]                 when bounded SWA storage is supported
 //
 // The gamma weights are engine weights: FP16 Constant initializers wired to plugin inputs,
 // baked into the engine at build time (device-resident, no runtime upload). Models without
@@ -109,16 +111,20 @@ constexpr int32_t kNUM_CONTEXT_MASK_SELECTOR_OPTIONAL_INPUTS{1};
 constexpr int32_t kNUM_TREE_ATTN_OPTIONAL_INPUTS{2};
 constexpr int32_t kNUM_VISION_BLOCK_OPTIONAL_INPUTS{1};
 constexpr int32_t kNUM_SKIP_SCALE_OPTIONAL_INPUTS{1};
+constexpr int32_t kNUM_SWA_CACHE_MODE_OPTIONAL_INPUTS{1};
 constexpr int32_t kNUM_REQUIRED_OUTPUTS{2};
+constexpr int64_t kFULL_KV_CACHE_MODE_LENGTH{0};
+constexpr int64_t kBOUNDED_SWA_CACHE_MODE_LENGTH{1};
 
 int32_t getExpectedNbInputs(int32_t enableQKNorm, int32_t enableContextMaskSelector, int32_t enableTreeAttention,
-    int32_t enableVisionBlockAttention, float skipSoftmaxScaleFactor)
+    int32_t enableVisionBlockAttention, float skipSoftmaxScaleFactor, bool supportsBoundedKVCache)
 {
     return kNUM_REQUIRED_INPUTS + (enableQKNorm ? kNUM_QK_NORM_OPTIONAL_INPUTS : 0)
         + (enableContextMaskSelector ? kNUM_CONTEXT_MASK_SELECTOR_OPTIONAL_INPUTS : 0)
         + (enableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0)
         + (enableVisionBlockAttention ? kNUM_VISION_BLOCK_OPTIONAL_INPUTS : 0)
-        + (skipSoftmaxScaleFactor > 0.F ? kNUM_SKIP_SCALE_OPTIONAL_INPUTS : 0);
+        + (skipSoftmaxScaleFactor > 0.F ? kNUM_SKIP_SCALE_OPTIONAL_INPUTS : 0)
+        + (supportsBoundedKVCache ? kNUM_SWA_CACHE_MODE_OPTIONAL_INPUTS : 0);
 }
 
 // Dynamic input-index helpers for the optional inputs (positions depend on which optional
@@ -150,6 +156,13 @@ constexpr int32_t skipSoftmaxScaleInputIdx(
     return attnMaskInputIdx(enableQKNorm, enableContextMaskSelector)
         + (enableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0)
         + (enableVisionBlock ? kNUM_VISION_BLOCK_OPTIONAL_INPUTS : 0);
+}
+
+constexpr int32_t swaCacheModeInputIdx(bool enableQKNorm, bool enableContextMaskSelector, bool enableTreeAttention,
+    bool enableVisionBlock, float skipSoftmaxScaleFactor)
+{
+    return skipSoftmaxScaleInputIdx(enableQKNorm, enableContextMaskSelector, enableTreeAttention, enableVisionBlock)
+        + (skipSoftmaxScaleFactor > 0.F ? kNUM_SKIP_SCALE_OPTIONAL_INPUTS : 0);
 }
 
 // Support Tree Attention decoding schema up to 128 tokens in the draft tree per batch.
@@ -271,10 +284,11 @@ struct FMHAKernelSelection
 };
 
 FMHAKernelSelection selectFMHAKernels(int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t smVersion,
-    nvinfer1::DataType dataType, bool useSlidingWindow, bool enableFp8KVCache)
+    nvinfer1::DataType dataType, bool useSlidingWindow, bool enableFp8KVCache,
+    [[maybe_unused]] bool allowPagedBlackwell = true)
 {
 #ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
-    if (CuteDslFMHARunner::canImplement(headSize, smVersion))
+    if (allowPagedBlackwell && CuteDslFMHARunner::canImplement(headSize, smVersion))
     {
         return {ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL, true};
     }
@@ -389,6 +403,27 @@ size_t getAttentionWorkspaceSize(int64_t batchSize, int64_t seqLen, int64_t kvCa
     return workspaceSize;
 }
 
+size_t getSwaKVCacheWorkspaceSize(int64_t batchSize, int64_t seqLen, int32_t slidingWindowSize, int32_t numQHeads,
+    int32_t numKVHeads, int32_t headSize, bool enableVisionBlockAttention)
+{
+    size_t workspaceSize = 0;
+    workspaceSize = accumulateWorkspaceSize(workspaceSize, {batchSize + 1}, DataType::kINT32);
+    workspaceSize = accumulateWorkspaceSize(workspaceSize, {batchSize + 1}, DataType::kINT32);
+    workspaceSize = accumulateWorkspaceSize(workspaceSize, {batchSize}, DataType::kINT32);
+    workspaceSize = accumulateWorkspaceSize(workspaceSize, {batchSize + 1}, DataType::kINT32);
+    workspaceSize = accumulateWorkspaceSize(workspaceSize, {batchSize, seqLen, numQHeads, headSize}, DataType::kHALF);
+    workspaceSize = accumulateWorkspaceSize(workspaceSize, {batchSize, seqLen, numKVHeads, headSize}, DataType::kHALF);
+    workspaceSize = accumulateWorkspaceSize(workspaceSize, {batchSize, seqLen, numKVHeads, headSize}, DataType::kHALF);
+    workspaceSize = accumulateWorkspaceSize(workspaceSize,
+        {batchSize, 2, numKVHeads, static_cast<int64_t>(slidingWindowSize) + seqLen, headSize}, DataType::kHALF);
+    if (enableVisionBlockAttention)
+    {
+        workspaceSize = accumulateWorkspaceSize(workspaceSize, {batchSize, seqLen}, DataType::kINT32);
+        workspaceSize = accumulateWorkspaceSize(workspaceSize, {batchSize, seqLen}, DataType::kINT32);
+    }
+    return workspaceSize;
+}
+
 bool isPagedPoolShape(Dims const& shape, int32_t numKVHeads, int32_t headSize, bool allowUnknownNumPages)
 {
     if (shape.nbDims != 5)
@@ -434,21 +469,22 @@ bool haveSameShape(Dims const& lhs, Dims const& rhs)
 }
 
 bool hasConcretePagedKVContract(Dims const& qkv, Dims const& kvCacheInput, Dims const& kvCacheOutput,
-    Dims const& kvPageTable, int32_t numKVHeads, int32_t headSize)
+    Dims const& kvPageTable, int32_t numKVHeads, int32_t headSize, bool allowSparseLogicalTable)
 {
     return qkv.nbDims == 3 && qkv.d[0] > 0 && isPagedPoolShape(kvCacheInput, numKVHeads, headSize, false)
         && haveSameShape(kvCacheInput, kvCacheOutput) && kvPageTable.nbDims == 3 && kvPageTable.d[0] == qkv.d[0]
-        && kvPageTable.d[1] == 2 && kvPageTable.d[2] > 0 && kvCacheInput.d[1] >= kvPageTable.d[2];
+        && kvPageTable.d[1] == 2 && kvPageTable.d[2] > 0
+        && (allowSparseLogicalTable || kvCacheInput.d[1] >= kvPageTable.d[2]);
 }
 
 bool hasConcretePagedKVContract(PluginTensorDesc const* in, PluginTensorDesc const* out, int32_t numKVHeads,
-    int32_t headSize, bool enableFp8KVCache)
+    int32_t headSize, bool enableFp8KVCache, bool allowSparseLogicalTable)
 {
     return isKVCacheDescriptor(in[kIN_KV_CACHE_IDX], enableFp8KVCache)
         && isKVCacheDescriptor(out[kOUT_KV_CACHE_IDX], enableFp8KVCache)
         && isKVPageTableDescriptor(in[kIN_KV_PAGE_TABLE_IDX])
         && hasConcretePagedKVContract(in[kIN_QKV_IDX].dims, in[kIN_KV_CACHE_IDX].dims, out[kOUT_KV_CACHE_IDX].dims,
-            in[kIN_KV_PAGE_TABLE_IDX].dims, numKVHeads, headSize);
+            in[kIN_KV_PAGE_TABLE_IDX].dims, numKVHeads, headSize, allowSparseLogicalTable);
 }
 
 } // namespace
@@ -527,8 +563,8 @@ void AttentionPlugin::enforceVisionBlockKernelSupport() const
 
 AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
     int32_t enableTreeAttention, int32_t enableFp8KVCache, int32_t enableVisionBlockAttention,
-    int32_t enableContextMaskSelector, int32_t slidingWindowSize, std::vector<float> const& qkvScales,
-    std::optional<float> attentionScale)
+    int32_t enableContextMaskSelector, bool supportsBoundedKVCache, int32_t slidingWindowSize,
+    std::vector<float> const& qkvScales, std::optional<float> attentionScale)
     : mLayerName(name)
     , mNumQHeads(numQHeads)
     , mNumKVHeads(numKVHeads)
@@ -540,6 +576,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     , mEnableContextMaskSelector(enableContextMaskSelector)
     , mQkvScales(enableFp8KVCache ? qkvScales : std::vector<float>{1.f, 1.f, 1.f})
     , mSlidingWindowSize(slidingWindowSize)
+    , mSupportsBoundedKVCache(supportsBoundedKVCache)
 {
     // The fused-norm warp reduction covers at most 32 lanes (headDim / vec width 8)
     // => no fused-norm kernel above head_size 256; fail at construction.
@@ -556,6 +593,10 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
         "FP8 KV cache enabled but qkv_scales has "
             + std::to_string(mQkvScales.size()) + " elements (expected 3). "
             "Re-export the model to include QKV scales [q, k, v].");
+    ELLM_CHECK(!mSupportsBoundedKVCache
+            || (mSlidingWindowSize > 0 && !mEnableTreeAttention && !mEnableFp8KVCache && !mEnableQKNorm
+                && !mEnableContextMaskSelector),
+        "Bounded KV cache capability requires FP16 vanilla sliding-window attention.");
 
     mSMVersion = getSMVersion();
     ELLM_CHECK(!mEnableFp8KVCache || isFp8KVCacheSupportedSM(mSMVersion),
@@ -563,8 +604,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
             + std::to_string(mSMVersion) + ".");
     applyThorSMRenumberWAR(mSMVersion);
 
-    FMHAKernelSelection const fmhaSelection = selectFMHAKernels(
-        mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType, mSlidingWindowSize > 0, mEnableFp8KVCache);
+    FMHAKernelSelection const fmhaSelection = selectFMHAKernels(mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion,
+        mDataType, mSlidingWindowSize > 0, mEnableFp8KVCache, /*allowPagedBlackwell=*/!mSupportsBoundedKVCache);
     mContextFMHABackend = fmhaSelection.backend;
     mCanImplementFMHA = fmhaSelection.canImplement;
     LOG_DEBUG("AttentionPlugin FMHA backend: %d, sliding_window: %s", static_cast<int32_t>(mContextFMHABackend),
@@ -575,6 +616,10 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
         && mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL && mCanImplementFMHA;
 #endif
 
+    ELLM_CHECK(!mSupportsBoundedKVCache
+            || (mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_V2 && mCanImplementFMHA
+                && canCompileXQAJitKernel()),
+        "Bounded SWA cache requires FMHA-v2 prefill and paged XQA decode kernels.");
     ELLM_CHECK(!(mHeadSize == 512 && mSlidingWindowSize > 0 && !mEnableVisionBlockAttention) || mCanImplementFMHA,
         "D512 sliding-window prefill requires the CuTe DSL paged FMHA kernel.");
 
@@ -631,6 +676,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
     , mEnableKVShared(parsePluginScalarField<int32_t>("enable_kv_shared", fc).value_or(0))
     , mEnableFp8KVCache(parsePluginScalarField<int32_t>("enable_fp8_kv_cache", fc).value_or(0))
     , mSlidingWindowSize(parsePluginScalarField<int32_t>("sliding_window_size", fc).value_or(-1))
+    , mSupportsBoundedKVCache(parsePluginScalarField<int32_t>("supports_bounded_kv_cache", fc).value_or(0) != 0)
     , mSkipSoftmaxScaleFactor(parsePluginScalarField<float>("skip_softmax_scale_factor", fc).value_or(0.f))
 {
     mEnableVisionBlockAttention = parsePluginScalarField<int32_t>("enable_vision_block_attention", fc).value_or(0);
@@ -647,6 +693,10 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
         "Tree attention and vision block attention are mutually exclusive.");
     ELLM_CHECK(!mEnableVisionBlockAttention || selectKvCacheDataType(mEnableFp8KVCache) == DataType::kHALF,
         "Vision block attention does not support an FP8 KV cache.");
+    ELLM_CHECK(!mSupportsBoundedKVCache
+            || (mSlidingWindowSize > 0 && !mEnableTreeAttention && !mEnableFp8KVCache && !mEnableQKNorm
+                && !mEnableContextMaskSelector),
+        "Bounded KV cache capability requires FP16 vanilla sliding-window attention.");
 
     // Parse qkv_scales float array
     for (int32_t i = 0; i < fc->nbFields; ++i)
@@ -692,8 +742,9 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
             + std::to_string(mSMVersion) + ".");
     applyThorSMRenumberWAR(mSMVersion);
 
-    FMHAKernelSelection const fmhaSelection = selectFMHAKernels(
-        mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType, mSlidingWindowSize > 0, mEnableFp8KVCache);
+    FMHAKernelSelection const fmhaSelection = selectFMHAKernels(mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion,
+        mDataType, mSlidingWindowSize > 0, mEnableFp8KVCache,
+        /*allowPagedBlackwell=*/!mSupportsBoundedKVCache);
     mContextFMHABackend = fmhaSelection.backend;
     mCanImplementFMHA = fmhaSelection.canImplement;
     LOG_DEBUG("AttentionPlugin FMHA backend: %d", static_cast<int32_t>(mContextFMHABackend));
@@ -703,6 +754,10 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
         && mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_BLACKWELL && mCanImplementFMHA;
 #endif
 
+    ELLM_CHECK(!mSupportsBoundedKVCache
+            || (mContextFMHABackend == ContextFMHABackend::kCUTE_DSL_FMHA_V2 && mCanImplementFMHA
+                && canCompileXQAJitKernel()),
+        "Bounded SWA cache requires FMHA-v2 prefill and paged XQA decode kernels.");
     ELLM_CHECK(!(mHeadSize == 512 && mSlidingWindowSize > 0 && !mEnableVisionBlockAttention) || mCanImplementFMHA,
         "D512 sliding-window prefill requires the CuTe DSL paged FMHA kernel.");
 
@@ -838,8 +893,8 @@ IPluginV3* AttentionPlugin::clone() noexcept
         // default` + clear the serialization scratch), which clones future fields
         // by construction.
         auto p = std::make_unique<AttentionPlugin>(mLayerName, mNumQHeads, mNumKVHeads, mHeadSize, mEnableTreeAttention,
-            mEnableFp8KVCache, mEnableVisionBlockAttention, mEnableContextMaskSelector, mSlidingWindowSize, mQkvScales,
-            mAttentionScale);
+            mEnableFp8KVCache, mEnableVisionBlockAttention, mEnableContextMaskSelector, mSupportsBoundedKVCache,
+            mSlidingWindowSize, mQkvScales, mAttentionScale);
         p->mEnableQKNorm = mEnableQKNorm;
         p->mEnableKVShared = mEnableKVShared;
         p->mRmsNormEps = mRmsNormEps;
@@ -951,7 +1006,7 @@ bool AttentionPlugin::supportsFormatCombination(
     // Support context/generation phase inputs:
     //      packed QKV tensor (linear FP16) with shape [B, S, (Hq + 2*Hkv) * D]
     //      KV-cache tensor (linear FP16/FP8): paged pool [2, numPages, kTOKENS_PER_PAGE, Hkv, D].
-    //      (numPages is a fixed value per engine build; see setupKVCacheProfiles in llmBuilder.cpp.)
+    //      (numPages can select the bounded or full pool for an SWA-capable engine.)
     //      Real context length: [B] (a vector of scalars) with type int32_t.
     //      RoPE cos/sin cache: [B or 1, Smax, D] (a tensor of scalars) with type float.
     //            Rope CosSin can be ND vector depending on rope type.
@@ -960,13 +1015,15 @@ bool AttentionPlugin::supportsFormatCombination(
     //      Optional context mask selector: [0] for causal/default, [B] for non-causal PADDING mask.
     //      Optional tree attention mask: [B, S, S] (a tensor of scalars) with type int32_t.
     //      Optional tree attention position ids: [B, S] (a tensor of scalars) with type int32_t.
+    //      Optional SWA cache mode: INT8 [0] for full storage or [1] for bounded O(W) storage.
 
     // Support context/generation phase outputs:
     //      attention result (linear FP16) with shape [B, S, Hq, D]
     //      KV-cache tensor, same as the above.
-    // Packed-QKV input channel count: (Hq + 2*Hkv) * D for normal layers, Hq * D for
-    // shared-KV layers (Q only). No channel assertion here — Gemma4 uses heterogeneous
-    // per-layer head configurations; the exact count is validated in enqueue().
+    // Packed-QKV input channel count: (Hq + 2*Hkv) * D for normal layers, and either
+    // Hq * D (Q only) or (Hq + 2*Hkv) * D (Q plus transient donor K/V) for shared-KV
+    // layers. No channel assertion here — Gemma4 uses heterogeneous per-layer head
+    // configurations; the exact count is validated in enqueue().
     auto checkPackedQKV = [](PluginTensorDesc const& tensorDesc) {
         bool status{true};
         status &= tensorDesc.type == DataType::kHALF;
@@ -1065,7 +1122,7 @@ bool AttentionPlugin::supportsFormatCombination(
     };
 
     int32_t const expectedNbInputs = getExpectedNbInputs(mEnableQKNorm, mEnableContextMaskSelector,
-        mEnableTreeAttention, mEnableVisionBlockAttention, mSkipSoftmaxScaleFactor);
+        mEnableTreeAttention, mEnableVisionBlockAttention, mSkipSoftmaxScaleFactor, mSupportsBoundedKVCache);
     bool const checkNumIOs = nbInputs == expectedNbInputs && nbOutputs == kNUM_REQUIRED_OUTPUTS;
     if (inOut == nullptr || !checkNumIOs || pos < 0 || pos >= nbInputs + nbOutputs)
     {
@@ -1134,10 +1191,21 @@ bool AttentionPlugin::supportsFormatCombination(
                 }
                 currentOptionalInputIdx += kNUM_VISION_BLOCK_OPTIONAL_INPUTS;
             }
-            if (mSkipSoftmaxScaleFactor > 0.F && pos == currentOptionalInputIdx)
+            if (mSkipSoftmaxScaleFactor > 0.F)
             {
-                // Shape-only carrier: 1-D INT8 dummy whose length encodes the runtime
-                // skip-softmax scale-factor override. Length is dynamic (>= 0).
+                if (pos == currentOptionalInputIdx)
+                {
+                    // Shape-only carrier: 1-D INT8 dummy whose length encodes the runtime
+                    // skip-softmax scale-factor override. Length is dynamic (>= 0).
+                    result = inOut[pos].desc.type == DataType::kINT8 && inOut[pos].desc.format == TensorFormat::kLINEAR
+                        && inOut[pos].desc.dims.nbDims == 1;
+                }
+                currentOptionalInputIdx += kNUM_SKIP_SCALE_OPTIONAL_INPUTS;
+            }
+            if (mSupportsBoundedKVCache && pos == currentOptionalInputIdx)
+            {
+                // Shape-only carrier: length 1 selects bounded O(W) storage and length 0 selects
+                // the ordinary full paged cache. The tensor data is never read.
                 result = inOut[pos].desc.type == DataType::kINT8 && inOut[pos].desc.format == TensorFormat::kLINEAR
                     && inOut[pos].desc.dims.nbDims == 1;
             }
@@ -1161,7 +1229,7 @@ int32_t AttentionPlugin::configurePlugin(
     DynamicPluginTensorDesc const* in, int32_t nbInputs, DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept
 {
     int32_t const expectedNbInputs = getExpectedNbInputs(mEnableQKNorm, mEnableContextMaskSelector,
-        mEnableTreeAttention, mEnableVisionBlockAttention, mSkipSoftmaxScaleFactor);
+        mEnableTreeAttention, mEnableVisionBlockAttention, mSkipSoftmaxScaleFactor, mSupportsBoundedKVCache);
     if (in == nullptr || out == nullptr || nbInputs != expectedNbInputs || nbOutputs != kNUM_REQUIRED_OUTPUTS)
     {
         LOG_ERROR("AttentionPlugin: expected %d inputs and %d outputs, but got %d inputs and %d outputs.",
@@ -1172,18 +1240,25 @@ int32_t AttentionPlugin::configurePlugin(
     bool const matchingDescriptors = isKVCacheDescriptor(in[kIN_KV_CACHE_IDX].desc, mEnableFp8KVCache)
         && isKVCacheDescriptor(out[kOUT_KV_CACHE_IDX].desc, mEnableFp8KVCache)
         && isKVPageTableDescriptor(in[kIN_KV_PAGE_TABLE_IDX].desc);
-    bool const validProfiles = matchingDescriptors
+    int32_t const swaModeIdx = swaCacheModeInputIdx(mEnableQKNorm != 0, mEnableContextMaskSelector != 0,
+        mEnableTreeAttention != 0, mEnableVisionBlockAttention != 0, mSkipSoftmaxScaleFactor);
+    bool const validSwaModeProfile = !mSupportsBoundedKVCache
+        || (in[swaModeIdx].min.d[0] == kFULL_KV_CACHE_MODE_LENGTH
+            && in[swaModeIdx].opt.d[0] == kBOUNDED_SWA_CACHE_MODE_LENGTH
+            && in[swaModeIdx].max.d[0] == kBOUNDED_SWA_CACHE_MODE_LENGTH);
+    bool const validProfiles = matchingDescriptors && validSwaModeProfile
         && hasConcretePagedKVContract(in[kIN_QKV_IDX].min, in[kIN_KV_CACHE_IDX].min, out[kOUT_KV_CACHE_IDX].min,
-            in[kIN_KV_PAGE_TABLE_IDX].min, mNumKVHeads, mHeadSize)
+            in[kIN_KV_PAGE_TABLE_IDX].min, mNumKVHeads, mHeadSize, mSupportsBoundedKVCache)
         && hasConcretePagedKVContract(in[kIN_QKV_IDX].opt, in[kIN_KV_CACHE_IDX].opt, out[kOUT_KV_CACHE_IDX].opt,
-            in[kIN_KV_PAGE_TABLE_IDX].opt, mNumKVHeads, mHeadSize)
+            in[kIN_KV_PAGE_TABLE_IDX].opt, mNumKVHeads, mHeadSize, mSupportsBoundedKVCache)
         && hasConcretePagedKVContract(in[kIN_QKV_IDX].max, in[kIN_KV_CACHE_IDX].max, out[kOUT_KV_CACHE_IDX].max,
-            in[kIN_KV_PAGE_TABLE_IDX].max, mNumKVHeads, mHeadSize);
+            in[kIN_KV_PAGE_TABLE_IDX].max, mNumKVHeads, mHeadSize, mSupportsBoundedKVCache);
     if (!validProfiles)
     {
         LOG_ERROR(
             "AttentionPlugin: KV cache profiles must use pool shape [2, N, %d, %d, %d], preserve the KV output "
-            "shape, and use INT32 LINEAR kv_page_table [B, 2, M] with B matching packed QKV and M <= N.",
+            "shape, and use INT32 LINEAR kv_page_table [B, 2, M] with B matching packed QKV; full-cache-only "
+            "profiles require M <= N.",
             rt::kTOKENS_PER_PAGE, mNumKVHeads, mHeadSize);
         return -1;
     }
@@ -1194,7 +1269,7 @@ size_t AttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, 
     DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept
 {
     int32_t const expectedNbInputs = getExpectedNbInputs(mEnableQKNorm, mEnableContextMaskSelector,
-        mEnableTreeAttention, mEnableVisionBlockAttention, mSkipSoftmaxScaleFactor);
+        mEnableTreeAttention, mEnableVisionBlockAttention, mSkipSoftmaxScaleFactor, mSupportsBoundedKVCache);
     if (inputs == nullptr || outputs == nullptr || nbInputs != expectedNbInputs || nbOutputs != kNUM_REQUIRED_OUTPUTS)
     {
         LOG_ERROR(
@@ -1207,6 +1282,16 @@ size_t AttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, 
     // Packed QKV: max batch/seq derived from packed input's first two dims (same as Q).
     int64_t const maxBatchSize = inputs[kIN_QKV_IDX].max.d[0];
     int64_t const maxSeqLen = inputs[kIN_QKV_IDX].max.d[1];
+    if (mSupportsBoundedKVCache)
+    {
+        // Both runtime policies use FMHA-v2/XQA. Full-cache mode stays native-paged, while the bounded path and
+        // vision-block fallback need at most W + current-sequence scratch, so neither policy needs a dense
+        // max-sequence KV workspace.
+        size_t const workspaceSize = getSwaKVCacheWorkspaceSize(maxBatchSize, maxSeqLen, mSlidingWindowSize, mNumQHeads,
+            mNumKVHeads, mHeadSize, mEnableVisionBlockAttention != 0);
+        LOG_DEBUG("AttentionPlugin dual-mode SWA workspace size: %zu bytes", workspaceSize);
+        return workspaceSize;
+    }
     // KV binding is the paged pool [2, numPages, 128, Hkv, D]; the per-slot padded capacity is the
     // page-table width times the page size (kv_page_table is [batch, 2, maxPagesPerSeq]).
     int64_t const maxKVCacheCapacity = inputs[kIN_KV_PAGE_TABLE_IDX].max.d[2] * rt::kTOKENS_PER_PAGE;
@@ -1274,7 +1359,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
 {
     check::check(inputDesc != nullptr && outputDesc != nullptr && inputs != nullptr && outputs != nullptr,
         "AttentionPlugin received null enqueue descriptors or bindings.");
-    check::check(hasConcretePagedKVContract(inputDesc, outputDesc, mNumKVHeads, mHeadSize, mEnableFp8KVCache),
+    check::check(hasConcretePagedKVContract(
+                     inputDesc, outputDesc, mNumKVHeads, mHeadSize, mEnableFp8KVCache, mSupportsBoundedKVCache),
         "AttentionPlugin requires kv_cache pool [2, N, kTOKENS_PER_PAGE, numKVHeads, headDim], identical KV input "
         "and output shapes, and INT32 LINEAR kv_page_table [B, 2, M] with B matching packed QKV and M <= N.");
     check::check(inputs[kIN_KV_CACHE_IDX] != nullptr && inputs[kIN_KV_PAGE_TABLE_IDX] != nullptr
@@ -1283,17 +1369,33 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
 
     // Packed QKV input, layout selected by the enable_kv_shared field:
     //   0: [B, S, (Hq+2*Hkv)*D] — Q+K+V; K/V are written to the KV cache.
-    //   1: [B, S, Hq*D] — Q only; K/V come from a donated cache and are not written.
+    //   1: [B, S, Hq*D] — Q only, or [B, S, (Hq+2*Hkv)*D] with the donor's
+    //      current K/V appended. Shared layers never write the donated cache.
     PluginTensorDesc const& packedQKVInputDesc = inputDesc[kIN_QKV_IDX];
     int32_t const runtimeBatchSize = static_cast<int32_t>(packedQKVInputDesc.dims.d[0]);
     int32_t const runtimeSeqLen = static_cast<int32_t>(packedQKVInputDesc.dims.d[1]);
     int32_t const actualChannels = static_cast<int32_t>(packedQKVInputDesc.dims.d[2]);
+    bool useBoundedSwaCache{false};
+    if (mSupportsBoundedKVCache)
+    {
+        int32_t const modeIdx = swaCacheModeInputIdx(mEnableQKNorm != 0, mEnableContextMaskSelector != 0,
+            mEnableTreeAttention != 0, mEnableVisionBlockAttention != 0, mSkipSoftmaxScaleFactor);
+        PluginTensorDesc const& modeDesc = inputDesc[modeIdx];
+        check::check(modeDesc.dims.nbDims == 1
+                && (modeDesc.dims.d[0] == kFULL_KV_CACHE_MODE_LENGTH
+                    || modeDesc.dims.d[0] == kBOUNDED_SWA_CACHE_MODE_LENGTH),
+            "AttentionPlugin swa_kv_cache_mode must have runtime shape [0] or [1].");
+        useBoundedSwaCache = modeDesc.dims.d[0] == kBOUNDED_SWA_CACHE_MODE_LENGTH;
+    }
     bool const sharedKV = (mEnableKVShared != 0);
-    int32_t const expectedChannels = (sharedKV ? mNumQHeads : (mNumQHeads + 2 * mNumKVHeads)) * mHeadSize;
-    check::check(actualChannels == expectedChannels,
-        "Packed QKV input last dim does not match enable_kv_shared: expected (Hq + 2*Hkv)*head_dim "
-        "(enable_kv_shared=0) or Hq*head_dim (enable_kv_shared=1).");
-    int32_t const combinedHeads = sharedKV ? mNumQHeads : (mNumQHeads + 2 * mNumKVHeads);
+    int32_t const qChannels = mNumQHeads * mHeadSize;
+    int32_t const qkvChannels = (mNumQHeads + 2 * mNumKVHeads) * mHeadSize;
+    bool const sharedKVWithCurrent = sharedKV && actualChannels == qkvChannels;
+    check::check((!sharedKV && actualChannels == qkvChannels)
+            || (sharedKV && (actualChannels == qChannels || sharedKVWithCurrent)),
+        "Packed QKV input last dim does not match enable_kv_shared: expected (Hq + 2*Hkv)*head_dim for "
+        "owned KV, or Hq*head_dim / (Hq + 2*Hkv)*head_dim for shared KV.");
+    int32_t const combinedHeads = sharedKVWithCurrent || !sharedKV ? (mNumQHeads + 2 * mNumKVHeads) : mNumQHeads;
 
     rt::Tensor packedQKVTensor(const_cast<void*>(inputs[kIN_QKV_IDX]),
         rt::Coords{runtimeBatchSize, runtimeSeqLen, combinedHeads, mHeadSize}, rt::DeviceType::kGPU,
@@ -1354,6 +1456,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
     check::check(!kvPageTableTensor.isEmpty(), "AttentionPlugin: kv_page_table input is required for paged attention.");
     int32_t const* const pageTable = kvPageTableTensor.dataPointer<int32_t>();
     int32_t const maxPagesPerSeq = static_cast<int32_t>(kvPageTableInputDesc.dims.d[2]);
+    check::check(useBoundedSwaCache || numPages >= maxPagesPerSeq,
+        "AttentionPlugin full-cache mode requires at least one physical page per logical page-table column.");
     // Padded per-slot token capacity spanned by the page table (each page holds kTOKENS_PER_PAGE).
     int32_t const kvCacheCapacity = maxPagesPerSeq * rt::kTOKENS_PER_PAGE;
 
@@ -1480,12 +1584,15 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
         }
         if (mEnableVisionBlockAttention)
         {
-            if (executionMode != AttentionExecutionMode::kNORMAL_PREFILL || sharedKV)
+            if (executionMode != AttentionExecutionMode::kNORMAL_PREFILL
+                || (useBoundedSwaCache && sharedKV && !sharedKVWithCurrent))
             {
                 LOG_ERROR(
-                    "AttentionPlugin: Gemma4 vision-block attention supports only normal prefill with owned KV "
-                    "(mode=%d, sharedKV=%d).",
-                    static_cast<int32_t>(executionMode), static_cast<int32_t>(sharedKV));
+                    "AttentionPlugin: Gemma4 vision-block attention supports only normal prefill; bounded shared "
+                    "KV additionally requires explicit current donor KV (mode=%d, bounded=%d, sharedKV=%d, "
+                    "currentKV=%d).",
+                    static_cast<int32_t>(executionMode), static_cast<int32_t>(useBoundedSwaCache),
+                    static_cast<int32_t>(sharedKV), static_cast<int32_t>(sharedKVWithCurrent));
                 return 1;
             }
             if (visionBlockIdsTensor.getShape()[0] != runtimeBatchSize
@@ -1530,14 +1637,6 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                 return -1;
             }
 
-            // Unpack packed QKV: roped Q to qScratch, roped K + V to the paged pool.
-            qInputTensor = assignTensorFromWorkspace(
-                alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
-            kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor, rt::OptionalInputTensor{},
-                rt::OptionalInputTensor{}, packedQKVTensor, qInputTensor, kvCacheTensor, kScale, vScale, stream,
-                pageTable, maxPagesPerSeq, nullptr /* kScratchOut */, nullptr /* vScratchOut */, nullptr /* fp8QOut */,
-                1.0f /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal);
-
             rt::Tensor cuQSeqLensTensor
                 = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
             rt::Tensor cuKVSeqLensTensor
@@ -1548,6 +1647,67 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                 = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
             kernel::calCuQCuKVSeqLensAndKVEndIdxs(contextLengthTensor, kvCacheStartIdxTensor, cuQSeqLensTensor,
                 cuKVSeqLensTensor, kvCacheEndIdxsTensor, paddedCuKVSeqLensTensor, runtimeSeqLen, stream);
+
+            if (sharedKV && !sharedKVWithCurrent)
+            {
+                // Full-cache shared layers already have the donor's complete K/V in the paged pool.
+                qInputTensor = aliasPackedAsQInput();
+                kernel::launchApplyRopeQOnly(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, stream);
+            }
+            else
+            {
+                // Unpack packed QKV: roped Q to qScratch, optional current K/V to dense scratch, and owned K/V to
+                // the paged pool.
+                qInputTensor = assignTensorFromWorkspace(
+                    alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
+                if (useBoundedSwaCache)
+                {
+                    kInputTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
+                        {runtimeBatchSize, runtimeSeqLen, mNumKVHeads, mHeadSize}, DataType::kHALF);
+                    vInputTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
+                        {runtimeBatchSize, runtimeSeqLen, mNumKVHeads, mHeadSize}, DataType::kHALF);
+                }
+                kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor, rt::OptionalInputTensor{},
+                    rt::OptionalInputTensor{}, packedQKVTensor, qInputTensor, kvCacheTensor, kScale, vScale, stream,
+                    pageTable, maxPagesPerSeq, useBoundedSwaCache ? kInputTensor.rawPointer() : nullptr,
+                    useBoundedSwaCache ? vInputTensor.rawPointer() : nullptr, nullptr /* fp8QOut */, 1.0f /* qScale */,
+                    qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal, std::nullopt, !sharedKV);
+            }
+
+            if (useBoundedSwaCache)
+            {
+                if (!mUseFMHAV2VisionBlockFMHA)
+                {
+                    LOG_ERROR(
+                        "AttentionPlugin bounded SWA: no FMHA-v2 vision-block kernel for S=%d (headSize=%d, SM=%d).",
+                        runtimeSeqLen, mHeadSize, mSMVersion);
+                    return 1;
+                }
+
+                LOG_DEBUG(
+                    "AttentionPlugin bounded SWA: vision-block prefill via FMHA-v2 "
+                    "(B=%d, S=%d, Hq=%d, Hkv=%d, window=%d)",
+                    runtimeBatchSize, runtimeSeqLen, mNumQHeads, mNumKVHeads, mSlidingWindowSize);
+
+                rt::Tensor blockBeginTensor = assignTensorFromWorkspace(
+                    alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen}, DataType::kINT32);
+                rt::Tensor blockEndTensor = assignTensorFromWorkspace(
+                    alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen}, DataType::kINT32);
+                kernel::launchBuildVisionBlockRanges(visionBlockIdsTensor.dataPointer<int32_t>(),
+                    contextLengthTensor.dataPointer<int32_t>(), blockBeginTensor.dataPointer<int32_t>(),
+                    blockEndTensor.dataPointer<int32_t>(), runtimeBatchSize, runtimeSeqLen, stream);
+
+                CuteDslFMHAV2Runner runner(
+                    mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, runtimeSeqLen);
+                if (!runner.runVisionBlock(qInputTensor.dataPointer<half>(), kInputTensor.dataPointer<half>(),
+                        vInputTensor.dataPointer<half>(), attentionOutputTensor.dataPointer<half>(),
+                        paddedCuKVSeqLensTensor.dataPointer<int32_t>(), blockBeginTensor.dataPointer<int32_t>(),
+                        blockEndTensor.dataPointer<int32_t>(), stream, mAttentionScale, mSlidingWindowSize - 1))
+                {
+                    return -1;
+                }
+                return 0;
+            }
 
             rt::Tensor blockBeginTensor{};
             rt::Tensor blockEndTensor{};
@@ -1641,9 +1801,15 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
             && (!usePaddingContextMask || mCanImplementPaddingFMHA))
         {
             bool const useSmallD64 = executionMode == AttentionExecutionMode::kNORMAL_PREFILL;
-            bool const useNativePagedFMHA = !usePaddingContextMask && !mEnableFp8KVCache;
-            int32_t const preflightKVSeqLen
-                = useNativePagedFMHA ? kvCacheCapacity : (useSmallD64 ? runtimeSeqLen : kvCacheCapacity);
+            bool const boundedSwaDense = useBoundedSwaCache;
+            bool const useNativePagedFMHA = !boundedSwaDense && !usePaddingContextMask && !mEnableFp8KVCache;
+            int32_t const boundedKVSeqLen = executionMode == AttentionExecutionMode::kCHUNKED_PREFILL
+                ? mSlidingWindowSize + runtimeSeqLen
+                : runtimeSeqLen;
+            int32_t const preflightKVSeqLen = boundedSwaDense ? boundedKVSeqLen
+                : useNativePagedFMHA                          ? kvCacheCapacity
+                : useSmallD64                                 ? runtimeSeqLen
+                                                              : kvCacheCapacity;
             CuteDslFMHAV2Runner runner(
                 mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, preflightKVSeqLen, useSmallD64);
             int32_t const slidingWindow = mSlidingWindowSize > 0 ? mSlidingWindowSize - 1 : INT_MAX;
@@ -1692,15 +1858,82 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
         // --- Shared KV prefill: Q gets RoPE, K/V read from donor layer's cache ---
         if (sharedKV)
         {
-            // Shared-KV: RoPE Q in-place only; the donor layer's cache is already populated.
-            qInputTensor = aliasPackedAsQInput();
-            if (useExplicitPositionIds)
+            if (sharedKVWithCurrent)
             {
-                kernel::launchApplyRopeQOnlyTreeDecoding(ropeCosSinTensor, attentionPosIdTensor, qInputTensor, stream);
+                qInputTensor = assignTensorFromWorkspace(
+                    alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
+                if (useBoundedSwaCache)
+                {
+                    kInputTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
+                        {runtimeBatchSize, runtimeSeqLen, mNumKVHeads, mHeadSize}, DataType::kHALF);
+                    vInputTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
+                        {runtimeBatchSize, runtimeSeqLen, mNumKVHeads, mHeadSize}, DataType::kHALF);
+                }
+                kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor,
+                    rt::OptionalInputTensor{kvCacheEndIdxsTensor}, rt::OptionalInputTensor{}, packedQKVTensor,
+                    qInputTensor, kvCacheTensor, kScale, vScale, stream, pageTable, maxPagesPerSeq,
+                    useBoundedSwaCache ? kInputTensor.rawPointer() : nullptr,
+                    useBoundedSwaCache ? vInputTensor.rawPointer() : nullptr, nullptr /* fp8QOut */, 1.0F /* qScale */,
+                    qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal, rt::OptionalInputTensor{cuQSeqLensTensor},
+                    false /* writeKVCache */);
             }
             else
             {
-                kernel::launchApplyRopeQOnly(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, stream);
+                check::check(!useBoundedSwaCache,
+                    "Bounded shared-KV prefill requires the donor's current K/V in the packed input.");
+                // Shared-KV: RoPE Q in-place only; the donor layer's cache is already populated.
+                qInputTensor = aliasPackedAsQInput();
+                if (useExplicitPositionIds)
+                {
+                    kernel::launchApplyRopeQOnlyTreeDecoding(
+                        ropeCosSinTensor, attentionPosIdTensor, qInputTensor, stream);
+                }
+                else
+                {
+                    kernel::launchApplyRopeQOnly(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, stream);
+                }
+            }
+
+            if (useBoundedSwaCache)
+            {
+                rt::Coords const currentKVShape{runtimeBatchSize, runtimeSeqLen, mNumKVHeads, mHeadSize};
+                rt::Tensor currentKInputTensor(
+                    kInputTensor.rawPointer(), currentKVShape, rt::DeviceType::kGPU, DataType::kHALF);
+                rt::Tensor currentVInputTensor(
+                    vInputTensor.rawPointer(), currentKVShape, rt::DeviceType::kGPU, DataType::kHALF);
+                half const* kData = currentKInputTensor.dataPointer<half>();
+                half const* vData = currentVInputTensor.dataPointer<half>();
+                int32_t kvSeqLen = runtimeSeqLen;
+                if (executionMode == AttentionExecutionMode::kCHUNKED_PREFILL)
+                {
+                    kernel::calSWAChunkedPrefillMetadata(contextLengthTensor, kvCacheStartIdxTensor, cuQSeqLensTensor,
+                        cuKVSeqLensTensor, kvCacheEndIdxsTensor, paddedCuKVSeqLensTensor, runtimeSeqLen,
+                        mSlidingWindowSize, stream);
+                    kvSeqLen = mSlidingWindowSize + runtimeSeqLen;
+                    rt::Tensor kvWorkspaceTensor = assignTensorFromWorkspace(
+                        alignedWorkspacePtr, {runtimeBatchSize, 2, mNumKVHeads, kvSeqLen, mHeadSize}, DataType::kHALF);
+                    size_t const halfSize = static_cast<size_t>(runtimeBatchSize) * kvSeqLen * mNumKVHeads * mHeadSize;
+                    half* const workspace = kvWorkspaceTensor.dataPointer<half>();
+                    kInputTensor = rt::Tensor(workspace, {runtimeBatchSize, kvSeqLen, mNumKVHeads, mHeadSize},
+                        rt::DeviceType::kGPU, DataType::kHALF);
+                    vInputTensor = rt::Tensor(workspace + halfSize,
+                        {runtimeBatchSize, kvSeqLen, mNumKVHeads, mHeadSize}, rt::DeviceType::kGPU, DataType::kHALF);
+                    kernel::assemblePagedSWAChunkedPrefillFMHAKV(kvCacheTensor, kvPageTableTensor, currentKInputTensor,
+                        currentVInputTensor, contextLengthTensor, kvCacheStartIdxTensor, kInputTensor, vInputTensor,
+                        mSlidingWindowSize, stream);
+                    kData = kInputTensor.dataPointer<half>();
+                    vData = vInputTensor.dataPointer<half>();
+                }
+
+                CuteDslFMHAV2Runner runner(
+                    mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, kvSeqLen, false);
+                if (!runner.run(qInputTensor.dataPointer<half>(), kData, vData,
+                        attentionOutputTensor.dataPointer<half>(), paddedCuKVSeqLensTensor.dataPointer<int32_t>(),
+                        stream, mAttentionScale, mSlidingWindowSize - 1))
+                {
+                    return -1;
+                }
+                return 0;
             }
 
             // Run FMHA reading from the donor's KV cache (bound to this layer's KV cache input).
@@ -1777,6 +2010,50 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                 LOG_ERROR(
                     "AttentionPlugin: selected shared-KV prefill kernel is unavailable (paddingMask=%d, D=%d, SM=%d).",
                     usePaddingContextMask ? 1 : 0, mHeadSize, mSMVersion);
+                return -1;
+            }
+            return 0;
+        }
+
+        if (useBoundedSwaCache && executionMode == AttentionExecutionMode::kCHUNKED_PREFILL)
+        {
+            kernel::calSWAChunkedPrefillMetadata(contextLengthTensor, kvCacheStartIdxTensor, cuQSeqLensTensor,
+                cuKVSeqLensTensor, kvCacheEndIdxsTensor, paddedCuKVSeqLensTensor, runtimeSeqLen, mSlidingWindowSize,
+                stream);
+
+            qInputTensor = assignTensorFromWorkspace(
+                alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
+            kInputTensor = assignTensorFromWorkspace(
+                alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumKVHeads, mHeadSize}, DataType::kHALF);
+            vInputTensor = assignTensorFromWorkspace(
+                alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumKVHeads, mHeadSize}, DataType::kHALF);
+
+            // Split packed QKV into current-chunk scratch and persist only logical pages mapped by the SWA table.
+            // Unmapped earlier chunk pages are intentionally skipped: the temporary W + chunk source still owns them.
+            kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor, rt::OptionalInputTensor{kvCacheEndIdxsTensor},
+                rt::OptionalInputTensor{}, packedQKVTensor, qInputTensor, kvCacheTensor, kScale, vScale, stream,
+                pageTable, maxPagesPerSeq, kInputTensor.rawPointer(), vInputTensor.rawPointer(), nullptr /* fp8QOut */,
+                1.0F /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal);
+
+            int32_t const workspaceSeqLen = mSlidingWindowSize + runtimeSeqLen;
+            rt::Tensor kvWorkspaceTensor = assignTensorFromWorkspace(
+                alignedWorkspacePtr, {runtimeBatchSize, 2, mNumKVHeads, workspaceSeqLen, mHeadSize}, DataType::kHALF);
+            size_t const halfSize = static_cast<size_t>(runtimeBatchSize) * workspaceSeqLen * mNumKVHeads * mHeadSize;
+            half* const workspace = kvWorkspaceTensor.dataPointer<half>();
+            rt::Tensor kWorkspaceTensor(workspace, {runtimeBatchSize, workspaceSeqLen, mNumKVHeads, mHeadSize},
+                rt::DeviceType::kGPU, DataType::kHALF);
+            rt::Tensor vWorkspaceTensor(workspace + halfSize,
+                {runtimeBatchSize, workspaceSeqLen, mNumKVHeads, mHeadSize}, rt::DeviceType::kGPU, DataType::kHALF);
+            kernel::assemblePagedSWAChunkedPrefillFMHAKV(kvCacheTensor, kvPageTableTensor, kInputTensor, vInputTensor,
+                contextLengthTensor, kvCacheStartIdxTensor, kWorkspaceTensor, vWorkspaceTensor, mSlidingWindowSize,
+                stream);
+
+            CuteDslFMHAV2Runner runner(
+                mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, workspaceSeqLen, false);
+            if (!runner.run(qInputTensor.dataPointer<half>(), kWorkspaceTensor.dataPointer<half>(),
+                    vWorkspaceTensor.dataPointer<half>(), attentionOutputTensor.dataPointer<half>(),
+                    paddedCuKVSeqLensTensor.dataPointer<int32_t>(), stream, mAttentionScale, mSlidingWindowSize - 1))
+            {
                 return -1;
             }
             return 0;
@@ -1863,7 +2140,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
             qInputTensor = assignTensorFromWorkspace(
                 alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
 
-            if (!mEnableFp8KVCache && !usePaddingContextMask)
+            if (!mEnableFp8KVCache && !usePaddingContextMask && !useBoundedSwaCache)
             {
                 // FP16 causal/sliding prefill writes K/V to the cache and reads that paged pool directly.
                 kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor,
@@ -1889,7 +2166,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
             }
             else
             {
-                // Preserve the legacy dense path for FP8 KV and the independent padding contract.
+                // Preserve dense K/V for bounded normal prefill, FP8 KV, and the independent padding contract.
                 bool const gatherKV
                     = executionMode == AttentionExecutionMode::kCHUNKED_PREFILL || usePaddingContextMask;
                 if (gatherKV)
@@ -1921,7 +2198,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                 }
                 else
                 {
-                    // Normal FP8-KV prefill keeps the existing dense FP16 scratch contract.
+                    // Normal bounded/FP8 prefill keeps the dense FP16 scratch contract.
                     kInputTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
                         {runtimeBatchSize, runtimeSeqLen, mNumKVHeads, mHeadSize}, DataType::kHALF);
                     vInputTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
@@ -1957,16 +2234,34 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
         // write). Decode reads K/V from the KV cache via XQA — no scratch K/V needed.
         if (sharedKV)
         {
-            // Shared-KV: packed input is [B,S,Hq,D] (Q only) — alias as qInputTensor
-            // and RoPE in-place.
-            qInputTensor = aliasPackedAsQInput();
-            if (executionMode == AttentionExecutionMode::kTREE_DECODING || useExplicitPositionIds)
+            if (sharedKVWithCurrent)
             {
-                kernel::launchApplyRopeQOnlyTreeDecoding(ropeCosSinTensor, attentionPosIdTensor, qInputTensor, stream);
+                qInputTensor = assignTensorFromWorkspace(
+                    alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
+                rt::OptionalInputTensor const tokenPosIds
+                    = (executionMode == AttentionExecutionMode::kTREE_DECODING || useExplicitPositionIds)
+                    ? rt::OptionalInputTensor{attentionPosIdTensor}
+                    : rt::OptionalInputTensor{};
+                kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor, rt::OptionalInputTensor{contextLengthTensor},
+                    tokenPosIds, packedQKVTensor, qInputTensor, kvCacheTensor, kScale, vScale, stream, pageTable,
+                    maxPagesPerSeq, nullptr /* kScratch */, nullptr /* vScratch */, nullptr /* fp8QOut */,
+                    1.0F /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal, std::nullopt,
+                    false /* writeKVCache */);
             }
             else
             {
-                kernel::launchApplyRopeQOnly(ropeCosSinTensor, contextLengthTensor, qInputTensor, stream);
+                // Shared-KV: packed input is [B,S,Hq,D] (Q only) — alias as qInputTensor
+                // and RoPE in-place.
+                qInputTensor = aliasPackedAsQInput();
+                if (executionMode == AttentionExecutionMode::kTREE_DECODING || useExplicitPositionIds)
+                {
+                    kernel::launchApplyRopeQOnlyTreeDecoding(
+                        ropeCosSinTensor, attentionPosIdTensor, qInputTensor, stream);
+                }
+                else
+                {
+                    kernel::launchApplyRopeQOnly(ropeCosSinTensor, contextLengthTensor, qInputTensor, stream);
+                }
             }
             // The Q-only path has no fused-norm kernel; enable_qk_norm + enable_kv_shared is
             // rejected at plugin construction.
@@ -2043,18 +2338,19 @@ int32_t AttentionPlugin::onShapeChange(
     PluginTensorDesc const* in, int32_t nbInputs, PluginTensorDesc const* out, int32_t nbOutputs) noexcept
 {
     int32_t const expectedNbInputs = getExpectedNbInputs(mEnableQKNorm, mEnableContextMaskSelector,
-        mEnableTreeAttention, mEnableVisionBlockAttention, mSkipSoftmaxScaleFactor);
+        mEnableTreeAttention, mEnableVisionBlockAttention, mSkipSoftmaxScaleFactor, mSupportsBoundedKVCache);
     if (in == nullptr || out == nullptr || nbInputs != expectedNbInputs || nbOutputs != kNUM_REQUIRED_OUTPUTS)
     {
         LOG_ERROR("AttentionPlugin: expected %d inputs and %d outputs, but got %d inputs and %d outputs.",
             expectedNbInputs, kNUM_REQUIRED_OUTPUTS, nbInputs, nbOutputs);
         return -1;
     }
-    if (!hasConcretePagedKVContract(in, out, mNumKVHeads, mHeadSize, mEnableFp8KVCache))
+    if (!hasConcretePagedKVContract(in, out, mNumKVHeads, mHeadSize, mEnableFp8KVCache, mSupportsBoundedKVCache))
     {
         LOG_ERROR(
             "AttentionPlugin: kv_cache must use pool shape [2, N, %d, %d, %d], preserve its output shape, and "
-            "use INT32 LINEAR kv_page_table [B, 2, M] with B matching packed QKV and M <= N.",
+            "use INT32 LINEAR kv_page_table [B, 2, M] with B matching packed QKV; full-cache-only profiles "
+            "require M <= N.",
             rt::kTOKENS_PER_PAGE, mNumKVHeads, mHeadSize);
         return -1;
     }
@@ -2082,6 +2378,9 @@ PluginFieldCollection const* AttentionPlugin::getFieldsToSerialize() noexcept
     mDataToSerialize.emplace_back(
         "enable_context_mask_selector", &mEnableContextMaskSelector, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("sliding_window_size", &mSlidingWindowSize, PluginFieldType::kINT32, 1);
+    mSupportsBoundedKVCacheToSerialize = static_cast<int32_t>(mSupportsBoundedKVCache);
+    mDataToSerialize.emplace_back(
+        "supports_bounded_kv_cache", &mSupportsBoundedKVCacheToSerialize, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("skip_softmax_scale_factor", &mSkipSoftmaxScaleFactor, PluginFieldType::kFLOAT32, 1);
     mDataToSerialize.emplace_back(
         "qkv_scales", mQkvScales.data(), PluginFieldType::kFLOAT32, static_cast<int32_t>(mQkvScales.size()));
@@ -2120,6 +2419,8 @@ AttentionPluginCreator::AttentionPluginCreator()
     mPluginAttributes.emplace_back(PluginField("enable_context_mask_selector", nullptr, PluginFieldType::kINT32, 0));
     // Sliding window size (-1 = no sliding window, >0 = window size)
     mPluginAttributes.emplace_back(PluginField("sliding_window_size", nullptr, PluginFieldType::kINT32, 0));
+    // Capability marker for runtime-selectable bounded KV storage.
+    mPluginAttributes.emplace_back(PluginField("supports_bounded_kv_cache", nullptr, PluginFieldType::kINT32, 0));
     // Skip-softmax (BLASST) calibrated scale factor S (0 = disabled, the default)
     mPluginAttributes.emplace_back(PluginField("skip_softmax_scale_factor", nullptr, PluginFieldType::kFLOAT32, 0));
     // Optional QKV dequant scales [q, k, v] for FP8 attention

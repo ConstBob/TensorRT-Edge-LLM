@@ -24,12 +24,14 @@
 #include "common/pagedKvTypes.h"
 #include "common/parallelArtifactNames.h"
 #include "common/ropeUtils.h"
+#include "common/specDecodeConfigUtils.h"
 #include "common/trtUtils.h"
 #include "common/version.h"
 
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -517,6 +519,10 @@ bool LLMBuilder::parseConfig()
             role.c_str());
         return false;
     }
+    if (mBuilderConfig.numSwaPages == 0 && mModelConfig.contains("num_swa_pages"))
+    {
+        mBuilderConfig.numSwaPages = mModelConfig["num_swa_pages"].get<int64_t>();
+    }
 
     mHiddenSize = mModelConfig["hidden_size"].get<int32_t>();
     // MTP draft consumes one target hidden state. Other draft modes may
@@ -590,69 +596,125 @@ bool LLMBuilder::parseConfig()
         mFullRotaryDim = getRotaryDim(mModelConfig["full_rope_config"], fullHeadDim);
     }
 
-    mNumLinearAttnLayers = mModelConfig.value("num_linear_attn_layers", 0);
-    mRecurrentStateNumHeads = mModelConfig.value("recurrent_state_num_heads", 0);
-    mRecurrentStateHeadDim = mModelConfig.value("recurrent_state_head_dim", 0);
-    mRecurrentStateSize = mModelConfig.value("recurrent_state_size", 0);
-    mConvDim = mModelConfig.value("conv_dim", 0);
-    mConvKernel = mModelConfig.value("conv_kernel", 0);
-
-    // Only attention layers own a KV cache. Prefer the authoritative
-    // per-attention-layer kv_layer_configs count; it is the only signal that is
-    // correct for hybrid drafts whose non-attention layers are neither mamba nor
-    // linear-attention (e.g. the MTP attention+MoE draft, num_linear_attn == 0).
-    if (mModelConfig.contains("kv_layer_configs") && mModelConfig["kv_layer_configs"].is_array())
-    {
-        mNbKVCacheInputs = 0;
-        for (auto const& layerConfig : mModelConfig["kv_layer_configs"])
-        {
-            if (layerConfig.is_object())
-            {
-                ++mNbKVCacheInputs;
-            }
-        }
-    }
-    else if (mNumLinearAttnLayers > 0)
-    {
-        mNbKVCacheInputs = mModelConfig.value("num_attention_layers", mModelConfig["num_hidden_layers"].get<int32_t>());
-    }
-    else
-    {
-        mNbKVCacheInputs = mModelConfig["num_hidden_layers"].get<int32_t>();
-    }
-
     // Build per-layer head size vector for heterogeneous models (e.g. Gemma4).
     // Prefer kv_layer_configs (authoritative per-layer dims) when available;
     // fall back to global_head_dim + layer_types for older exports.
+    mPerLayerHeadSize.clear();
+    mPerLayerNumKVHeads.clear();
+    mPerLayerKVCacheCapacity.clear();
     int64_t globalHeadSize = mModelConfig.value("global_head_dim", static_cast<int64_t>(0));
-    if (mModelConfig.contains("kv_layer_configs") && !mModelConfig["kv_layer_configs"].is_null())
+    if (mBuilderConfig.maxBatchSize <= 0
+        || mBuilderConfig.maxBatchSize > static_cast<int64_t>(std::numeric_limits<int32_t>::max())
+        || mBuilderConfig.maxKVCacheCapacity <= 0
+        || mBuilderConfig.maxKVCacheCapacity > static_cast<int64_t>(std::numeric_limits<int32_t>::max())
+        || mBuilderConfig.numSwaPages < 0
+        || mBuilderConfig.numSwaPages > static_cast<int64_t>(std::numeric_limits<int32_t>::max()))
+    {
+        LOG_ERROR(
+            "maxBatchSize/maxKVCacheCapacity must be positive int32 values and numSwaPages must be a "
+            "non-negative int32 value.");
+        return false;
+    }
+    int32_t const maxKVCacheCapacity = static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity);
+
+    if (mModelConfig.contains("kv_layer_configs") && mModelConfig["kv_layer_configs"].is_array())
     {
         auto const& kvLayerConfigs = mModelConfig["kv_layer_configs"];
-        check::check(static_cast<int>(kvLayerConfigs.size()) >= mNbKVCacheInputs,
-            "kv_layer_configs has fewer entries than expected KV cache layers");
-        for (int i = 0; i < mNbKVCacheInputs; ++i)
+        for (size_t configIdx = 0; configIdx < kvLayerConfigs.size(); ++configIdx)
         {
-            auto const& lc = kvLayerConfigs[i];
-            int64_t layerHeadDim
-                = (lc.is_null() || !lc.contains("head_dim")) ? mHeadSize : lc["head_dim"].get<int64_t>();
+            auto const& lc = kvLayerConfigs[configIdx];
+            if (lc.is_null())
+            {
+                continue;
+            }
+            if (!lc.is_object())
+            {
+                LOG_ERROR("kv_layer_configs[%zu] must be an object or null.", configIdx);
+                return false;
+            }
+            int64_t const layerHeadDim = lc.value("head_dim", mHeadSize);
             mPerLayerHeadSize.push_back(layerHeadDim);
-            int64_t layerNumKVHeads
-                = (lc.is_null() || !lc.contains("num_kv_heads")) ? mNumKVHeads : lc["num_kv_heads"].get<int64_t>();
+            int64_t const layerNumKVHeads = lc.value("num_kv_heads", mNumKVHeads);
             mPerLayerNumKVHeads.push_back(layerNumKVHeads);
+
+            if (lc.contains("kv_cache_capacity") && !lc["kv_cache_capacity"].is_number_integer())
+            {
+                LOG_ERROR("kv_layer_configs[%zu].kv_cache_capacity must be an integer.", configIdx);
+                return false;
+            }
+            int64_t const capacity = lc.value("kv_cache_capacity", static_cast<int64_t>(0));
+            if (capacity < 0 || capacity > maxKVCacheCapacity)
+            {
+                LOG_ERROR("kv_layer_configs[%zu].kv_cache_capacity=%ld must be in [0, %d].", configIdx, capacity,
+                    maxKVCacheCapacity);
+                return false;
+            }
+            mPerLayerKVCacheCapacity.push_back(static_cast<int32_t>(capacity));
         }
+        check::check(static_cast<int32_t>(mPerLayerHeadSize.size()) == mNbKVCacheInputs,
+            "kv_layer_configs attention-entry count does not match the expected KV cache input count");
         LOG_INFO("Heterogeneous head sizes from kv_layer_configs: %d layers", mNbKVCacheInputs);
     }
-    else if (globalHeadSize > 0 && globalHeadSize != mHeadSize && mModelConfig.contains("layer_types"))
+    else
     {
-        auto const& layerTypes = mModelConfig["layer_types"];
-        for (int i = 0; i < mNbKVCacheInputs; ++i)
+        mPerLayerKVCacheCapacity.assign(static_cast<size_t>(mNbKVCacheInputs), 0);
+        if (globalHeadSize > 0 && globalHeadSize != mHeadSize && mModelConfig.contains("layer_types"))
         {
-            std::string lt = (i < static_cast<int>(layerTypes.size())) ? layerTypes[i].get<std::string>() : "";
-            mPerLayerHeadSize.push_back((lt == "full_attention") ? globalHeadSize : mHeadSize);
+            auto const& layerTypes = mModelConfig["layer_types"];
+            for (int i = 0; i < mNbKVCacheInputs; ++i)
+            {
+                std::string lt = (i < static_cast<int>(layerTypes.size())) ? layerTypes[i].get<std::string>() : "";
+                mPerLayerHeadSize.push_back((lt == "full_attention") ? globalHeadSize : mHeadSize);
+            }
+            LOG_INFO("Heterogeneous head sizes: %d layers with head_dim=%ld, %ld layers with global_head_dim=%ld",
+                mNbKVCacheInputs, mHeadSize,
+                std::count(mPerLayerHeadSize.begin(), mPerLayerHeadSize.end(), globalHeadSize), globalHeadSize);
         }
-        LOG_INFO("Heterogeneous head sizes: %d layers with head_dim=%ld, %ld layers with global_head_dim=%ld",
-            mNbKVCacheInputs, mHeadSize, std::count(mPerLayerHeadSize.begin(), mPerLayerHeadSize.end(), globalHeadSize),
-            globalHeadSize);
+    }
+
+    std::optional<int32_t> reducedCapacity;
+    for (int32_t const capacity : mPerLayerKVCacheCapacity)
+    {
+        int32_t const resolvedCapacity = rt::resolveKvCacheCapacity(capacity, maxKVCacheCapacity);
+        if (resolvedCapacity == maxKVCacheCapacity)
+        {
+            continue;
+        }
+        if (reducedCapacity.has_value() && *reducedCapacity != resolvedCapacity)
+        {
+            LOG_ERROR("All reduced KV layers must use one common non-full kv_cache_capacity.");
+            return false;
+        }
+        reducedCapacity = resolvedCapacity;
+    }
+    if (reducedCapacity.has_value())
+    {
+        if (mModelConfig.value("kv_cache_dtype", "fp16") == "fp8")
+        {
+            LOG_ERROR("Reduced SWA KV pools do not support FP8 KV cache.");
+            return false;
+        }
+        if (specType != "none" || configRevealsSpecDecode(mModelConfig) || mBuilderConfig.specBase
+            || mBuilderConfig.specDraft)
+        {
+            LOG_ERROR("Reduced SWA KV pools do not support speculative decoding.");
+            return false;
+        }
+        try
+        {
+            bool const autoSized = mBuilderConfig.numSwaPages == 0;
+            int32_t const resolvedSwaPages = mBuilderConfig.resolveNumSwaPages(*reducedCapacity);
+            if (autoSized)
+            {
+                LOG_INFO("Auto-sized numSwaPages=%d for maxBatchSize=%ld and kv_cache_capacity=%d.", resolvedSwaPages,
+                    mBuilderConfig.maxBatchSize, *reducedCapacity);
+            }
+        }
+        catch (std::exception const& error)
+        {
+            LOG_ERROR("Invalid numSwaPages for reduced SWA pool: %s", error.what());
+            return false;
+        }
     }
 
     if (mModelConfig.contains("diffusion_config") && mModelConfig["diffusion_config"].is_object())
@@ -802,6 +864,35 @@ bool LLMBuilder::setupCommonProfiles(nvinfer1::IOptimizationProfile& contextProf
     result &= setOptimizationProfile(&generationProfile, binding_names::kKVPageTable,
         createDims({1, 2, maxPagesPerSeq}), createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}),
         createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}));
+    bool const hasReducedPool
+        = std::any_of(mPerLayerKVCacheCapacity.begin(), mPerLayerKVCacheCapacity.end(), [&](int32_t capacity) {
+              return rt::isReducedKvCacheCapacity(capacity, static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
+          });
+    bool const hasSwaPageTableInput = hasInputBinding(network, binding_names::kSwaKVPageTable);
+    bool const hasSwaModeInput = hasInputBinding(network, binding_names::kSwaKVCacheMode);
+    if (hasReducedPool != hasSwaPageTableInput || hasReducedPool != hasSwaModeInput)
+    {
+        LOG_ERROR(
+            "Reduced kv_cache_capacity markers, swa_kv_page_table, and swa_kv_cache_mode must either all be present "
+            "or all be absent.");
+        return false;
+    }
+    if (hasSwaPageTableInput)
+    {
+        result &= setOptimizationProfile(&contextProfile, binding_names::kSwaKVPageTable,
+            createDims({1, 2, maxPagesPerSeq}), createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}),
+            createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}));
+        result &= setOptimizationProfile(&generationProfile, binding_names::kSwaKVPageTable,
+            createDims({1, 2, maxPagesPerSeq}), createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}),
+            createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}));
+
+        // Shape-only runtime selector: [1] uses bounded SWA storage and [0] uses the full KV pool.
+        result &= setOptimizationProfile(
+            &contextProfile, binding_names::kSwaKVCacheMode, createDims({0}), createDims({1}), createDims({1}));
+        result &= setOptimizationProfile(
+            &generationProfile, binding_names::kSwaKVCacheMode, createDims({0}), createDims({1}), createDims({1}));
+    }
+
     // KV cache profiles
     LOG_DEBUG("Setting up KV cache profiles for %d layers...", mNbKVCacheInputs);
     result &= setupKVCacheProfiles(contextProfile, generationProfile);
@@ -1151,11 +1242,15 @@ bool LLMBuilder::setupGemma4MTPDraftProfiles(nvinfer1::IOptimizationProfile& con
         // KV cache per-layer: the assistant binds the TARGET model's paged pool tensors
         // directly ([2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim]), so the profile
         // uses the same fixed page count as the target's setupKVCacheProfiles.
-        int64_t const numPages = mBuilderConfig.resolvedKVPoolPages();
         for (int i = 0; i < mNbKVCacheInputs; ++i)
         {
             int64_t const layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
             int64_t const layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
+            int32_t const layerCapacity
+                = mPerLayerKVCacheCapacity.empty() ? 0 : mPerLayerKVCacheCapacity[static_cast<size_t>(i)];
+            bool const reduced
+                = rt::isReducedKvCacheCapacity(layerCapacity, static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
+            int64_t const numPages = reduced ? mBuilderConfig.numSwaPages : mBuilderConfig.resolvedKVPoolPages();
             nvinfer1::Dims const kvCacheShape
                 = createDims({2, numPages, rt::kTOKENS_PER_PAGE, layerNumKVHeads, layerHeadSize});
             ok &= setOptimizationProfile(
@@ -1497,26 +1592,32 @@ bool LLMBuilder::setupKVCacheProfiles(
     nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
 {
     bool result = true;
-    // Plugin path: paged pool binding [2, numPages, kTOKENS_PER_PAGE, num_kv_heads, head_dim].
-    // numPages is the exact engine-authoritative pool count for the life of the engine.
-    // maxKVPoolPages=0 resolves to the minimum active pages; a larger supported value adds pages retained
-    // across requests.
+    // Plugin path: paged pool binding [2, numPages_i, kTOKENS_PER_PAGE, num_kv_heads, head_dim].
+    // Full-only layers have a fixed page count. For SWA-capable layers, MIN/OPT use the smaller of
+    // bounded and full storage while MAX covers the larger count. This lets short-sequence engines
+    // optimize for full storage when bounded transition reservations would consume more memory.
     // "Empty vs non-empty" cache is conveyed by kvcache_start_index's own profile, not by this
-    // tensor's shape (the plugin reads numPages from dims.d[1], so the binding must always be
-    // pool-shaped).
-    int64_t const numPages = mBuilderConfig.resolvedKVPoolPages();
+    // tensor's shape (the plugin reads numPages from dims.d[1]).
     for (int i = 0; i < mNbKVCacheInputs; ++i)
     {
         // Per-layer dims mirror the runtime registry (kv_layer_configs): head size varies on
         // Gemma4 today; the KV head count is per-layer for the same forward-compat reason.
         int64_t layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
         int64_t layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
-        nvinfer1::Dims kvCacheShape = createDims({2, numPages, rt::kTOKENS_PER_PAGE, layerNumKVHeads, layerHeadSize});
+        int32_t const layerCapacity
+            = mPerLayerKVCacheCapacity.empty() ? 0 : mPerLayerKVCacheCapacity[static_cast<size_t>(i)];
+        std::array<int64_t, 3> const pageProfile = mBuilderConfig.resolveKVPoolPageProfile(layerCapacity);
+        nvinfer1::Dims const minKVCacheShape
+            = createDims({2, pageProfile[0], rt::kTOKENS_PER_PAGE, layerNumKVHeads, layerHeadSize});
+        nvinfer1::Dims const optKVCacheShape
+            = createDims({2, pageProfile[1], rt::kTOKENS_PER_PAGE, layerNumKVHeads, layerHeadSize});
+        nvinfer1::Dims const maxKVCacheShape
+            = createDims({2, pageProfile[2], rt::kTOKENS_PER_PAGE, layerNumKVHeads, layerHeadSize});
 
         result &= setOptimizationProfile(&contextProfile, binding_names::formatKVCacheName(i, true).c_str(),
-            kvCacheShape, kvCacheShape, kvCacheShape);
+            minKVCacheShape, optKVCacheShape, maxKVCacheShape);
         result &= setOptimizationProfile(&generationProfile, binding_names::formatKVCacheName(i, true).c_str(),
-            kvCacheShape, kvCacheShape, kvCacheShape);
+            minKVCacheShape, optKVCacheShape, maxKVCacheShape);
     }
 
     return result;
@@ -1796,8 +1897,13 @@ bool LLMBuilder::copyConfig()
                     normalizedLayerTypes.push_back("attention");
                     int64_t const layerNumKVHeads
                         = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[attnIdx] : mNumKVHeads;
-                    kvLayerConfigs.push_back(
-                        Json{{"num_kv_heads", layerNumKVHeads}, {"head_dim", mPerLayerHeadSize[attnIdx]}});
+                    Json layerConfig
+                        = Json{{"num_kv_heads", layerNumKVHeads}, {"head_dim", mPerLayerHeadSize[attnIdx]}};
+                    if (!mPerLayerKVCacheCapacity.empty() && mPerLayerKVCacheCapacity[attnIdx] > 0)
+                    {
+                        layerConfig["kv_cache_capacity"] = mPerLayerKVCacheCapacity[attnIdx];
+                    }
+                    kvLayerConfigs.push_back(std::move(layerConfig));
                     ++attnIdx;
                 }
             }
@@ -1810,7 +1916,12 @@ bool LLMBuilder::copyConfig()
             {
                 normalizedLayerTypes.push_back("attention");
                 int64_t layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
-                kvLayerConfigs.push_back(Json{{"num_kv_heads", layerNumKVHeads}, {"head_dim", mPerLayerHeadSize[i]}});
+                Json layerConfig = Json{{"num_kv_heads", layerNumKVHeads}, {"head_dim", mPerLayerHeadSize[i]}};
+                if (!mPerLayerKVCacheCapacity.empty() && mPerLayerKVCacheCapacity[i] > 0)
+                {
+                    layerConfig["kv_cache_capacity"] = mPerLayerKVCacheCapacity[i];
+                }
+                kvLayerConfigs.push_back(std::move(layerConfig));
             }
             for (int i = 0; i < mNumLinearAttnLayers; ++i)
             {

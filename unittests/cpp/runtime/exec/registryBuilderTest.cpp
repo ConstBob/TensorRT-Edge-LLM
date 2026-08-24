@@ -790,6 +790,48 @@ TEST(RegistryBuilderTest, HeterogeneousKVLayerEmitsPerLayerSpecs)
     EXPECT_NE(layer0->shape[4].value, layer1->shape[4].value);
 }
 
+TEST(RegistryBuilderTest, SwaCapableRegistryUsesActivePageCountAndAlwaysCarriesModeInputs)
+{
+    LLMEngineConfig cfg = makeBasicLLMConfig();
+    cfg.numAttentionLayers = 2;
+    cfg.numDecoderLayers = 2;
+    cfg.numSwaPages = 64;
+    cfg.layerTypes = {HybridCacheManager::LayerType::kAttention, HybridCacheManager::LayerType::kAttention};
+    cfg.kvLayerConfigs = {
+        KVLayerConfig{/*numKVHeads=*/8, /*headDim=*/128},
+        KVLayerConfig{/*numKVHeads=*/8, /*headDim=*/128, /*kvCacheCapacity=*/129},
+    };
+
+    auto const boundedSpecs = buildRegistryForLLM(cfg).allExpandedSpecs();
+    auto const full = std::find_if(boundedSpecs.begin(), boundedSpecs.end(),
+        [](TensorSpec const& spec) { return spec.name == "past_key_values_0"; });
+    auto const swa = std::find_if(boundedSpecs.begin(), boundedSpecs.end(),
+        [](TensorSpec const& spec) { return spec.name == "past_key_values_1"; });
+    auto const mode = std::find_if(boundedSpecs.begin(), boundedSpecs.end(),
+        [](TensorSpec const& spec) { return spec.name == trt_edgellm::binding_names::kSwaKVCacheMode; });
+    ASSERT_NE(full, boundedSpecs.end());
+    ASSERT_NE(swa, boundedSpecs.end());
+    ASSERT_NE(mode, boundedSpecs.end());
+
+    EXPECT_EQ(full->shape[1].value, computeMinimumKvPoolPages(cfg.maxSupportedBatchSize, cfg.maxKVCacheCapacity));
+    EXPECT_EQ(swa->shape[1].value, cfg.numSwaPages);
+    EXPECT_NE(full->shape[1].value, swa->shape[1].value);
+    ASSERT_EQ(mode->shape.size(), 1U);
+    EXPECT_EQ(mode->shape[0].symbol, &InferenceDims::swaKVCacheModeLen);
+    EXPECT_TRUE(hasName(buildRegistryForLLM(cfg).allTensorNames(), trt_edgellm::binding_names::kSwaKVPageTable));
+
+    int32_t const capabilityMarker = cfg.kvLayerConfigs[1].kvCacheCapacity;
+    cfg.setSwaKVCacheMode(SwaKVCacheMode::kFull);
+    auto const fullModeSpecs = buildRegistryForLLM(cfg).allExpandedSpecs();
+    auto const fullModeSwa = std::find_if(fullModeSpecs.begin(), fullModeSpecs.end(),
+        [](TensorSpec const& spec) { return spec.name == "past_key_values_1"; });
+    ASSERT_NE(fullModeSwa, fullModeSpecs.end());
+    EXPECT_EQ(fullModeSwa->shape[1].value, cfg.kvPoolPages);
+    EXPECT_EQ(cfg.kvLayerConfigs[1].kvCacheCapacity, capabilityMarker);
+    EXPECT_TRUE(hasName(buildRegistryForLLM(cfg).allTensorNames(), trt_edgellm::binding_names::kSwaKVPageTable));
+    EXPECT_TRUE(hasName(buildRegistryForLLM(cfg).allTensorNames(), trt_edgellm::binding_names::kSwaKVCacheMode));
+}
+
 // =====================================================================
 // Symbolic dimension resolution integration
 // =====================================================================

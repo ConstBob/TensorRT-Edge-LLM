@@ -63,7 +63,8 @@ namespace rt
 {
 
 class ContextCacheCoordinator;
-class ContextCacheRequest;
+class ManagedKVCacheRequest;
+class BoundedSwaKVPageManager;
 
 /*!
  * @brief Internal one-rank LLM execution runtime.
@@ -276,7 +277,9 @@ private:
     DeploymentConfig mDeployment{};                    //!< Parsed base+draft configs + consolidated strategy settings
     std::unique_ptr<EngineExecutor> mBaseExecutor;     //!< Base model TRT wrapper
     std::unique_ptr<SharedResources> mSharedResources; //!< KV caches / RoPE / LoRA / context memory
-    //! Declared after SharedResources so shutdown and destruction release cache ownership before physical buffers.
+    //! Declared after SharedResources so SWA page ownership is released before the physical buffers.
+    std::unique_ptr<BoundedSwaKVPageManager> mBoundedSwaKVPageManager;
+    //! Declared after SharedResources so context-cache ownership is released before the physical buffers.
     std::unique_ptr<ContextCacheCoordinator> mContextCache;
     std::unique_ptr<PipelineIO> mPipelineIO; //!< Per-pipeline I/O tensors
     //! Scratch [maxSeq, baseOutputHiddenDim] used to shift baseHiddenStates down one row when folding a reused
@@ -377,7 +380,7 @@ private:
     // Key functions to drive the runtime, defined in a consumer-producer pattern.
     // Consume tokenized IDS as input and produce hidden states for the whole sequence and first generated token.
     //! @throws std::runtime_error if a CUDA error occurs
-    bool runBaseModelPrefill(DecodingInferenceContext& context, ContextCacheRequest* contextCacheRequest = nullptr,
+    bool runBaseModelPrefill(DecodingInferenceContext& context, ManagedKVCacheRequest* managedKVCacheRequest = nullptr,
         bool sampleOutput = true);
 
     //! Hybrid+MTP endpoint-reuse prefill. Mirrors the reference llmInferenceRuntime.cpp::runHybridMtpPrefill: a
@@ -386,7 +389,7 @@ private:
     //! Only reachable when shouldUseHybridMtpEndpointReuse() already established that the cache is live for this
     //! request, so lookup and publication are both enabled here by construction.
     bool runHybridMtpPrefill(
-        DecodingInferenceContext& context, DecodingStrategy& strategy, ContextCacheRequest& contextCacheRequest);
+        DecodingInferenceContext& context, DecodingStrategy& strategy, ManagedKVCacheRequest& managedKVCacheRequest);
 
     //! Validate request shape/runtime compatibility.
     bool validateRequestConfig(LLMGenerationRequest const& request);
@@ -414,7 +417,7 @@ private:
     //! @return True on success, false on failure
     //! @throws std::runtime_error if a CUDA error occurs
     bool performBatchEvict(
-        DecodingInferenceContext& context, DecodingStrategy& strategy, ContextCacheRequest* contextCacheRequest);
+        DecodingInferenceContext& context, DecodingStrategy& strategy, ManagedKVCacheRequest* managedKVCacheRequest);
 
     // Stage-specific metrics
     metrics::LLMPrefillMetrics mPrefillMetrics;

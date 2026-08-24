@@ -2397,6 +2397,8 @@ class TestConfig:
             "tests/test_cases/llm_lora.json",
             "llm_context_reuse":
             "tests/test_cases/llm_context_reuse.json",
+            "llm_sliding_window":
+            "tests/test_cases/llm_sliding_window.json",
             "llm_spec_prefill_evict":
             "tests/test_cases/llm_spec_prefill_evict.json",
             "asr_basic":
