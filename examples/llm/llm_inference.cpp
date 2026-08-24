@@ -409,7 +409,7 @@ void printUsage(char const* programName)
     std::cerr << "  --encoderCacheBudgetBytes  Device byte budget for encoder embedding cache (default: 256 MiB;"
               << " 0 disables)" << std::endl;
     std::cerr << "\nVisual-Token Pruning Options:" << std::endl;
-    std::cerr << "  --visualPrune             Enable visual-token pruning (mRoPE VLM prefill, batch 1)" << std::endl;
+    std::cerr << "  --visualPrune             Enable visual-token pruning (mRoPE VLM prefill)" << std::endl;
     std::cerr << "  --visualPruneAlgo         Prune selection algorithm (default: dart)" << std::endl;
     std::cerr << "  --dartReductionRatio      Fraction of visual tokens to remove, in (0, 1) (default: 0.25)"
               << std::endl;

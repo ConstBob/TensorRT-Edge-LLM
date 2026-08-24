@@ -2489,22 +2489,25 @@ bool LLMRankRuntime::runBaseModelPrefill(
         mGemma4Ple->embed(mIdsInput, context.stream);
     }
 
-    // Visual-token pruning compacts the assembled embeddings before the engine runs. The coordinator currently
-    // rejects multi-device pruning, and setVisualPrunerConfig excludes spec decode and action execution.
-    if (mVisualPruner && activeBatchSize == 1 && baseKVAllEmpty && !mDeployment.base.isDiffusionBackbone
-        && !context.outputThinkerEmbeddings && context.layerDebugger == nullptr)
+    // Visual-token pruning compacts the assembled embeddings before the engine runs, pruning each
+    // request in the batch independently. The coordinator currently rejects multi-device pruning,
+    // and setVisualPrunerConfig excludes spec decode and action execution.
+    if (mVisualPruner && baseKVAllEmpty && !mDeployment.base.isDiffusionBackbone && !context.outputThinkerEmbeddings
+        && context.layerDebugger == nullptr)
     {
-        int32_t const prunedLen
-            = mVisualPruner->pruneForPrefill(context.tokenIds[0], *mPipelineIO, inputIdsLength, context.stream);
-        if (prunedLen < inputIdsLength)
+        int32_t const newMaxLen = mVisualPruner->pruneBatchForPrefill(context.tokenIds, *mPipelineIO,
+            context.effectivePrefillLengths, inputIdsLength, context.prunedPrefillTokens, context.stream);
+        bool const anyPruned = std::any_of(
+            context.prunedPrefillTokens.begin(), context.prunedPrefillTokens.end(), [](int32_t n) { return n > 0; });
+        if (anyPruned)
         {
             LOG_DEBUG("Visual-token pruning (%s) shortened prefill from %d to %d tokens.", mVisualPruner->name(),
-                inputIdsLength, prunedLen);
-            context.prunedPrefillTokens.assign(context.effectivePrefillLengths.size(), 0);
-            context.prunedPrefillTokens[0] = inputIdsLength - prunedLen;
-            context.effectivePrefillLengths[0] = prunedLen;
-            hostCtxLenData[0] = prunedLen;
-            inputIdsLength = prunedLen;
+                inputIdsLength, newMaxLen);
+            for (int32_t i = 0; i < activeBatchSize; ++i)
+            {
+                hostCtxLenData[i] = context.effectivePrefillLengths[i];
+            }
+            inputIdsLength = newMaxLen;
         }
     }
 
