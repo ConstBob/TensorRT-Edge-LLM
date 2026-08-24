@@ -152,6 +152,24 @@ edgellm_add_unit_test(
 
 edgellm_add_unit_test(NAME unitTestKernelsMoe DIRS cpp/kernels/moe)
 
+# CuTe DSL AOT wrappers lower extended launches through the runtime's
+# _cudaLaunchKernelEx entry point. Intercept it only when NVFP4 MoE artifacts
+# are linked so ordinary and QNX unit-test builds do not acquire a dependency on
+# that private runtime symbol. CUDA 12.0--12.6 already use this linker seam for
+# the CuTe DSL compatibility shim; NVFP4 MoE targets CUDA 12.8+ and therefore
+# has no competing wrapper.
+get_target_property(_moe_unit_test_definitions unitTestKernelsMoe
+                    COMPILE_DEFINITIONS)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux"
+   AND CUDA_CTK_VERSION VERSION_GREATER_EQUAL 12.8
+   AND "CUTE_DSL_NVFP4_MOE_ENABLED" IN_LIST _moe_unit_test_definitions)
+  target_compile_definitions(unitTestKernelsMoe
+                             PRIVATE EDGELLM_TEST_WRAP_CUTEDSL_LAUNCH)
+  target_link_options(unitTestKernelsMoe PRIVATE
+                      "-Wl,--wrap=_cudaLaunchKernelEx")
+endif()
+unset(_moe_unit_test_definitions)
+
 edgellm_add_unit_test(NAME unitTestKernelsSpeculative DIRS
                       cpp/kernels/speculative)
 
