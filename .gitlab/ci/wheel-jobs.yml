@@ -3,6 +3,8 @@
 
 .wheel_rules:
   rules:
+    - if: $EDGE_LLM_SKIP_TESTS == "true"
+      when: never
     - if: $CI_COMMIT_BRANCH =~ /^release/
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       changes: &wheel_changes
