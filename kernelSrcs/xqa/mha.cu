@@ -492,6 +492,42 @@ using WarpAcc = WarpAccT<warpTile.y, warpTile.x>;
 #if SPEC_DEC
 #define MMAS_N_PER_MASK 2
 
+#if SLIDING_WINDOW && CONTIGUOUS_QUERY_SWA
+__device__ inline void applyContiguousQuerySlidingWindowMask(Warp const& warp, WarpAcc& acc, uint32_t rowOffset,
+    uint32_t warpTileTokenBeg, uint32_t firstQueryPosition, uint32_t actualQSeqLen, uint32_t headGrpSize,
+    uint32_t slidingWinSize)
+{
+    uint32_t const idxInQuad = laneId() % 4;
+    uint32_t const idxQuad = laneId() / 4;
+#pragma unroll
+    for (uint32_t m = 0; m < acc.rows; m++)
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < InstAcc::rows; i++)
+        {
+            uint32_t const flatRow = rowOffset + instM * m + idxQuad + i * 8;
+            uint32_t const queryRow = min(flatRow / headGrpSize, actualQSeqLen - 1);
+            uint32_t const queryPosition = firstQueryPosition + queryRow;
+            uint32_t const queryLeftEdge = queryPosition < slidingWinSize ? 0U : queryPosition - slidingWinSize + 1U;
+            uint32_t const validColBeg = queryLeftEdge < warpTileTokenBeg ? 0U : queryLeftEdge - warpTileTokenBeg;
+#pragma unroll
+            for (uint32_t n = 0; n < acc.cols; n++)
+            {
+#pragma unroll
+                for (uint32_t j = 0; j < InstAcc::cols; j++)
+                {
+                    uint32_t const col = instN * n + InstAcc::cols * idxInQuad + j;
+                    if (col < validColBeg)
+                    {
+                        acc(m, n)(i, j) = mha::numeric_limits<float>::lowest();
+                    }
+                }
+            }
+        }
+    }
+}
+#endif
+
 __device__ inline void applyMaskFromInput(Warp const& warp, WarpAcc& acc, MaskType const* mask, uint32_t rowOffset,
     uint32_t nbValidCols, uint32_t qSeqLen, uint32_t actualQSeqLen, uint32_t headGrpSize)
 {
@@ -1506,17 +1542,26 @@ __device__ inline ThrdRegRowMax mergeRowMax(
     return mergedRowMax;
 }
 
-__device__ inline void addAttentionSinks(
-    ThrdRegRowMax& globalRowSum, ThrdRegRowMax const globalRowMax, float const* attentionSinks)
+__device__ inline ThrdRegRowMax mergeAttentionSinks(ThrdRegRowMax& globalRowSum, ThrdRegRowMax& globalRowMax,
+    float const* attentionSinks, uint32_t sinkHeadGrpSize, uint32_t rowOffset, uint32_t nbValidRows)
 {
+    assert(sinkHeadGrpSize > 0);
+    ThrdRegRowMax rowScales = ThrdRegRowMax::filled(1.F);
     for (uint32_t i = 0; i < globalRowSum.size; i++)
     {
-        uint32_t srcOffset = warp_size * i + laneId();
-        if (srcOffset < headGrpSize)
+        uint32_t const localRow = warp_size * i + laneId();
+        if (localRow < nbValidRows)
         {
-            globalRowSum[i] += expf(attentionSinks[srcOffset] - globalRowMax[i]);
+            uint32_t const headIdx = (rowOffset + localRow) % sinkHeadGrpSize;
+            float const sink = attentionSinks[headIdx];
+            float const newRowMax = fmaxf(globalRowMax[i], sink);
+            float const rowScale = expf(globalRowMax[i] - newRowMax);
+            globalRowSum[i] = globalRowSum[i] * rowScale + expf(sink - newRowMax);
+            globalRowMax[i] = newRowMax;
+            rowScales[i] = rowScale;
         }
     }
+    return rowScales;
 }
 
 #ifdef NDEBUG
@@ -1795,8 +1840,16 @@ CUBIN_EXPORT __global__
 
     uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
 #if SLIDING_WINDOW
+#if SPEC_DEC && CONTIGUOUS_QUERY_SWA
+    uint32_t const firstQueryPosition = cacheSeqLen - actualQSeqLen;
+    bool const rtIsReallySliding = (cacheSeqLen > slidingWinSize);
+    uint32_t const nbTotalSkipTokens
+        = firstQueryPosition < slidingWinSize ? 0U : firstQueryPosition - slidingWinSize + 1U;
+    uint32_t const maxQueryLeftEdge = rtIsReallySliding ? cacheSeqLen - slidingWinSize : 0U;
+#else
     bool const rtIsReallySliding = (cacheSeqLen > slidingWinSize);
     uint32_t const nbTotalSkipTokens = rtIsReallySliding ? cacheSeqLen - slidingWinSize : 0;
+#endif
 #else
     constexpr bool rtIsReallySliding = false;
     constexpr uint32_t nbTotalSkipTokens = 0;
@@ -2265,6 +2318,13 @@ CUBIN_EXPORT __global__
             uint32_t const warpTileTokenBeg = ctaTile.x * seqIter + warpTile.x * warpIdx.x;
 #if SPEC_DEC
 #if SLIDING_WINDOW
+#if CONTIGUOUS_QUERY_SWA
+            if (warpTileTokenBeg < maxQueryLeftEdge)
+            {
+                applyContiguousQuerySlidingWindowMask(warp, acc, idxHeadTokenInGrp, warpTileTokenBeg,
+                    firstQueryPosition, actualQSeqLen, headGrpSize, slidingWinSize);
+            }
+#else
             // Full leading tiles are skipped by seqIterInit; mask residual leading tokens in the first computed tile.
             bool const isFirstIter = (seqIter == nbSkipLeadingTiles);
             bool const needMaskLeading = (rtIsReallySliding && isFirstIter);
@@ -2277,6 +2337,7 @@ CUBIN_EXPORT __global__
                     applyMask(warp, acc, validTokenBeg, warpTile.x);
                 }
             }
+#endif
 #endif
             if (seqIter >= nbSeqItersWithoutMask)
             {
@@ -2771,7 +2832,14 @@ CUBIN_EXPORT __global__
             if (!isMultiBlock && attentionSinks != nullptr)
             {
                 // Attention sinks are per head.
-                addAttentionSinks(globalRowSum, globalRowMax, attentionSinks + headGrpSize * idxHeadGrp);
+#if SPEC_DEC
+                ThrdRegRowMax const sinkRowScales = mergeAttentionSinks(globalRowSum, globalRowMax,
+                    attentionSinks + headGrpSize * idxHeadGrp, headGrpSize, idxHeadTokenInGrp, nbValidHeadTokens);
+#else
+                ThrdRegRowMax const sinkRowScales = mergeAttentionSinks(globalRowSum, globalRowMax,
+                    attentionSinks + headGrpSize * idxHeadGrp, headGrpSize, 0U, nbValidRows);
+#endif
+                rescaleAcc(warp, acc, fullRescaleMask, sinkRowScales);
             }
             ThrdRegRowMax const rcpRowSum = __frcp_rn(globalRowSum);
 #if LOW_PREC_OUTPUT
@@ -2893,7 +2961,7 @@ CUBIN_EXPORT __global__
                     smemRowMax.storeFromReg<false>(warp, mergedRowMax);
                 }
                 __syncthreads();
-                ThrdRegRowMax const mergedRowMax = smemRowMax.loadToReg<false>(warp);
+                ThrdRegRowMax mergedRowMax = smemRowMax.loadToReg<false>(warp);
 
                 // rescale and accumulate
                 auto getTileBuf = [&](auto& buffers, uint32_t d) -> decltype(buffers[0][0][0])&
@@ -2964,7 +3032,14 @@ CUBIN_EXPORT __global__
                 if (attentionSinks != nullptr)
                 {
                     // Attention sinks are per head.
-                    addAttentionSinks(mergedRowSum, mergedRowMax, attentionSinks + headGrpSize * idxHeadGrp);
+#if SPEC_DEC
+                    ThrdRegRowMax const sinkRowScales = mergeAttentionSinks(mergedRowSum, mergedRowMax,
+                        attentionSinks + headGrpSize * idxHeadGrp, headGrpSize, idxHeadTokenInGrp, nbValidHeadTokens);
+#else
+                    ThrdRegRowMax const sinkRowScales = mergeAttentionSinks(mergedRowSum, mergedRowMax,
+                        attentionSinks + headGrpSize * idxHeadGrp, headGrpSize, 0U, nbValidRows);
+#endif
+                    rescaleAcc(warp, sumAcc, fullRescaleMask, sinkRowScales);
                 }
                 __syncthreads();
                 rescaleAcc(warp, sumAcc, fullRescaleMask, __frcp_rn(mergedRowSum));
