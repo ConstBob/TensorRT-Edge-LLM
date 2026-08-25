@@ -26,15 +26,21 @@ binding is declared as the AttentionPlugin's paged-pool contract
 import ast
 import os
 import pathlib
+from types import SimpleNamespace
 
 import onnx
+import pytest
 import torch
 
-from tensorrt_edgellm.config import QUANT_NVFP4, ModelConfig, QuantConfig
+from tensorrt_edgellm.checkpoint.checkpoint_utils import \
+    build_runtime_llm_config_dict
+from tensorrt_edgellm.config import (LAYER_GDN, QUANT_NVFP4, GdnConfig,
+                                     ModelConfig, QuantConfig)
 from tensorrt_edgellm.models.default.modeling_default import (
     CausalLM, fuse_qkv_projections)
 from tensorrt_edgellm.models.ops import (KV_PAGE_SIZE,
-                                         dflash_target_kv_cache_update)
+                                         dflash_target_kv_cache_update,
+                                         use_generic_nvfp4_gemm_allreduce)
 from tensorrt_edgellm.onnx.export import (_export_model,
                                           setup_fp8_qkv_scales_for_export)
 from tensorrt_edgellm.onnx.onnx_custom_schemas import \
@@ -76,6 +82,45 @@ def _export_tiny_model(tmp_path) -> str:
     output_path = os.path.join(str(tmp_path), "model.onnx")
     _export_model(model, output_path)
     return output_path
+
+
+def _export_tiny_tp_nvfp4_model(tmp_path) -> str:
+    config = _tiny_default_config()
+    config.hidden_size = 64
+    config.num_hidden_layers = 1
+    config.intermediate_size = 128
+    config.head_dim = 16
+    config.default_attention_scale = 16**-0.5
+    config.quant = QuantConfig(quant_type=QUANT_NVFP4, group_size=16)
+    model = CausalLM(config.for_rank(rank=0, world=2))
+    model.eval()
+    output_path = os.path.join(str(tmp_path), "model.onnx")
+    _export_model(model, output_path)
+    return output_path
+
+
+@pytest.mark.parametrize(
+    "target,expected_op,unexpected_op",
+    [
+        ("sm110", "FusedNvfp4GemmAllReducePlugin", "AllReducePlugin"),
+        ("sm103", "FusedNvfp4GemmAllReducePlugin", "AllReducePlugin"),
+        ("sm121", "AllReducePlugin", "FusedNvfp4GemmAllReducePlugin"),
+    ],
+)
+def test_nvfp4_tp_gemm_allreduce_target_export(monkeypatch, tmp_path, target,
+                                               expected_op, unexpected_op):
+    monkeypatch.setenv("EDGELLM_NVFP4_GEMM_ALLREDUCE_TARGET", target)
+    assert use_generic_nvfp4_gemm_allreduce() is (target == "sm121")
+
+    output_path = _export_tiny_tp_nvfp4_model(tmp_path)
+    model = onnx.load(output_path, load_external_data=False)
+    op_types = [node.op_type for node in model.graph.node]
+
+    # One attention output projection and one MLP down projection per layer.
+    assert op_types.count(expected_op) == 2
+    assert unexpected_op not in op_types
+    if target == "sm121":
+        assert "MatMul" in op_types
 
 
 def test_nvfp4_fp8_kv_qkv_fusion_preserves_export_scales(tmp_path):
@@ -133,6 +178,63 @@ def test_nvfp4_fp8_kv_qkv_fusion_preserves_export_scales(tmp_path):
         }
         assert attributes["enable_fp8_kv_cache"] == 1
         assert attributes["qkv_scales"] == scales
+
+
+def test_tp_runtime_config_preserves_global_gdn_metadata():
+    global_config = _tiny_default_config()
+    global_config.model_type = "qwen3_5_text"
+    global_config.layer_types = [LAYER_GDN, "full_attention"]
+    global_config.gdn_cfg = GdnConfig(
+        num_key_heads=4,
+        num_value_heads=4,
+        key_head_dim=4,
+        value_head_dim=8,
+        conv_kernel=4,
+    )
+    rank_config = global_config.for_rank(rank=1, world=2)
+    model = SimpleNamespace(
+        config=rank_config,
+        RECURRENT_STATE_DTYPE=torch.float32,
+        CONV_STATE_DTYPE=torch.float16,
+    )
+    global_llm_config = {
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "intermediate_size": 32,
+    }
+
+    runtime_config = build_runtime_llm_config_dict(
+        model, global_llm_config=global_llm_config)
+
+    assert runtime_config["num_attention_heads"] == 4
+    assert runtime_config["num_key_value_heads"] == 2
+    assert runtime_config["intermediate_size"] == 32
+    assert runtime_config["recurrent_state_num_heads"] == 4
+    assert runtime_config["conv_dim"] == 64
+    assert runtime_config["kv_layer_configs"] == [
+        None,
+        {
+            "num_kv_heads": 2,
+            "head_dim": 4,
+        },
+    ]
+    assert runtime_config["rank_configs"] == [{
+        "rank": 1,
+        "config_overrides": {
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "intermediate_size": 16,
+            "recurrent_state_num_heads": 2,
+            "conv_dim": 32,
+            "kv_layer_configs": [
+                None,
+                {
+                    "num_kv_heads": 1,
+                    "head_dim": 4,
+                },
+            ],
+        },
+    }]
 
 
 def test_kv_page_table_graph_input_shape(tmp_path):

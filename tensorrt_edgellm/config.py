@@ -986,9 +986,17 @@ class ModelConfig:
         import copy
         if world == 1:
             return self
-        for name, v in (("num_attention_heads", self.num_attention_heads),
-                        ("num_key_value_heads", self.num_key_value_heads),
-                        ("intermediate_size", self.intermediate_size)):
+        parallel_dimensions = [
+            ("num_attention_heads", self.num_attention_heads),
+            ("num_key_value_heads", self.num_key_value_heads),
+            ("intermediate_size", self.intermediate_size),
+        ]
+        if self.gdn_cfg is not None:
+            parallel_dimensions.extend((
+                ("gdn_cfg.num_key_heads", self.gdn_cfg.num_key_heads),
+                ("gdn_cfg.num_value_heads", self.gdn_cfg.num_value_heads),
+            ))
+        for name, v in parallel_dimensions:
             if v % world:
                 raise ValueError(
                     f"TP world={world}: {name}={v} is not divisible by {world}"
@@ -1001,6 +1009,9 @@ class ModelConfig:
         c.num_attention_heads //= world
         c.num_key_value_heads //= world
         c.intermediate_size //= world
+        if c.gdn_cfg is not None:
+            c.gdn_cfg.num_key_heads //= world
+            c.gdn_cfg.num_value_heads //= world
         return c
 
     # ------------------------------------------------------------------

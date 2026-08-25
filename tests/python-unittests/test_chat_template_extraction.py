@@ -17,6 +17,8 @@ import json
 
 import transformers
 
+from experimental.builder.core.artifacts.chat_template import \
+    process_chat_template as process_direct_chat_template
 from tensorrt_edgellm.chat_template import process_chat_template
 
 
@@ -27,7 +29,7 @@ class _DiffusionGemmaLikeTokenizer:
 
     def apply_chat_template(self, messages, **kwargs):
         del kwargs["tokenize"]
-        add_generation_prompt = kwargs["add_generation_prompt"]
+        add_generation_prompt = kwargs.get("add_generation_prompt", False)
         enable_thinking = kwargs.get("enable_thinking", False)
 
         output = self.bos_token
@@ -77,6 +79,28 @@ def test_process_chat_template_handles_global_bos_and_trim(
     data = json.loads((out_dir / "processed_chat_template.json").read_text())
     assert data["prompt_prefix"] == "<bos>"
     assert data["roles"]["system"]["prefix"] == "<|turn>system\n"
+    assert data["roles"]["user"]["prefix"] == "<|turn>user\n"
+    assert data["trim_content"] is True
+    assert data["generation_prompt"] == "<|turn>model\n"
+
+
+def test_direct_process_chat_template_preserves_trim_contract(
+        monkeypatch, tmp_path):
+    model_dir = tmp_path / "model"
+    out_dir = tmp_path / "out"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForCausalLM"],
+        }))
+
+    tokenizer = _DiffusionGemmaLikeTokenizer()
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained",
+                        lambda *args, **kwargs: tokenizer)
+    process_direct_chat_template(str(model_dir), str(out_dir))
+
+    data = json.loads((out_dir / "processed_chat_template.json").read_text())
     assert data["roles"]["user"]["prefix"] == "<|turn>user\n"
     assert data["trim_content"] is True
     assert data["generation_prompt"] == "<|turn>model\n"

@@ -382,6 +382,19 @@ def _apply_global_model_fields(out: Dict[str, Any],
             out[field] = global_llm_config[field]
 
 
+def _tp_global_kv_layer_configs(local_configs: list, tp_size: int) -> list:
+    global_configs = []
+    for layer in local_configs:
+        if layer is None:
+            global_configs.append(None)
+            continue
+        global_layer = dict(layer)
+        if "num_kv_heads" in global_layer:
+            global_layer["num_kv_heads"] *= tp_size
+        global_configs.append(global_layer)
+    return global_configs
+
+
 def build_runtime_llm_config_dict(
         model: "CausalLM",
         global_llm_config: Any = None,
@@ -473,33 +486,6 @@ def build_runtime_llm_config_dict(
             "moe_intermediate_size": int(config.moe_intermediate_size),
             "enable_moe_block": bool(config.enable_moe_block),
         })
-
-    local_shape_values = {
-        field: out[field]
-        for field in _RANK_LOCAL_OVERRIDE_FIELDS if field in out
-    }
-
-    if world_size > 1 or tp_size > 1:
-        # Only TP exports need a shared world-level view. Single-device and
-        # specialized exports (for example reduced-layer validation, MTP
-        # draft, and TTS code-predictor models) must retain model.config
-        # because it describes the ONNX graph that was actually exported.
-        _apply_global_model_fields(out, global_llm_config)
-
-        config_overrides: Dict[str, Any] = {}
-        for field, local_value in local_shape_values.items():
-            if out.get(field) != local_value:
-                config_overrides[field] = local_value
-
-        rank_config: Dict[str, Any] = {
-            "rank": rank,
-        }
-        if tp_rank != rank:
-            rank_config["tp_rank"] = tp_rank
-        if config_overrides:
-            rank_config["config_overrides"] = config_overrides
-        out["rank_configs"] = _merge_rank_config(existing_rank_configs,
-                                                 rank_config)
 
     if config.is_diffusion_gemma:
         diffusion_cfg = (config.diffusion.to_dict()
@@ -878,6 +864,50 @@ def build_runtime_llm_config_dict(
                     f"the dtype of the dummy state tensor its export_onnx "
                     f"builds and the dtype mandated by the plugin schema.")
             out[key] = _torch_dtype_to_config_str(torch_dtype)
+
+    if world_size > 1 or tp_size > 1:
+        # Rank-local fields are emitted throughout this function. Capture
+        # them only after the complete runtime config has been assembled,
+        # then restore the shared top-level model view.
+        override_fields = list(_RANK_LOCAL_OVERRIDE_FIELDS)
+        if config.gdn_cfg is not None:
+            override_fields.extend(("recurrent_state_num_heads", "conv_dim"))
+        local_shape_values = {
+            field: out[field]
+            for field in override_fields if field in out
+        }
+        if "kv_layer_configs" in out:
+            local_shape_values["kv_layer_configs"] = [
+                dict(layer) if layer is not None else None
+                for layer in out["kv_layer_configs"]
+            ]
+
+        # Only TP exports need a shared world-level view. Single-device and
+        # specialized exports (for example reduced-layer validation, MTP
+        # draft, and TTS code-predictor models) must retain model.config
+        # because it describes the ONNX graph that was actually exported.
+        _apply_global_model_fields(out, global_llm_config)
+        if isinstance(global_llm_config, dict):
+            if config.gdn_cfg is not None:
+                for field in ("recurrent_state_num_heads", "conv_dim"):
+                    if field in local_shape_values:
+                        out[field] = local_shape_values[field] * tp_size
+            if "kv_layer_configs" in local_shape_values:
+                out["kv_layer_configs"] = _tp_global_kv_layer_configs(
+                    local_shape_values["kv_layer_configs"], tp_size)
+
+        config_overrides: Dict[str, Any] = {}
+        for field, local_value in local_shape_values.items():
+            if out.get(field) != local_value:
+                config_overrides[field] = local_value
+
+        rank_config: Dict[str, Any] = {"rank": rank}
+        if tp_rank != rank:
+            rank_config["tp_rank"] = tp_rank
+        if config_overrides:
+            rank_config["config_overrides"] = config_overrides
+        out["rank_configs"] = _merge_rank_config(existing_rank_configs,
+                                                 rank_config)
 
     return out
 

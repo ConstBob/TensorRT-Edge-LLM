@@ -1254,6 +1254,19 @@ def _fp16_moe_plugin_sigmoid_translation(
 
 
 # ---------------------------------------------------------------------------
+# AllReducePlugin
+# ---------------------------------------------------------------------------
+
+
+@script()
+def _all_reduce_translation(
+    hidden_states: onnxscript.FLOAT16,
+    tp_size: int,
+) -> onnxscript.FLOAT16:
+    return _trt_edgellm.AllReducePlugin(hidden_states, tp_size=tp_size)
+
+
+# ---------------------------------------------------------------------------
 # FusedNvfp4GemmAllReducePlugin (row-parallel NVFP4 GEMM + AllReduce)
 # ---------------------------------------------------------------------------
 
@@ -1433,6 +1446,8 @@ def build_custom_translation_table() -> dict:
         _kv_cache_update_onnx_translation,
         torch.ops.trt.attention_onnx.default:
         _attention_onnx_translation,
+        torch.ops.trt_edgellm.all_reduce.default:
+        _all_reduce_translation,
         torch.ops.trt_edgellm.fused_nvfp4_gemm_allreduce.default:
         _fused_nvfp4_gemm_allreduce_translation,
         torch.ops.trt_edgellm.gemma4_audio_attention_plugin.default:

@@ -38,12 +38,13 @@ from ..config import (QUANT_FP8, QUANT_FP16, QUANT_INT4_AWQ,
                       QUANT_INT4_AWQ_MODELOPT, QUANT_INT4_GPTQ, QUANT_INT8_SQ,
                       QUANT_MXFP8, QUANT_NVFP4, QUANT_NVFP4_A16, Mapping,
                       ModelConfig, module_quant_type)
-from .ops import (fp8_dequantize, fp8_quantize, fused_nvfp4_gemm_allreduce,
-                  int4_gemm_plugin_version, int4_groupwise_gemm,
-                  int4_groupwise_gemm_v2, int8_sq_act_qdq, int8_sq_weight_dq,
-                  mxfp8_act_qdq, mxfp8_weight_dq, nvfp4_a16_blackwell_gemm,
-                  nvfp4_a16_gemm, nvfp4_act_qdq, nvfp4_dequantize,
-                  use_blackwell_nvfp4_a16_gemm)
+from .ops import (all_reduce, fp8_dequantize, fp8_quantize,
+                  fused_nvfp4_gemm_allreduce, int4_gemm_plugin_version,
+                  int4_groupwise_gemm, int4_groupwise_gemm_v2, int8_sq_act_qdq,
+                  int8_sq_weight_dq, mxfp8_act_qdq, mxfp8_weight_dq,
+                  nvfp4_a16_blackwell_gemm, nvfp4_a16_gemm, nvfp4_act_qdq,
+                  nvfp4_dequantize, use_blackwell_nvfp4_a16_gemm,
+                  use_generic_nvfp4_gemm_allreduce)
 
 logger = logging.getLogger(__name__)
 
@@ -284,7 +285,8 @@ class NVFP4LinearMethod(LinearMethodBase):
         else:
             module.bias = None
 
-    def apply(self, module: "LinearBase", x: torch.Tensor) -> torch.Tensor:
+    def _apply_without_bias(self, module: "LinearBase",
+                            x: torch.Tensor) -> torch.Tensor:
         _require_fp16_input(x, type(module).__name__)
         # Weight-only leaves the activation in fp16 and drops input_scale; the
         # weight path is identical either way.
@@ -293,30 +295,38 @@ class NVFP4LinearMethod(LinearMethodBase):
         # Weight: 2xstandard-ONNX DQ -> w_dq (float16)
         w_dq = nvfp4_dequantize(module.weight, module.weight_scale,
                                 module.weight_scale_2, module.group_size)
-        bias = module.bias.to(
-            torch.float16) if module.bias is not None else None
-        return F.linear(x_dq, w_dq, bias)
+        return F.linear(x_dq, w_dq, None)
+
+    def apply(self, module: "LinearBase", x: torch.Tensor) -> torch.Tensor:
+        out = self._apply_without_bias(module, x)
+        if module.bias is not None:
+            out = out + module.bias.to(torch.float16)
+        return out
 
     def apply_linear_allreduce(self, module: "LinearBase",
                                x: torch.Tensor) -> torch.Tensor:
         _require_fp16_input(x, type(module).__name__)
-        if not module.quantize_activations:
+        if use_generic_nvfp4_gemm_allreduce():
+            out = all_reduce(self._apply_without_bias(module, x),
+                             module.tp_size)
+        elif not module.quantize_activations:
             # The fused plugin quantizes the activation internally, so weight-only
             # cannot be expressed here; failing loudly beats a TP run that keeps
             # W4A4 on its row-parallel linears alone.
             raise NotImplementedError(
                 "--no-quantize-activations is not supported by "
                 "FusedNvfp4GemmAllReduce (row-parallel TP)")
-        # Single op: TRT_FP4DynamicQuantize + DequantizeLinear +
-        # FusedNvfp4GemmAllReducePlugin. Output is FP16, already AllReduced.
-        out = fused_nvfp4_gemm_allreduce(
-            x,
-            module.input_scale,
-            module.weight,
-            module.weight_scale,
-            module.weight_scale_2,
-            tp_size=module.tp_size,
-        )
+        else:
+            # Single op: TRT_FP4DynamicQuantize + DequantizeLinear +
+            # FusedNvfp4GemmAllReducePlugin. Output is FP16 and AllReduced.
+            out = fused_nvfp4_gemm_allreduce(
+                x,
+                module.input_scale,
+                module.weight,
+                module.weight_scale,
+                module.weight_scale_2,
+                tp_size=module.tp_size,
+            )
         if module.bias is not None:
             out = out + module.bias.to(torch.float16)
         return out

@@ -51,7 +51,7 @@ lm_head.weight                                             - output projection
 
 import itertools
 import logging
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -59,7 +59,7 @@ import torch.nn.functional as F
 
 from ...config import LAYER_GDN, GdnConfig, ModelConfig
 from ..default.modeling_default import MLP, OnnxSpec, RMSNorm
-from ..linear import (AWQLinear, FP16Linear, GPTQLinear,
+from ..linear import (AWQLinear, ColumnParallelLinear, FP16Linear, GPTQLinear,
                       ModelOptAWQPrepackedLinear, NVFP4LinearMethod,
                       ReplicatedLinear, TPMode, is_nvfp4_linear, make_linear)
 from ..ops import (KV_PAGE_SIZE, attention_plugin, causal_conv1d,
@@ -121,10 +121,18 @@ class Conv1dBuffers(nn.Module):
     ``model.layers.N.linear_attn.conv1d.weight`` resolve correctly.
     """
 
-    def __init__(self, conv_dim: int, conv_kernel: int) -> None:
+    def __init__(self, conv_dim: int, conv_kernel: int,
+                 tp_split_sizes: Tuple[int, ...]) -> None:
         super().__init__()
         self.register_buffer("weight", torch.zeros(conv_dim, 1, conv_kernel))
         self.register_buffer("bias", torch.zeros(conv_dim))
+        self.tp_split_sizes = tp_split_sizes or None
+
+    def tp_split_dim(self, attr: str) -> Optional[int]:
+        """Shard Q, K, and V convolution channels independently under TP."""
+        if self.tp_split_sizes is not None and attr in ("weight", "bias"):
+            return 0
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -152,27 +160,36 @@ class GdnMixer(nn.Module):
             hidden_size,
             gc.conv_dim,
             bias=False,
-            module_name=f"{module_prefix}.in_proj_qkv")
+            module_name=f"{module_prefix}.in_proj_qkv",
+            tp_mode=TPMode.COL)
         self.in_proj_z = make_linear(config,
                                      hidden_size,
                                      gc.value_dim,
                                      bias=False,
-                                     module_name=f"{module_prefix}.in_proj_z")
+                                     module_name=f"{module_prefix}.in_proj_z",
+                                     tp_mode=TPMode.COL)
         self.in_proj_b = make_linear(config,
                                      hidden_size,
                                      gc.num_value_heads,
                                      bias=False,
-                                     module_name=f"{module_prefix}.in_proj_b")
+                                     module_name=f"{module_prefix}.in_proj_b",
+                                     tp_mode=TPMode.COL)
         self.in_proj_a = make_linear(config,
                                      hidden_size,
                                      gc.num_value_heads,
                                      bias=False,
-                                     module_name=f"{module_prefix}.in_proj_a")
+                                     module_name=f"{module_prefix}.in_proj_a",
+                                     tp_mode=TPMode.COL)
+        qkv_split_sizes = (gc.key_dim, gc.key_dim, gc.value_dim)
+        if config.tp_size > 1:
+            self.in_proj_qkv.tp_split_sizes = qkv_split_sizes
         self._fused_splits: List[int] = [
             gc.conv_dim, gc.value_dim, gc.num_value_heads, gc.num_value_heads
         ]
 
-        self.conv1d = Conv1dBuffers(gc.conv_dim, gc.conv_kernel)
+        self.conv1d = Conv1dBuffers(
+            gc.conv_dim, gc.conv_kernel,
+            qkv_split_sizes if config.tp_size > 1 else ())
 
         # GDN decay and bias: store as FP16 so Cast nodes appear in ONNX.
         self.register_buffer(
@@ -188,7 +205,11 @@ class GdnMixer(nn.Module):
                                     gc.value_dim,
                                     hidden_size,
                                     bias=False,
-                                    module_name=f"{module_prefix}.out_proj")
+                                    module_name=f"{module_prefix}.out_proj",
+                                    tp_mode=TPMode.ROW)
+
+        self.tp_mode = (TPMode.COL
+                        if config.tp_size > 1 else TPMode.REPLICATED)
 
         self.num_k_heads = gc.num_key_heads
         self.num_v_heads = gc.num_value_heads
@@ -198,6 +219,12 @@ class GdnMixer(nn.Module):
         self.value_dim = gc.value_dim
         self.conv_dim = gc.conv_dim
         self.conv_kernel = gc.conv_kernel
+
+    def tp_split_dim(self, attr: str) -> Optional[int]:
+        """Shard per-value-head state parameters under TP."""
+        if self.tp_mode == TPMode.COL and attr in ("A_log", "dt_bias"):
+            return 0
+        return None
 
     def forward(
         self,
@@ -787,6 +814,26 @@ def _can_fuse_nvfp4_scales(mixer: "GdnMixer") -> bool:
     return True
 
 
+def _make_fused_nvfp4_linear(source: nn.Module,
+                             out_features: int) -> nn.Module:
+    """Create a fused NVFP4 projection with the source TP ownership."""
+    method = NVFP4LinearMethod(group_size=source.quant_method.group_size)
+    if source.tp_mode == TPMode.COL:
+        return ColumnParallelLinear(source.in_features,
+                                    out_features,
+                                    bias=False,
+                                    dtype=torch.float16,
+                                    mapping=source.mapping,
+                                    quant_method=method,
+                                    tp_mode=TPMode.COL)
+    return ReplicatedLinear(source.in_features,
+                            out_features,
+                            bias=False,
+                            dtype=torch.float16,
+                            mapping=source.mapping,
+                            quant_method=method)
+
+
 def fuse_gdn_input_projections(model: nn.Module) -> int:
     """Post-load optimisation: fuse 4 GDN input projections into one GEMM.
 
@@ -828,14 +875,7 @@ def fuse_gdn_input_projections(model: nn.Module) -> int:
                                 for s in _NVFP4_SCALAR_SCALE_SUFFIXES))
                 if pairable:
                     splits = mixer._fused_splits
-                    method = NVFP4LinearMethod(
-                        group_size=qkv.quant_method.group_size)
-                    qkvz = ReplicatedLinear(qkv.in_features,
-                                            splits[0] + splits[1],
-                                            bias=False,
-                                            dtype=torch.float16,
-                                            mapping=qkv.mapping,
-                                            quant_method=method)
+                    qkvz = _make_fused_nvfp4_linear(qkv, splits[0] + splits[1])
                     qkvz._buffers["weight"] = torch.cat(
                         [qkv.weight, zp.weight], dim=0)
                     qkvz._buffers["weight_scale"] = torch.cat(
@@ -885,14 +925,7 @@ def fuse_gdn_input_projections(model: nn.Module) -> int:
         fused_out_dim = sum(mixer._fused_splits)
         in_features = first_proj.in_features
         if is_nvfp4_linear(first_proj):
-            method = NVFP4LinearMethod(
-                group_size=first_proj.quant_method.group_size)
-            fused_linear = ReplicatedLinear(in_features,
-                                            fused_out_dim,
-                                            bias=False,
-                                            dtype=torch.float16,
-                                            mapping=first_proj.mapping,
-                                            quant_method=method)
+            fused_linear = _make_fused_nvfp4_linear(first_proj, fused_out_dim)
         else:
             fused_linear = FP16Linear(in_features, fused_out_dim)
 

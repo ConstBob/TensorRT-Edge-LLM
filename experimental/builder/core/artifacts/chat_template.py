@@ -252,6 +252,23 @@ def process_chat_template(model_dir: str,
                 if assistant_prefix.startswith(bos_token):
                     assistant_prefix = assistant_prefix[len(bos_token):]
 
+        # Keep the direct-builder runtime artifact aligned with the source
+        # Jinja template when it applies ``|trim`` to message content.
+        trim_content = False
+        try:
+            padded_content = f"  {user_text}  "
+            padded_formatted = _format_chat(tokenizer,
+                                            [{
+                                                "role": "user",
+                                                "content": padded_content
+                                            }],
+                                            add_generation_prompt=False)
+            if (padded_content not in padded_formatted
+                    and padded_content.strip() in padded_formatted):
+                trim_content = True
+        except Exception:
+            pass
+
         data: Dict[str, Any] = {
             "model_path": model_dir,
             "roles": {
@@ -274,6 +291,8 @@ def process_chat_template(model_dir: str,
         }
         if prompt_prefix:
             data["prompt_prefix"] = prompt_prefix
+        if trim_content:
+            data["trim_content"] = True
         if generation_prompt_thinking is not None:
             data["generation_prompt_thinking"] = generation_prompt_thinking
 

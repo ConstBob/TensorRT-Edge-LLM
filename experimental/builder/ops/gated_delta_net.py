@@ -27,16 +27,32 @@ class GatedDeltaNet(Module):
 
     def __init__(self, ctx, prefix: str) -> None:
         super().__init__(ctx, prefix)
-        self.in_proj_qkv = Linear(ctx, self.key("in_proj_qkv"))
+        gdn = ctx.cfg.gdn_cfg
+        self.tp_qkv_segments = (
+            gdn.key_dim * ctx.cfg.tp_size,
+            gdn.key_dim * ctx.cfg.tp_size,
+            gdn.value_dim * ctx.cfg.tp_size,
+        )
+        self.in_proj_qkv = Linear(ctx,
+                                  self.key("in_proj_qkv"),
+                                  tp_output_segments=self.tp_qkv_segments)
         self.in_proj_z = Linear(ctx, self.key("in_proj_z"))
-        self.in_proj_b = Linear(ctx, self.key("in_proj_b"))
-        self.in_proj_a = Linear(ctx, self.key("in_proj_a"))
+        self.in_proj_b = Linear(ctx,
+                                self.key("in_proj_b"),
+                                tensor_parallel=False)
+        self.in_proj_a = Linear(ctx,
+                                self.key("in_proj_a"),
+                                tensor_parallel=False)
         self.out_proj = Linear(ctx, self.key("out_proj"))
 
-    def _constant_weight(self, suffix: str, shape, dtype):
+    def _constant_weight(self, suffix: str, shape, dtype, tp_segments=()):
         key = self.key(suffix)
         value = (self.weights.f32(key)
                  if dtype == np.float32 else self.weights.f16(key))
+        if tp_segments:
+            value = self.weights.shard_segments(value, tp_segments,
+                                                self.cfg.tp_size,
+                                                self.cfg.tp_rank)
         if value.shape != tuple(shape):
             raise ValueError(
                 f"{key} must have shape {tuple(shape)}, got {value.shape}")
@@ -56,12 +72,22 @@ class GatedDeltaNet(Module):
         gate = self.in_proj_z(hidden_states)
         beta = self.in_proj_b(hidden_states)
         alpha = self.in_proj_a(hidden_states)
+        if cfg.tp_size > 1:
+            # Keep the small alpha and beta projections replicated because a
+            # rank-local shard is narrower than the supported NVFP4 GEMM tile.
+            start = cfg.tp_rank * gdn.num_value_heads
+            stop = start + gdn.num_value_heads
+            beta = beta[..., start:stop]
+            alpha = alpha[..., start:stop]
         conv_weight = self._constant_weight("conv1d.weight",
                                             (gdn.conv_dim, 1, gdn.conv_kernel),
-                                            np.float16)
+                                            np.float16, self.tp_qkv_segments)
         conv_bias_data = self.weights.opt_f16(self.key("conv1d.bias"))
         if conv_bias_data is None:
             conv_bias_data = np.zeros(gdn.conv_dim, dtype=np.float16)
+        elif cfg.tp_size > 1:
+            conv_bias_data = self.weights.shard_segments(
+                conv_bias_data, self.tp_qkv_segments, cfg.tp_size, cfg.tp_rank)
         if conv_bias_data.shape != (gdn.conv_dim, ):
             raise ValueError(f"{self.key('conv1d.bias')} must have shape "
                              f"{(gdn.conv_dim,)}, got {conv_bias_data.shape}")
@@ -78,10 +104,11 @@ class GatedDeltaNet(Module):
         value = mixed[...,
                       gdn.key_dim * 2:gdn.key_dim * 2 + gdn.value_dim].reshape(
                           (0, 0, gdn.num_value_heads, gdn.value_head_dim))
+        full_value_heads = (gdn.num_value_heads * cfg.tp_size, )
         a_log = self._constant_weight("A_log", (gdn.num_value_heads, ),
-                                      np.float32)
+                                      np.float32, full_value_heads)
         dt_bias = self._constant_weight("dt_bias", (gdn.num_value_heads, ),
-                                        np.float16)
+                                        np.float16, full_value_heads)
         output, recurrent_state_out, intermediate_recurrent = F.gated_delta_net(
             query, key, value, alpha, beta, a_log, dt_bias, recurrent_state,
             context_lengths, gdn.key_head_dim, gdn.value_head_dim,
