@@ -10,7 +10,7 @@ TensorRT Edge-LLM supports the checkpoint IDs listed below. Dense LLM families i
 
 The model coverage list is not comprehensive, and not every listed checkpoint has been fully verified on every supported platform and precision. If a listed model does not export, build, or run correctly, please report an issue with the checkpoint ID, precision, platform, and command line used.
 
-The model class names were checked against the installed `transformers==5.9.0` package and the upstream [Transformers model source tree](https://github.com/huggingface/transformers/tree/main/src/transformers/models). Checkpoint IDs are linked to their Hugging Face pages and grouped into original checkpoints and quantized checkpoints.
+The model class names were checked against the upstream [Transformers model source tree](https://github.com/huggingface/transformers/tree/main/src/transformers/models). Checkpoint IDs are linked to their Hugging Face pages and grouped into original checkpoints and quantized checkpoints.
 
 ## Precision Notes
 
