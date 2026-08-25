@@ -27,9 +27,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
-#ifndef __CUDACC__
 #include <nlohmann/json.hpp>
-#endif // !__CUDACC__
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -251,7 +249,6 @@ struct RopeConfig
     std::optional<YarnParams> yarn{};         //!< YaRN specific parameters
 };
 
-#ifndef __CUDACC__
 /*! \brief Collect rope configuration from the model config
  *
  *  Parses the common RoPE fields as well as LongRoPE-specific parameters when the
@@ -263,7 +260,6 @@ struct RopeConfig
  *  \throws nlohmann::json::type_error if JSON value types don't match expected types
  */
 RopeConfig collectRopeConfig(nlohmann::json const& config);
-#endif // !__CUDACC__
 
 /*! \brief Initialize the rope cos/sin cache tensor for persistent type of RoPE (default, longrope)
  *
