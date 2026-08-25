@@ -2,10 +2,16 @@ tests:
   - tests/defs/test_common.py::test_build_project
   - tests/defs/test_common.py::test_unit_tests
   - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen3-0.6B-NVFP4-nvfp4-mxsl2048-mxbs1-mxil1024-tp2]
+  - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen3-0.6B-NVFP4-nvfp4-mxsl2048-mxbs1-mxil1024]
+  # TP=1 on the same board and prompt. Gives the TP2 rows a same-hardware
+  # reference under the same ROUGE floor.
+  - tests/defs/test_llm_pipeline.py::test_inference[Qwen3-0.6B-NVFP4-nvfp4-mxsl2048-mxbs1-mxil1024-llm_basic]
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen3-0.6B-NVFP4-nvfp4-mxsl2048-mxbs1-mxil1024-tp2-llm_basic]
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen3-0.6B-NVFP4-nvfp4-mxsl2048-mxbs1-mxil1024-tp2-mdmpi-llm_basic]
-  # The cases above run NCCL, which is what the OSS build always uses. This one
-  # covers the SHM fast path, which exists only in the internal build.
+  # The cases above run NCCL, which is what the OSS build always uses. The 2 below
+  # cover the SHM fast path, which exists only in the internal build, on both the
+  # threaded and the MPI launch.
   # {$edge-llm-internal-release begin}
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen3-0.6B-NVFP4-nvfp4-mxsl2048-mxbs1-mxil1024-tp2-arshm-llm_basic]
+  - tests/defs/test_llm_pipeline.py::test_inference[Qwen3-0.6B-NVFP4-nvfp4-mxsl2048-mxbs1-mxil1024-tp2-mdmpi-arshm-llm_basic]
   # {$edge-llm-internal-release end}

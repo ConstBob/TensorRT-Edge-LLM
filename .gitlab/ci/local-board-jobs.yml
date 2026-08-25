@@ -87,6 +87,10 @@ l0_super_thor:
     L0_JOB_WRITES_ENGINES: "1"
     ENABLE_MULTI_DEVICE: "ON"
     ENABLE_MULTI_DEVICE_MPI: "ON"
+    # The shell executor runs as root and OpenMPI refuses that by default, so the
+    # mdmpi cases need its documented override.
+    OMPI_ALLOW_RUN_AS_ROOT: "1"
+    OMPI_ALLOW_RUN_AS_ROOT_CONFIRM: "1"
     NCCL_CUMEM_ENABLE: "0"
     NCCL_IB_DISABLE: "1"
     NCCL_MNNVL_ENABLE: "0"
