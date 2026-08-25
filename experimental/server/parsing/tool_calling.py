@@ -309,6 +309,172 @@ class _GenericToolParser:
             } for c in calls], False)
         return [{"type": "content", "text": text}], False
 
+    def stream(self, tool_config: ToolConfig) -> "_StreamingGenericToolParser":
+        return _StreamingGenericToolParser(self, tool_config)
+
+
+class _StreamingGenericToolParser:
+    """Split complete tool blocks from content across generated chunks."""
+
+    _FIXED_BLOCKS = (
+        ("<tool_call>", "</tool_call>"),
+        ("<tool_calls>", "</tool_calls>"),
+        ("<toolcall>", "</toolcall>"),
+        ("<toolcalls>", "</toolcalls>"),
+        ("<function_call>", "</function_call>"),
+        ("<function_calls>", "</function_calls>"),
+        ("[TOOL_CALL]", "[/TOOL_CALL]"),
+        ("[TOOL_CALLS]", "[/TOOL_CALLS]"),
+    )
+    _OPEN_PREFIXES = tuple(opening
+                           for opening, _ in _FIXED_BLOCKS) + ("<function=", )
+
+    def __init__(self, parser: _GenericToolParser,
+                 tool_config: ToolConfig) -> None:
+        self._parser = parser
+        self._tool_config = tool_config
+        self._buffer = ""
+
+    def feed(self, text: str) -> Iterable[Dict[str, Any]]:
+        self._buffer += text
+        while self._buffer:
+            block = self._find_block_start()
+            if block is None:
+                calls = self._complete_untagged_calls()
+                if calls:
+                    self._buffer = ""
+                    for call in calls:
+                        yield {"type": "tool_call", "tool_call": call}
+                    continue
+                if self._could_be_untagged_call():
+                    return
+                emit_length = self._safe_content_length()
+                if not emit_length:
+                    return
+                yield {"type": "content", "text": self._buffer[:emit_length]}
+                self._buffer = self._buffer[emit_length:]
+                continue
+
+            start, opening, closing = block
+            if start:
+                yield {"type": "content", "text": self._buffer[:start]}
+                self._buffer = self._buffer[start:]
+            close = self._buffer.find(closing, len(opening))
+            if close < 0:
+                return
+            end = close + len(closing)
+            raw_block = self._buffer[:end]
+            calls = _parse_tool_block(raw_block, self._tool_config)
+            if calls:
+                for call in calls:
+                    yield {"type": "tool_call", "tool_call": call}
+            else:
+                yield {"type": "content", "text": raw_block}
+            self._buffer = self._buffer[end:]
+
+    def flush(self) -> Iterable[Dict[str, Any]]:
+        if not self._buffer:
+            return
+        events, _ = self._parser.parse(self._buffer, self._tool_config)
+        self._buffer = ""
+        yield from events
+
+    def _find_block_start(self) -> Optional[Tuple[int, str, str]]:
+        matches: List[Tuple[int, str, str]] = []
+        for opening, closing in self._FIXED_BLOCKS:
+            index = self._buffer.find(opening)
+            if index >= 0:
+                matches.append((index, opening, closing))
+        function = re.search(r"<function=[^>]+>", self._buffer)
+        if function:
+            matches.append(
+                (function.start(), function.group(0), "</function>"))
+        return min(matches, default=None, key=lambda item: item[0])
+
+    def _safe_content_length(self) -> int:
+        function = self._buffer.rfind("<function=")
+        if function >= 0 and ">" not in self._buffer[function:]:
+            return function
+        keep = 0
+        for opening in self._OPEN_PREFIXES:
+            limit = min(len(opening) - 1, len(self._buffer))
+            for length in range(limit, 0, -1):
+                if self._buffer.endswith(opening[:length]):
+                    keep = max(keep, length)
+                    break
+        return len(self._buffer) - keep
+
+    def _complete_untagged_calls(self) -> List[ToolCall]:
+        text = self._buffer.strip()
+        if not text:
+            return []
+        is_candidate = text.startswith(("{", "[")) or any(
+            text.startswith(f"{name}(") for name in self._tool_config.names)
+        return _parse_tool_block(text,
+                                 self._tool_config) if is_candidate else []
+
+    def _could_be_untagged_call(self) -> bool:
+        text = self._buffer.lstrip()
+        if not text:
+            return True
+        if text.startswith(("{", "[")):
+            return True
+        return any(f"{name}(".startswith(text) or text.startswith(f"{name}(")
+                   for name in self._tool_config.names)
+
+
+class StreamingAssistantOutputParser:
+    """Incrementally emit ordered reasoning, content, and tool-call events."""
+
+    def __init__(self, tool_config: ToolConfig, model_dir: str,
+                 tool_parser: str, reasoning_parser: str) -> None:
+        parser = _select_parser(model_dir, tool_parser)
+        self._tools = parser.stream(
+            tool_config) if tool_config.parse_output else None
+        reasoning = REASONING_PARSERS.resolve(reasoning_parser, model_dir)
+        self._reasoning = (reasoning.stream(
+            allow_implicit=not tool_config.parse_output)
+                           if reasoning else None)
+
+    def feed(self, text: str) -> Iterable[Dict[str, Any]]:
+        events = (self._tools.feed(text) if self._tools else ({
+            "type": "content",
+            "text": text
+        }, ))
+        yield from self._expand(events)
+
+    def flush(self) -> Iterable[Dict[str, Any]]:
+        if self._tools:
+            yield from self._expand(self._tools.flush())
+        if self._reasoning:
+            yield from self._reasoning_events(self._reasoning.flush())
+
+    def _expand(self, events: Iterable[Dict[str,
+                                            Any]]) -> Iterable[Dict[str, Any]]:
+        for event in events:
+            if event["type"] == "content" and self._reasoning:
+                yield from self._reasoning_events(
+                    self._reasoning.feed(event["text"]))
+                continue
+            if event["type"] == "tool_call" and self._reasoning:
+                yield from self._reasoning_events(self._reasoning.flush())
+            yield event
+
+    @staticmethod
+    def _reasoning_events(deltas: Iterable[Any]) -> Iterable[Dict[str, Any]]:
+        for delta in deltas:
+            yield {"type": delta.field, "text": delta.text}
+
+
+def stream_assistant_output(
+        tool_config: ToolConfig,
+        model_dir: str,
+        tool_parser: str = "auto",
+        reasoning_parser: str = "none") -> StreamingAssistantOutputParser:
+    """Create incremental parsing state for one assistant response."""
+    return StreamingAssistantOutputParser(tool_config, model_dir, tool_parser,
+                                          reasoning_parser)
+
 
 class _ToolParserRegistry:
 

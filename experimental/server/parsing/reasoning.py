@@ -46,18 +46,27 @@ class ReasoningParser:
         reasoning, _, content = candidate.partition(self.end_token)
         return (reasoning or None), (content or None)
 
-    def stream(self) -> "StreamingReasoningParser":
+    def stream(self,
+               *,
+               allow_implicit: bool = True) -> "StreamingReasoningParser":
         """Create independent state for one streaming response."""
-        return StreamingReasoningParser(self.start_token, self.end_token)
+        return StreamingReasoningParser(self.start_token,
+                                        self.end_token,
+                                        allow_implicit=allow_implicit)
 
 
 class StreamingReasoningParser:
     """Incrementally split reasoning when delimiters cross chunk boundaries."""
 
-    def __init__(self, start_token: str, end_token: str) -> None:
+    def __init__(self,
+                 start_token: str,
+                 end_token: str,
+                 *,
+                 allow_implicit: bool = True) -> None:
         self._start = start_token
         self._end = end_token
-        self._reasoning = True
+        self._reasoning = allow_implicit
+        self._allow_implicit = allow_implicit
         self._at_start = True
         self._buffer = ""
 
@@ -67,8 +76,10 @@ class StreamingReasoningParser:
         if self._at_start:
             if self._buffer.startswith(self._start):
                 self._buffer = self._buffer[len(self._start):]
+                self._reasoning = True
                 self._at_start = False
             elif len(self._buffer) >= len(self._start):
+                self._reasoning = self._allow_implicit
                 self._at_start = False
 
         while self._buffer:
@@ -96,6 +107,9 @@ class StreamingReasoningParser:
     def flush(self) -> Iterable[ReasoningDelta]:
         """Yield buffered text after generation finishes."""
         if self._buffer:
+            if self._at_start:
+                self._reasoning = self._allow_implicit
+                self._at_start = False
             yield ReasoningDelta("reasoning" if self._reasoning else "content",
                                  self._buffer)
             self._buffer = ""

@@ -319,12 +319,6 @@
     - |
       : "${TEST_LOG_DIR:?TEST_LOG_DIR must be set}"
       : "${ENGINE_DIR:?ENGINE_DIR must be set}"
-      : "${ONNX_DIR:?ONNX_DIR must be set}"
-      echo "Using ONNX cache: $ONNX_DIR"
-      if [ ! -d "$ONNX_DIR" ]; then
-        echo "ONNX cache not found at $ONNX_DIR"
-        exit 1
-      fi
     - echo "Checking TRT x86_64 package"
     - if [ ! -d "$TRT_PACKAGE_DIR" ]; then echo "TensorRT x86_64 cache not found at $TRT_PACKAGE_DIR"; exit 1; fi
     - echo "Using TensorRT x86_64 package directly from cache"

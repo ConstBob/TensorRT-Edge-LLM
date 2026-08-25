@@ -18,7 +18,7 @@ import asyncio
 import contextlib
 import uuid
 from dataclasses import dataclass
-from typing import Any, AsyncGenerator, Dict
+from typing import Any, AsyncGenerator, Dict, Iterable, Optional
 
 from ..runtime.engine_client import EngineClient, PreparedRequest
 from . import anthropic_compat as protocol
@@ -33,6 +33,99 @@ class PreparedAnthropicStream:
     chat: PreparedChatRequest
     engine: PreparedRequest
     message_id: str
+
+
+class _ContentBlockStream:
+    """Serialize ordered parser events as Anthropic content blocks."""
+
+    def __init__(self) -> None:
+        self._index = 0
+        self._open_type: Optional[str] = None
+        self.tool_calls = 0
+        self.has_blocks = False
+
+    def feed(self, events: Iterable[Dict[str, Any]]) -> Iterable[str]:
+        for parsed in events:
+            event_type = parsed["type"]
+            if event_type == "tool_call":
+                yield from self._close_block()
+                call = parsed["tool_call"]
+                yield protocol.event(
+                    "content_block_start", {
+                        "index": self._index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": call.id,
+                            "name": call.name,
+                            "input": {},
+                        },
+                    })
+                yield protocol.event(
+                    "content_block_delta", {
+                        "index": self._index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": call.arguments,
+                        },
+                    })
+                yield protocol.event("content_block_stop",
+                                     {"index": self._index})
+                self._index += 1
+                self.tool_calls += 1
+                self.has_blocks = True
+                continue
+
+            text = parsed.get("text", "")
+            if not text:
+                continue
+            block_type = "thinking" if event_type == "reasoning" else "text"
+            if self._open_type != block_type:
+                yield from self._close_block()
+                content_block = ({
+                    "type": "thinking",
+                    "thinking": "",
+                    "signature": "",
+                } if block_type == "thinking" else {
+                    "type": "text",
+                    "text": "",
+                })
+                yield protocol.event("content_block_start", {
+                    "index": self._index,
+                    "content_block": content_block,
+                })
+                self._open_type = block_type
+                self.has_blocks = True
+            delta = ({
+                "type": "thinking_delta",
+                "thinking": text,
+            } if block_type == "thinking" else {
+                "type": "text_delta",
+                "text": text,
+            })
+            yield protocol.event("content_block_delta", {
+                "index": self._index,
+                "delta": delta,
+            })
+
+    def finish(self) -> Iterable[str]:
+        if not self.has_blocks:
+            yield protocol.event(
+                "content_block_start", {
+                    "index": self._index,
+                    "content_block": {
+                        "type": "text",
+                        "text": ""
+                    },
+                })
+            self._open_type = "text"
+        yield from self._close_block()
+
+    def _close_block(self) -> Iterable[str]:
+        if self._open_type is None:
+            return
+        yield protocol.event("content_block_stop", {"index": self._index})
+        self._index += 1
+        self._open_type = None
 
 
 class AnthropicServingMessages:
@@ -115,76 +208,92 @@ class AnthropicServingMessages:
         self,
         prepared: PreparedAnthropicStream,
     ) -> AsyncGenerator[str, None]:
-        prompt_tokens = asyncio.get_running_loop().create_future()
-        task = asyncio.create_task(
-            self._collect_stream(prepared, prompt_tokens))
+        parser = self._chat.stream_output_parser(prepared.chat)
+        blocks = _ContentBlockStream()
+        prompt_tokens = None
+        completion_tokens = 0
+        finish_reason = "stop"
+        started = False
+        native_stream = self._client.stream(
+            prepared.request.messages,
+            prepared.chat.sampling,
+            tools=prepared.chat.tool_config.tools,
+            tool_choice=prepared.chat.tool_config.tool_choice,
+            prepared=prepared.engine,
+        )
+        next_delta = None
         try:
-            exact_prompt_tokens = await prompt_tokens
-            for chunk in protocol.message_start_events(prepared.message_id,
-                                                       self._client.model_name,
-                                                       exact_prompt_tokens):
-                yield chunk
-            while not task.done():
-                done, _ = await asyncio.wait({task}, timeout=5.0)
+            while True:
+                if next_delta is None:
+                    next_delta = asyncio.create_task(anext(native_stream))
+                done, _ = await asyncio.wait({next_delta}, timeout=5.0)
                 if not done:
-                    yield protocol.event("ping", {})
-            blocks, finish_reason, completion_tokens = await task
+                    if started:
+                        yield protocol.event("ping", {})
+                    continue
+                try:
+                    delta = next_delta.result()
+                except StopAsyncIteration:
+                    next_delta = None
+                    break
+                next_delta = None
+                completion_tokens += len(delta.token_ids)
+                if delta.prompt_tokens is not None:
+                    prompt_tokens = delta.prompt_tokens
+                if delta.finished:
+                    finish_reason = delta.finish_reason or "stop"
+                if not started:
+                    for chunk in protocol.message_start_events(
+                            prepared.message_id, self._client.model_name,
+                            prompt_tokens):
+                        yield chunk
+                    started = True
+                    if delta.text:
+                        text = delta.text.replace(IM_END_TOKEN, "")
+                        for chunk in blocks.feed(parser.feed(text)):
+                            yield chunk
+                elif delta.text:
+                    text = delta.text.replace(IM_END_TOKEN, "")
+                    for chunk in blocks.feed(parser.feed(text)):
+                        yield chunk
         except asyncio.CancelledError:
-            task.cancel()
-            with contextlib.suppress(BaseException):
-                await task
             raise
         except ServerError as exc:
-            with contextlib.suppress(BaseException):
-                await task
             status = 529 if exc.status_code == 429 else exc.status_code
             yield protocol.event("error",
                                  protocol.error_payload(status, str(exc)))
             return
         except Exception as exc:
-            with contextlib.suppress(BaseException):
-                await task
             yield protocol.event("error",
                                  protocol.error_payload(500, str(exc)))
             return
+        finally:
+            if next_delta is not None:
+                next_delta.cancel()
+                with contextlib.suppress(BaseException):
+                    await next_delta
+            with contextlib.suppress(BaseException):
+                await native_stream.aclose()
 
-        for chunk in protocol.content_tail_events(
-                blocks, protocol.convert_stop_reason(finish_reason),
-                completion_tokens):
+        if not started:
+            for chunk in protocol.message_start_events(prepared.message_id,
+                                                       self._client.model_name,
+                                                       prompt_tokens):
+                yield chunk
+        for chunk in blocks.feed(parser.flush()):
             yield chunk
-
-    async def _collect_stream(self, prepared: PreparedAnthropicStream,
-                              prompt_tokens: asyncio.Future):
-        text_parts = []
-        completion_tokens = 0
-        finish_reason = "stop"
-        try:
-            async for delta in self._client.stream(
-                    prepared.request.messages,
-                    prepared.chat.sampling,
-                    tools=prepared.chat.tool_config.tools,
-                    tool_choice=prepared.chat.tool_config.tool_choice,
-                    prepared=prepared.engine):
-                if (not prompt_tokens.done()
-                        and delta.prompt_tokens is not None):
-                    prompt_tokens.set_result(delta.prompt_tokens)
-                completion_tokens += len(delta.token_ids)
-                if delta.text:
-                    text_parts.append(delta.text)
-                if delta.finished:
-                    finish_reason = delta.finish_reason or "stop"
-        except BaseException as exc:
-            if not prompt_tokens.done():
-                prompt_tokens.set_exception(exc)
-            raise
-        if not prompt_tokens.done():
-            prompt_tokens.set_result(None)
-
-        parsed = self._chat.parse_output(
-            "".join(text_parts).replace(IM_END_TOKEN, ""), prepared.chat)
-        tool_calls = [call.to_openai() for call in parsed.tool_calls]
-        if tool_calls and finish_reason == "stop":
+        for chunk in blocks.finish():
+            yield chunk
+        if blocks.tool_calls and finish_reason == "stop":
             finish_reason = "tool_calls"
-        blocks = protocol.build_content_blocks(parsed.content, tool_calls,
-                                               parsed.reasoning)
-        return blocks, finish_reason, completion_tokens
+        yield protocol.event(
+            "message_delta", {
+                "delta": {
+                    "stop_reason": protocol.convert_stop_reason(finish_reason),
+                    "stop_sequence": None,
+                },
+                "usage": {
+                    "output_tokens": completion_tokens
+                },
+            })
+        yield protocol.event("message_stop", {})

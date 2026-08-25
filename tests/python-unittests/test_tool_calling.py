@@ -18,6 +18,7 @@ import json
 import pytest
 
 from experimental.server.parsing.tool_calling import (parse_assistant_output,
+                                                      stream_assistant_output,
                                                       validate_tool_request)
 
 
@@ -128,3 +129,73 @@ def test_filters_forced_tool(tmp_path):
     )
     assert parsed.tool_calls == []
     assert parsed.content == text
+
+
+def test_streams_content_reasoning_and_tools_across_chunk_boundaries(tmp_path):
+    parser = stream_assistant_output(_config(),
+                                     str(tmp_path),
+                                     reasoning_parser="qwen3")
+    events = []
+    for chunk in (
+            "<th",
+            "ink>plan</think>Before<tool_",
+            'call>{"name":"get_weather","arguments":{"city":',
+            '"Paris"}}</tool_call>After',
+    ):
+        events.extend(parser.feed(chunk))
+    events.extend(parser.flush())
+
+    assert "".join(event["text"] for event in events
+                   if event["type"] == "reasoning") == "plan"
+    assert "".join(event["text"] for event in events
+                   if event["type"] == "content") == "BeforeAfter"
+    calls = [
+        event["tool_call"] for event in events if event["type"] == "tool_call"
+    ]
+    assert len(calls) == 1
+    assert calls[0].name == "get_weather"
+    assert json.loads(calls[0].arguments) == {"city": "Paris"}
+
+
+def test_stream_parser_flushes_untagged_provider_format(tmp_path):
+    parser = stream_assistant_output(_config(), str(tmp_path))
+    events = list(parser.feed('get_weather(city="Paris")'))
+    events.extend(parser.flush())
+
+    assert len(events) == 1
+    assert events[0]["type"] == "tool_call"
+    assert json.loads(events[0]["tool_call"].arguments) == {"city": "Paris"}
+
+
+@pytest.mark.parametrize(
+    "text, expected_cities",
+    [
+        (
+            "Before<function=get_weather><parameter=city>Paris</parameter>"
+            "</function>After",
+            ["Paris"],
+        ),
+        (
+            'Before<tool_calls>[{"name":"get_weather","arguments":'
+            '{"city":"Paris"}},{"name":"get_weather","arguments":'
+            '{"city":"Tokyo"}}]</tool_calls>After',
+            ["Paris", "Tokyo"],
+        ),
+    ],
+)
+def test_stream_parser_accepts_every_tool_delimiter_split(
+        tmp_path, text, expected_cities):
+    for split in range(len(text) + 1):
+        parser = stream_assistant_output(_config(), str(tmp_path))
+        events = list(parser.feed(text[:split]))
+        events.extend(parser.feed(text[split:]))
+        events.extend(parser.flush())
+
+        assert "".join(event["text"] for event in events
+                       if event["type"] == "content") == "BeforeAfter"
+        calls = [
+            event["tool_call"] for event in events
+            if event["type"] == "tool_call"
+        ]
+        assert [json.loads(call.arguments)["city"]
+                for call in calls] == expected_cities

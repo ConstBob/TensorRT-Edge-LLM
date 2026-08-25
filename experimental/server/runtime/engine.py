@@ -734,7 +734,8 @@ class LLM:
         cached = getattr(self, "_video_family_cache", None)
         if cached is not None:
             return cached
-        model_type = self._visual_config().get("model_type", "")
+        config = self._visual_config()
+        model_type = config.get("model_type", "")
         qwen_video_types = ("qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_5",
                             "qwen3_omni")
         # Audio-side model types have no video path (qwen3_omni_audio_encoder,
@@ -747,7 +748,8 @@ class LLM:
             os.path.join(root, "visual", "visual.engine"))
         if "internvl" in model_type and has_visual:
             family = "internvl"
-        elif "nemotron" in model_type and not is_audio_type and has_visual:
+        elif ("nemotron" in model_type and not is_audio_type and has_visual
+              and config.get("supports_video", True)):
             family = "nemotron"
         elif (model_type.startswith(qwen_video_types) and not is_audio_type
               and has_visual):

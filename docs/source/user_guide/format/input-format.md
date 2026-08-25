@@ -80,10 +80,12 @@ This guide describes the input JSON format for the LLM inference tool. The forma
 - Image: `{"type": "image", "image": "/path/to/image.jpg"}`. Optional `"do_resize"` (default `true`): set to `false` when the image is already resized to the model's target size — the vision runner then consumes it as-is instead of resizing internally (see [Pre-resized image input](#pre-resized-image-input-do_resize-false)).
 - Audio: `{"type": "audio", "audio": "/path/to/clip.wav"}` (raw `.wav` / `.mp3` / `.flac` decoded in C++ via vendored miniaudio + in-tree mel extractor. Feature-extractor family — `whisper` / `parakeet` — is auto-derived from the engine's `audio/config.json`, mirroring HF / vLLM where FE is pinned by the model. The HTTP server in `experimental.server` accepts the same audio formats via `input_audio` / `audio_url` and routes through the same C++ mel path.)
 - The C++ `llm_inference` CLI does not accept video content. The
-  [OpenAI-compatible server](../examples/experimental-server.md#video-input)
+  [OpenAI-compatible server](../examples/experimental-server.md#image-video-and-audio-input)
   accepts `video`, `video_url`, or an explicit frame list for supported Qwen
-  and InternVL model families. The Cosmos3 policy runtime has a separate
-  observation/action contract; see the [Cosmos3 VLA guide](../examples/vla/cosmos3.md).
+  and InternVL model families and Nemotron Omni. Nemotron Omni accepts exactly
+  one video and no images per request. The Cosmos3 policy runtime has a
+  separate observation/action contract; see the
+  [Cosmos3 VLA guide](../examples/vla/cosmos3.md).
 
 ## Examples
 

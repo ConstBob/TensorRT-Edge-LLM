@@ -2001,16 +2001,19 @@ bool LLMRankRuntime::multiModalRuntimePreprocess(
             {
                 rt::Tensor const& output = mVisionRunner->getOutputEmbedding();
                 auto const& tokenLengths = mVisionRunner->getLastMediaTokenLengths();
-                int64_t const hiddenSize = output.getShape()[1];
-                size_t const typeSize = rt::utils::getTypeSize(output.getDataType());
-                int64_t byteOffset = 0;
-                for (size_t i = 0; i < imageHashes.size(); ++i)
+                if (tokenLengths.size() == imageHashes.size())
                 {
-                    int64_t const numTok = tokenLengths[i];
-                    mEncoderEmbeddingCache->storeSlice(imageHashes[i],
-                        static_cast<char const*>(output.rawPointer()) + byteOffset, numTok, hiddenSize,
-                        output.getDataType(), stream);
-                    byteOffset += numTok * hiddenSize * static_cast<int64_t>(typeSize);
+                    int64_t const hiddenSize = output.getShape()[1];
+                    size_t const typeSize = rt::utils::getTypeSize(output.getDataType());
+                    int64_t byteOffset = 0;
+                    for (size_t i = 0; i < imageHashes.size(); ++i)
+                    {
+                        int64_t const numTok = tokenLengths[i];
+                        mEncoderEmbeddingCache->storeSlice(imageHashes[i],
+                            static_cast<char const*>(output.rawPointer()) + byteOffset, numTok, hiddenSize,
+                            output.getDataType(), stream);
+                        byteOffset += numTok * hiddenSize * static_cast<int64_t>(typeSize);
+                    }
                 }
             }
         }
