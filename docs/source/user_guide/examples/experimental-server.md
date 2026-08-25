@@ -213,6 +213,8 @@ Requests use OpenAI `tools`, `tool_choice`, assistant `tool_calls`, and matching
 `tool` messages. Parsed thinking is returned as `reasoning_content` only when
 the request sets `enable_thinking=true` or
 `chat_template_kwargs.enable_thinking=true`.
+Streaming responses emit indexed tool-call deltas as soon as each generated
+call is complete and end with `finish_reason="tool_calls"`.
 
 ### Image, Video, and Audio Input
 
@@ -231,6 +233,21 @@ URLs and files under `--allowed-local-media-path` are supported. Remote HTTP
 and HTTPS sources are downloaded with per-modality size limits and a bounded
 timeout. Local paths remain disabled unless they are under the configured
 allowed path.
+
+Nemotron Omni video uses its checkpoint's video patch embedder and dynamic
+aspect-preserving frame grids:
+
+```bash
+tensorrt-edgellm-serve \
+  nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4 \
+  --cache-dir /data/edgellm-cache \
+  --allowed-local-media-path /data/media
+```
+
+Each Nemotron Omni request accepts one video and no additional images. Use
+either `fps` or `nframes`; the server samples the clip, validates the visual
+engine profile before decoding, and rejects frame lists that exceed its raw
+pre-pruning tubelet capacity.
 
 ASR-capable models expose transcription:
 

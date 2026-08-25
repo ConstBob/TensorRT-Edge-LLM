@@ -1424,14 +1424,15 @@ print('HLAPI_GENERATE_WITH_LOGIT_BIAS_PASSED')
                                   test_logger: logging.Logger,
                                   env_config: EnvironmentConfig) -> None:
         """HLAPI video path, generate + streaming: local clip -> decode+sample ->
-        video ImageData -> per-model ViT runner, covering any video-capable VLM
-        (Qwen-VL / InternVL3). ``VIDEO_TEST_CLIP`` overrides the synthetic PyAV
+        video ImageData -> per-model ViT runner, covering Qwen-VL, InternVL3,
+        and Nemotron-Omni. ``VIDEO_TEST_CLIP`` overrides the synthetic PyAV
         clip encoded on the inference machine; ``VIDEO_TEST_NFRAMES`` must fit
         the visual engine's profile."""
-        is_vlm = "-mnit" in test_param
-        if not is_vlm:
-            pytest.skip("video HLAPI test requires a VLM test_param ('-mnit')")
-        config = TestConfig.from_param_string(test_param, ModelType.VLM,
+        if "-mnit" not in test_param:
+            pytest.skip("video HLAPI test requires a multimodal test_param")
+        model_type = (ModelType.OMNI
+                      if "-omni" in test_param.lower() else ModelType.VLM)
+        config = TestConfig.from_param_string(test_param, model_type,
                                               TaskType.INFERENCE, env_config)
         test_clip = os.environ.get("VIDEO_TEST_CLIP", "")
         nframes = int(os.environ.get("VIDEO_TEST_NFRAMES", "8"))

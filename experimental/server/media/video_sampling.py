@@ -992,6 +992,18 @@ def load_video_buffer(rt_module,
         elif cap is not None:
             if family == "nemotron":
                 # Aspect-preserving tubelet estimate; no cu_seqlens binding.
+                geom = _nemotron_tubelet_geometry(limits)
+                if geom is not None:
+                    temporal, tokens_per_tubelet, _ = geom
+                    tubelets = -(-len(frame_paths) // temporal)
+                    engine_tubelets = max(
+                        1, limits["max_image_tokens"] // tokens_per_tubelet)
+                    if tubelets > engine_tubelets:
+                        raise ValueError(
+                            f"{len(frame_paths)} pre-sampled frames need "
+                            f"{tubelets} tubelets but the visual engine "
+                            f"profile holds {engine_tubelets}; reduce the "
+                            "frame count")
                 est = _estimate_nemotron_video_tokens(len(frame_paths), limits)
                 if est > cap:
                     raise ValueError(

@@ -18,12 +18,14 @@ import asyncio
 import base64
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from experimental.server.api.errors import ServerOverloadedError
 from experimental.server.config import ApiConfig
-from experimental.server.runtime.engine import CompletionOutput, StreamDelta
+from experimental.server.runtime.engine import (CompletionOutput,
+                                                SamplingParams, StreamDelta)
 
 
 def _create_app(llm, config=None):
@@ -111,10 +113,19 @@ class _FakeLLM:
                                 finish_reason="stop")
 
     def generate_stream(self, _messages, _params, *, tools=None, **_kwargs):
-        text = ('<tool_call>{"name":"get_weather",'
-                '"arguments":{"city":"Paris"}}</tool_call>'
-                if tools else "hello")
-        yield StreamDelta(text=text,
+        if tools:
+            yield StreamDelta(text="Before<tool_",
+                              token_ids=[1],
+                              prompt_tokens=7)
+            yield StreamDelta(text=('call>{"name":"get_weather",'
+                                    '"arguments":{"city":"Paris"}}'
+                                    '</tool_call>'),
+                              token_ids=[2])
+            yield StreamDelta(text="After",
+                              finished=True,
+                              finish_reason="stop")
+            return
+        yield StreamDelta(text="hello",
                           token_ids=[1, 2],
                           prompt_tokens=7,
                           finished=True,
@@ -174,6 +185,14 @@ def test_video_model_family_nemotron(tmp_path):
     llm = eng.LLM.__new__(eng.LLM)
     llm._media_dir = str(root)
     assert llm._video_model_family() == "nemotron"
+
+    (root / "visual" / "config.json").write_text(
+        '{"model_type": "nemotron_omni_vision_encoder", '
+        '"supports_video": false}')
+    image_only = eng.LLM.__new__(eng.LLM)
+    image_only._media_dir = str(root)
+    with pytest.raises(ValueError, match="video input is not supported"):
+        image_only._video_model_family()
 
 
 def test_load_image_buffers_nemotron_minimum():
@@ -637,12 +656,86 @@ def test_streaming_tool_call_and_usage_share_one_contract(client_and_llm):
         payload for payload in payloads if payload.get("choices")
         and payload["choices"][0]["delta"].get("tool_calls")
     ]
+    choices = [
+        payload["choices"][0] for payload in payloads if payload.get("choices")
+    ]
     usage_chunks = [payload for payload in payloads if payload.get("usage")]
-    assert tool_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["function"][
-        "name"] == "get_weather"
+    initial_call = tool_chunks[0]["choices"][0]["delta"]["tool_calls"][0]
+    assert initial_call["index"] == 0
+    assert initial_call["type"] == "function"
+    assert initial_call["function"] == {
+        "name": "get_weather",
+        "arguments": "",
+    }
+    argument_delta = tool_chunks[1]["choices"][0]["delta"]["tool_calls"][0]
+    assert argument_delta["index"] == 0
+    assert json.loads(argument_delta["function"]["arguments"]) == {
+        "city": "Paris"
+    }
+    tool_position = next(i for i, choice in enumerate(choices)
+                         if choice["delta"].get("tool_calls"))
+    trailing_content = next(i for i, choice in enumerate(choices)
+                            if choice["delta"].get("content") == "After")
+    assert tool_position < trailing_content
+    assert choices[-1]["finish_reason"] == "tool_calls"
     assert len(usage_chunks) == 1
     assert usage_chunks[0]["choices"] == []
     assert usage_chunks[0]["usage"]["prompt_tokens"] == 7
+
+
+def test_tool_call_delta_does_not_wait_for_native_stream_end(tmp_path):
+    from experimental.server.api.protocol import ChatCompletionRequest
+    from experimental.server.api.serving_chat import (OpenAIServingChat,
+                                                      PreparedChatRequest)
+    from experimental.server.parsing.tool_calling import validate_tool_request
+
+    release_finish = asyncio.Event()
+
+    class BlockingClient:
+        llm = SimpleNamespace(model_dir=str(tmp_path))
+        model_name = "fake-model"
+
+        async def stream(self, *_args, **_kwargs):
+            yield StreamDelta(
+                text=('<tool_call>{"name":"get_weather","arguments":'
+                      '{"city":"Paris"}}</tool_call>'),
+                token_ids=[1],
+                prompt_tokens=7,
+            )
+            await release_finish.wait()
+            yield StreamDelta(finished=True, finish_reason="stop")
+
+    request = ChatCompletionRequest(
+        messages=[{
+            "role": "user",
+            "content": "Weather?"
+        }],
+        tools=[_tool()],
+        tool_choice="required",
+        stream=True,
+    )
+    prepared = PreparedChatRequest(
+        sampling=SamplingParams(),
+        tool_config=validate_tool_request(request.messages, request.tools,
+                                          request.tool_choice),
+        reasoning_parser="none",
+    )
+
+    async def exercise():
+        handler = OpenAIServingChat(BlockingClient(),
+                                    ApiConfig(enable_auto_tool_choice=True))
+        chunks = handler._stream_tools(request, prepared, "chatcmpl-test", 0,
+                                       False, None)
+        first = await anext(chunks)
+        assert not release_finish.is_set()
+        payload = json.loads(first.removeprefix("data: "))
+        call = payload["choices"][0]["delta"]["tool_calls"][0]
+        assert call["function"]["name"] == "get_weather"
+        release_finish.set()
+        tail = [chunk async for chunk in chunks]
+        assert tail[-1] == "data: [DONE]\n\n"
+
+    asyncio.run(exercise())
 
 
 def test_streaming_audio_orders_text_pcm_usage_and_done(client_and_llm):
@@ -770,6 +863,55 @@ def test_anthropic_stream_uses_valid_event_order(client_and_llm):
     assert events[-1] == "message_stop"
     assert events.index("content_block_start") < events.index(
         "content_block_stop")
+
+
+def test_anthropic_stream_orders_tool_and_following_content(client_and_llm):
+    client, _ = client_and_llm
+    response = client.post(
+        "/v1/messages",
+        json={
+            "model":
+            "fake-model",
+            "max_tokens":
+            8,
+            "stream":
+            True,
+            "messages": [{
+                "role": "user",
+                "content": "Weather?"
+            }],
+            "tools": [{
+                "name": "get_weather",
+                "description": "Get weather",
+                "input_schema": {
+                    "type": "object"
+                },
+            }],
+            "tool_choice": {
+                "type": "any"
+            },
+        },
+    )
+    assert response.status_code == 200, response.text
+    events = []
+    for frame in response.text.strip().split("\n\n"):
+        lines = frame.splitlines()
+        if len(lines) == 2 and lines[0].startswith("event: "):
+            events.append((lines[0].removeprefix("event: "),
+                           json.loads(lines[1].removeprefix("data: "))))
+
+    deltas = [(index, data["delta"])
+              for index, (event, data) in enumerate(events)
+              if event == "content_block_delta"]
+    tool_index, tool_delta = next(item for item in deltas
+                                  if item[1]["type"] == "input_json_delta")
+    after_index, _ = next(item for item in deltas
+                          if item[1].get("text") == "After")
+    assert json.loads(tool_delta["partial_json"]) == {"city": "Paris"}
+    assert tool_index < after_index
+    message_delta = next(data for event, data in events
+                         if event == "message_delta")
+    assert message_delta["delta"]["stop_reason"] == "tool_use"
 
 
 def test_anthropic_x_api_key_auth(tmp_path):
