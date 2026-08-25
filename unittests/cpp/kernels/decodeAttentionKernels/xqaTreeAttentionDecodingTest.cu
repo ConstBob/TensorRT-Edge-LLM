@@ -58,9 +58,45 @@ void initializeCudaContextForXQATest()
     CUDA_CHECK(cudaFree(0));
 }
 
+enum class XQATreeMaskPattern
+{
+    kRandom,
+    kCausal,
+    kAllMasked,
+};
+
+enum class XQATreeDataPattern
+{
+    kRandom,
+    kDeterministic,
+    kZeroQKUnitV,
+    kSwaBoundarySpikes,
+};
+
+struct XQATreeAttentionTestOptions
+{
+    bool contiguousQuerySwa{false};
+    XQATreeMaskPattern maskPattern{XQATreeMaskPattern::kRandom};
+    XQATreeDataPattern dataPattern{XQATreeDataPattern::kRandom};
+    std::optional<std::vector<float>> attentionSinks{std::nullopt};
+};
+
+template <typename T>
+void deterministicFloatInitialization(std::vector<T>& values, int32_t seed)
+{
+    constexpr int32_t kMODULUS = 257;
+    constexpr float kSCALE = 1.0F / 128.0F;
+    for (size_t i = 0; i < values.size(); ++i)
+    {
+        int32_t const value = (static_cast<int32_t>(i % kMODULUS) * 37 + seed * 17) % kMODULUS;
+        values[i] = T(static_cast<float>(value - 128) * kSCALE);
+    }
+}
+
 void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
     int32_t kvSequenceLength, int32_t qSequenceLength, bool useFp8Cache = false, int32_t slidingWindowSize = 0,
-    int32_t tokensPerPage = 0, std::optional<float> attentionScale = std::nullopt)
+    int32_t tokensPerPage = 0, std::optional<float> attentionScale = std::nullopt,
+    XQATreeAttentionTestOptions const& options = {}, int32_t kvCacheCapacity = 0)
 {
     float const resolvedAttentionScale = attentionScale.value_or(1.0F / std::sqrt(static_cast<float>(headSize)));
     initializeCudaContextForXQATest();
@@ -72,19 +108,23 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
         GTEST_SKIP() << "Skipping FP8 KV cache tests: requires SM >= 89, but got SM " << smVersion;
     }
     bool const usePagedKVCache = tokensPerPage > 0;
+    int32_t const resolvedKvCacheCapacity = kvCacheCapacity > 0 ? kvCacheCapacity : kvSequenceLength;
+    ASSERT_GE(resolvedKvCacheCapacity, kvSequenceLength);
+    ASSERT_TRUE(usePagedKVCache || resolvedKvCacheCapacity == kvSequenceLength);
     ASSERT_TRUE(
         trt_edgellm::canCompileXQAKernel(numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, DataType::kHALF))
         << "No compatible FP16 XQA kernel for SM " << smVersion << " paged_kv=" << usePagedKVCache;
     ASSERT_TRUE(trt_edgellm::loadXQAJitKernelForTest(smVersion, DataType::kHALF, DataType::kHALF, headSize, numQHeads,
-        numKVHeads, slidingWindowSize > 0, /*specDecode=*/true, tokensPerPage));
+        numKVHeads, slidingWindowSize > 0, /*specDecode=*/true, tokensPerPage, options.contiguousQuerySwa));
     if (usePagedKVCache)
     {
-        ASSERT_EQ(kvSequenceLength % tokensPerPage, 0);
+        ASSERT_EQ(resolvedKvCacheCapacity % tokensPerPage, 0);
 #if SUPPORTS_FP8
         if (useFp8Cache)
         {
-            ASSERT_TRUE(trt_edgellm::loadXQAJitKernelForTest(smVersion, DataType::kHALF, DataType::kFP8, headSize,
-                numQHeads, numKVHeads, slidingWindowSize > 0, /*specDecode=*/true, tokensPerPage));
+            ASSERT_TRUE(
+                trt_edgellm::loadXQAJitKernelForTest(smVersion, DataType::kHALF, DataType::kFP8, headSize, numQHeads,
+                    numKVHeads, slidingWindowSize > 0, /*specDecode=*/true, tokensPerPage, options.contiguousQuerySwa));
         }
 #endif
     }
@@ -99,7 +139,7 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
     std::vector<std::vector<int32_t>> treeMasks;
     treeMasks.reserve(batchSize);
 
-    int32_t const maxNbPagesPerSeq = usePagedKVCache ? kvSequenceLength / tokensPerPage : 0;
+    int32_t const maxNbPagesPerSeq = usePagedKVCache ? resolvedKvCacheCapacity / tokensPerPage : 0;
     std::vector<int32_t> kvCachePageList;
     if (usePagedKVCache)
     {
@@ -124,16 +164,125 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
         std::vector<half> vi(numKVHeads * headSize * kvSequenceLength);
         std::vector<int32_t> treeMaski(qSequenceLength * qSequenceLength);
 
-        uniformFloatInitialization(qi, -1.0F, 1.0F);
-        uniformFloatInitialization(ki, -1.0F, 1.0F);
-        uniformFloatInitialization(vi, -1.0F, 1.0F);
-        uniformIntInitialization(treeMaski, 0, 1);
-        int32_t const attentionLength
-            = slidingWindowSize > 0 ? std::min(kvSequenceLength, slidingWindowSize) : kvSequenceLength;
-        auto kiRef = sliceKVWindow(ki, numKVHeads, headSize, kvSequenceLength, slidingWindowSize);
-        auto viRef = sliceKVWindow(vi, numKVHeads, headSize, kvSequenceLength, slidingWindowSize);
-        auto ref = casualAttentionRef<half>(qi, kiRef, viRef, qSequenceLength, attentionLength, numQHeads, numKVHeads,
-            headSize, resolvedAttentionScale, std::make_optional(treeMaski));
+        if (options.dataPattern == XQATreeDataPattern::kRandom)
+        {
+            uniformFloatInitialization(qi, -1.0F, 1.0F);
+            uniformFloatInitialization(ki, -1.0F, 1.0F);
+            uniformFloatInitialization(vi, -1.0F, 1.0F);
+        }
+        else if (options.dataPattern == XQATreeDataPattern::kDeterministic)
+        {
+            deterministicFloatInitialization(qi, i * 3 + 1);
+            deterministicFloatInitialization(ki, i * 3 + 2);
+            deterministicFloatInitialization(vi, i * 3 + 3);
+        }
+        else if (options.dataPattern == XQATreeDataPattern::kZeroQKUnitV)
+        {
+            std::fill(qi.begin(), qi.end(), __float2half(0.0F));
+            std::fill(ki.begin(), ki.end(), __float2half(0.0F));
+            std::fill(vi.begin(), vi.end(), __float2half(1.0F));
+        }
+        else
+        {
+            constexpr float kSPIKE_VALUE = 64.0F;
+            int32_t const firstWindowLeft = kvSequenceLength - qSequenceLength + 1 - slidingWindowSize;
+            ASSERT_GT(firstWindowLeft, 0);
+            std::fill(qi.begin(), qi.end(), __float2half(0.0F));
+            std::fill(ki.begin(), ki.end(), __float2half(0.0F));
+            std::fill(vi.begin(), vi.end(), __float2half(0.0F));
+            for (int32_t kvHeadIdx = 0; kvHeadIdx < numKVHeads; ++kvHeadIdx)
+            {
+                for (int32_t spikeIdx = 0; spikeIdx < qSequenceLength; ++spikeIdx)
+                {
+                    int32_t const tokenIdx = firstWindowLeft + spikeIdx;
+                    std::fill_n(vi.begin() + (kvHeadIdx * kvSequenceLength + tokenIdx) * headSize, headSize,
+                        __float2half(kSPIKE_VALUE));
+                }
+            }
+        }
+
+        if (options.maskPattern == XQATreeMaskPattern::kRandom)
+        {
+            uniformIntInitialization(treeMaski, 0, 1);
+        }
+        else if (options.maskPattern == XQATreeMaskPattern::kCausal)
+        {
+            for (int32_t queryIdx = 0; queryIdx < qSequenceLength; ++queryIdx)
+            {
+                std::fill_n(treeMaski.begin() + queryIdx * qSequenceLength, queryIdx + 1, 1);
+            }
+        }
+
+        std::vector<half> ref;
+        if (options.dataPattern == XQATreeDataPattern::kSwaBoundarySpikes)
+        {
+            constexpr float kSPIKE_VALUE = 64.0F;
+            ASSERT_TRUE(options.contiguousQuerySwa);
+            ASSERT_TRUE(options.maskPattern == XQATreeMaskPattern::kCausal);
+            ASSERT_GT(slidingWindowSize, 0);
+            ASSERT_GE(kvSequenceLength - qSequenceLength + 1, slidingWindowSize);
+            ASSERT_TRUE(options.attentionSinks.has_value());
+            ASSERT_TRUE(std::all_of(options.attentionSinks->begin(), options.attentionSinks->end(),
+                [](float sink) { return sink == 0.0F; }));
+            ref.resize(static_cast<size_t>(qSequenceLength) * numQHeads * headSize);
+            float const denominator = static_cast<float>(slidingWindowSize + 1);
+            for (int32_t queryIdx = 0; queryIdx < qSequenceLength; ++queryIdx)
+            {
+                float const expected = static_cast<float>(qSequenceLength - queryIdx) * kSPIKE_VALUE / denominator;
+                std::fill_n(ref.begin() + static_cast<size_t>(queryIdx) * numQHeads * headSize,
+                    static_cast<size_t>(numQHeads) * headSize, __float2half(expected));
+            }
+        }
+        else if (options.contiguousQuerySwa)
+        {
+            ref = casualAttentionRef<half>(qi, ki, vi, qSequenceLength, kvSequenceLength, numQHeads, numKVHeads,
+                headSize, resolvedAttentionScale, std::make_optional(treeMaski), 1.0F, 1.0F, slidingWindowSize,
+                /*contiguousQuerySwa=*/true, options.attentionSinks);
+        }
+        else
+        {
+            int32_t const attentionLength
+                = slidingWindowSize > 0 ? std::min(kvSequenceLength, slidingWindowSize) : kvSequenceLength;
+            auto kiRef = sliceKVWindow(ki, numKVHeads, headSize, kvSequenceLength, slidingWindowSize);
+            auto viRef = sliceKVWindow(vi, numKVHeads, headSize, kvSequenceLength, slidingWindowSize);
+            ref = casualAttentionRef<half>(qi, kiRef, viRef, qSequenceLength, attentionLength, numQHeads, numKVHeads,
+                headSize, resolvedAttentionScale, std::make_optional(treeMaski), 1.0F, 1.0F, 0,
+                /*contiguousQuerySwa=*/false, options.attentionSinks);
+        }
+
+        if (options.dataPattern == XQATreeDataPattern::kZeroQKUnitV)
+        {
+            int32_t const qBase = kvSequenceLength - qSequenceLength;
+            for (int32_t queryIdx = 0; queryIdx < qSequenceLength; ++queryIdx)
+            {
+                int32_t const windowStart = options.contiguousQuerySwa && slidingWindowSize > 0
+                    ? std::max(0, qBase + queryIdx + 1 - slidingWindowSize)
+                    : 0;
+                int32_t visibleKeys = 0;
+                for (int32_t keyIdx = windowStart; keyIdx < kvSequenceLength; ++keyIdx)
+                {
+                    bool const visible = keyIdx < qBase || treeMaski[queryIdx * qSequenceLength + keyIdx - qBase] != 0;
+                    visibleKeys += visible ? 1 : 0;
+                }
+                for (int32_t qHeadIdx = 0; qHeadIdx < numQHeads; ++qHeadIdx)
+                {
+                    double expected = visibleKeys > 0 ? 1.0 : 0.0;
+                    if (visibleKeys > 0 && options.attentionSinks.has_value())
+                    {
+                        double const logVisibleKeys = std::log(static_cast<double>(visibleKeys));
+                        double const sink = static_cast<double>((*options.attentionSinks)[qHeadIdx]);
+                        double const rowMax = std::max(logVisibleKeys, sink);
+                        double const visibleWeight = std::exp(logVisibleKeys - rowMax);
+                        expected = visibleWeight / (visibleWeight + std::exp(sink - rowMax));
+                    }
+                    for (int32_t d = 0; d < headSize; ++d)
+                    {
+                        size_t const offset = (static_cast<size_t>(queryIdx) * numQHeads + qHeadIdx) * headSize + d;
+                        ASSERT_NEAR(__half2float(ref[offset]), static_cast<float>(expected), 1.0e-3F);
+                    }
+                }
+            }
+        }
 
         // Add data from batch to input Tensors
         qInput.insert(qInput.end(), qi.begin(), qi.end());
@@ -200,6 +349,7 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
     thrust::device_vector<int32_t> kvCacheLengthDevice(kvCacheLength);
     thrust::device_vector<int32_t> kvCachePageListDevice(kvCachePageList);
     thrust::device_vector<int32_t> packedTreeMaskDevice(packedTreeMaskInput);
+    thrust::device_vector<float> attentionSinksDevice(options.attentionSinks.value_or(std::vector<float>{}));
 
     trt_edgellm::DecoderXQARunner runner(
         DataType::kHALF, DataType::kHALF, batchSize, numQHeads, numKVHeads, headSize, smVersion);
@@ -208,7 +358,7 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
     params.qInputPtr = thrust::raw_pointer_cast(qInputDevice.data());
     params.kvCache.data = thrust::raw_pointer_cast(kvInputDevice.data());
     params.kvCache.sequence_lengths = thrust::raw_pointer_cast(kvCacheLengthDevice.data());
-    params.kvCache.capacity = kvSequenceLength;
+    params.kvCache.capacity = resolvedKvCacheCapacity;
     if (usePagedKVCache)
     {
         params.kvCache.pageList = thrust::raw_pointer_cast(kvCachePageListDevice.data());
@@ -216,8 +366,11 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
     }
     params.output = thrust::raw_pointer_cast(outDevice.data());
     params.treeAttnMask = thrust::raw_pointer_cast(packedTreeMaskDevice.data());
+    params.attentionSinks
+        = options.attentionSinks.has_value() ? thrust::raw_pointer_cast(attentionSinksDevice.data()) : nullptr;
     params.attentionScale = resolvedAttentionScale;
     params.slidingWinSize = slidingWindowSize > 0 ? static_cast<uint32_t>(slidingWindowSize) : 0U;
+    params.contiguousQuerySwa = options.contiguousQuerySwa;
     // Use default stream .
     cudaStream_t stream{nullptr};
     runner.dispatchSpecDecodeXQAKernel(params, stream);
@@ -237,7 +390,7 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
         {
             numErrorWithin1E_3++;
         }
-        if (isnan(__half2float(outHost[i])))
+        if (!std::isfinite(__half2float(outHost[i])))
         {
             NanValueDetected = true;
         }
@@ -246,10 +399,10 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
 
     std::cout << "XQA Tree Attention Decoding test. [FP16 KV cache] batch_size: " << batchSize
               << " num_Q_heads: " << numQHeads << " num_KV_heads: " << numKVHeads << " head_size: " << headSize
-              << " kvcache seq_len: " << kvSequenceLength << " q_seq_len: " << qSequenceLength
-              << " sliding_window: " << slidingWindowSize << " paged_kv: " << usePagedKVCache
-              << " tokens_per_page: " << tokensPerPage << " attention_scale: " << resolvedAttentionScale
-              << " pass_rate_1e-3: " << passRate1E_3 << std::endl;
+              << " kvcache seq_len: " << kvSequenceLength << " kvcache capacity: " << resolvedKvCacheCapacity
+              << " q_seq_len: " << qSequenceLength << " sliding_window: " << slidingWindowSize
+              << " paged_kv: " << usePagedKVCache << " tokens_per_page: " << tokensPerPage
+              << " attention_scale: " << resolvedAttentionScale << " pass_rate_1e-3: " << passRate1E_3 << std::endl;
     EXPECT_GT(passRate1E_3, 0.9);
     EXPECT_FALSE(NanValueDetected);
 
@@ -394,13 +547,23 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
                 }
             }
 
-            int32_t const attentionLength
-                = slidingWindowSize > 0 ? std::min(kvSequenceLength, slidingWindowSize) : kvSequenceLength;
-            auto kiRef = sliceKVWindow(ki, numKVHeads, headSize, kvSequenceLength, slidingWindowSize);
-            auto viRef = sliceKVWindow(vi, numKVHeads, headSize, kvSequenceLength, slidingWindowSize);
-            auto refFp8 = casualAttentionRef<__nv_fp8_e4m3>(qi, kiRef, viRef, qSequenceLength, attentionLength,
-                numQHeads, numKVHeads, headSize, resolvedAttentionScale, std::make_optional(treeMasks[b]),
-                kScaleQuantOrig, vScaleQuantOrig);
+            std::vector<half> refFp8;
+            if (options.contiguousQuerySwa)
+            {
+                refFp8 = casualAttentionRef<__nv_fp8_e4m3>(qi, ki, vi, qSequenceLength, kvSequenceLength, numQHeads,
+                    numKVHeads, headSize, resolvedAttentionScale, std::make_optional(treeMasks[b]), kScaleQuantOrig,
+                    vScaleQuantOrig, slidingWindowSize, /*contiguousQuerySwa=*/true, options.attentionSinks);
+            }
+            else
+            {
+                int32_t const attentionLength
+                    = slidingWindowSize > 0 ? std::min(kvSequenceLength, slidingWindowSize) : kvSequenceLength;
+                auto kiRef = sliceKVWindow(ki, numKVHeads, headSize, kvSequenceLength, slidingWindowSize);
+                auto viRef = sliceKVWindow(vi, numKVHeads, headSize, kvSequenceLength, slidingWindowSize);
+                refFp8 = casualAttentionRef<__nv_fp8_e4m3>(qi, kiRef, viRef, qSequenceLength, attentionLength,
+                    numQHeads, numKVHeads, headSize, resolvedAttentionScale, std::make_optional(treeMasks[b]),
+                    kScaleQuantOrig, vScaleQuantOrig, 0, /*contiguousQuerySwa=*/false, options.attentionSinks);
+            }
             outReferenceFp8.insert(outReferenceFp8.end(), refFp8.begin(), refFp8.end());
         }
 
@@ -410,8 +573,9 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
 
         EXPECT_TRUE(trt_edgellm::canCompileXQAKernel(
             numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, DataType::kFP8));
-        ASSERT_TRUE(trt_edgellm::loadXQAJitKernelForTest(smVersion, DataType::kHALF, DataType::kFP8, headSize,
-            numQHeads, numKVHeads, slidingWindowSize > 0, /*specDecode=*/true, tokensPerPage));
+        ASSERT_TRUE(
+            trt_edgellm::loadXQAJitKernelForTest(smVersion, DataType::kHALF, DataType::kFP8, headSize, numQHeads,
+                numKVHeads, slidingWindowSize > 0, /*specDecode=*/true, tokensPerPage, options.contiguousQuerySwa));
         trt_edgellm::DecoderXQARunner runnerFp8(
             DataType::kHALF, DataType::kFP8, batchSize, numQHeads, numKVHeads, headSize, smVersion);
         auto paramsFp8 = runnerFp8.initXQAParams();
@@ -419,7 +583,7 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
         paramsFp8.qInputPtr = thrust::raw_pointer_cast(qInputDevice.data());
         paramsFp8.kvCache.data = thrust::raw_pointer_cast(kvInputFp8Device.data());
         paramsFp8.kvCache.sequence_lengths = thrust::raw_pointer_cast(kvCacheLengthDevice.data());
-        paramsFp8.kvCache.capacity = kvSequenceLength;
+        paramsFp8.kvCache.capacity = resolvedKvCacheCapacity;
         if (usePagedKVCache)
         {
             paramsFp8.kvCache.pageList = thrust::raw_pointer_cast(kvCachePageListDevice.data());
@@ -427,10 +591,13 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
         }
         paramsFp8.output = thrust::raw_pointer_cast(outFp8Device.data());
         paramsFp8.treeAttnMask = thrust::raw_pointer_cast(packedTreeMaskDevice.data());
+        paramsFp8.attentionSinks
+            = options.attentionSinks.has_value() ? thrust::raw_pointer_cast(attentionSinksDevice.data()) : nullptr;
         paramsFp8.attentionScale = resolvedAttentionScale;
         paramsFp8.kScale = kScaleQuantOrig;
         paramsFp8.vScale = vScaleQuantOrig;
         paramsFp8.slidingWinSize = slidingWindowSize > 0 ? static_cast<uint32_t>(slidingWindowSize) : 0U;
+        paramsFp8.contiguousQuerySwa = options.contiguousQuerySwa;
 
         // Reuse the same stream used for FP16 decoding.
         cudaStream_t stream{nullptr};
@@ -452,11 +619,11 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
             {
                 numClose++;
             }
-            if (isnan(__half2float(outFp8Host[i])))
+            if (!std::isfinite(__half2float(outFp8Host[i])))
             {
                 NanValueDetectedFp8 = true;
             }
-            EXPECT_FALSE(isnan(__half2float(outFp8Host[i])));
+            EXPECT_TRUE(std::isfinite(__half2float(outFp8Host[i])));
         }
         float const fp8PassRate1E_3 = static_cast<float>(numClose) / static_cast<float>(outReferenceFp8.size());
 
@@ -472,6 +639,124 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
 #else
     (void) useFp8Cache;
 #endif
+}
+
+void TestXQATreeAttentionRaggedDSpark()
+{
+    constexpr int32_t kBATCH_SIZE = 2;
+    constexpr int32_t kNUM_Q_HEADS = 32;
+    constexpr int32_t kNUM_KV_HEADS = 2;
+    constexpr int32_t kHEAD_SIZE = 128;
+    constexpr int32_t kMAX_Q_SEQUENCE_LENGTH = 8;
+    constexpr int32_t kHISTORY_LENGTH = 1040;
+    constexpr int32_t kKV_CACHE_CAPACITY = kHISTORY_LENGTH + kMAX_Q_SEQUENCE_LENGTH;
+    constexpr int32_t kSLIDING_WINDOW_SIZE = 1024;
+    std::vector<int32_t> const actualQSequenceLengths{8, 5};
+    std::vector<int32_t> const qCuSequenceLengths{0, 8, 13};
+    std::vector<int32_t> const kvCacheLengths{
+        kHISTORY_LENGTH + actualQSequenceLengths[0], kHISTORY_LENGTH + actualQSequenceLengths[1]};
+    std::vector<float> attentionSinks(kNUM_Q_HEADS);
+    for (int32_t headIdx = 0; headIdx < kNUM_Q_HEADS; ++headIdx)
+    {
+        attentionSinks[headIdx] = static_cast<float>(headIdx - kNUM_Q_HEADS / 2) * 0.125F;
+    }
+
+    initializeCudaContextForXQATest();
+    int32_t smVersion = getSMVersion();
+    applyThorSMRenumberWAR(smVersion);
+    ASSERT_TRUE(trt_edgellm::canCompileXQAKernel(
+        kNUM_Q_HEADS, kNUM_KV_HEADS, kHEAD_SIZE, smVersion, DataType::kHALF, DataType::kHALF));
+    ASSERT_TRUE(trt_edgellm::loadXQAJitKernelForTest(smVersion, DataType::kHALF, DataType::kHALF, kHEAD_SIZE,
+        kNUM_Q_HEADS, kNUM_KV_HEADS, /*slidingWindow=*/true, /*specDecode=*/true, 0,
+        /*contiguousQuerySwa=*/true));
+
+    std::vector<half> qInput;
+    std::vector<half> kvInput(
+        static_cast<size_t>(kBATCH_SIZE) * 2 * kNUM_KV_HEADS * kKV_CACHE_CAPACITY * kHEAD_SIZE, __float2half(0.0F));
+    std::vector<half> outReference;
+    std::vector<int32_t> packedTreeMask;
+    float const attentionScale = 1.0F / std::sqrt(static_cast<float>(kHEAD_SIZE));
+
+    for (int32_t batchIdx = 0; batchIdx < kBATCH_SIZE; ++batchIdx)
+    {
+        int32_t const actualQSequenceLength = actualQSequenceLengths[batchIdx];
+        int32_t const kvSequenceLength = kvCacheLengths[batchIdx];
+        std::vector<half> q(static_cast<size_t>(actualQSequenceLength) * kNUM_Q_HEADS * kHEAD_SIZE);
+        std::vector<half> k(static_cast<size_t>(kvSequenceLength) * kNUM_KV_HEADS * kHEAD_SIZE);
+        std::vector<half> v(static_cast<size_t>(kvSequenceLength) * kNUM_KV_HEADS * kHEAD_SIZE);
+        deterministicFloatInitialization(q, batchIdx * 3 + 1);
+        deterministicFloatInitialization(k, batchIdx * 3 + 2);
+        deterministicFloatInitialization(v, batchIdx * 3 + 3);
+
+        std::vector<int32_t> treeMask(actualQSequenceLength * actualQSequenceLength, 0);
+        for (int32_t queryIdx = 0; queryIdx < actualQSequenceLength; ++queryIdx)
+        {
+            std::fill_n(treeMask.begin() + queryIdx * actualQSequenceLength, queryIdx + 1, 1);
+            uint32_t const packedMask = (1U << (queryIdx + 1)) - 1U;
+            packedTreeMask.push_back(static_cast<int32_t>(packedMask));
+        }
+
+        auto reference = casualAttentionRef<half>(q, k, v, actualQSequenceLength, kvSequenceLength, kNUM_Q_HEADS,
+            kNUM_KV_HEADS, kHEAD_SIZE, attentionScale, treeMask, 1.0F, 1.0F, kSLIDING_WINDOW_SIZE,
+            /*contiguousQuerySwa=*/true, attentionSinks);
+        qInput.insert(qInput.end(), q.begin(), q.end());
+        outReference.insert(outReference.end(), reference.begin(), reference.end());
+
+        size_t const batchOffset = static_cast<size_t>(batchIdx) * 2 * kNUM_KV_HEADS * kKV_CACHE_CAPACITY * kHEAD_SIZE;
+        size_t const vOffset = static_cast<size_t>(kNUM_KV_HEADS) * kKV_CACHE_CAPACITY * kHEAD_SIZE;
+        for (int32_t kvHeadIdx = 0; kvHeadIdx < kNUM_KV_HEADS; ++kvHeadIdx)
+        {
+            for (int32_t tokenIdx = 0; tokenIdx < kvSequenceLength; ++tokenIdx)
+            {
+                for (int32_t d = 0; d < kHEAD_SIZE; ++d)
+                {
+                    size_t const compactOffset
+                        = (static_cast<size_t>(kvHeadIdx) * kvSequenceLength + tokenIdx) * kHEAD_SIZE + d;
+                    size_t const cacheOffset
+                        = (static_cast<size_t>(kvHeadIdx) * kKV_CACHE_CAPACITY + tokenIdx) * kHEAD_SIZE + d;
+                    kvInput[batchOffset + cacheOffset] = k[compactOffset];
+                    kvInput[batchOffset + vOffset + cacheOffset] = v[compactOffset];
+                }
+            }
+        }
+    }
+
+    thrust::device_vector<half> qInputDevice(qInput);
+    thrust::device_vector<half> kvInputDevice(kvInput);
+    thrust::device_vector<half> outputDevice(outReference.size(), __float2half(0.0F));
+    thrust::device_vector<int32_t> kvCacheLengthsDevice(kvCacheLengths);
+    thrust::device_vector<int32_t> qCuSequenceLengthsDevice(qCuSequenceLengths);
+    thrust::device_vector<int32_t> packedTreeMaskDevice(packedTreeMask);
+    thrust::device_vector<float> attentionSinksDevice(attentionSinks);
+
+    trt_edgellm::DecoderXQARunner runner(
+        DataType::kHALF, DataType::kHALF, kBATCH_SIZE, kNUM_Q_HEADS, kNUM_KV_HEADS, kHEAD_SIZE, smVersion);
+    auto params = runner.initXQAParams();
+    params.qSeqLen = kMAX_Q_SEQUENCE_LENGTH;
+    params.qCuSeqLen = thrust::raw_pointer_cast(qCuSequenceLengthsDevice.data());
+    params.qInputPtr = thrust::raw_pointer_cast(qInputDevice.data());
+    params.kvCache.data = thrust::raw_pointer_cast(kvInputDevice.data());
+    params.kvCache.sequence_lengths = thrust::raw_pointer_cast(kvCacheLengthsDevice.data());
+    params.kvCache.capacity = kKV_CACHE_CAPACITY;
+    params.output = thrust::raw_pointer_cast(outputDevice.data());
+    params.treeAttnMask = thrust::raw_pointer_cast(packedTreeMaskDevice.data());
+    params.attentionSinks = thrust::raw_pointer_cast(attentionSinksDevice.data());
+    params.attentionScale = attentionScale;
+    params.slidingWinSize = kSLIDING_WINDOW_SIZE;
+    params.contiguousQuerySwa = true;
+
+    cudaStream_t stream{nullptr};
+    runner.dispatchSpecDecodeXQAKernel(params, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+
+    thrust::host_vector<half> outputHost(outputDevice);
+    ASSERT_EQ(outputHost.size(), outReference.size());
+    for (size_t i = 0; i < outReference.size(); ++i)
+    {
+        ASSERT_TRUE(std::isfinite(__half2float(outputHost[i])));
+        EXPECT_TRUE(isclose(outputHost[i], outReference[i], 1.0e-2F, 1.0e-2F));
+    }
 }
 
 // Test with capacity > kvSequenceLength (simulates runtime with large allocated KV cache, partially filled).
@@ -716,7 +1001,155 @@ TEST(XQATreeAttentionDecodingTest, slidingWindowAccuracy)
     TestXQATreeAttentionDecodingAccuracy(1, 32, 4, 128, 96, 48, false, 192);
 }
 
+TEST(XQATreeAttentionDecodingTest, contiguousQuerySwaDSparkBoundaries)
+{
+    constexpr int32_t kNUM_Q_HEADS = 32;
+    constexpr int32_t kNUM_KV_HEADS = 2;
+    constexpr int32_t kHEAD_SIZE = 128;
+    constexpr int32_t kQ_SEQUENCE_LENGTH = 8;
+    constexpr int32_t kSLIDING_WINDOW_SIZE = 1024;
+    struct TestCase
+    {
+        int32_t historyLength;
+        int32_t tokensPerPage;
+    };
+    std::vector<TestCase> const cases{{32, 0}, {1020, 0}, {1040, 0}, {1144, 128}, {1272, 128}};
+    XQATreeAttentionTestOptions const options{
+        true, XQATreeMaskPattern::kCausal, XQATreeDataPattern::kDeterministic, std::nullopt};
+
+    for (int32_t const batchSize : {1, 2})
+    {
+        for (TestCase const& testCase : cases)
+        {
+            TestXQATreeAttentionDecodingAccuracy(batchSize, kNUM_Q_HEADS, kNUM_KV_HEADS, kHEAD_SIZE,
+                testCase.historyLength + kQ_SEQUENCE_LENGTH, kQ_SEQUENCE_LENGTH, false, kSLIDING_WINDOW_SIZE,
+                testCase.tokensPerPage, std::nullopt, options);
+        }
+    }
+}
+
+TEST(XQATreeAttentionDecodingTest, contiguousQuerySwaAttentionSink)
+{
+    constexpr int32_t kNUM_Q_HEADS = 32;
+    constexpr int32_t kNUM_KV_HEADS = 2;
+    constexpr int32_t kHEAD_SIZE = 128;
+    constexpr int32_t kKV_SEQUENCE_LENGTH = 1048;
+    constexpr int32_t kQ_SEQUENCE_LENGTH = 8;
+    constexpr int32_t kSLIDING_WINDOW_SIZE = 1024;
+    XQATreeAttentionTestOptions options{
+        true, XQATreeMaskPattern::kCausal, XQATreeDataPattern::kDeterministic, std::vector<float>(kNUM_Q_HEADS, 0.0F)};
+
+    TestXQATreeAttentionDecodingAccuracy(1, kNUM_Q_HEADS, kNUM_KV_HEADS, kHEAD_SIZE, kKV_SEQUENCE_LENGTH,
+        kQ_SEQUENCE_LENGTH, false, kSLIDING_WINDOW_SIZE, 0, std::nullopt, options);
+
+    std::vector<float> distinctSinks(kNUM_Q_HEADS);
+    for (int32_t headIdx = 0; headIdx < kNUM_Q_HEADS; ++headIdx)
+    {
+        distinctSinks[headIdx] = static_cast<float>(headIdx - kNUM_Q_HEADS / 2) * 0.125F;
+    }
+    options.attentionSinks = distinctSinks;
+    TestXQATreeAttentionDecodingAccuracy(1, kNUM_Q_HEADS, kNUM_KV_HEADS, kHEAD_SIZE, kKV_SEQUENCE_LENGTH,
+        kQ_SEQUENCE_LENGTH, false, kSLIDING_WINDOW_SIZE, 0, std::nullopt, options);
+
+    std::vector<float> extremeSinks(kNUM_Q_HEADS);
+    for (int32_t headIdx = 0; headIdx < kNUM_Q_HEADS; ++headIdx)
+    {
+        extremeSinks[headIdx] = headIdx % 2 == 0 ? -80.0F : 100.0F;
+    }
+    options.attentionSinks = extremeSinks;
+    TestXQATreeAttentionDecodingAccuracy(1, kNUM_Q_HEADS, kNUM_KV_HEADS, kHEAD_SIZE, kKV_SEQUENCE_LENGTH,
+        kQ_SEQUENCE_LENGTH, false, kSLIDING_WINDOW_SIZE, 0, std::nullopt, options);
+}
+
+TEST(XQATreeAttentionDecodingTest, contiguousQuerySwaAttentionSinkAnalytic)
+{
+    constexpr int32_t kNUM_Q_HEADS = 32;
+    constexpr int32_t kNUM_KV_HEADS = 2;
+    constexpr int32_t kHEAD_SIZE = 128;
+    constexpr int32_t kQ_SEQUENCE_LENGTH = 8;
+    constexpr int32_t kSLIDING_WINDOW_SIZE = 1024;
+    XQATreeAttentionTestOptions options{
+        true, XQATreeMaskPattern::kCausal, XQATreeDataPattern::kZeroQKUnitV, std::vector<float>(kNUM_Q_HEADS, 0.0F)};
+
+    TestXQATreeAttentionDecodingAccuracy(1, kNUM_Q_HEADS, kNUM_KV_HEADS, kHEAD_SIZE, 40, kQ_SEQUENCE_LENGTH, false,
+        kSLIDING_WINDOW_SIZE, 0, std::nullopt, options);
+
+    options.maskPattern = XQATreeMaskPattern::kAllMasked;
+    TestXQATreeAttentionDecodingAccuracy(1, kNUM_Q_HEADS, kNUM_KV_HEADS, kHEAD_SIZE, kQ_SEQUENCE_LENGTH,
+        kQ_SEQUENCE_LENGTH, false, kSLIDING_WINDOW_SIZE, 0, std::nullopt, options);
+}
+
+TEST(XQATreeAttentionDecodingTest, contiguousQuerySwaIndependentBoundaryOracle)
+{
+    constexpr int32_t kNUM_Q_HEADS = 32;
+    constexpr int32_t kNUM_KV_HEADS = 2;
+    constexpr int32_t kHEAD_SIZE = 128;
+    constexpr int32_t kKV_SEQUENCE_LENGTH = 1048;
+    constexpr int32_t kQ_SEQUENCE_LENGTH = 8;
+    constexpr int32_t kSLIDING_WINDOW_SIZE = 1024;
+    XQATreeAttentionTestOptions const options{true, XQATreeMaskPattern::kCausal, XQATreeDataPattern::kSwaBoundarySpikes,
+        std::vector<float>(kNUM_Q_HEADS, 0.0F)};
+
+    TestXQATreeAttentionDecodingAccuracy(1, kNUM_Q_HEADS, kNUM_KV_HEADS, kHEAD_SIZE, kKV_SEQUENCE_LENGTH,
+        kQ_SEQUENCE_LENGTH, false, kSLIDING_WINDOW_SIZE, 0, std::nullopt, options);
+}
+
+TEST(XQATreeAttentionDecodingTest, contiguousQuerySwaPagedPartialLastPage)
+{
+    constexpr int32_t kNUM_Q_HEADS = 32;
+    constexpr int32_t kNUM_KV_HEADS = 2;
+    constexpr int32_t kHEAD_SIZE = 128;
+    constexpr int32_t kKV_SEQUENCE_LENGTH = 1150;
+    constexpr int32_t kKV_CACHE_CAPACITY = 1152;
+    constexpr int32_t kQ_SEQUENCE_LENGTH = 8;
+    constexpr int32_t kSLIDING_WINDOW_SIZE = 1024;
+    constexpr int32_t kTOKENS_PER_PAGE = 128;
+    XQATreeAttentionTestOptions const options{
+        true, XQATreeMaskPattern::kCausal, XQATreeDataPattern::kDeterministic, std::nullopt};
+
+    TestXQATreeAttentionDecodingAccuracy(1, kNUM_Q_HEADS, kNUM_KV_HEADS, kHEAD_SIZE, kKV_SEQUENCE_LENGTH,
+        kQ_SEQUENCE_LENGTH, false, kSLIDING_WINDOW_SIZE, kTOKENS_PER_PAGE, std::nullopt, options, kKV_CACHE_CAPACITY);
+}
+
+TEST(XQATreeAttentionDecodingTest, contiguousQuerySwaKVRatio7Smoke)
+{
+    constexpr int32_t kNUM_Q_HEADS = 14;
+    constexpr int32_t kNUM_KV_HEADS = 2;
+    constexpr int32_t kHEAD_SIZE = 128;
+    constexpr int32_t kKV_SEQUENCE_LENGTH = 72;
+    constexpr int32_t kQ_SEQUENCE_LENGTH = 8;
+    constexpr int32_t kSLIDING_WINDOW_SIZE = 64;
+    std::vector<float> const distinctSinks{
+        0.0F, 10.0F, 1.0F, 11.0F, 2.0F, 12.0F, 3.0F, 0.5F, 10.5F, 1.5F, 11.5F, 2.5F, 12.5F, 3.5F};
+    XQATreeAttentionTestOptions const options{
+        true, XQATreeMaskPattern::kCausal, XQATreeDataPattern::kDeterministic, distinctSinks};
+
+    TestXQATreeAttentionDecodingAccuracy(1, kNUM_Q_HEADS, kNUM_KV_HEADS, kHEAD_SIZE, kKV_SEQUENCE_LENGTH,
+        kQ_SEQUENCE_LENGTH, false, kSLIDING_WINDOW_SIZE, 0, std::nullopt, options);
+}
+
+TEST(XQATreeAttentionDecodingTest, contiguousQuerySwaRaggedBatch)
+{
+    TestXQATreeAttentionRaggedDSpark();
+}
+
 #if SUPPORTS_FP8
+TEST(XQATreeAttentionDecodingFP8Test, contiguousQuerySwaDSparkPagedSmoke)
+{
+    constexpr int32_t kNUM_Q_HEADS = 32;
+    constexpr int32_t kNUM_KV_HEADS = 2;
+    constexpr int32_t kHEAD_SIZE = 128;
+    constexpr int32_t kKV_SEQUENCE_LENGTH = 1152;
+    constexpr int32_t kQ_SEQUENCE_LENGTH = 8;
+    constexpr int32_t kSLIDING_WINDOW_SIZE = 1024;
+    constexpr int32_t kTOKENS_PER_PAGE = 128;
+    XQATreeAttentionTestOptions const options{
+        true, XQATreeMaskPattern::kCausal, XQATreeDataPattern::kDeterministic, std::nullopt};
+
+    TestXQATreeAttentionDecodingAccuracy(1, kNUM_Q_HEADS, kNUM_KV_HEADS, kHEAD_SIZE, kKV_SEQUENCE_LENGTH,
+        kQ_SEQUENCE_LENGTH, true, kSLIDING_WINDOW_SIZE, kTOKENS_PER_PAGE, std::nullopt, options);
+}
+
 TEST(XQATreeAttentionDecodingFP8Test, accuracyKVRatio4HeadDim128)
 {
     /// KVSequence 256, QSequence 48
@@ -815,6 +1248,8 @@ struct XQATreeAttentionBenchConfig
     int32_t tokensPerPage{128};
     float peakBwGbps{273.0F};
     float peakTflops{0.0F};
+    bool contiguousQuerySwa{false};
+    bool attentionSink{false};
 };
 
 int32_t getBenchEnvInt(char const* name, int32_t defaultValue)
@@ -839,6 +1274,12 @@ float getBenchEnvFloat(char const* name, float defaultValue)
     return parsed > 0.0F ? parsed : defaultValue;
 }
 
+bool getBenchEnvBool(char const* name, bool defaultValue)
+{
+    char const* value = std::getenv(name);
+    return value == nullptr ? defaultValue : std::atoi(value) != 0;
+}
+
 XQATreeAttentionBenchConfig getBenchConfigFromEnv()
 {
     XQATreeAttentionBenchConfig config;
@@ -848,6 +1289,8 @@ XQATreeAttentionBenchConfig getBenchConfigFromEnv()
     config.tokensPerPage = getBenchEnvInt("XQA_BENCH_TOKENS_PER_PAGE", config.tokensPerPage);
     config.peakBwGbps = getBenchEnvFloat("XQA_BENCH_PEAK_BW_GBPS", config.peakBwGbps);
     config.peakTflops = getBenchEnvFloat("XQA_BENCH_PEAK_TFLOPS", config.peakTflops);
+    config.contiguousQuerySwa = getBenchEnvBool("XQA_BENCH_CONTIGUOUS_QUERY_SWA", config.contiguousQuerySwa);
+    config.attentionSink = getBenchEnvBool("XQA_BENCH_ATTENTION_SINK", config.attentionSink);
     return config;
 }
 
@@ -1096,6 +1539,8 @@ void runXQATreeAttentionBenchmark(nvinfer1::DataType kvDataType, char const* kvL
     {
         ASSERT_EQ(shape.kvSequenceLength % tokensPerPage, 0);
     }
+    ASSERT_FALSE(config.contiguousQuerySwa && shape.slidingWindowSize <= 0)
+        << "XQA_BENCH_CONTIGUOUS_QUERY_SWA requires XQA_BENCH_SLIDING_WINDOW_SIZE > 0";
 
     int32_t smVersion = getSMVersion();
     applyThorSMRenumberWAR(smVersion);
@@ -1107,7 +1552,8 @@ void runXQATreeAttentionBenchmark(nvinfer1::DataType kvDataType, char const* kvL
         shape.numQHeads, shape.numKVHeads, shape.headSize, smVersion, DataType::kHALF, kvDataType))
         << "No compatible XQA kernel for SM " << smVersion << " paged_kv=" << usePagedKVCache;
     ASSERT_TRUE(trt_edgellm::loadXQAJitKernelForTest(smVersion, DataType::kHALF, kvDataType, shape.headSize,
-        shape.numQHeads, shape.numKVHeads, shape.slidingWindowSize > 0, /*specDecode=*/true, tokensPerPage));
+        shape.numQHeads, shape.numKVHeads, shape.slidingWindowSize > 0, /*specDecode=*/true, tokensPerPage,
+        config.contiguousQuerySwa));
 
     int32_t deviceId{0};
     CUDA_CHECK(cudaGetDevice(&deviceId));
@@ -1118,6 +1564,8 @@ void runXQATreeAttentionBenchmark(nvinfer1::DataType kvDataType, char const* kvL
     std::vector<int32_t> const packedMask = makeCausalPackedTreeMask(shape.batchSize, shape.qSequenceLength);
     std::vector<int32_t> const pageList
         = usePagedKVCache ? makeBenchPagedKvPageList(shape, tokensPerPage) : std::vector<int32_t>{};
+    std::vector<float> const attentionSinksHost(shape.numQHeads, 0.0F);
+    thrust::device_vector<float> attentionSinksDevice(attentionSinksHost);
     size_t const outputElems
         = static_cast<size_t>(shape.batchSize) * shape.qSequenceLength * shape.numQHeads * shape.headSize;
 
@@ -1174,10 +1622,12 @@ void runXQATreeAttentionBenchmark(nvinfer1::DataType kvDataType, char const* kvL
         }
         params.output = thrust::raw_pointer_cast(buffer.output.data());
         params.treeAttnMask = thrust::raw_pointer_cast(buffer.packedMask.data());
+        params.attentionSinks = config.attentionSink ? thrust::raw_pointer_cast(attentionSinksDevice.data()) : nullptr;
         params.attentionScale = 1.0F / std::sqrt(static_cast<float>(shape.headSize));
         params.kScale = buffer.kScale;
         params.vScale = buffer.vScale;
         params.slidingWinSize = shape.slidingWindowSize > 0 ? static_cast<uint32_t>(shape.slidingWindowSize) : 0U;
+        params.contiguousQuerySwa = config.contiguousQuerySwa;
         paramsList.push_back(params);
     }
 
@@ -1242,22 +1692,25 @@ void runXQATreeAttentionBenchmark(nvinfer1::DataType kvDataType, char const* kvL
     benchmarkOutput << "Device: " << prop.name << " SM " << prop.major << "." << prop.minor
                     << " sm_count: " << prop.multiProcessorCount << "\n";
     benchmarkOutput << "DTypes: Q/O=FP16 KV=" << kvLabel << "\n";
+    benchmarkOutput << "Variant: " << (config.contiguousQuerySwa ? "contiguous_query_swa" : "legacy_request_tail")
+                    << " attention_sink=" << config.attentionSink << "\n";
     benchmarkOutput << "KV cache: " << (usePagedKVCache ? "paged" : "contiguous")
                     << " tokens_per_page=" << tokensPerPage << "\n";
     benchmarkOutput << "Warmup: " << config.warmup << " iterations: " << config.iterations
                     << " buffers: " << config.buffers << "\n";
     benchmarkOutput << "Buffer policy: round-robin independent Q/KV/output/mask buffers\n";
     benchmarkOutput << "Workspace: none\n";
-    benchmarkOutput << "shape,kv_dtype,paged_kv,tokens_per_page,q_heads,kv_heads,group,q_len,kv_len,sliding_window,"
-                    << "effective_kv_len,head_dim,latency_ms,min_compute_ms,min_memory_ms,achieved_tflops,"
-                    << "achieved_gbps,compute_util_pct,bw_util_pct\n";
+    benchmarkOutput << "shape,kv_dtype,paged_kv,tokens_per_page,contiguous_query_swa,attention_sink,q_heads,kv_heads,"
+                    << "group,q_len,kv_len,sliding_window,effective_kv_len,head_dim,latency_ms,min_compute_ms,"
+                    << "min_memory_ms,achieved_tflops,achieved_gbps,compute_util_pct,bw_util_pct\n";
     benchmarkOutput << shapeToString(shape) << "," << kvLabel << "," << usePagedKVCache << "," << tokensPerPage << ","
-                    << shape.numQHeads << "," << shape.numKVHeads << "," << shape.numQHeads / shape.numKVHeads << ","
-                    << shape.qSequenceLength << "," << shape.kvSequenceLength << "," << shape.slidingWindowSize << ","
-                    << effectiveKvLength << "," << shape.headSize << "," << formatBenchFloat(medianMs) << ","
-                    << minComputeStr << "," << formatBenchFloat(minMemoryMs) << "," << formatBenchFloat(achievedTflops)
-                    << "," << formatBenchFloat(achievedGbps) << "," << computeUtilStr << ","
-                    << formatBenchFloat(bandwidthUtil) << "\n";
+                    << config.contiguousQuerySwa << "," << config.attentionSink << "," << shape.numQHeads << ","
+                    << shape.numKVHeads << "," << shape.numQHeads / shape.numKVHeads << "," << shape.qSequenceLength
+                    << "," << shape.kvSequenceLength << "," << shape.slidingWindowSize << "," << effectiveKvLength
+                    << "," << shape.headSize << "," << formatBenchFloat(medianMs) << "," << minComputeStr << ","
+                    << formatBenchFloat(minMemoryMs) << "," << formatBenchFloat(achievedTflops) << ","
+                    << formatBenchFloat(achievedGbps) << "," << computeUtilStr << "," << formatBenchFloat(bandwidthUtil)
+                    << "\n";
     benchmarkOutput << "Metric notes: FLOPs estimate = 4 * B * QHeads * QLen * effective_KVLen * HeadDim.\n";
     benchmarkOutput << "Memory estimate includes Q read, effective K/V cache read, output write, packed tree mask read,"
                     << " and page list read when paged.\n";
@@ -1268,6 +1721,8 @@ void runXQATreeAttentionBenchmark(nvinfer1::DataType kvDataType, char const* kvL
     // `GTEST_OUTPUT=json:/tmp/xqa_bench.json ./run.py xqa-bench`, then read each testcase's
     // `benchmark_output` CSV from the JSON `testsuites[].testsuite[]` entries.
     ::testing::Test::RecordProperty("benchmark_output", benchmarkOutput.str());
+    ::testing::Test::RecordProperty("contiguous_query_swa", config.contiguousQuerySwa ? "1" : "0");
+    ::testing::Test::RecordProperty("attention_sink", config.attentionSink ? "1" : "0");
     EXPECT_GT(medianMs, 0.0);
 }
 

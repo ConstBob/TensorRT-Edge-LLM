@@ -58,9 +58,18 @@ struct XQAJitKeyHasher
         hash = mix(hash, static_cast<size_t>(key.tokensPerPage));
         hash = mix(hash, static_cast<size_t>(key.slidingWindow));
         hash = mix(hash, static_cast<size_t>(key.specDecode));
+        hash = mix(hash, static_cast<size_t>(key.contiguousQuerySwa));
         return hash;
     }
 };
+
+void validateXQAJitKey(XQAJitKey const& key)
+{
+    if (key.contiguousQuerySwa && (!key.specDecode || !key.slidingWindow))
+    {
+        throw std::runtime_error("Contiguous-query XQA SWA requires spec-decode and sliding-window attention.");
+    }
+}
 
 int32_t getKVCacheEnum(nvinfer1::DataType kvDataType)
 {
@@ -95,6 +104,7 @@ std::string getGpuArchitectureOption(int32_t sm)
 
 std::vector<std::string> buildNvrtcOptions(XQAJitKey const& key)
 {
+    validateXQAJitKey(key);
     if (key.dataType != nvinfer1::DataType::kHALF)
     {
         throw std::runtime_error("XQA NVRTC JIT supports only FP16 Q/O tensors.");
@@ -116,6 +126,7 @@ std::vector<std::string> buildNvrtcOptions(XQAJitKey const& key)
     options.emplace_back("-DCACHE_ELEM_ENUM=" + std::to_string(getKVCacheEnum(key.kvDataType)));
     options.emplace_back("-DSLIDING_WINDOW=" + std::to_string(key.slidingWindow ? 1 : 0));
     options.emplace_back("-DSPEC_DEC=" + std::to_string(key.specDecode ? 1 : 0));
+    options.emplace_back("-DCONTIGUOUS_QUERY_SWA=" + std::to_string(key.contiguousQuerySwa ? 1 : 0));
     options.emplace_back("-DHEAD_GRP_SIZE=" + std::to_string(key.specDecode ? 0 : key.qHeadsPerKv));
     options.emplace_back("-DM_TILESIZE=" + std::to_string(getXQAJitMTileSize(key)));
 
@@ -135,13 +146,13 @@ std::string keyToString(XQAJitKey const& key)
 {
     return format::fmtstr(
         "SM%d, dtype=%d, kv_dtype=%d, head_dim=%d, q_heads_per_kv=%d, tokens_per_page=%d, sliding_window=%d, "
-        "spec_decode=%d",
+        "spec_decode=%d, contiguous_query_swa=%d",
         key.sm, static_cast<int32_t>(key.dataType), static_cast<int32_t>(key.kvDataType), key.headSize, key.qHeadsPerKv,
-        key.tokensPerPage, key.slidingWindow ? 1 : 0, key.specDecode ? 1 : 0);
+        key.tokensPerPage, key.slidingWindow ? 1 : 0, key.specDecode ? 1 : 0, key.contiguousQuerySwa ? 1 : 0);
 }
 
 //! Format version for the serialized XQA JIT kernel blob. Bump on any layout change.
-constexpr uint32_t kXQA_JIT_BLOB_VERSION{1};
+constexpr uint32_t kXQA_JIT_BLOB_VERSION{2};
 
 void appendU32(std::vector<uint8_t>& out, uint32_t value)
 {
@@ -178,6 +189,7 @@ void appendKey(std::vector<uint8_t>& out, XQAJitKey const& key)
     appendU32(out, static_cast<uint32_t>(key.tokensPerPage));
     appendU32(out, key.slidingWindow ? 1U : 0U);
     appendU32(out, key.specDecode ? 1U : 0U);
+    appendU32(out, key.contiguousQuerySwa ? 1U : 0U);
 }
 
 XQAJitKey readKey(uint8_t const*& cursor, size_t& remaining)
@@ -191,6 +203,8 @@ XQAJitKey readKey(uint8_t const*& cursor, size_t& remaining)
     key.tokensPerPage = static_cast<int32_t>(readU32(cursor, remaining));
     key.slidingWindow = readU32(cursor, remaining) != 0U;
     key.specDecode = readU32(cursor, remaining) != 0U;
+    key.contiguousQuerySwa = readU32(cursor, remaining) != 0U;
+    validateXQAJitKey(key);
     return key;
 }
 
@@ -203,6 +217,7 @@ std::vector<uint8_t> serializeXQAJitKernels(std::vector<XQAJitKernel> const& ker
     appendU32(blob, static_cast<uint32_t>(kernels.size()));
     for (XQAJitKernel const& kernel : kernels)
     {
+        validateXQAJitKey(kernel.key);
         appendKey(blob, kernel.key);
         appendU32(blob, static_cast<uint32_t>(kernel.cubin.size()));
         blob.insert(blob.end(), kernel.cubin.begin(), kernel.cubin.end());
@@ -297,6 +312,7 @@ bool canCompileXQAKernel(int32_t numQHeads, int32_t numKVHeads, int32_t headSize
 
 XQAJitResult compileXQAKernel(XQAJitKey const& key)
 {
+    validateXQAJitKey(key);
     static PluginJitCompileCache<XQAJitKey, XQAJitResult, XQAJitKeyHasher> sCache;
     return sCache.getOrCompile(key, [&key] {
         XQAJitResult result;

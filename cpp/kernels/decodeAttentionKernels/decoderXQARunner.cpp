@@ -70,6 +70,13 @@ XQADataType trtToXqaDataType(nvinfer1::DataType type)
     }
     return xqaType;
 }
+
+void validateContiguousQuerySwaKey(XQAJitKey const& key)
+{
+    check::check(!key.contiguousQuerySwa || (key.specDecode && key.slidingWindow),
+        "Contiguous-query XQA SWA requires spec-decode and sliding-window attention.");
+}
+
 struct XQAKernelLoadHashKey
 {
     XQADataType data_type;
@@ -112,13 +119,15 @@ struct XQAKernelRuntimeHashKey
     int32_t num_q_heads_per_kv;
     int32_t beam_size;
     bool sliding_window;
+    bool contiguous_query_swa;
     int32_t tokens_per_page;
 
     bool operator==(XQAKernelRuntimeHashKey const& other) const noexcept
     {
         return q_data_type == other.q_data_type && kv_data_type == other.kv_data_type && head_size == other.head_size
             && num_q_heads_per_kv == other.num_q_heads_per_kv && beam_size == other.beam_size
-            && sliding_window == other.sliding_window && tokens_per_page == other.tokens_per_page;
+            && sliding_window == other.sliding_window && contiguous_query_swa == other.contiguous_query_swa
+            && tokens_per_page == other.tokens_per_page;
     }
 };
 
@@ -127,7 +136,8 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQALaunchParams const& xq
     constexpr int32_t kBEAM_SIZE{1};
     int32_t numQHeadPerKV = xqaParams.numQheads / xqaParams.numKVheads;
     return {trtToXqaDataType(xqaParams.dataType), trtToXqaDataType(xqaParams.kvDataType), xqaParams.headSize,
-        numQHeadPerKV, kBEAM_SIZE, xqaParams.slidingWinSize > 0, static_cast<int32_t>(xqaParams.kvCache.tokensPerPage)};
+        numQHeadPerKV, kBEAM_SIZE, xqaParams.slidingWinSize > 0, xqaParams.contiguousQuerySwa,
+        static_cast<int32_t>(xqaParams.kvCache.tokensPerPage)};
 }
 
 XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParamsSpecDecode(XQALaunchParams const& xqaParams) noexcept
@@ -135,7 +145,8 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParamsSpecDecode(XQALaunchParams
     constexpr int32_t kBEAM_SIZE{1};
     constexpr int32_t kQHEAD_PER_KV = 0; // Tree attention kernel supports any ratio of Q/KV heads.
     return {trtToXqaDataType(xqaParams.dataType), trtToXqaDataType(xqaParams.kvDataType), xqaParams.headSize,
-        kQHEAD_PER_KV, kBEAM_SIZE, xqaParams.slidingWinSize > 0, static_cast<int32_t>(xqaParams.kvCache.tokensPerPage)};
+        kQHEAD_PER_KV, kBEAM_SIZE, xqaParams.slidingWinSize > 0, xqaParams.contiguousQuerySwa,
+        static_cast<int32_t>(xqaParams.kvCache.tokensPerPage)};
 }
 
 std::string formatMissingXQAKernelMessage(char const* kernelName, XQAKernelRuntimeHashKey const& hashKey,
@@ -143,16 +154,19 @@ std::string formatMissingXQAKernelMessage(char const* kernelName, XQAKernelRunti
 {
     return format::fmtstr(
         "No available cubin for %s. Runtime key: sm=%d, q_dtype=%d, kv_dtype=%d, head_size=%d, "
-        "q_heads_per_kv=%d, beam_size=%d, sliding_window=%d. Launch params: q_heads=%d, kv_heads=%d, batch_size=%d, "
-        "kv_cache_capacity=%u, q_seq_len=%d, head_group_size=%d, trt_dtype=%d, trt_kv_dtype=%d. "
+        "q_heads_per_kv=%d, beam_size=%d, sliding_window=%d, contiguous_query_swa=%d, tokens_per_page=%d. Launch "
+        "params: q_heads=%d, kv_heads=%d, batch_size=%d, kv_cache_capacity=%u, q_seq_len=%d, head_group_size=%d, "
+        "trt_dtype=%d, trt_kv_dtype=%d. "
         "Expected JIT cubin key: sm=%d, data_type=%d, kv_data_type=%d, head_size=%d, q_heads_per_kv=%d, "
-        "sliding_window=%d, spec_decode=%d.",
+        "sliding_window=%d, spec_decode=%d, contiguous_query_swa=%d, tokens_per_page=%d.",
         kernelName, smVersion, static_cast<int32_t>(hashKey.q_data_type), static_cast<int32_t>(hashKey.kv_data_type),
         hashKey.head_size, hashKey.num_q_heads_per_kv, hashKey.beam_size, static_cast<int32_t>(hashKey.sliding_window),
-        params.numQheads, params.numKVheads, params.batchSize, params.kvCache.capacity, params.qSeqLen,
-        params.headGroupSize, static_cast<int32_t>(params.dataType), static_cast<int32_t>(params.kvDataType), smVersion,
+        static_cast<int32_t>(hashKey.contiguous_query_swa), hashKey.tokens_per_page, params.numQheads,
+        params.numKVheads, params.batchSize, params.kvCache.capacity, params.qSeqLen, params.headGroupSize,
+        static_cast<int32_t>(params.dataType), static_cast<int32_t>(params.kvDataType), smVersion,
         static_cast<int32_t>(params.dataType), static_cast<int32_t>(params.kvDataType), hashKey.head_size,
-        hashKey.num_q_heads_per_kv, static_cast<int32_t>(hashKey.sliding_window), static_cast<int32_t>(specDecode));
+        hashKey.num_q_heads_per_kv, static_cast<int32_t>(hashKey.sliding_window), static_cast<int32_t>(specDecode),
+        static_cast<int32_t>(hashKey.contiguous_query_swa), hashKey.tokens_per_page);
 }
 
 struct XQAKernelRuntimeHasher
@@ -170,6 +184,8 @@ struct XQAKernelRuntimeHasher
         key ^= s.beam_size;
         key <<= 4;
         key ^= s.sliding_window;
+        key <<= 4;
+        key ^= s.contiguous_query_swa;
         key <<= 8;
         key ^= s.tokens_per_page;
         return key;
@@ -465,6 +481,7 @@ public:
     bool loadJitKernel(XQAJitKey const& key, void const* cubinData, size_t cubinSize)
     {
         check::check(cubinData != nullptr && cubinSize > 0, "Invalid XQA JIT cubin data.");
+        validateContiguousQuerySwaKey(key);
         if (!isJitKernelSupportedByBuild(key))
         {
             return false;
@@ -472,7 +489,8 @@ public:
 
         constexpr int32_t kBEAM_SIZE{1};
         XQAKernelRuntimeHashKey const hashKey{trtToXqaDataType(key.dataType), trtToXqaDataType(key.kvDataType),
-            key.headSize, key.specDecode ? 0 : key.qHeadsPerKv, kBEAM_SIZE, key.slidingWindow, key.tokensPerPage};
+            key.headSize, key.specDecode ? 0 : key.qHeadsPerKv, kBEAM_SIZE, key.slidingWindow, key.contiguousQuerySwa,
+            key.tokensPerPage};
 
         std::lock_guard<std::mutex> lock(mMutex);
         auto const findIter = mFunctions.find(hashKey);
@@ -623,6 +641,7 @@ XQALaunchParams DecoderXQARunner::initXQAParams() noexcept
 
 bool DecoderXQARunner::loadDecodeXQAKernelFromCubin(XQAJitKey const& key, void const* cubinData, size_t cubinSize)
 {
+    validateContiguousQuerySwaKey(key);
     XQAKernelList* xqaKernelList = getXQAKernels(trtToXqaDataType(key.dataType), trtToXqaDataType(key.kvDataType),
         key.sm, key.specDecode, key.tokensPerPage != 0);
     return xqaKernelList != nullptr && xqaKernelList->loadJitKernel(key, cubinData, cubinSize);
@@ -630,6 +649,7 @@ bool DecoderXQARunner::loadDecodeXQAKernelFromCubin(XQAJitKey const& key, void c
 
 void DecoderXQARunner::dispatchXQAKernel(XQALaunchParams& params, cudaStream_t const& stream)
 {
+    check::check(!params.contiguousQuerySwa, "Contiguous-query XQA SWA requires spec-decode dispatch.");
     // Check all device pointers are valid.
     check::check(params.output != nullptr && params.qInputPtr != nullptr && params.kvCache.data != nullptr
             && params.kvCache.sequence_lengths != nullptr
@@ -661,6 +681,8 @@ void DecoderXQARunner::dispatchXQAKernel(XQALaunchParams& params, cudaStream_t c
 
 void DecoderXQARunner::dispatchSpecDecodeXQAKernel(XQALaunchParams& params, cudaStream_t const& stream)
 {
+    check::check(!params.contiguousQuerySwa || params.slidingWinSize > 0,
+        "Contiguous-query XQA SWA requires a non-zero sliding-window size.");
     // Check all device pointers are valid.
     check::check(params.output != nullptr && params.qInputPtr != nullptr && params.kvCache.data != nullptr
             && params.kvCache.sequence_lengths != nullptr && params.treeAttnMask != nullptr

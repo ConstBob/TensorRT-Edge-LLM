@@ -48,6 +48,7 @@ struct XQALaunchParams
     float kScale = 1.0f;             //!< K dequant scale (quantized -> original), host scalar
     float vScale = 1.0f;             //!< V dequant scale (quantized -> original), host scalar
     uint32_t slidingWinSize = 0;     //!< Sliding window size (0 = no sliding window)
+    bool contiguousQuerySwa = false; //!< Use a query-relative sliding-window boundary
     int32_t* semaphores = nullptr;   //!< Semaphores for synchronization
     void* scratch = nullptr;         //!< Scratch memory
 
