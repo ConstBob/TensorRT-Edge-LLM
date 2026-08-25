@@ -15,7 +15,7 @@
 """Checkpoint-backed dense projection shared by model families."""
 
 from dataclasses import replace
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 import tensorrt as trt
@@ -49,17 +49,22 @@ class Linear(Module):
         "in_proj_a",
     ))
 
-    def __init__(self,
-                 ctx: BuildContext,
-                 prefix: str,
-                 rank: int = 3,
-                 *,
-                 tensor_parallel: bool = True,
-                 tp_mode: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        ctx: BuildContext,
+        prefix: str,
+        rank: int = 3,
+        *,
+        tensor_parallel: bool = True,
+        tp_mode: Optional[str] = None,
+        tp_output_segments: Sequence[int] = ()
+    ) -> None:
         super().__init__(ctx, prefix)
         self.rank = rank
         self.tensor_parallel = tensor_parallel
         self.explicit_tp_mode = tp_mode
+        self.tp_output_segments = tuple(
+            int(size) for size in tp_output_segments)
 
     def forward(self, hidden_states, rank: Optional[int] = None):
         rank = self.rank if rank is None else rank
@@ -79,15 +84,11 @@ class Linear(Module):
                               and quant_type == "nvfp4"
                               and not self.has_adapter()
                               and not self.ctx.options.sm12x)
-        full_descriptor = self.weights.linear_descriptor(
-            self.prefix,
-            quant_type,
-            external_kind=(weight_policy.EXTERNAL_WEIGHT_NVFP4_TP
-                           if use_fused_nvfp4_tp else ""),
-        )
+        full_descriptor = self._full_descriptor(quant_type, use_fused_nvfp4_tp)
         descriptor = self.weights.shard_linear(full_descriptor, tp_mode,
                                                self.cfg.tp_size,
-                                               self.cfg.tp_rank)
+                                               self.cfg.tp_rank,
+                                               self.tp_output_segments)
         if use_fused_nvfp4_tp:
             sharded_weights = replace(descriptor, bias=None, bias_recipe=None)
             return F.fused_nvfp4_gemm_all_reduce(
@@ -139,13 +140,25 @@ class Linear(Module):
 
     def weight_descriptor(self):
         """Load and tensor-parallel shard the base projection weights."""
-        descriptor = self.weights.linear_descriptor(self.prefix,
-                                                    self.quant_type())
+        descriptor = self._full_descriptor(self.quant_type(), False)
         if not self.tensor_parallel:
             return descriptor
         tp_mode = self._tp_mode()
         return self.weights.shard_linear(descriptor, tp_mode, self.cfg.tp_size,
-                                         self.cfg.tp_rank)
+                                         self.cfg.tp_rank,
+                                         self.tp_output_segments)
+
+    def _full_descriptor(self, quant_type: str, use_fused_nvfp4_tp: bool):
+        # Runtime checkpoint recipes describe one contiguous TP shard, so
+        # segmented GDN Q/K/V projections remain engine constants.
+        if self.tp_output_segments and self.cfg.tp_size > 1:
+            return self.weights.linear(self.prefix, quant_type)
+        return self.weights.linear_descriptor(
+            self.prefix,
+            quant_type,
+            external_kind=(weight_policy.EXTERNAL_WEIGHT_NVFP4_TP
+                           if use_fused_nvfp4_tp else ""),
+        )
 
     def has_adapter(self) -> bool:
         """Whether this projection needs model or runtime LoRA handling."""

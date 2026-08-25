@@ -310,6 +310,87 @@ def test_tp_external_fp16_shard_recipe_is_rank_neutral(mode, source_shape,
     }
 
 
+def test_tp_runtime_kv_metadata_uses_rank_local_head_counts():
+    # Keep the TensorRT-dependent runtime-config import out of module scope so
+    # non-TensorRT test jobs can still collect this shared test module.
+    from experimental.builder.core.artifacts.runtime_config import \
+        _tp_rank_overrides
+
+    global_config = {
+        "num_attention_heads":
+        24,
+        "num_key_value_heads":
+        4,
+        "intermediate_size":
+        17408,
+        "recurrent_state_num_heads":
+        48,
+        "conv_dim":
+        10240,
+        "kv_layer_configs": [
+            {
+                "num_kv_heads": 4,
+                "head_dim": 128,
+            },
+            None,
+            {
+                "num_kv_heads": 8,
+                "head_dim": 256,
+            },
+        ],
+    }
+
+    overrides = _tp_rank_overrides(global_config, 2)
+
+    assert overrides["recurrent_state_num_heads"] == 24
+    assert overrides["conv_dim"] == 5120
+    assert overrides["kv_layer_configs"] == [
+        {
+            "num_kv_heads": 2,
+            "head_dim": 128,
+        },
+        None,
+        {
+            "num_kv_heads": 4,
+            "head_dim": 256,
+        },
+    ]
+    assert global_config["kv_layer_configs"][0]["num_kv_heads"] == 4
+
+
+def test_tp_segmented_column_shard_preserves_qkv_layout():
+    weight = np.arange(20 * 4, dtype=np.float16).reshape(20, 4)
+    scale = np.arange(20 * 2, dtype=np.uint8).reshape(20, 2)
+    descriptor = LinearWeights(
+        quantization.QUANT_NVFP4,
+        weight,
+        weight_scale=scale,
+        group_size=4,
+        logical_out_features=20,
+        logical_in_features=8,
+    )
+
+    rank0 = Weights.shard_linear(descriptor,
+                                 "column",
+                                 2,
+                                 0,
+                                 output_segments=(4, 4, 12))
+    rank1 = Weights.shard_linear(descriptor,
+                                 "column",
+                                 2,
+                                 1,
+                                 output_segments=(4, 4, 12))
+
+    assert np.array_equal(rank0.weight,
+                          weight[[0, 1, 4, 5, 8, 9, 10, 11, 12, 13]])
+    assert np.array_equal(rank1.weight,
+                          weight[[2, 3, 6, 7, 14, 15, 16, 17, 18, 19]])
+    assert np.array_equal(rank0.weight_scale,
+                          scale[[0, 1, 4, 5, 8, 9, 10, 11, 12, 13]])
+    assert np.array_equal(rank1.weight_scale,
+                          scale[[2, 3, 6, 7, 14, 15, 16, 17, 18, 19]])
+
+
 def test_tp_nvfp4_row_parallel_shards_scale_on_input_axis():
     descriptor = LinearWeights(
         quantization.QUANT_NVFP4,

@@ -15,6 +15,11 @@ tests:
 
   # ONNX-less builder checkpoint contracts
   - tests/python-unittests/test_direct_builder_checkpoint_contract.py
+  - tests/python-unittests/test_checkpoint_loader_shard.py
+
+  - tests/python-unittests/test_chat_template_extraction.py::test_direct_process_chat_template_preserves_trim_contract
+  - tests/python-unittests/test_export_kv_page_table.py::test_tp_runtime_config_preserves_global_gdn_metadata
+  - tests/python-unittests/test_export_kv_page_table.py::test_nvfp4_tp_gemm_allreduce_target_export
 
   # AttentionPlugin tests (custom plugin vs PyTorch reference)
   - tests/python-unittests/test_attention_plugin.py::test_cutedsl_lazy_module_failure_propagates_before_attention_mutation

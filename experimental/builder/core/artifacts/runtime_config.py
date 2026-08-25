@@ -48,6 +48,52 @@ def _edgellm_version() -> str:
                            "the package or use a full source checkout")
 
 
+def _tp_local_kv_layer_configs(kv_layer_configs: list, tp_size: int) -> list:
+    """Return rank-local KV metadata for a tensor-parallel engine."""
+    result = []
+    for index, layer in enumerate(kv_layer_configs):
+        if layer is None:
+            result.append(None)
+            continue
+        num_kv_heads = int(layer["num_kv_heads"])
+        if num_kv_heads % tp_size:
+            raise ValueError(
+                f"TP size {tp_size} does not divide kv_layer_configs[{index}]"
+                f".num_kv_heads={num_kv_heads}")
+        local_layer = dict(layer)
+        local_layer["num_kv_heads"] = num_kv_heads // tp_size
+        result.append(local_layer)
+    return result
+
+
+def _tp_rank_overrides(config: Dict[str, Any], tp_size: int) -> Dict[str, Any]:
+    sharded_dimensions = (
+        "num_attention_heads",
+        "num_key_value_heads",
+        "intermediate_size",
+        "recurrent_state_num_heads",
+        "conv_dim",
+    )
+    dimensions = {
+        name: config[name]
+        for name in sharded_dimensions if name in config
+    }
+    invalid = {
+        name: value
+        for name, value in dimensions.items() if value % tp_size
+    }
+    if invalid:
+        details = ", ".join(f"{name}={value}"
+                            for name, value in sorted(invalid.items()))
+        raise ValueError(
+            f"TP size {tp_size} does not divide runtime dimensions: {details}")
+    overrides = {name: value // tp_size for name, value in dimensions.items()}
+    if "kv_layer_configs" in config:
+        overrides["kv_layer_configs"] = _tp_local_kv_layer_configs(
+            config["kv_layer_configs"], tp_size)
+    return overrides
+
+
 def build_runtime_config(cfg: DeviceConfig, args) -> Dict[str, Any]:
     """Build the runtime configuration for the supported models."""
     out: Dict[str, Any] = {
@@ -253,25 +299,7 @@ def build_runtime_config(cfg: DeviceConfig, args) -> Dict[str, Any]:
         "max_draft_tree_size": args.max_draft_tree_size,
     }
     if args.tp_size > 1:
-        dimensions = {
-            "num_attention_heads": cfg.num_attention_heads,
-            "num_key_value_heads": cfg.num_key_value_heads,
-            "intermediate_size": cfg.intermediate_size,
-        }
-        invalid = {
-            name: value
-            for name, value in dimensions.items() if value % args.tp_size
-        }
-        if invalid:
-            details = ", ".join(f"{name}={value}"
-                                for name, value in sorted(invalid.items()))
-            raise ValueError(
-                f"TP size {args.tp_size} does not divide runtime dimensions: {details}"
-            )
-        overrides = {
-            name: value // args.tp_size
-            for name, value in dimensions.items()
-        }
+        overrides = _tp_rank_overrides(out, args.tp_size)
         out["rank_configs"] = [{
             "rank": rank,
             "engine": f"llm_world{args.tp_size}_rank{rank}.engine",

@@ -17,6 +17,17 @@ GB10 GPU per system. Connect the systems through their high-speed ConnectX-7
 QSFP/RoCE interfaces. The Dual DGX Spark path runs one MPI process per system
 and uses NCCL for cross-system communication.
 
+## Supported Models
+
+| Model |
+|---|
+| Qwen3-4B |
+| Qwen3-8B |
+| Qwen3-14B |
+| Qwen3-32B |
+| Qwen3.5-27B |
+| Qwen3-VL-8B |
+
 ## Tensor Parallel Inference
 
 Tensor parallelism (TP) splits supported model projections across multiple GPUs
@@ -318,13 +329,13 @@ checkpoint. Set `LLM_BUILD` and `LLM_INFERENCE` to the binaries under
 
 ### Accuracy And Performance Run
 
-For tensor-parallel AllReduce, prefer SHM over NCCL on SuperThor because it
-provides lower-latency communication for the supported payloads. NCCL remains
-active for token synchronization and as the AllReduce fallback when SHM is
-disabled or unavailable.
+NCCL is required for generation-state synchronization and provides the
+AllReduce fallback. On SuperThor, SHM optionally accelerates local AllReduce.
+The optimized fused NVFP4 path can use an FP8 SHM intermediate for eligible
+decode-sized attention output projections and FP16 SHM for other supported
+payloads. The generic AllReduce plugin uses FP16 SHM following a TensorRT GEMM.
 
-The validated fast path uses FP8 SHM for decode-sized payloads and FP16 SHM for
-larger prefill payloads:
+Run the accuracy and performance workload with SHM enabled:
 
 ```bash
 export NCCL_ALGO=Ring

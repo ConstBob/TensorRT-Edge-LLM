@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 KV_PAGE_SIZE = 128
 
 # ---------------------------------------------------------------------------
-# NVFP4 MoE target arch selector
+# NVFP4 target architecture selectors
 # ---------------------------------------------------------------------------
 #
 # ``Nvfp4MoePlugin`` (SM100/101/110, split FC1/FC2) and ``NvFP4MoEPluginGeforce``
@@ -56,10 +56,34 @@ KV_PAGE_SIZE = 128
 #
 # Accepted aliases for SM12x: ``sm120``, ``sm121``, ``geforce``.
 
-_NVFP4_MOE_TARGET_ENV = "EDGELLM_NVFP4_MOE_TARGET"
-_NVFP4_MOE_SM110_ALIASES = frozenset(
+_NVFP4_MOE_SM110_TARGET_ALIASES = frozenset(
     ("sm100", "sm101", "sm110", "blackwell_dc", "thor", ""))
-_NVFP4_MOE_SM12X_ALIASES = frozenset(("sm12x", "sm120", "sm121", "geforce"))
+_NVFP4_GEMM_ALLREDUCE_FUSED_TARGET_ALIASES = frozenset(
+    ("sm100", "sm101", "sm103", "sm110", "blackwell_dc", "thor", ""))
+_NVFP4_SM12X_TARGET_ALIASES = frozenset(("sm12x", "sm120", "sm121", "geforce"))
+
+_NVFP4_MOE_TARGET_ENV = "EDGELLM_NVFP4_MOE_TARGET"
+_NVFP4_GEMM_ALLREDUCE_TARGET_ENV = \
+    "EDGELLM_NVFP4_GEMM_ALLREDUCE_TARGET"
+
+
+def use_generic_nvfp4_gemm_allreduce() -> bool:
+    """Return True for the portable SM12x NVFP4 GEMM + AllReduce path.
+
+    SM100/101/103/110 keep the existing fused CuTeDSL GEMM + AllReduce plugin.
+    SM120/121 use TensorRT NVFP4 Q/DQ MatMul followed by ``AllReducePlugin``
+    because the fused CuTeDSL runner does not support those architectures.
+    """
+    target = os.environ.get(_NVFP4_GEMM_ALLREDUCE_TARGET_ENV,
+                            "sm110").strip().lower()
+    if target in _NVFP4_SM12X_TARGET_ALIASES:
+        return True
+    if target in _NVFP4_GEMM_ALLREDUCE_FUSED_TARGET_ALIASES:
+        return False
+    raise ValueError(
+        f"{_NVFP4_GEMM_ALLREDUCE_TARGET_ENV}={target!r} is not recognized. "
+        "Use 'sm100'/'sm110' or 'sm12x'. Aliases: "
+        "sm101/sm103/blackwell_dc/thor, sm120/sm121/geforce.")
 
 
 def use_geforce_nvfp4_moe() -> bool:
@@ -69,9 +93,9 @@ def use_geforce_nvfp4_moe() -> bool:
     the 64-row up/gate interleave layout consumed by ``Nvfp4MoePlugin``.
     """
     val = os.environ.get(_NVFP4_MOE_TARGET_ENV, "sm110").strip().lower()
-    if val in _NVFP4_MOE_SM12X_ALIASES:
+    if val in _NVFP4_SM12X_TARGET_ALIASES:
         return True
-    if val in _NVFP4_MOE_SM110_ALIASES:
+    if val in _NVFP4_MOE_SM110_TARGET_ALIASES:
         return False
     raise ValueError(
         f"{_NVFP4_MOE_TARGET_ENV}={val!r} is not recognized. Use 'sm100'/'sm110' "
@@ -1819,6 +1843,22 @@ def _(router_logits, hidden_states, fc1_weights, fc2_weights,
       e_score_correction_bias, num_experts, top_k, hidden_size, moe_inter_size,
       activation_type, n_group, topk_group, norm_topk_prob,
       routed_scaling_factor, max_routed_rows):
+    return torch.empty_like(hidden_states)
+
+
+# ---------------------------------------------------------------------------
+# Custom op: trt_edgellm::all_reduce
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt_edgellm::all_reduce", mutates_args=())
+def all_reduce(hidden_states: torch.Tensor, tp_size: int) -> torch.Tensor:
+    """Trace-time stub for the portable TensorRT ``AllReducePlugin``."""
+    return torch.empty_like(hidden_states)
+
+
+@all_reduce.register_fake
+def _(hidden_states, tp_size):
     return torch.empty_like(hidden_states)
 
 

@@ -1752,6 +1752,40 @@ _nvfp4_moe_plugin_geforce_schema = OpSchema(
 )
 
 # ---------------------------------------------------------------------------
+# trt_edgellm::AllReducePlugin
+# ---------------------------------------------------------------------------
+
+_all_reduce_plugin_schema = OpSchema(
+    name="AllReducePlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc="Tensor-parallel all-reduce of an FP16 tensor.",
+    inputs=[
+        OpSchema.FormalParameter(
+            name="input",
+            description="Per-rank FP16 partial result",
+            type_str="tensor(float16)",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="output",
+            description="All-reduced FP16 result",
+            type_str="tensor(float16)",
+        ),
+    ],
+    type_constraints=[],
+    attributes=[
+        OpSchema.Attribute(
+            name="tp_size",
+            type=OpSchema.AttrType.INT,
+            description="Tensor parallel world size",
+            required=True,
+        ),
+    ],
+)
+
+# ---------------------------------------------------------------------------
 # trt_edgellm::FusedNvfp4GemmAllReducePlugin (row-parallel NVFP4 GEMM)
 # ---------------------------------------------------------------------------
 
@@ -1993,6 +2027,7 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _nvfp4_a16_moe_plugin_schema,
     _nvfp4_moe_plugin_geforce_schema,
     _fp16_moe_plugin_schema,
+    _all_reduce_plugin_schema,
     _fused_nvfp4_gemm_allreduce_plugin_schema,
     _dflash_target_kv_cache_update_schema,
     _gemma4_audio_attention_plugin_schema,

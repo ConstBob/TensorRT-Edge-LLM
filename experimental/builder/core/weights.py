@@ -841,9 +841,51 @@ class Weights:
         return np.ascontiguousarray(np.take(array, indices, axis=axes[-1]))
 
     @staticmethod
-    def shard_linear(linear: LinearWeights, mode: str, tp_size: int,
-                     tp_rank: int) -> LinearWeights:
-        """Return one contiguous tensor-parallel shard of a linear."""
+    def shard_segments(value: np.ndarray,
+                       segments: Sequence[int],
+                       tp_size: int,
+                       tp_rank: int,
+                       axis: int = 0) -> np.ndarray:
+        """Shard each concatenated segment independently along one axis."""
+        if tp_size < 1:
+            raise ValueError("tp_size must be positive")
+        if tp_rank < 0 or tp_rank >= tp_size:
+            raise ValueError("tp_rank must be in [0, tp_size)")
+        if axis < 0 or axis >= value.ndim:
+            raise ValueError(f"invalid shard axis {axis} for {value.shape}")
+        segment_sizes = tuple(int(size) for size in segments)
+        if not segment_sizes or any(size <= 0 for size in segment_sizes):
+            raise ValueError("shard segments must be positive")
+        if sum(segment_sizes) != value.shape[axis]:
+            raise ValueError(
+                f"shard segments {segment_sizes} do not cover axis {axis} "
+                f"of shape {value.shape}")
+        if any(size % tp_size for size in segment_sizes):
+            raise ValueError(
+                f"shard segments {segment_sizes} are not divisible by "
+                f"tp_size {tp_size}")
+        if tp_size == 1:
+            return np.ascontiguousarray(value)
+
+        pieces = []
+        offset = 0
+        for size in segment_sizes:
+            local_size = size // tp_size
+            selected = [slice(None)] * value.ndim
+            start = offset + tp_rank * local_size
+            selected[axis] = slice(start, start + local_size)
+            pieces.append(value[tuple(selected)])
+            offset += size
+        return np.ascontiguousarray(np.concatenate(pieces, axis=axis))
+
+    @staticmethod
+    def shard_linear(
+        linear: LinearWeights,
+        mode: str,
+        tp_size: int,
+        tp_rank: int,
+        output_segments: Sequence[int] = ()) -> LinearWeights:
+        """Return one tensor-parallel shard of a linear."""
         if tp_size == 1 or mode == "replicated":
             return linear
         full_out = linear.out_features
@@ -853,6 +895,15 @@ class Weights:
             raise ValueError(
                 f"cannot {mode}-shard linear dimension {split_size} over {tp_size} ranks"
             )
+        output_segments = tuple(int(size) for size in output_segments)
+        if output_segments:
+            if mode != "column":
+                raise ValueError(
+                    "output segments require column-parallel sharding")
+            if sum(output_segments) != full_out:
+                raise ValueError(
+                    f"output segments {output_segments} do not match "
+                    f"linear output size {full_out}")
 
         def rank_neutral_recipe(recipe, **fields):
             if recipe is None:
@@ -866,6 +917,13 @@ class Weights:
         def split(value, recipe, axis):
             if value is None:
                 return value, recipe
+            if output_segments and axis == 0:
+                if isinstance(value, ParameterSpec):
+                    raise ValueError(
+                        "segmented TP projections must remain engine "
+                        "constants")
+                return (Weights.shard_segments(value, output_segments, tp_size,
+                                               tp_rank, axis), None)
             if isinstance(value, ParameterSpec):
                 shape = list(value.shape)
                 if shape[axis] % tp_size:
