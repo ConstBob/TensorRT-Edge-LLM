@@ -25,8 +25,8 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from ..config import ApiConfig
 from ..parsing.reasoning import REASONING_PARSERS
-from ..parsing.tool_calling import (ToolConfig, list_tool_parsers,
-                                    parse_assistant_output,
+from ..parsing.tool_calling import (ToolConfig, _select_parser,
+                                    list_tool_parsers, parse_assistant_output,
                                     validate_tool_request)
 from ..runtime.engine import (OMNI_AUDIO_SAMPLE_RATE, AudioParams,
                               SamplingParams)
@@ -628,10 +628,58 @@ class OpenAIServingChat:
         include_usage: bool,
         engine_stream: Optional[PreparedRequest],
     ) -> AsyncGenerator[str, None]:
-        text_parts: List[str] = []
+        parser = _select_parser(self._model_dir,
+                                self._config.tool_call_parser).stream(
+                                    prepared.tool_config)
+        reasoning = REASONING_PARSERS.resolve(prepared.reasoning_parser,
+                                              self._model_dir)
+        reasoning_stream = reasoning.stream() if reasoning else None
         completion_tokens = 0
         prompt_tokens = None
         finish_reason = "stop"
+        tool_heads = 0
+
+        def chunks_for(events):
+            nonlocal tool_heads
+            for event in events:
+                if event.kind == "content":
+                    if reasoning_stream is not None:
+                        for parsed in reasoning_stream.feed(event.text):
+                            field = ("reasoning_content" if parsed.field
+                                     == "reasoning" else "content")
+                            yield self._chunk(
+                                response_id, created,
+                                DeltaMessage(**{field: parsed.text}))
+                    elif event.text:
+                        yield self._chunk(response_id, created,
+                                          DeltaMessage(content=event.text))
+                elif event.kind == "tool_head":
+                    tool_heads += 1
+                    yield self._chunk(
+                        response_id,
+                        created,
+                        DeltaMessage(tool_calls=[{
+                            "index": event.index,
+                            "id": event.call_id,
+                            "type": "function",
+                            "function": {
+                                "name": event.name,
+                                "arguments": "",
+                            },
+                        }]),
+                    )
+                elif event.kind == "tool_args":
+                    yield self._chunk(
+                        response_id,
+                        created,
+                        DeltaMessage(tool_calls=[{
+                            "index": event.index,
+                            "function": {
+                                "arguments": event.text,
+                            },
+                        }]),
+                    )
+
         try:
             async for delta in self._client.stream(
                     request.messages,
@@ -643,7 +691,9 @@ class OpenAIServingChat:
                 if delta.prompt_tokens is not None:
                     prompt_tokens = delta.prompt_tokens
                 if delta.text:
-                    text_parts.append(delta.text)
+                    text = delta.text.replace(IM_END_TOKEN, "")
+                    for chunk in chunks_for(parser.feed(text)):
+                        yield chunk
                 if delta.finished:
                     finish_reason = delta.finish_reason or "stop"
         except asyncio.CancelledError:
@@ -660,40 +710,16 @@ class OpenAIServingChat:
             yield "data: [DONE]\n\n"
             return
 
-        parsed = self.parse_output(
-            "".join(text_parts).replace(IM_END_TOKEN, ""), prepared)
-        tool_index = 0
-        for event in parsed.events:
-            if event["type"] == "reasoning" and event["text"]:
-                yield self._chunk(
-                    response_id,
-                    created,
-                    DeltaMessage(reasoning_content=event["text"]),
-                )
-            elif event["type"] == "content" and event["text"]:
-                yield self._chunk(
-                    response_id,
-                    created,
-                    DeltaMessage(content=event["text"]),
-                )
-            elif event["type"] == "tool_call":
-                call = event["tool_call"]
-                yield self._chunk(
-                    response_id,
-                    created,
-                    DeltaMessage(tool_calls=[{
-                        "index": tool_index,
-                        "id": call.id,
-                        "type": "function",
-                        "function": {
-                            "name": call.name,
-                            "arguments": call.arguments,
-                        },
-                    }]),
-                )
-                tool_index += 1
+        for chunk in chunks_for(parser.flush()):
+            yield chunk
+        if reasoning_stream is not None:
+            for parsed in reasoning_stream.flush():
+                field = ("reasoning_content"
+                         if parsed.field == "reasoning" else "content")
+                yield self._chunk(response_id, created,
+                                  DeltaMessage(**{field: parsed.text}))
 
-        if tool_index and finish_reason == "stop":
+        if tool_heads and finish_reason == "stop":
             finish_reason = "tool_calls"
         yield self._chunk(response_id,
                           created,
