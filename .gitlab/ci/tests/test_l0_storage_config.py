@@ -64,7 +64,6 @@ EXPECTED_EXPORT_JOBS = {
         "l0_checkpoint_export_ampere",
         "l0_a30",
         "l0_nemo_eval_a30",
-        "l0_a30_trt11",
         "l0_rtx3090",
         "l0_jetson_orin",
     },

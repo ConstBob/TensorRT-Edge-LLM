@@ -9,6 +9,9 @@ export ONNX_DIR=/path/to/onnx/models                # Required: ONNX model direc
 export ENGINE_DIR=/path/to/engine/outputs           # Required for pipeline tests
 export LLM_MODELS_DIR=/path/to/pytorch/models       # Required for export tests (LLM torch models)
 export EDGELLM_DATA_DIR=/path/to/datasets           # Required for datasets and draft models
+export QUANT_CHECKPOINT_DIR=/path/to/quantized/checkpoints
+export HF_CHECKPOINT_DOWNLOAD_DIR=/managed/checkpoints/huggingface  # Optional
+export EDGE_LLM_ALLOW_HF_DOWNLOAD=0                 # Optional: disable downloads
 export TRT_PACKAGE_DIR=/path/to/tensorrt            # Optional: TensorRT installation
 ```
 
@@ -20,6 +23,20 @@ export TRT_PACKAGE_DIR=/path/to/tensorrt            # Optional: TensorRT install
   - `/scratch.edge_llm_cache`
   - `/home/edge_llm_cache` (fallback)
   - `/home/scratch.edge_llm_cache` (fallback)
+
+Checkpoint lookup first uses paths registered in the TRT-LLM model mirror,
+then managed quantized checkpoints. If downloads are enabled, missing public
+checkpoints are stored under `HF_CHECKPOINT_DOWNLOAD_DIR/<organization>/<model>`;
+CI enables this fallback and uses
+`/scratch.edge_llm_cache/checkpoints/huggingface`. Set `HF_HOME` beneath the same
+managed directory to avoid implicit downloads in a user home directory. Local
+tests also enable downloading by default and use
+`EDGELLM_DATA_DIR/checkpoints/huggingface` when
+`HF_CHECKPOINT_DOWNLOAD_DIR` is unset.
+An explicit Hugging Face ID such as `Qwen/Qwen2.5-0.5B` may use this fallback
+without an inventory entry. Unknown short names are not guessed; use the full
+`organization/model` ID. Set `EDGE_LLM_ALLOW_HF_DOWNLOAD=0` to disable network
+downloads while retaining access to checkpoints already in the managed cache.
 
 ### 2. Install Dependencies
 ```bash

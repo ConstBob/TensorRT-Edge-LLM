@@ -51,7 +51,7 @@ def test_build_pybind(env_config: EnvironmentConfig,
     install_cmd = (f'cd {shlex.quote(repo_root)}'
                    f' && python3 -m venv {pybind_venv}'
                    f' && {pybind_venv}/bin/pip install -q'
-                   ' -e ".[server,native-build]"')
+                   ' -e ".[server,server-tools,native-build]"')
     if env_config.trt_package_dir:
         trt_python_dir = shlex.quote(
             os.path.join(env_config.trt_package_dir, "python"))
@@ -960,6 +960,63 @@ class TestHLAPI:
     """E2E tests for checkpoint-direct high-level Python inference."""
 
     @staticmethod
+    def _checkpoint_config(test_param: str, model_type: ModelType,
+                           env_config: EnvironmentConfig) -> TestConfig:
+        """Parse inference options with checkpoint-direct path validation."""
+        env_config.validate_for_checkpoint_builder_tests()
+        return TestConfig.from_param_string(test_param,
+                                            model_type,
+                                            TaskType.INFERENCE,
+                                            env_config,
+                                            validate_environment=False)
+
+    @staticmethod
+    def _stage_remote_checkpoint(model_dir: str,
+                                 remote_config: Optional[RemoteConfig],
+                                 test_logger: logging.Logger) -> str:
+        """Make a controller-local checkpoint visible to a remote board."""
+        if remote_config is None:
+            return model_dir
+
+        visible = run_command(
+            ["test", "-f",
+             os.path.join(model_dir, "config.json")],
+            remote_config,
+            timeout=15,
+            logger=test_logger,
+        )
+        if visible["success"]:
+            return model_dir
+
+        staged_dir = os.path.join(remote_config.remote_workspace,
+                                  ".ci-checkpoints",
+                                  os.path.basename(model_dir.rstrip("/")))
+        created = run_command(["mkdir", "-p", staged_dir],
+                              remote_config,
+                              timeout=30,
+                              logger=test_logger)
+        if not created["success"]:
+            raise RuntimeError(f"Cannot create remote checkpoint directory: "
+                               f"{staged_dir}")
+
+        remote_host = f"{remote_config.user}@{remote_config.host}"
+        synced = run_command(
+            [
+                "sshpass", "-e", "rsync", "-aL", "-e",
+                "ssh -o StrictHostKeyChecking=no", f"{model_dir.rstrip('/')}/",
+                f"{remote_host}:{staged_dir}/"
+            ],
+            remote_config=None,
+            timeout=1800,
+            logger=test_logger,
+            env_vars={"SSHPASS": remote_config.password},
+        )
+        if not synced["success"]:
+            raise RuntimeError(f"Cannot stage checkpoint on remote board: "
+                               f"{model_dir}")
+        return staged_dir
+
+    @staticmethod
     def _build_hlapi_env_setup(trt_package_dir: str = "") -> str:
         """Return inline script preamble that sets up sys.path and LD_LIBRARY_PATH."""
         parts = [
@@ -981,8 +1038,9 @@ class TestHLAPI:
         return f'{repo_root}/{_SERVER_VENV}/bin/python3'
 
     @staticmethod
-    def _llm_init_script(config: TestConfig,
-                         env_config: EnvironmentConfig) -> str:
+    def _llm_init_script(config: TestConfig, env_config: EnvironmentConfig,
+                         remote_config: Optional[RemoteConfig],
+                         test_logger: logging.Logger) -> str:
         """Construct the public checkpoint/cache API with the CI profile."""
         try:
             model_dir = config.get_torch_model_dir()
@@ -1002,6 +1060,12 @@ class TestHLAPI:
             elif config.is_eagle:
                 spec_type = "eagle3"
                 draft_model_dir = config.get_eagle_draft_checkpoint_dir()
+
+            model_dir = TestHLAPI._stage_remote_checkpoint(
+                model_dir, remote_config, test_logger)
+            if draft_model_dir:
+                draft_model_dir = TestHLAPI._stage_remote_checkpoint(
+                    draft_model_dir, remote_config, test_logger)
         except ValueError as exc:
             pytest.skip("checkpoint-direct HLAPI source is unavailable on "
                         f"this runner: {exc}")
@@ -1041,12 +1105,12 @@ llm = LLM(
                                    test_logger: logging.Logger,
                                    env_config: EnvironmentConfig) -> None:
         """Exercise the real ASGI API, including stream cancellation."""
-        config = TestConfig.from_param_string(test_param, ModelType.LLM,
-                                              TaskType.INFERENCE, env_config)
+        config = self._checkpoint_config(test_param, ModelType.LLM, env_config)
         test_logger.info("HTTP server lifecycle: model=%s", config.model_name)
 
         setup = self._build_hlapi_env_setup(env_config.trt_package_dir or "")
-        llm_init = self._llm_init_script(config, env_config)
+        llm_init = self._llm_init_script(config, env_config, remote_config,
+                                         test_logger)
         script = f"""\
 {setup}
 import http.client
@@ -1203,8 +1267,7 @@ finally:
         """Test LLM.generate() from a checkpoint and shared build cache."""
         is_vlm = "-mnit" in test_param
         model_type = ModelType.VLM if is_vlm else ModelType.LLM
-        config = TestConfig.from_param_string(test_param, model_type,
-                                              TaskType.INFERENCE, env_config)
+        config = self._checkpoint_config(test_param, model_type, env_config)
 
         test_logger.info("HLAPI generate: model=%s", config.model_name)
 
@@ -1212,7 +1275,8 @@ finally:
         max_tokens = 128
 
         setup = self._build_hlapi_env_setup(env_config.trt_package_dir or "")
-        llm_init = self._llm_init_script(config, env_config)
+        llm_init = self._llm_init_script(config, env_config, remote_config,
+                                         test_logger)
 
         script = f"""\
 {setup}
@@ -1266,8 +1330,7 @@ print('HLAPI_GENERATE_PASSED')
             remote_config: Optional[RemoteConfig], test_logger: logging.Logger,
             env_config: EnvironmentConfig) -> None:
         """Test LLM.generate() returns per-token logprobs when num_logprobs > 0."""
-        config = TestConfig.from_param_string(test_param, ModelType.LLM,
-                                              TaskType.INFERENCE, env_config)
+        config = self._checkpoint_config(test_param, ModelType.LLM, env_config)
         test_logger.info("HLAPI generate with logprobs: model=%s",
                          config.model_name)
 
@@ -1275,7 +1338,8 @@ print('HLAPI_GENERATE_PASSED')
         max_tokens = 32
         num_logprobs = 3
         setup = self._build_hlapi_env_setup(env_config.trt_package_dir or "")
-        llm_init = self._llm_init_script(config, env_config)
+        llm_init = self._llm_init_script(config, env_config, remote_config,
+                                         test_logger)
 
         script = f"""\
 {setup}
@@ -1345,8 +1409,7 @@ for step in lps:
         # ASR/OMNI param strings carry audio-only tokens (mnts/mxts), which
         # only those model types are allowed to parse.
         model_type = ModelType.ASR if is_asr else ModelType.OMNI
-        config = TestConfig.from_param_string(test_param, model_type,
-                                              TaskType.INFERENCE, env_config)
+        config = self._checkpoint_config(test_param, model_type, env_config)
         test_wav = (getattr(config, "get_audio_test_wav", lambda: "")()
                     or os.environ.get("AUDIO_TEST_WAV", ""))
         if test_wav:
@@ -1368,7 +1431,8 @@ with wave.open(buf, 'wb') as w:
 wav_bytes = buf.getvalue()"""
 
         setup = self._build_hlapi_env_setup(env_config.trt_package_dir or "")
-        llm_init = self._llm_init_script(config, env_config)
+        llm_init = self._llm_init_script(config, env_config, remote_config,
+                                         test_logger)
         script = f"""\
 {setup}
 import base64
@@ -1421,14 +1485,14 @@ print('HLAPI_STREAM_WITH_AUDIO_PASSED')
         verifies biasing that token suppresses it. A speculative bundle remains
         on its native speculative path.
         """
-        config = TestConfig.from_param_string(test_param, ModelType.LLM,
-                                              TaskType.INFERENCE, env_config)
+        config = self._checkpoint_config(test_param, ModelType.LLM, env_config)
 
         test_logger.info("HLAPI logit_bias: model=%s", config.model_name)
 
         prompt = "Complete this sentence with one short word: NVIDIA makes"
         setup = self._build_hlapi_env_setup(env_config.trt_package_dir or "")
-        llm_init = self._llm_init_script(config, env_config)
+        llm_init = self._llm_init_script(config, env_config, remote_config,
+                                         test_logger)
 
         script = f"""\
 {setup}
@@ -1561,13 +1625,13 @@ print('HLAPI_GENERATE_WITH_LOGIT_BIAS_PASSED')
         surface (which additionally reaches regex), and the pre-check that turns an
         unenforceable schema keyword into a clean error instead of a silently wrong answer.
         """
-        config = TestConfig.from_param_string(test_param, ModelType.LLM,
-                                              TaskType.INFERENCE, env_config)
+        config = self._checkpoint_config(test_param, ModelType.LLM, env_config)
 
         test_logger.info("HLAPI guided decoding: model=%s", config.model_name)
 
         setup = self._build_hlapi_env_setup(env_config.trt_package_dir or "")
-        llm_init = self._llm_init_script(config, env_config)
+        llm_init = self._llm_init_script(config, env_config, remote_config,
+                                         test_logger)
 
         script = f"""\
 {setup}
@@ -1651,13 +1715,13 @@ print('HLAPI_GENERATE_WITH_GUIDED_DECODING_PASSED')
         is_vlm = "-mnit" in test_param
         if not is_vlm:
             pytest.skip("video HLAPI test requires a VLM test_param ('-mnit')")
-        config = TestConfig.from_param_string(test_param, ModelType.VLM,
-                                              TaskType.INFERENCE, env_config)
+        config = self._checkpoint_config(test_param, ModelType.VLM, env_config)
         test_clip = os.environ.get("VIDEO_TEST_CLIP", "")
         nframes = int(os.environ.get("VIDEO_TEST_NFRAMES", "8"))
 
         setup = self._build_hlapi_env_setup(env_config.trt_package_dir or "")
-        llm_init = self._llm_init_script(config, env_config)
+        llm_init = self._llm_init_script(config, env_config, remote_config,
+                                         test_logger)
         if test_clip:
             clip_setup = f"clip_path = {test_clip!r}"
         else:
@@ -1742,8 +1806,7 @@ print('HLAPI_VIDEO_TOO_LONG_PASSED')
                              test_logger: logging.Logger,
                              env_config: EnvironmentConfig) -> None:
         """Test LLM.generate_stream() from the checkpoint cache."""
-        config = TestConfig.from_param_string(test_param, ModelType.LLM,
-                                              TaskType.INFERENCE, env_config)
+        config = self._checkpoint_config(test_param, ModelType.LLM, env_config)
 
         test_logger.info("HLAPI streaming: model=%s", config.model_name)
 
@@ -1751,7 +1814,8 @@ print('HLAPI_VIDEO_TOO_LONG_PASSED')
         max_tokens = 128
 
         setup = self._build_hlapi_env_setup(env_config.trt_package_dir or "")
-        llm_init = self._llm_init_script(config, env_config)
+        llm_init = self._llm_init_script(config, env_config, remote_config,
+                                         test_logger)
 
         script = f"""\
 {setup}
@@ -1805,8 +1869,7 @@ print('HLAPI_STREAMING_PASSED')
             remote_config: Optional[RemoteConfig], test_logger: logging.Logger,
             env_config: EnvironmentConfig) -> None:
         """Test LLM.generate_stream() delivers per-token logprobs matching token count."""
-        config = TestConfig.from_param_string(test_param, ModelType.LLM,
-                                              TaskType.INFERENCE, env_config)
+        config = self._checkpoint_config(test_param, ModelType.LLM, env_config)
         test_logger.info("HLAPI streaming with logprobs: model=%s",
                          config.model_name)
 
@@ -1814,7 +1877,8 @@ print('HLAPI_STREAMING_PASSED')
         max_tokens = 32
         num_logprobs = 3
         setup = self._build_hlapi_env_setup(env_config.trt_package_dir or "")
-        llm_init = self._llm_init_script(config, env_config)
+        llm_init = self._llm_init_script(config, env_config, remote_config,
+                                         test_logger)
 
         script = f"""\
 {setup}
@@ -1913,12 +1977,12 @@ print('HLAPI_STREAMING_LOGPROBS_PASSED')
                                       test_logger: logging.Logger,
                                       env_config: EnvironmentConfig) -> None:
         """HLAPI non-streaming: SamplingParams(stop=[...]) trims output, finish_reason == 'stop'."""
-        config = TestConfig.from_param_string(test_param, ModelType.LLM,
-                                              TaskType.INFERENCE, env_config)
+        config = self._checkpoint_config(test_param, ModelType.LLM, env_config)
         prompt = "List three colors, separated by commas. End your list with '###'."
         stop = "###"
         setup = self._build_hlapi_env_setup(env_config.trt_package_dir or "")
-        llm_init = self._llm_init_script(config, env_config)
+        llm_init = self._llm_init_script(config, env_config, remote_config,
+                                         test_logger)
 
         script = f"""\
 {setup}
@@ -1969,12 +2033,12 @@ print('HLAPI_GENERATE_WITH_STOP_PASSED')
                                        test_logger: logging.Logger,
                                        env_config: EnvironmentConfig) -> None:
         """HLAPI streaming: stop string trimmed from chunks, last chunk reason == 'stop'."""
-        config = TestConfig.from_param_string(test_param, ModelType.LLM,
-                                              TaskType.INFERENCE, env_config)
+        config = self._checkpoint_config(test_param, ModelType.LLM, env_config)
         prompt = "List three colors, separated by commas. End your list with '###'."
         stop = "###"
         setup = self._build_hlapi_env_setup(env_config.trt_package_dir or "")
-        llm_init = self._llm_init_script(config, env_config)
+        llm_init = self._llm_init_script(config, env_config, remote_config,
+                                         test_logger)
 
         script = f"""\
 {setup}
@@ -2025,11 +2089,11 @@ print('HLAPI_STREAMING_WITH_STOP_PASSED')
             remote_config: Optional[RemoteConfig], test_logger: logging.Logger,
             env_config: EnvironmentConfig) -> None:
         """Verify HLAPI non-streaming reports finish_reason='length' on max_tokens hit."""
-        config = TestConfig.from_param_string(test_param, ModelType.LLM,
-                                              TaskType.INFERENCE, env_config)
+        config = self._checkpoint_config(test_param, ModelType.LLM, env_config)
         prompt = "Write a long detailed essay about transformer neural networks."
         setup = self._build_hlapi_env_setup(env_config.trt_package_dir or "")
-        llm_init = self._llm_init_script(config, env_config)
+        llm_init = self._llm_init_script(config, env_config, remote_config,
+                                         test_logger)
 
         script = f"""\
 {setup}
@@ -2075,11 +2139,11 @@ print('HLAPI_GENERATE_LENGTH_REASON_PASSED')
             remote_config: Optional[RemoteConfig], test_logger: logging.Logger,
             env_config: EnvironmentConfig) -> None:
         """HLAPI streaming: terminal chunk reports finish_reason='length' on max_tokens hit."""
-        config = TestConfig.from_param_string(test_param, ModelType.LLM,
-                                              TaskType.INFERENCE, env_config)
+        config = self._checkpoint_config(test_param, ModelType.LLM, env_config)
         prompt = "Write a long detailed essay about transformer neural networks."
         setup = self._build_hlapi_env_setup(env_config.trt_package_dir or "")
-        llm_init = self._llm_init_script(config, env_config)
+        llm_init = self._llm_init_script(config, env_config, remote_config,
+                                         test_logger)
 
         script = f"""\
 {setup}

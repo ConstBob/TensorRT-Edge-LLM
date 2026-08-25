@@ -140,7 +140,8 @@ l0_nemo_eval_a30:
 l0_a30_trt11:
   stage: l0_test
   needs:
-    - l0_checkpoint_export_ampere
+    - job: init_l0_storage
+      artifacts: false
     - job: build_cutedsl_docker_matrix
       artifacts: true
   variables:
@@ -148,7 +149,7 @@ l0_a30_trt11:
     TRT_VERSION: "$TRT11_VERSION"
     TRT_CUDA_VERSION: "13.2"
     IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    PRIORITY: l0_pipeline_a30
+    PRIORITY: l0_hlapi_a30
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/a30_trt11.csv"
   tags:
@@ -156,7 +157,6 @@ l0_a30_trt11:
   image: "$IMAGE"
   extends:
     - .l0_storage_paths
-    - .l0_ampere_exports
     - .x86_test_template
     - .l0_rules
   interruptible: true
