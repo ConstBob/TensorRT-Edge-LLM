@@ -120,12 +120,12 @@ def _find_directory(
     return _search(root_dir, 0)
 
 
-# A real HF checkpoint dir has config.json plus at least one weight file
-# (any *.safetensors or *.bin). Used by _find_directory.require_files to
-# distinguish HF checkpoints from engine-cache dirs (no config.json).
+# A real HF checkpoint dir has config.json plus weights or a weight index.
+# Used by _find_directory.require_files to distinguish checkpoint dirs from
+# engine-cache dirs (no config.json).
 _HF_CHECKPOINT_FILES = [
     "config.json",
-    ["*.safetensors", "*.bin"],
+    ["*.safetensors", "*.bin", "*.safetensors.index.json"],
 ]
 
 _NVFP4_MOE_TARGET_ENV = "EDGELLM_NVFP4_MOE_TARGET"
@@ -217,6 +217,7 @@ def infer_checkpoint_export_model_type(param_str: str) -> ModelType:
         return ModelType.OMNI
     if ("-VL-" in base or base.startswith("InternVL")
             or base.startswith("Cosmos-Reason")
+            or base.startswith("Cosmos3-Edge-reasoning")
             or "multimodal" in base.lower()):
         return ModelType.VLM
     return ModelType.LLM
@@ -373,6 +374,8 @@ LLM_MODELS_DIR_MAP = {
     # Cosmos VLM
     "Cosmos-Reason2-8B":
     "Cosmos-Reason2-8B",
+    "Cosmos3-Edge-reasoning":
+    "Cosmos3-Edge",
     # Qwen3.5/3.6 35B-A3B (BF16 base; GPTQ-Int4 / NVFP4 variants in GPTQ map)
     "Qwen3.5-35B-A3B":
     "Qwen3.5-35B-A3B",
@@ -1816,7 +1819,7 @@ class TestConfig:
         raise ValueError(
             f"Model directory not found: none of {candidates} under any of "
             f"{search_roots} (search depth {DEFAULT_SEARCH_DEPTH}, "
-            f"requiring config.json + *.safetensors)")
+            f"requiring config.json + checkpoint weights or index)")
 
     def is_prequantized(self) -> bool:
         """Model is pre-quantized if its name contains the precision suffix."""
@@ -1875,7 +1878,7 @@ class TestConfig:
             raise ValueError(
                 f"DFlash draft model directory not found: '{model_dir_name}' under "
                 f"{self.llm_models_dir} or {self.edgellm_data_dir} with search depth 5 "
-                f"(requiring config.json + *.safetensors)")
+                f"(requiring config.json + checkpoint weights or index)")
         return model_dir
 
     def _jetspec_draft_models_for_base(self) -> Optional[dict]:
@@ -1970,7 +1973,8 @@ class TestConfig:
                     return model_dir
         raise ValueError(
             f"Draft model directory not found: none of {candidates} under "
-            f"{search_roots} (requiring config.json + *.safetensors)")
+            f"{search_roots} (requiring config.json + checkpoint weights or index)"
+        )
 
     def _draft_torch_search_roots(self) -> list[str]:
         roots = []
@@ -2410,6 +2414,8 @@ class TestConfig:
             "SeedTTS_en_meta":
             f"{self.edgellm_data_dir}/updated_datasets/SeedTTS_en_meta/seedtts_en_meta.json",
             "vlm_basic":
+            "tests/test_cases/vlm_basic.json",
+            "cosmos3_reasoner":
             "tests/test_cases/vlm_basic.json",
             "vlm_lora":
             "tests/test_cases/vlm_lora.json",

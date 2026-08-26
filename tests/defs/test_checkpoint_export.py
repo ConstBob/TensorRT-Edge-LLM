@@ -209,6 +209,9 @@ def test_checkpoint_export(test_param: str, test_logger,
             tmp_dir,
         ]
 
+        if config.model_name.startswith("Cosmos3-Edge-reasoning"):
+            export_cmd += ["--task", "reasoning"]
+
         extw_kinds = _extw_cli_kinds(config.externalize_weights)
         if extw_kinds:
             export_cmd += ["--externalize-weights", *extw_kinds]
