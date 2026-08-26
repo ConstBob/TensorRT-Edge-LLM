@@ -33,6 +33,12 @@ namespace rt
 {
 namespace decoder_utils
 {
+void zeroActiveRegion(Tensor& tensor, cudaStream_t stream)
+{
+    auto const bytes = static_cast<size_t>(tensor.getShape().volume()) * utils::getTypeSize(tensor.getDataType());
+    CUDA_CHECK(cudaMemsetAsync(tensor.rawPointer(), 0, bytes, stream));
+}
+
 std::unique_ptr<EngineExecutor> loadDraftEngine(
     std::filesystem::path const& engineDir, DeploymentConfig const& deployment)
 {
