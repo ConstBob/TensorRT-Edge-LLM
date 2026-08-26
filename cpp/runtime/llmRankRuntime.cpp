@@ -682,7 +682,7 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
         static_cast<size_t>(audioContextMemorySize), static_cast<size_t>(actionContextMemorySize));
 
     // Encoder embedding cache — content-addressed GPU cache for ViT/audio encoder outputs.
-    if (mVisionRunner || mAudioRunner)
+    if ((mVisionRunner || mAudioRunner) && contextCacheConfig.encoderEmbeddingCacheBudgetBytes > 0)
     {
         auto const budgetBytes = contextCacheConfig.encoderEmbeddingCacheBudgetBytes;
         mEncoderEmbeddingCache = std::make_unique<EncoderEmbeddingCache>(budgetBytes);
