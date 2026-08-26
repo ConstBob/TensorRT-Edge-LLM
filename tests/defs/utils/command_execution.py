@@ -21,6 +21,7 @@ unnecessary abstraction layers.
 """
 
 import json
+import math
 import os
 import subprocess
 from typing import Any, Dict, Optional
@@ -166,6 +167,29 @@ def _check_context_reuse_cold_hit_equivalence(config: TestConfig) -> None:
         )
 
 
+def _logprobs_equivalent(a: Any, b: Any, abs_tol: float = 1e-3) -> bool:
+    """Compare two logprobs structures, tolerating float noise in 'logprob' values.
+
+    Batch compaction reassigns a surviving sequence to a different batch-slot
+    index than an uncompacted replay of the same content, which changes
+    kernel-launch/reduction order and perturbs 'logprob' floats by ordinary
+    GPU non-associativity (~1e-4 to 1e-7 in practice) without changing the
+    generated token IDs. Everything else in the structure must still match
+    exactly.
+    """
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(
+            _logprobs_equivalent(x, y, abs_tol) for x, y in zip(a, b))
+    if isinstance(a, dict) and isinstance(b, dict):
+        if a.keys() != b.keys():
+            return False
+        return all(
+            math.isclose(a[key], b[key], abs_tol=abs_tol) if key ==
+            'logprob' else _logprobs_equivalent(a[key], b[key], abs_tol)
+            for key in a)
+    return a == b
+
+
 def _check_spec_prefill_evict_equivalence(config: TestConfig) -> None:
     """Require a survivor compacted after a first-token stop to match a later uncompacted replay."""
     with open(config.get_output_json_file(), encoding='utf-8') as output_file:
@@ -182,11 +206,16 @@ def _check_spec_prefill_evict_equivalence(config: TestConfig) -> None:
             "The speculative prefill-eviction fixture did not stop slot 0 on its first token."
         )
 
-    for field in ('output_text', 'finish_reason', 'logprobs'):
+    for field in ('output_text', 'finish_reason'):
         if compacted_survivor.get(field) != replayed_survivor.get(field):
             raise RuntimeError(
                 f"The compacted survivor differs from its replayed baseline in {field}."
             )
+    if not _logprobs_equivalent(compacted_survivor.get('logprobs'),
+                                replayed_survivor.get('logprobs')):
+        raise RuntimeError(
+            "The compacted survivor differs from its replayed baseline in logprobs."
+        )
 
 
 def _source_test_case_file(config: TestConfig) -> Optional[str]:
