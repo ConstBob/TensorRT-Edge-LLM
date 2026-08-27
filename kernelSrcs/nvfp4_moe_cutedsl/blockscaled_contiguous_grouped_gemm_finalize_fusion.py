@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
 # Redistribution and use in source and binary forms, with or without
@@ -2241,6 +2241,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                                 sC[epi_tidx, None, 0],
                                 cutlass.Int32(self.copy_size),
                             )
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
                     self.epilog_sync_barrier.arrive_and_wait()
 
                 # Advance to next tile
