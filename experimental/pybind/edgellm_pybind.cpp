@@ -580,6 +580,8 @@ PYBIND11_MODULE(_edgellm_runtime, m)
     py::class_<metrics::SpecDecodeGenerationMetrics>(m, "SpecDecodeGenerationMetrics")
         .def_readonly("total_iterations", &metrics::SpecDecodeGenerationMetrics::totalIterations)
         .def_readonly("total_generated_tokens", &metrics::SpecDecodeGenerationMetrics::totalGeneratedTokens)
+        .def_readonly("total_accepted_draft_tokens", &metrics::SpecDecodeGenerationMetrics::totalAcceptedDraftTokens)
+        .def_readonly("total_proposed_draft_tokens", &metrics::SpecDecodeGenerationMetrics::totalProposedDraftTokens)
         .def("get_total_runs", &metrics::SpecDecodeGenerationMetrics::getTotalRuns);
 
     py::class_<metrics::MultimodalMetrics>(m, "MultimodalMetrics")

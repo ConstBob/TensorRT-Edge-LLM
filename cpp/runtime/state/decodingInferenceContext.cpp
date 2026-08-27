@@ -48,6 +48,8 @@ void DecodingInferenceContext::initialize(int32_t batchSize, int32_t maxGenLengt
     thinkingDone.resize(batchSize, 0);
     guidedReasoningEnded.clear();
     guidedReasoningEnded.resize(batchSize, 0);
+    acceptedDraftTokens.assign(batchSize, 0);
+    proposedDraftTokens.assign(batchSize, 0);
     slotStreams.clear();
     slotStreams.resize(batchSize);
     stopStringsPerSlot.clear();

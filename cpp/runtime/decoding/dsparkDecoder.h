@@ -180,6 +180,8 @@ private:
     int32_t mLastBaseVerifyHiddenStride{0};
     int32_t mMinScheduledProposalLen{1};
     int32_t mMaxScheduledProposalLen{0};
+    //! Per-slot scheduled proposal lengths for the current round (scheduler on); empty otherwise.
+    std::vector<int32_t> mScheduledProposalLengths;
 };
 
 } // namespace rt

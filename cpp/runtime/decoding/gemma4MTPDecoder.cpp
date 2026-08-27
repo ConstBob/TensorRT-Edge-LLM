@@ -602,7 +602,7 @@ bool Gemma4MTPDecoder::acceptAndCommit(DecodingInferenceContext& context)
     mRuntime.base.cacheManager.commitSequenceLength(mAcceptLength, context.stream);
 
     decoder_utils::appendAcceptedTokens(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
-        mAcceptedTokenIds, verifySize, mRuntime.tokenizer, context.stream);
+        mAcceptedTokenIds, verifySize, mRuntime.tokenizer, context.stream, verifySize - 1);
 
     if (context.numLogprobs > 0)
     {

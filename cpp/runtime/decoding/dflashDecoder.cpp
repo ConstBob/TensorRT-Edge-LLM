@@ -653,7 +653,7 @@ bool DFlashDecoder::runBaseVerification(DecodingInferenceContext& context)
 
     // Step 8: Append accepted tokens to context (includes the round's D2H sync)
     decoder_utils::appendAcceptedTokens(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
-        mAcceptedTokenIds, maxAcceptLength, mRuntime.tokenizer, context.stream);
+        mAcceptedTokenIds, maxAcceptLength, mRuntime.tokenizer, context.stream, verifySize - 1);
 
     if (context.numLogprobs > 0)
     {

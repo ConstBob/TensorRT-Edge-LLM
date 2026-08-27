@@ -69,7 +69,8 @@ PERF_LOWER_IS_BETTER = {
 PERF_HIGHER_IS_BETTER = {
     'llm_prefill_tokens_per_second (tokens/s)',
     'llm_generation_excluding_sampling_after_prefill_tokens_per_second (tokens/s)',
-    'spec_decode_avg_acceptance_rate',
+    'spec_decode_avg_accept_length',
+    'spec_decode_acceptance_rate',
     'spec_decode_avg_tokens_per_run',
     'spec_decode_overall_tokens_per_second (tokens/s)',
 }
@@ -90,8 +91,10 @@ _STDOUT_PERF_PATTERNS = [
      ),
     (r'Peak GPU Memory:\s+([\d.]+)\s+MB', 'memory_usage_peak_gpu_memory (MB)'),
     (r'Peak CPU Memory:\s+([\d.]+)\s+MB', 'memory_usage_peak_cpu_memory (MB)'),
-    (r'=== (?:Eagle|MTP|DFlash|JetSpec|DSpark|SpecDecode) Generation ===.*?Average Acceptance Rate:\s+([\d.]+)',
-     'spec_decode_avg_acceptance_rate'),
+    (r'=== (?:Eagle|MTP|DFlash|JetSpec|DSpark|SpecDecode) Generation ===.*?Average Accept Length:\s+([\d.]+)',
+     'spec_decode_avg_accept_length'),
+    (r'=== (?:Eagle|MTP|DFlash|JetSpec|DSpark|SpecDecode) Generation ===.*?Acceptance Rate:\s+([\d.]+)',
+     'spec_decode_acceptance_rate'),
     (r'=== (?:Eagle|MTP|DFlash|JetSpec|DSpark|SpecDecode) Generation ===.*?Average Tokens per Run:\s+([\d.]+)',
      'spec_decode_avg_tokens_per_run'),
     (r'=== (?:Eagle|MTP|DFlash|JetSpec|DSpark|SpecDecode) Generation ===.*?Overall Tokens/Second \(excluding base prefill\):\s+([\d.]+)',

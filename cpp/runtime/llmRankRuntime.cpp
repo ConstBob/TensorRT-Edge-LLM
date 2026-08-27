@@ -1650,6 +1650,8 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
     int32_t totalPrunedTokens = 0;
     int32_t totalGeneratedTokens = 0;
     int32_t totalIterations = 0;
+    int64_t totalAcceptedDraftTokens = 0;
+    int64_t totalProposedDraftTokens = 0;
 
     // Accumulate from completed batches
     for (auto const& [originalIdx, batchResult] : context.completedBatches)
@@ -1661,12 +1663,15 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
         totalPrunedTokens += batchResult.prunedPrefillTokens;
         totalGeneratedTokens += batchResult.generateLength;
         totalIterations += batchResult.actualIterations;
+        totalAcceptedDraftTokens += batchResult.acceptedDraftTokens;
+        totalProposedDraftTokens += batchResult.proposedDraftTokens;
     }
 
     mPrefillMetrics.recordRun(totalReusedTokens, totalComputedTokens, totalPrunedTokens);
     if (enableSpecDecode)
     {
-        mSpecDecodeGenerationMetrics.recordRun(totalIterations, totalGeneratedTokens);
+        mSpecDecodeGenerationMetrics.recordRun(
+            totalIterations, totalGeneratedTokens, totalAcceptedDraftTokens, totalProposedDraftTokens);
     }
     else
     {
@@ -1690,14 +1695,17 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
         // Log acceptance metrics for evicted batch
         if (enableSpecDecode)
         {
-            int32_t const verificationTokens = genLength > 0 ? genLength - 1 : 0;
-            float const acceptanceRate = batchResult.actualIterations > 0
-                ? static_cast<float>(verificationTokens) / static_cast<float>(batchResult.actualIterations)
+            float const acceptLength = batchResult.actualIterations > 0
+                ? static_cast<float>(genLength) / static_cast<float>(batchResult.actualIterations)
+                : 0.0f;
+            float const acceptanceRate = batchResult.proposedDraftTokens > 0
+                ? static_cast<float>(batchResult.acceptedDraftTokens)
+                    / static_cast<float>(batchResult.proposedDraftTokens)
                 : 0.0f;
             LOG_DEBUG(
-                "Batch (completed with SpecDecode, original idx %d) - Acceptance rate: %.3f, Generated tokens: %d, "
-                "Iterations: %d",
-                originalIdx, acceptanceRate, genLength, batchResult.actualIterations);
+                "Batch (completed with SpecDecode, original idx %d) - Accept length: %.3f, Acceptance rate: "
+                "%.3f, Generated tokens: %d, Iterations: %d",
+                originalIdx, acceptLength, acceptanceRate, genLength, batchResult.actualIterations);
         }
 
         // Extract generated tokens
@@ -3251,6 +3259,8 @@ bool LLMRankRuntime::performBatchEvict(
             result.rawBatchedInputIds = std::move(context.rawBatchedInputIds[i]);
             result.effectivePrefillLength = context.effectivePrefillLengths[i];
             result.prunedPrefillTokens = i < context.prunedPrefillTokens.size() ? context.prunedPrefillTokens[i] : 0;
+            result.acceptedDraftTokens = context.acceptedDraftTokens[i];
+            result.proposedDraftTokens = context.proposedDraftTokens[i];
             result.terminalReason = context.slotStreams[i].terminalReason;
             // Convert flat LogprobsSlot -> nested vector for BatchResult (once per completed request).
             // Enrich each (token_id, logprob) with the raw token piece so consumers can render the
@@ -3284,6 +3294,8 @@ bool LLMRankRuntime::performBatchEvict(
     rt::compactVector(batchMapping, context.systemPrompts);
     rt::compactVector(batchMapping, context.rawBatchedInputIds);
     rt::compactVector(batchMapping, context.effectivePrefillLengths);
+    rt::compactVector(batchMapping, context.acceptedDraftTokens);
+    rt::compactVector(batchMapping, context.proposedDraftTokens);
     rt::compactVector(batchMapping, context.batchIndexMapping);
     rt::compactVector(batchMapping, context.callbackEmittedTokenCounts);
     rt::compactVector(batchMapping, context.slotStreams);
