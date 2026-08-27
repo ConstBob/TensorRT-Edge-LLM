@@ -32,9 +32,10 @@ from pytest_helpers import check_file_exists, run_command, run_with_trt_env
 
 from ..config import ModelType, TaskType, TestConfig
 from .accuracy import check_accuracy_with_dataset
-from .baseline import (get_baseline, map_accuracy_result_to_csv,
-                       parse_perf_from_output, promote_baseline_if_better,
-                       save_to_baseline)
+from .baseline import (get_baseline, gpu_memory_metric_from_output,
+                       map_accuracy_result_to_csv, parse_perf_from_output,
+                       peak_gpu_memory_is_comparable,
+                       promote_baseline_if_better, save_to_baseline)
 from .command_generation import (generate_build_commands,
                                  generate_e2e_bench_commands,
                                  generate_inference_commands,
@@ -353,6 +354,21 @@ def _try_save_baseline(config: TestConfig, test_func: str,
             config.param_str, csv_path)
 
 
+_DEVICE_CONFIG = None
+
+
+def _detected_compute_capability(logger=None):
+    """Compute capability of the board under test, detected once per session."""
+    global _DEVICE_CONFIG
+    if _DEVICE_CONFIG is None:
+        try:
+            from .device import DeviceConfig
+            _DEVICE_CONFIG = DeviceConfig.auto_detect(None, logger)
+        except Exception:
+            _DEVICE_CONFIG = False
+    return getattr(_DEVICE_CONFIG, "compute_capability", None) or None
+
+
 def _check_baseline_regression(config: TestConfig,
                                test_func: str,
                                result: Dict[str, Any],
@@ -400,7 +416,13 @@ def _check_baseline_regression(config: TestConfig,
 
     if check_perf:
         raw_output = result.get('output', '')
-        current_perf = parse_perf_from_output(raw_output)
+        cc = _detected_compute_capability(logger)
+        current_perf = parse_perf_from_output(raw_output, cc)
+        if not peak_gpu_memory_is_comparable(raw_output, cc):
+            all_summaries.append(
+                "memory_usage_peak_gpu_memory (MB): skipped - this platform reports "
+                f"'{gpu_memory_metric_from_output(raw_output)}', which measures system "
+                "memory pressure, not this process's GPU allocation")
         # Merge accuracy metrics into perf dict; check_perf_regression
         # only looks at columns in PERF_LOWER/HIGHER_IS_BETTER, so extras
         # (e.g. rouge scores) are naturally ignored.
