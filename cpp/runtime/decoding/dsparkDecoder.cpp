@@ -736,10 +736,16 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
             maxScheduledProposalLen = std::max(maxScheduledProposalLen, hostProposalLengths[batchIdx]);
         }
         mCurrentProposalLen = std::max(1, std::min(proposalLen, maxScheduledProposalLen));
+        mScheduledProposalLengths.resize(activeBatchSize);
+        for (int32_t batchIdx = 0; batchIdx < activeBatchSize; ++batchIdx)
+        {
+            mScheduledProposalLengths[batchIdx] = std::min(hostProposalLengths[batchIdx], mCurrentProposalLen);
+        }
     }
     else
     {
         kernel::dsparkFillProposalLengths(mProposalLengths, activeBatchSize, proposalLen, context.stream);
+        mScheduledProposalLengths.clear();
     }
     if (mUseTree)
     {
@@ -904,8 +910,9 @@ bool DSparkDecoder::runBaseVerification(DecodingInferenceContext& context)
         // The hidden compaction leaves rows at stride maxAcceptLength, not verifyLen.
         mLastBaseVerifyHiddenStride = maxAcceptLength;
 
+        // Tree convention: every non-root node in the verify tree is a proposal, matching DFlash DDTree.
         decoder_utils::appendAcceptedTokens(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
-            mAcceptedTokenIds, maxAcceptLength, mRuntime.tokenizer, context.stream);
+            mAcceptedTokenIds, maxAcceptLength, mRuntime.tokenizer, context.stream, verifyLen - 1);
         return true;
     }
 
@@ -974,7 +981,8 @@ bool DSparkDecoder::runBaseVerification(DecodingInferenceContext& context)
     mRuntime.base.cacheManager.getMambaCacheManager().scatterAcceptedLinearStates(mAcceptLength, context.stream);
 
     decoder_utils::appendAcceptedTokens(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
-        mAcceptedTokenIds, verifyLen, mRuntime.tokenizer, context.stream);
+        mAcceptedTokenIds, verifyLen, mRuntime.tokenizer, context.stream, mCurrentProposalLen,
+        mScheduledProposalLengths.empty() ? nullptr : mScheduledProposalLengths.data());
 
     return true;
 }

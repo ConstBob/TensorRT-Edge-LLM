@@ -69,6 +69,8 @@ struct BatchResult
     int32_t actualIterations{0};             //!< Number of iterations executed
     int32_t effectivePrefillLength{0};       //!< Effective prefill length after system prompt cache reuse
     int32_t prunedPrefillTokens{0};          //!< Prompt tokens removed by visual-token pruning
+    int64_t acceptedDraftTokens{0};          //!< Spec decode: draft tokens accepted by verification, summed over rounds
+    int64_t proposedDraftTokens{0}; //!< Spec decode: draft tokens proposed for verification, summed over rounds
     //! Per-step top log-probabilities: logprobs[step] = [LogprobEntry, ...], sorted descending.
     //! Populated only when numLogprobs > 0 in the original request.
     std::vector<std::vector<LogprobEntry>> logprobs;
@@ -92,7 +94,9 @@ struct DecodingInferenceContext
     //! Per-slot prompt tokens removed by visual-token pruning (empty when pruning is off —
     //! treat a missing entry as 0).
     std::vector<int32_t> prunedPrefillTokens;
-    std::vector<int8_t> finishedStates; //!< Finished state for each sequence
+    std::vector<int8_t> finishedStates;       //!< Finished state for each sequence
+    std::vector<int64_t> acceptedDraftTokens; //!< Spec decode: accepted draft tokens summed per slot
+    std::vector<int64_t> proposedDraftTokens; //!< Spec decode: proposed draft tokens summed per slot
     //! Per-slot thinking tracker: 1 once thinking is complete (end marker emitted, or the model
     //! never entered thinking). Lives here, rather than as a `handleRequest` local, so batch
     //! compaction reindexes it together with every other per-slot vector; otherwise an eviction

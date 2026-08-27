@@ -68,7 +68,8 @@ void appendSampledTokens(DecodingInferenceContext& context, int32_t const* sampl
 
 void appendAcceptedTokens(DecodingInferenceContext& context, Tensor& hostAcceptLengths, Tensor& hostAcceptedTokenIds,
     Tensor const& deviceAcceptLength, Tensor const& deviceAcceptedTokenIds, int32_t maxAcceptDepth,
-    tokenizer::Tokenizer const& tokenizer, cudaStream_t stream)
+    tokenizer::Tokenizer const& tokenizer, cudaStream_t stream, int32_t proposedDraftsPerRound,
+    int32_t const* perSlotProposedDrafts)
 {
     int32_t const activeBatchSize = context.activeBatchSize;
 
@@ -91,6 +92,7 @@ void appendAcceptedTokens(DecodingInferenceContext& context, Tensor& hostAcceptL
             continue;
         }
         int32_t const acceptLength = hostAcceptLengthsData[batchIdx];
+        int32_t const proposedDrafts = perSlotProposedDrafts ? perSlotProposedDrafts[batchIdx] : proposedDraftsPerRound;
         int32_t appended = 0;
         for (int32_t i = 0; i < acceptLength; i++)
         {
@@ -109,6 +111,17 @@ void appendAcceptedTokens(DecodingInferenceContext& context, Tensor& hostAcceptL
         // EOS / stop can end the slot mid-accept; write back the appended count so
         // collectSpecLogprobsFromHost skips verify rows past the end of the sequence.
         hostAcceptLengthsData[batchIdx] = appended;
+        // Full accept: last token is the target-sampled bonus, not a draft, so -1.
+        // EOS truncation: count drafts up to and including the EOS.
+        int32_t const acceptedDrafts
+            = std::min(std::max(0, appended - (appended == acceptLength ? 1 : 0)), proposedDrafts);
+        context.acceptedDraftTokens[batchIdx] += acceptedDrafts;
+        context.proposedDraftTokens[batchIdx] += proposedDrafts;
+        LOG_DEBUG(
+            "SpecRound %d batchIdx %d: generated=%d, acceptedDrafts=%d, proposedDrafts=%d, "
+            "cumGenerateLength=%d",
+            context.generationRound, batchIdx, appended, acceptedDrafts, proposedDrafts,
+            context.currentGenerateLengths[batchIdx]);
     }
 }
 

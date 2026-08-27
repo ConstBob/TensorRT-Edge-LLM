@@ -50,7 +50,8 @@ void appendSampledTokens(DecodingInferenceContext& context, int32_t const* sampl
 //! On return, hostAcceptLengths holds the number of tokens actually appended per slot.
 void appendAcceptedTokens(DecodingInferenceContext& context, Tensor& hostAcceptLengths, Tensor& hostAcceptedTokenIds,
     Tensor const& deviceAcceptLength, Tensor const& deviceAcceptedTokenIds, int32_t maxAcceptDepth,
-    tokenizer::Tokenizer const& tokenizer, cudaStream_t stream);
+    tokenizer::Tokenizer const& tokenizer, cudaStream_t stream, int32_t proposedDraftsPerRound = 0,
+    int32_t const* perSlotProposedDrafts = nullptr);
 
 //! @brief Clamp device accept lengths so multi-token speculative commits never exceed max_generate_length.
 void clampAcceptLengthsToRemainingGeneration(

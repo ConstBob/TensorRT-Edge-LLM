@@ -661,7 +661,8 @@ bool EagleDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     }
 
     decoder_utils::appendAcceptedTokens(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
-        mAcceptedTokenIds, maxAcceptDepth, mRuntime.tokenizer, context.stream);
+        mAcceptedTokenIds, maxAcceptDepth, mRuntime.tokenizer, context.stream,
+        mRuntime.deployment.specConfig->verifySize - 1);
     int32_t const* const hostAcceptLengths = mHostAcceptLengths.dataPointer<int32_t>();
     mCommonStateTracker.recordAccepted(hostAcceptLengths, activeBatchSize);
 

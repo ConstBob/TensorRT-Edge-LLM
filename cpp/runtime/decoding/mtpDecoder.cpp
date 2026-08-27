@@ -758,7 +758,8 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     }
 
     decoder_utils::appendAcceptedTokens(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
-        mAcceptedTokenIds, maxAcceptDepth, mRuntime.tokenizer, context.stream);
+        mAcceptedTokenIds, maxAcceptDepth, mRuntime.tokenizer, context.stream,
+        mRuntime.deployment.specConfig->verifySize - 1);
 
     // Few-layer-validation dump (no-op unless EDGELLM_DUMP_LOGITS_KVCACHE_* are set).
     decoder_utils::dumpSpecRound(context, mRuntime.base.cacheManager, *mRuntime.base.sharedResources.kvPageTables[0],

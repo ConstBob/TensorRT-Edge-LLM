@@ -619,6 +619,7 @@ void compactVector(std::vector<int32_t> const& batchMapping, std::vector<T>& vec
 
 template void compactVector<int8_t>(std::vector<int32_t> const&, std::vector<int8_t>&);
 template void compactVector<int32_t>(std::vector<int32_t> const&, std::vector<int32_t>&);
+template void compactVector<int64_t>(std::vector<int32_t> const&, std::vector<int64_t>&);
 template void compactVector<std::vector<int32_t>>(std::vector<int32_t> const&, std::vector<std::vector<int32_t>>&);
 template void compactVector<std::string>(std::vector<int32_t> const&, std::vector<std::string>&);
 template void compactVector<std::vector<std::string>>(
