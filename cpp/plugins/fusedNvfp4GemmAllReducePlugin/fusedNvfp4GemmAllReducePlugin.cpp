@@ -129,6 +129,7 @@ struct FusedAllReduceExecutionContext
     void* const* outputs;
     uint8_t const* globalActScaleTiled;
     uint8_t const* weightScaleTiled;
+    void const* weightScale2;
     int32_t m;
     int32_t n;
     int32_t k;
@@ -144,9 +145,9 @@ AllReduceExecutionStatus executeSmallShmFusedAllReducePath(
 {
     half* rankSlot = (rank == 0) ? state->shmBuf : state->shmBuf1;
     auto* gemmOutputFp8 = reinterpret_cast<uint8_t*>(rankSlot);
-    cudaError_t const error
-        = context.gemmRunner->runFp8(context.activation, context.weight, context.globalActScaleTiled,
-            context.weightScaleTiled, gemmOutputFp8, context.m, context.n, context.k, context.stream);
+    cudaError_t const error = context.gemmRunner->runFp8(context.activation, context.weight,
+        context.globalActScaleTiled, context.weightScaleTiled, gemmOutputFp8, context.weightScale2, context.m,
+        context.n, context.k, context.stream);
     if (error != cudaSuccess)
     {
         LOG_ERROR(
@@ -170,7 +171,8 @@ AllReduceExecutionStatus executeLargeShmFusedAllReducePath(
 {
     half* gemmOutputFp16 = (rank == 0) ? state->shmBuf : state->shmBuf1;
     cudaError_t const error = context.gemmRunner->run(context.activation, context.weight, context.globalActScaleTiled,
-        context.weightScaleTiled, gemmOutputFp16, context.m, context.n, context.k, context.stream);
+        context.weightScaleTiled, gemmOutputFp16, context.weightScale2, context.m, context.n, context.k,
+        context.stream);
     if (error != cudaSuccess)
     {
         LOG_ERROR(
@@ -257,8 +259,8 @@ AllReduceExecutionStatus executeGemmNcclAllReducePath(
     }
 
     cudaError_t const gemmError = context.gemmRunner->run(context.activation, context.weight,
-        context.globalActScaleTiled, context.weightScaleTiled, context.outputs[kOUT_TENSOR_IDX], context.m, context.n,
-        context.k, context.stream);
+        context.globalActScaleTiled, context.weightScaleTiled, context.outputs[kOUT_TENSOR_IDX], context.weightScale2,
+        context.m, context.n, context.k, context.stream);
     if (gemmError != cudaSuccess)
     {
         LOG_ERROR("FusedNvfp4GemmAllReducePlugin: FP16 CuTe DSL GEMM (NCCL fallback) failed: %s",
@@ -695,9 +697,8 @@ int32_t FusedNvfp4GemmAllReducePlugin::enqueue(PluginTensorDesc const* inputDesc
                 }
                 else
                 {
-                    kernels::fusedFp8ToSfAtom(static_cast<__nv_fp8_e4m3 const*>(weightScale),
-                        static_cast<float const*>(weightScale2), mCachedWeightScaleTiled, wNumRows, wNumKBlocks,
-                        stream);
+                    kernels::fusedFp8ToSfAtom(static_cast<__nv_fp8_e4m3 const*>(weightScale), mCachedWeightScaleTiled,
+                        wNumRows, wNumKBlocks, stream);
 
                     mCachedWeightNumRows = wNumRows;
                     mCachedWeightNumKBlocks = wNumKBlocks;
@@ -737,13 +738,13 @@ int32_t FusedNvfp4GemmAllReducePlugin::enqueue(PluginTensorDesc const* inputDesc
             rt::Tensor weightScaleTiledTensor
                 = assignTensorFromWorkspace(workspaceCursor, rt::Coords{weightTiledSize}, DataType::kINT8);
             auto* weightScaleTiled = static_cast<uint8_t*>(weightScaleTiledTensor.rawPointer());
-            kernels::fusedFp8ToSfAtom(static_cast<__nv_fp8_e4m3 const*>(weightScale),
-                static_cast<float const*>(weightScale2), weightScaleTiled, wNumRows, wNumKBlocks, stream);
+            kernels::fusedFp8ToSfAtom(
+                static_cast<__nv_fp8_e4m3 const*>(weightScale), weightScaleTiled, wNumRows, wNumKBlocks, stream);
             weightSFB = weightScaleTiled;
         }
 
         FusedAllReduceExecutionContext const executionContext{mGemmRunner, inputs[kFP4_ACT_IDX], weight, outputs,
-            globalActScaleTiled, weightSFB, m, N, K, mTpSize, currentDevice, outElements, stream};
+            globalActScaleTiled, weightSFB, weightScale2, m, N, K, mTpSize, currentDevice, outElements, stream};
         AllReduceExecutionStatus status = AllReduceExecutionStatus::kUnavailable;
 
         // {$edge-llm-internal-release begin}

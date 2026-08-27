@@ -150,6 +150,7 @@ def _create_nvfp4_pointers(
       * SFA : uint8[atom_bytes]   (atom layout Float8E4M3FN)
       * SFB : uint8[atom_bytes]
       * C   : <c_dtype>[M, N]     (m_padded along M for the kernel epilogue)
+      * ALPHA : float32[1]        (epilogue scalar multiplier)
     """
     import cutlass.cute.runtime as cute_runtime
 
@@ -172,6 +173,7 @@ def _create_nvfp4_pointers(
     b_raw = _alloc((n, k // 2), cp.uint8)
     sfa_raw = _alloc(_compute_sf_buffer_elements(m, k, sf_vec_size), cp.uint8)
     sfb_raw = _alloc(_compute_sf_buffer_elements(n, k, sf_vec_size), cp.uint8)
+    alpha_raw = _alloc((1,), cp.float32)
     if c_dtype is cutlass.Float16:
         c_raw = _alloc((m_padded, n), cp.float16)
     elif c_dtype is cutlass.Float8E4M3FN:
@@ -204,9 +206,14 @@ def _create_nvfp4_pointers(
         c_dtype, c_raw.data.ptr,
         cute.AddressSpace.gmem, assumed_align=16,
     )
+    alpha_ptr = cute_runtime.make_ptr(
+        cutlass.Float32, alpha_raw.data.ptr,
+        cute.AddressSpace.gmem, assumed_align=4,
+    )
 
     return (
-        dict(a=a_ptr, b=b_ptr, sfa=sfa_ptr, sfb=sfb_ptr, c=c_ptr),
+        dict(a=a_ptr, b=b_ptr, sfa=sfa_ptr, sfb=sfb_ptr, c=c_ptr,
+             alpha=alpha_ptr),
         bufs,
     )
 
@@ -503,6 +510,7 @@ class GemmBlackwellNvFp4WS:
         sfa: cute.Tensor,
         sfb: cute.Tensor,
         c: cute.Tensor,
+        alpha: cute.Tensor,
         max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
@@ -695,6 +703,7 @@ class GemmBlackwellNvFp4WS:
             tma_atom_sfa, tma_tensor_sfa,
             tma_atom_sfb, tma_tensor_sfb,
             tma_atom_c, tma_tensor_c,
+            alpha,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -720,6 +729,7 @@ class GemmBlackwellNvFp4WS:
         sfa_ptr: cute.Pointer,
         sfb_ptr: cute.Pointer,
         c_ptr: cute.Pointer,
+        alpha_ptr: cute.Pointer,
         m: cutlass.Int64,
         n: cutlass.Int64,
         k: cutlass.Int64,
@@ -743,6 +753,7 @@ class GemmBlackwellNvFp4WS:
           extern "C" int gemm_blackwell_nvfp4_ws_fp16(
               Kernel_Module_t* module,
               void* a_ptr, void* b_ptr, void* sfa_ptr, void* sfb_ptr, void* c_ptr,
+              void* alpha_ptr,
               int64_t m, int64_t n, int64_t k,
               int32_t max_active_clusters,
               CUstream stream);
@@ -750,6 +761,12 @@ class GemmBlackwellNvFp4WS:
         ``max_active_clusters`` sizes the persistent tile-scheduler grid and
         must describe the GPU the kernel launches on (typically
         ``cudaDevAttrMultiProcessorCount`` for cluster (1,1)).
+
+        ``alpha_ptr`` points at one device-resident FP32 scalar. The epilogue
+        multiplies the FP32 accumulator by it before the narrowing store, so a
+        per-tensor dequant scale keeps full FP32 range instead of being folded
+        into the 8-bit block scales. Callers with no scale must pass a pointer
+        to 1.0f.
         """
         scale_k = k // scaling_vector_size
         m_padded = ((m + 127) // 128) * 128
@@ -799,7 +816,8 @@ class GemmBlackwellNvFp4WS:
         c = cute.make_tensor(
             c_ptr, layout=cute.make_ordered_layout((m, n, 1), order=(1, 0, 2))
         )
-        return self(a, b, sfa, sfb, c, max_active_clusters, stream)
+        alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((1,)))
+        return self(a, b, sfa, sfb, c, alpha, max_active_clusters, stream)
 
     @cute.kernel
     def kernel(
@@ -816,6 +834,7 @@ class GemmBlackwellNvFp4WS:
         mSFB: cute.Tensor,
         tma_atom_c: cute.CopyAtom,
         mC_mnl: cute.Tensor,
+        mAlpha: cute.Tensor,
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -1376,6 +1395,12 @@ class GemmBlackwellNvFp4WS:
                 pipeline.PipelineUserType.Consumer, self.num_acc_stage
             )
 
+            # Read once per CTA: the per-tensor dequant scale stays in FP32
+            # here instead of being folded into the 8-bit block scales, whose
+            # narrow exponent range would flush most folded products to
+            # subnormal.
+            alpha_val = mAlpha[0]
+
             # TMA-store pipeline over the 4 epilog warps.
             c_producer_group = pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
@@ -1424,9 +1449,9 @@ class GemmBlackwellNvFp4WS:
                     tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
-                    # Cast FP32 acc -> c_dtype (FP16 or FP8 E4M3).
+                    # Scale in FP32, then cast to c_dtype (FP16 or FP8 E4M3).
                     acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
-                    tRS_rC.store(acc_vec.to(self.c_dtype))
+                    tRS_rC.store((alpha_val * acc_vec).to(self.c_dtype))
 
                     # Register -> SMEM (ring-buffered across num_c_stage).
                     c_buffer = (num_prev_subtiles + subtile_idx) % self.num_c_stage
@@ -1803,6 +1828,7 @@ def run(
     compiled_gemm = cute.compile(
         gemm.wrapper,
         ptrs["a"], ptrs["b"], ptrs["sfa"], ptrs["sfb"], ptrs["c"],
+        ptrs["alpha"],
         m, n, k,
         sf_vec_size,
         max_active_clusters,
