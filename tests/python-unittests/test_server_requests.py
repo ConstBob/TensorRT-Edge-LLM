@@ -24,7 +24,7 @@ import pytest
 
 from experimental.server.api.errors import ServerOverloadedError
 from experimental.server.config import ApiConfig
-from experimental.server.runtime.engine import (CompletionOutput,
+from experimental.server.runtime.engine import (CompletionOutput, LogprobEntry,
                                                 SamplingParams, StreamDelta)
 
 
@@ -736,6 +736,361 @@ def test_tool_call_delta_does_not_wait_for_native_stream_end(tmp_path):
         assert tail[-1] == "data: [DONE]\n\n"
 
     asyncio.run(exercise())
+
+
+def test_streaming_with_tools_keeps_plain_text_incremental(client_and_llm):
+    # #719 regression: tools + tool_choice=auto + stream must not buffer a
+    # plain-text answer until generation ends.
+    client, llm = client_and_llm
+
+    def word_stream(_messages, _params, **_kwargs):
+        words = ["The ", "weather ", "looks ", "fine ", "today."]
+        for i, word in enumerate(words):
+            last = i == len(words) - 1
+            yield StreamDelta(text=word,
+                              token_ids=[i],
+                              prompt_tokens=7,
+                              finished=last,
+                              finish_reason="stop" if last else None)
+
+    llm.generate_stream = word_stream
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Weather?"
+                               }],
+                               "tools": [_tool()],
+                               "tool_choice":
+                               "auto",
+                               "stream":
+                               True,
+                           })
+    assert response.status_code == 200, response.text
+    payloads = _sse_payloads(response)
+    contents = [
+        payload["choices"][0]["delta"]["content"] for payload in payloads
+        if payload.get("choices")
+        and payload["choices"][0]["delta"].get("content")
+    ]
+    assert len(contents) > 1  # exactly 1 before the fix
+    assert "".join(contents) == "The weather looks fine today."
+    finish = [
+        payload["choices"][0]["finish_reason"] for payload in payloads if
+        payload.get("choices") and payload["choices"][0].get("finish_reason")
+    ]
+    assert finish == ["stop"]
+
+
+def test_streaming_tool_call_wire_format_and_assembly(client_and_llm):
+    # OpenAI wire contract: head chunk carries index/id/type/name with empty
+    # arguments; later chunks carry only argument fragments; the documented
+    # client-side assembly must reproduce the call.
+    client, llm = client_and_llm
+
+    def tool_stream(_messages, _params, **_kwargs):
+        pieces = [
+            "Sure. ",
+            '<tool_call>{"name": "get_weather", "arguments": {"city": "Par',
+            'is"}}</tool_call>',
+        ]
+        for i, piece in enumerate(pieces):
+            last = i == len(pieces) - 1
+            yield StreamDelta(text=piece,
+                              token_ids=[i],
+                              prompt_tokens=7,
+                              finished=last,
+                              finish_reason="stop" if last else None)
+
+    llm.generate_stream = tool_stream
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Weather?"
+                               }],
+                               "tools": [_tool()],
+                               "tool_choice":
+                               "auto",
+                               "stream":
+                               True,
+                           })
+    assert response.status_code == 200, response.text
+    payloads = _sse_payloads(response)
+    deltas = [
+        payload["choices"][0]["delta"] for payload in payloads
+        if payload.get("choices")
+    ]
+    tool_deltas = [d["tool_calls"][0] for d in deltas if d.get("tool_calls")]
+    head, *fragments = tool_deltas
+    assert head["id"].startswith("call_") and head["type"] == "function"
+    assert head["function"] == {"name": "get_weather", "arguments": ""}
+    assert len(fragments) >= 2  # argument bytes streamed, not one late blob
+    for fragment in fragments:
+        assert set(fragment["function"]) == {"arguments"}
+        assert "id" not in fragment
+        assert fragment["index"] == head["index"]
+    assembled = "".join(f["function"]["arguments"] for f in fragments)
+    assert json.loads(assembled) == {"city": "Paris"}
+    contents = [d["content"] for d in deltas if d.get("content")]
+    assert "".join(contents) == "Sure. "
+    finish = [
+        payload["choices"][0]["finish_reason"] for payload in payloads if
+        payload.get("choices") and payload["choices"][0].get("finish_reason")
+    ]
+    assert finish == ["tool_calls"]
+
+
+def test_streaming_parallel_tool_calls_keep_stable_indices(client_and_llm):
+    client, llm = client_and_llm
+
+    def two_calls(_messages, _params, **_kwargs):
+        yield StreamDelta(
+            text=('<tool_call>{"name": "get_weather", "arguments": '
+                  '{"city": "A"}}</tool_call> then '),
+            token_ids=[1],
+            prompt_tokens=7)
+        yield StreamDelta(
+            text=('<tool_call>{"name": "get_weather", "arguments": '
+                  '{"city": "B"}}</tool_call>'),
+            token_ids=[2],
+            prompt_tokens=7,
+            finished=True,
+            finish_reason="stop")
+
+    llm.generate_stream = two_calls
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Weather?"
+                               }],
+                               "tools": [_tool()],
+                               "tool_choice":
+                               "auto",
+                               "stream":
+                               True,
+                           })
+    assert response.status_code == 200, response.text
+    calls = {}
+    for payload in _sse_payloads(response):
+        for choice in payload.get("choices") or []:
+            for tc in choice["delta"].get("tool_calls") or []:
+                slot = calls.setdefault(tc["index"], {"id": None, "args": ""})
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                slot["args"] += tc.get("function", {}).get("arguments", "")
+    assert sorted(calls) == [0, 1]
+    assert calls[0]["id"] != calls[1]["id"]
+    assert json.loads(calls[0]["args"]) == {"city": "A"}
+    assert json.loads(calls[1]["args"]) == {"city": "B"}
+
+
+def test_streaming_tool_call_truncation_keeps_length_finish_reason(
+        client_and_llm):
+    # Design R2: a call cut off by max_tokens must not be re-labelled
+    # "tool_calls"; the client needs "length" to treat it as truncated.
+    client, llm = client_and_llm
+
+    def truncated(_messages, _params, **_kwargs):
+        yield StreamDelta(
+            text='<tool_call>{"name": "get_weather", "arguments": {"city": "tr',
+            token_ids=[1],
+            prompt_tokens=7,
+            finished=True,
+            finish_reason="length")
+
+    llm.generate_stream = truncated
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Weather?"
+                               }],
+                               "tools": [_tool()],
+                               "tool_choice":
+                               "auto",
+                               "stream":
+                               True,
+                           })
+    payloads = _sse_payloads(response)
+    finish = [
+        payload["choices"][0]["finish_reason"] for payload in payloads if
+        payload.get("choices") and payload["choices"][0].get("finish_reason")
+    ]
+    assert finish == ["length"]
+    args = "".join(
+        tc.get("function", {}).get("arguments", "") for payload in payloads
+        for choice in payload.get("choices") or []
+        for tc in choice["delta"].get("tool_calls") or [])
+    assert args == '{"city": "tr'
+
+
+def test_streaming_tools_with_thinking_splits_reasoning(client_and_llm):
+    # D5 mainstream case: reasoning closes, then the tool call follows.
+    client, llm = client_and_llm
+
+    def thinking_then_tool(_messages, _params, **_kwargs):
+        for i, piece in enumerate([
+                "plan it</think>",
+                "ok ",
+                '<tool_call>{"name": "get_weather", "arguments": {}}'
+                "</tool_call>",
+        ]):
+            yield StreamDelta(text=piece,
+                              token_ids=[i],
+                              prompt_tokens=7,
+                              finished=piece.endswith("</tool_call>"),
+                              finish_reason="stop"
+                              if piece.endswith("</tool_call>") else None)
+
+    llm.generate_stream = thinking_then_tool
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Weather?"
+                               }],
+                               "tools": [_tool()],
+                               "tool_choice":
+                               "auto",
+                               "stream":
+                               True,
+                               "enable_thinking":
+                               True,
+                           })
+    assert response.status_code == 200, response.text
+    deltas = [
+        payload["choices"][0]["delta"] for payload in _sse_payloads(response)
+        if payload.get("choices")
+    ]
+    reasoning = "".join(d.get("reasoning_content") or "" for d in deltas)
+    contents = "".join(d.get("content") or "" for d in deltas)
+    heads = [
+        tc for d in deltas for tc in d.get("tool_calls") or [] if tc.get("id")
+    ]
+    assert reasoning == "plan it"
+    assert contents == "ok "
+    assert len(heads) == 1 and heads[0]["function"]["name"] == "get_weather"
+
+
+def _stream_with_logprobs(pieces):
+    """One delta per piece, each carrying its own single-token logprob step."""
+
+    def stream(_messages, _params, **_kwargs):
+        for i, piece in enumerate(pieces):
+            last = i == len(pieces) - 1
+            yield StreamDelta(text=piece,
+                              token_ids=[i],
+                              prompt_tokens=7,
+                              logprobs=[[
+                                  LogprobEntry(token_id=i,
+                                               logprob=-0.5,
+                                               token=piece,
+                                               bytes=list(piece.encode()))
+                              ]],
+                              finished=last,
+                              finish_reason="stop" if last else None)
+
+    return stream
+
+
+# Deltas short enough that the tool and reasoning parsers withhold them, which
+# is the normal shape of token-by-token streaming.
+_LOGPROB_CASES = {
+    "plain": ["Sun", "ny", " today", "."],
+    "thinking": ["The", " sky", " is", "</think>", "Sun", "ny."],
+    "tools": [
+        "Sure. ",
+        "<tool_",
+        'call>{"name": "get_weather", "arguments": {"city": "Par',
+        'is"}}</tool_call>',
+    ],
+    "tools+thinking": [
+        "plan",
+        " it</think>",
+        "ok ",
+        '<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>',
+    ],
+}
+
+
+def _stream_logprob_request(client, case, extra):
+    body = {
+        "messages": [{
+            "role": "user",
+            "content": "Weather?"
+        }],
+        "stream": True,
+        "enable_thinking": "thinking" in case,
+        **extra,
+    }
+    if "tools" in case:
+        body["tools"] = [_tool()]
+        body["tool_choice"] = "auto"
+    return client.post("/v1/chat/completions", json=body)
+
+
+@pytest.mark.parametrize("case", sorted(_LOGPROB_CASES))
+@pytest.mark.parametrize("extra", [{}, {
+    "logprobs": True
+}, {
+    "logprobs": True,
+    "top_logprobs": 2
+}],
+                         ids=["off", "on", "on+top"])
+def test_streaming_logprobs_hold_across_tool_and_thinking_combos(
+        client_and_llm, case, extra):
+    # #719 follow-up: both streaming paths dropped the logprobs of any delta
+    # whose bytes the tool or reasoning parser withheld, while the
+    # non-streaming path returned them for the same request.
+    client, llm = client_and_llm
+    pieces = _LOGPROB_CASES[case]
+    llm.generate_stream = _stream_with_logprobs(pieces)
+
+    response = _stream_logprob_request(client, case, extra)
+    assert response.status_code == 200, response.text
+    choices = [
+        payload["choices"][0] for payload in _sse_payloads(response)
+        if payload.get("choices")
+    ]
+    entries = [
+        entry for choice in choices if choice["logprobs"]
+        for entry in choice["logprobs"]["content"]
+    ]
+    if extra:
+        # Concatenating the chunks reproduces the generated token sequence:
+        # every delta delivers its logprobs exactly once, in order.
+        assert [entry["token_id"]
+                for entry in entries] == list(range(len(pieces)))
+        assert all(
+            bool(entry["top_logprobs"]) == ("top_logprobs" in extra)
+            for entry in entries)
+    else:
+        assert entries == []
+    assert choices[-1]["finish_reason"] == ("tool_calls"
+                                            if "tools" in case else "stop")
+
+
+def test_streaming_tools_carry_logprobs_on_head_and_empty_chunks(
+        client_and_llm):
+    # A delta reaches the wire in one of two shapes, and both must carry the
+    # logprobs: as the first of the chunks it expands into, or -- when the
+    # parser withheld all of its bytes -- as an otherwise empty delta.
+    client, llm = client_and_llm
+    llm.generate_stream = _stream_with_logprobs(_LOGPROB_CASES["tools"])
+
+    response = _stream_logprob_request(client, "tools", {"logprobs": True})
+    assert response.status_code == 200, response.text
+    carried = [
+        choice["delta"] for payload in _sse_payloads(response)
+        if payload.get("choices") for choice in [payload["choices"][0]]
+        if choice["logprobs"]
+    ]
+    assert carried[0]["content"] == "Sure. "
+    assert not any(carried[1][field] for field in ("content", "tool_calls"))
+    assert carried[2]["tool_calls"][0]["function"]["name"] == "get_weather"
+    assert carried[3]["tool_calls"][0]["function"]["arguments"]
 
 
 def test_streaming_audio_orders_text_pcm_usage_and_done(client_and_llm):

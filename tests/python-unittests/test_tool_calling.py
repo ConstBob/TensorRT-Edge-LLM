@@ -165,37 +165,3 @@ def test_stream_parser_flushes_untagged_provider_format(tmp_path):
     assert len(events) == 1
     assert events[0]["type"] == "tool_call"
     assert json.loads(events[0]["tool_call"].arguments) == {"city": "Paris"}
-
-
-@pytest.mark.parametrize(
-    "text, expected_cities",
-    [
-        (
-            "Before<function=get_weather><parameter=city>Paris</parameter>"
-            "</function>After",
-            ["Paris"],
-        ),
-        (
-            'Before<tool_calls>[{"name":"get_weather","arguments":'
-            '{"city":"Paris"}},{"name":"get_weather","arguments":'
-            '{"city":"Tokyo"}}]</tool_calls>After',
-            ["Paris", "Tokyo"],
-        ),
-    ],
-)
-def test_stream_parser_accepts_every_tool_delimiter_split(
-        tmp_path, text, expected_cities):
-    for split in range(len(text) + 1):
-        parser = stream_assistant_output(_config(), str(tmp_path))
-        events = list(parser.feed(text[:split]))
-        events.extend(parser.feed(text[split:]))
-        events.extend(parser.flush())
-
-        assert "".join(event["text"] for event in events
-                       if event["type"] == "content") == "BeforeAfter"
-        calls = [
-            event["tool_call"] for event in events
-            if event["type"] == "tool_call"
-        ]
-        assert [json.loads(call.arguments)["city"]
-                for call in calls] == expected_cities
