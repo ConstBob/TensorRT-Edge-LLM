@@ -1057,8 +1057,10 @@ class TestConfig:
                 parsed_params['tp_size'] = int(part[2:])
             elif part in ("mdthread", "mdmpi"):
                 parsed_params['md_launch_mode'] = part[2:]
+            # {$edge-llm-internal-release begin}
             elif part in ("arshm", "arnccl"):
                 parsed_params['allreduce_backend'] = part[2:]
+            # {$edge-llm-internal-release end}
             # For benchmark parameters
             elif part.startswith('bs'):
                 parsed_params['batch_size'] = int(part[2:])

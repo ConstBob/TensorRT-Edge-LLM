@@ -729,6 +729,27 @@ def execute_inference_test(
                 'test_type': TaskType.INFERENCE.value
             }
 
+    # {$edge-llm-internal-release begin}
+    # The runtime silently falls back to NCCL when the SHM path fails to
+    # register, so an arshm case passes even when SHM never ran. Require the
+    # positive marker from tensorParallelPluginResources.
+    if config.allreduce_backend == "shm":
+        joined = '\n'.join(all_outputs)
+        if "shm=registered" not in joined:
+            return {
+                'success':
+                False,
+                'error':
+                ("The case requested the SHM all-reduce path, but the "
+                 "runtime did not register it. Expected "
+                 "'shm=registered' in the log."),
+                'output':
+                joined,
+                'test_type':
+                TaskType.INFERENCE.value
+            }
+    # {$edge-llm-internal-release end}
+
     # Calculate metrics based on dataset type
     final_result = {
         'success': True,

@@ -15,12 +15,6 @@
  * limitations under the License.
  */
 
-/*
- * AllReducePlugin coverage for the SHM execution path and for its fallback to
- * NCCL. The two TP ranks run as worker threads in one process, which matches the
- * Edge-LLM unit-test build flow.
- */
-
 #include "allReducePluginTestUtils.h"
 
 #include "common/cudaUtils.h"
