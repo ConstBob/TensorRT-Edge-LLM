@@ -289,9 +289,10 @@ bool canCompileXQAKernel(int32_t numQHeads, int32_t numKVHeads, int32_t headSize
     // Current kernel list supports
     // (1) Head ratio 1-8 for head_dim {32, 64, 128}
     // (2) Head ratio 16 for head_dim 128 only (NemotronH).
-    // (3) Head ratio 2, 4, 6, 8 for head_dim 256
+    // (3) Head ratio 2, 4, 6, 8, 16 for head_dim 256
     //     (4/6/8 for Qwen3.5-MoE / Qwen3.5-Omni Thinker+Talker;
-    //      2 for Qwen3.5-Omni Talker decode attention — 16 Q heads / 8 KV heads).
+    //      2 for Qwen3.5-Omni Talker decode attention — 16 Q heads / 8 KV heads;
+    //      16 for Qwen3.5-122B-A10B gated full attention — 32 Q heads / 2 KV heads).
     // (4) Head ratio 2, 4, 8, 16 for head_dim 512.
     //     (2 for Gemma4 E4B assistant: 4 Q heads / 2 KV heads;
     //      4 for Gemma4 E4B: 8 Q heads / 2 KV heads;
@@ -304,7 +305,8 @@ bool canCompileXQAKernel(int32_t numQHeads, int32_t numKVHeads, int32_t headSize
     bool const checkQHeadPerKV
         = ((headSize == 32 || headSize == 64 || headSize == 128) && headRatio >= 1 && headRatio <= 8)
         || (headSize == 128 && headRatio == 16)
-        || (headSize == 256 && (headRatio == 2 || headRatio == 4 || headRatio == 6 || headRatio == 8))
+        || (headSize == 256
+            && (headRatio == 2 || headRatio == 4 || headRatio == 6 || headRatio == 8 || headRatio == 16))
         || (headSize == 512 && (headRatio == 2 || headRatio == 4 || headRatio == 8 || headRatio == 16));
 
     return checkHeadNumbers && checkType && checkKVType && checkSMVersion && checkQHeadPerKV;
