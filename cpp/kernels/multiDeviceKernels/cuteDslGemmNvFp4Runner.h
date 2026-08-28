@@ -100,11 +100,7 @@ public:
     /// @param aSF    UE4M3 atom-layout SF buffer for A, device ptr
     /// @param bSF    UE4M3 atom-layout SF buffer for B, device ptr
     /// @param d      FP16 output buffer, device ptr to [M, N] half
-    /// @param alpha  device ptr to one FP32 scalar. The epilogue multiplies
-    ///               the FP32 accumulator by it before the narrowing store, so
-    ///               a per-tensor dequant scale never has to be folded into the
-    ///               8-bit block scales. Must not be null; pass a pointer to
-    ///               1.0f when no scale applies.
+    /// @param alpha  device ptr to the per tensor FP32 dequant scale
     /// @param M, N, K dynamic shapes. N must be multiple of 128 and K a
     ///               multiple of 64 (satisfied by TP layouts). M may be any
     ///               positive integer.

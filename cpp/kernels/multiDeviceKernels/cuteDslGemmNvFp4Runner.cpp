@@ -242,7 +242,6 @@ cudaError_t CuteDslGemmNvFp4Runner::run(void const* a, void const* b, void const
             &sModWsFp16Tn64, aMut, bMut, sfaMut, sfbMut, dPtr, alphaMut, m64, n64, k64, maxActiveClusters, stream);
         break;
 #else
-        // Only the warp-specialised AOT ABI carries the epilogue alpha.
         return cudaErrorNotSupported;
 #endif
     case 128:

@@ -697,8 +697,8 @@ int32_t FusedNvfp4GemmAllReducePlugin::enqueue(PluginTensorDesc const* inputDesc
                 }
                 else
                 {
-                    kernels::fusedFp8ToSfAtom(static_cast<__nv_fp8_e4m3 const*>(weightScale), mCachedWeightScaleTiled,
-                        wNumRows, wNumKBlocks, stream);
+                    kernels::repackE4m3ScalesToSfAtom(static_cast<__nv_fp8_e4m3 const*>(weightScale),
+                        mCachedWeightScaleTiled, wNumRows, wNumKBlocks, stream);
 
                     mCachedWeightNumRows = wNumRows;
                     mCachedWeightNumKBlocks = wNumKBlocks;
@@ -738,7 +738,7 @@ int32_t FusedNvfp4GemmAllReducePlugin::enqueue(PluginTensorDesc const* inputDesc
             rt::Tensor weightScaleTiledTensor
                 = assignTensorFromWorkspace(workspaceCursor, rt::Coords{weightTiledSize}, DataType::kINT8);
             auto* weightScaleTiled = static_cast<uint8_t*>(weightScaleTiledTensor.rawPointer());
-            kernels::fusedFp8ToSfAtom(
+            kernels::repackE4m3ScalesToSfAtom(
                 static_cast<__nv_fp8_e4m3 const*>(weightScale), weightScaleTiled, wNumRows, wNumKBlocks, stream);
             weightSFB = weightScaleTiled;
         }

@@ -53,12 +53,7 @@ inline int64_t getSfAtomTiledBufferSize(int32_t numRows, int32_t numKBlocks)
 void fusedFp32ToSfAtom(
     float const* fp32Scales, uint8_t* tiledOut, int32_t numRows, int32_t numKBlocks, cudaStream_t stream);
 
-/// Fused FP8E4M3 -> UE4M3 conversion + SfAtom tiled repack in a single kernel.
-///
-/// The repack is bit-exact: E4M3 and UE4M3 share the same encoding for the
-/// non-negative values a checkpoint stores. Any per-tensor scale must be
-/// applied on the GEMM's FP32 accumulator instead, because the folded product
-/// would fall below the E4M3 normal minimum for realistic scale magnitudes.
+/// Repack checkpoint block scales into the SfAtom tiled layout.
 ///
 /// Output buffer does not need to be pre-zeroed; padding bytes are written by the kernel.
 ///
@@ -68,7 +63,7 @@ void fusedFp32ToSfAtom(
 /// @param numKBlocks   Number of K-dimension scale blocks
 /// @param stream       CUDA stream
 #if SUPPORTS_FP8
-void fusedFp8ToSfAtom(
+void repackE4m3ScalesToSfAtom(
     __nv_fp8_e4m3 const* fp8Scales, uint8_t* tiledOut, int32_t numRows, int32_t numKBlocks, cudaStream_t stream);
 #endif // SUPPORTS_FP8
 

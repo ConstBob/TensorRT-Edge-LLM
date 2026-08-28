@@ -762,8 +762,8 @@ class GemmBlackwellNvFp4WS:
         must describe the GPU the kernel launches on (typically
         ``cudaDevAttrMultiProcessorCount`` for cluster (1,1)).
 
-        ``alpha_ptr`` points at one device-resident FP32 scalar. The epilogue
-        multiplies the FP32 accumulator by it before the narrowing store, so a
+        ``alpha_ptr`` points at one FP32 scalar on device. The epilogue
+        multiplies the FP32 accumulator by it before the store, so a
         per-tensor dequant scale keeps full FP32 range instead of being folded
         into the 8-bit block scales. Callers with no scale must pass a pointer
         to 1.0f.
@@ -1395,10 +1395,7 @@ class GemmBlackwellNvFp4WS:
                 pipeline.PipelineUserType.Consumer, self.num_acc_stage
             )
 
-            # Read once per CTA: the per-tensor dequant scale stays in FP32
-            # here instead of being folded into the 8-bit block scales, whose
-            # narrow exponent range would flush most folded products to
-            # subnormal.
+            # Read once per CTA
             alpha_val = mAlpha[0]
 
             # TMA-store pipeline over the 4 epilog warps.
