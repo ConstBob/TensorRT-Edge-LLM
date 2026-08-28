@@ -245,6 +245,7 @@ The model class names were checked against the upstream [Transformers model sour
 | [deepseek-ai/dspark_qwen3_4b_block7](https://huggingface.co/deepseek-ai/dspark_qwen3_4b_block7) | [Qwen/Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) |
 | [deepseek-ai/dspark_qwen3_8b_block7](https://huggingface.co/deepseek-ai/dspark_qwen3_8b_block7) | [Qwen/Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) |
 | [deepseek-ai/dspark_gemma4_12b_block7](https://huggingface.co/deepseek-ai/dspark_gemma4_12b_block7) | [google/gemma-4-12B-it](https://huggingface.co/google/gemma-4-12B-it) |
+| [RadixArk/Qwen3.8-27B-DSpark](https://huggingface.co/RadixArk/Qwen3.8-27B-DSpark) | [RadixArk/Qwen3.8-27B-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4) |
 
 ### JetSpec Draft Models
 
