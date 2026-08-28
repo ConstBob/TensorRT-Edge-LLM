@@ -91,6 +91,7 @@ bool Tokenizer::loadFromHF(std::filesystem::path const& modelDir, bool requireCh
     mTokenEncoder.reset();
     mSpecialTokensEncoder.clear();
     mSpecialTokensDecoder.clear();
+    mSkippableSpecialTokenIds.clear();
     mBosId = -1;
     mEosId = -1;
     mAdditionalEosIds.clear();
@@ -134,9 +135,20 @@ bool Tokenizer::loadFromHF(std::filesystem::path const& modelDir, bool requireCh
 
     LOG_INFO("Loaded %zu special tokens", specialTokens.size());
 
+    // Older tokenizers omit the `special` flag; the configured sentinels are
+    // skippable regardless.
+    for (Rank id : {mBosId, mEosId, mPadId, mUnkId})
+    {
+        if (id >= 0)
+        {
+            mSkippableSpecialTokenIds.insert(id);
+        }
+    }
+
     if (mTokenEncoder)
     {
         mTokenEncoder->initialize(vocab, specialTokens);
+        mTokenEncoder->setSkippableSpecialTokenIds(mSkippableSpecialTokenIds);
     }
 
     // Store special tokens for fast lookup
@@ -622,6 +634,10 @@ bool Tokenizer::loadSpecialTokens(Json const& tokenizerConfig, TokenToRanks& spe
                     if (!content.empty())
                     {
                         specialTokens[content] = specialId;
+                        if (token.value("special", false))
+                        {
+                            mSkippableSpecialTokenIds.insert(specialId);
+                        }
                     }
                 }
                 catch (std::exception const& e)
@@ -646,6 +662,10 @@ bool Tokenizer::loadSpecialTokens(Json const& tokenizerConfig, TokenToRanks& spe
                     if (!content.empty())
                     {
                         specialTokens[content] = specialId;
+                        if (tokenData.value("special", false))
+                        {
+                            mSkippableSpecialTokenIds.insert(specialId);
+                        }
                     }
                 }
                 catch (std::exception const& e)
@@ -910,14 +930,16 @@ std::string Tokenizer::idToPiece(Rank token, bool skipSpecialTokens) const
     {
         return "";
     }
-    // Special tokens: return empty when skipping, the textual content otherwise.
-    if (mSpecialTokensDecoder.find(token) != mSpecialTokensDecoder.end())
+    // Mirrors TokenEncoder::decode: only ids flagged `special` are dropped, and an
+    // added token's definition wins over the base vocab.
+    if (skipSpecialTokens && mTokenEncoder->isSkippableSpecial(token))
     {
-        if (skipSpecialTokens)
-        {
-            return "";
-        }
-        return mSpecialTokensDecoder.at(token);
+        return "";
+    }
+    auto addedIt = mSpecialTokensDecoder.find(token);
+    if (addedIt != mSpecialTokensDecoder.end())
+    {
+        return addedIt->second;
     }
     std::string piece = mTokenEncoder->getRankToken(token);
 
