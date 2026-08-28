@@ -99,25 +99,34 @@ bool TokenEncoder::decode(std::vector<Rank> const& tokens, std::string& output, 
 
         for (Rank token : tokens)
         {
-            auto it = mDecoder.find(token);
-            if (it != mDecoder.end())
+            if (skipSpecialTokens && isSkippableSpecial(token))
             {
-                output += it->second;
+                continue;
             }
-            else if (!skipSpecialTokens)
+
+            // An added token can also live in the base vocab (Nemotron), so its
+            // definition has to win before the base-vocab lookup.
+            auto addedIt = mSpecialTokensDecoder.find(token);
+            if (addedIt != mSpecialTokensDecoder.end())
             {
-                auto specialIt = mSpecialTokensDecoder.find(token);
-                if (specialIt != mSpecialTokensDecoder.end())
-                {
-                    output += specialIt->second;
-                }
-                else
-                {
-                    LOG_ERROR("Unknown token %d during decode", token);
-                    return false;
-                }
+                output += addedIt->second;
+                continue;
             }
-            // Skip unknown tokens if skipSpecialTokens is true
+
+            auto vocabIt = mDecoder.find(token);
+            if (vocabIt != mDecoder.end())
+            {
+                output += vocabIt->second;
+                continue;
+            }
+
+            if (skipSpecialTokens)
+            {
+                continue;
+            }
+
+            LOG_ERROR("Unknown token %d during decode", token);
+            return false;
         }
         return true;
     }

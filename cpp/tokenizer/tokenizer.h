@@ -287,6 +287,12 @@ public:
                 }
             }
         }
+        if (mTokenEncoder)
+        {
+            RankSet skippableIds = mSkippableSpecialTokenIds;
+            skippableIds.insert(mAdditionalEosIds.begin(), mAdditionalEosIds.end());
+            mTokenEncoder->setSkippableSpecialTokenIds(skippableIds);
+        }
     }
 
     /*!
@@ -441,9 +447,11 @@ protected:
     std::unique_ptr<PreTokenizer> mPreTokenizer; //!< Pretokenizer for splitting input text
     std::unique_ptr<TokenEncoder> mTokenEncoder; //!< Token encoder for encoding/decoding
 
-    // Special token mappings for fast lookup
-    TokenToRanks mSpecialTokensEncoder;                          //!< Special tokens encoder mapping
-    std::unordered_map<Rank, std::string> mSpecialTokensDecoder; //!< Special tokens decoder mapping
+    // Added-token mappings for fast lookup (special or not: `<think>` is an added
+    // token without the `special` flag and must survive skipSpecialTokens).
+    TokenToRanks mSpecialTokensEncoder;                          //!< Added tokens encoder mapping
+    std::unordered_map<Rank, std::string> mSpecialTokensDecoder; //!< Added tokens decoder mapping
+    RankSet mSkippableSpecialTokenIds; //!< Flagged added tokens plus configured bos/eos/pad/unk ids
 
     // Configuration
     int mNumVocab;                       //!< Total vocabulary size

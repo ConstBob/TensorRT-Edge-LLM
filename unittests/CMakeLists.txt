@@ -126,6 +126,7 @@ edgellm_add_unit_test(
   unitTestCommon
   DIRS
   cpp/common
+  cpp/tokenizer
   cpp/profiling
   cpp/builder
   cpp/sampler
