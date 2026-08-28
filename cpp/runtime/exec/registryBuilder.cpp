@@ -298,7 +298,8 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
         reg.addTensor({binding_names::kAttentionPosId, TensorIO::kInput, nvinfer1::DataType::kINT32,
             {sym(&InferenceDims::batch), sym(&InferenceDims::attnMaskSeqLen)}});
 
-        if ((cfg.specDecodeType == SpecDecodeMode::kMTP || isCachedBlockDraftMode(cfg.specDecodeType))
+        if ((cfg.specDecodeType == SpecDecodeMode::kMTP || isCachedBlockDraftMode(cfg.specDecodeType)
+                || cfg.specDecodeType == SpecDecodeMode::kDSpark)
             && cfg.numLinearAttnLayers > 0)
         {
             reg.addTensor({binding_names::kSpecVerifyPhaseMarker, TensorIO::kInput, nvinfer1::DataType::kINT32,
