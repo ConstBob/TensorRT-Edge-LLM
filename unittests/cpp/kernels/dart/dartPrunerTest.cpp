@@ -659,6 +659,156 @@ TEST(VisualTokenPruner, RejectsInvalidRetainedIndices)
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
+//! Build a marker feature tensor [rows, hidden]: column 0 = row index.
+static rt::Tensor makeMarkerFeatures(int32_t rows, int32_t hidden)
+{
+    std::vector<half> host(static_cast<size_t>(rows) * hidden, __float2half(0.0F));
+    for (int32_t r = 0; r < rows; ++r)
+    {
+        host[static_cast<int64_t>(r) * hidden] = __float2half(float(r));
+    }
+    rt::Tensor t({rows, hidden}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "features");
+    CUDA_CHECK(cudaMemcpy(t.rawPointer(), host.data(), host.size() * sizeof(half), cudaMemcpyHostToDevice));
+    return t;
+}
+
+static std::vector<int32_t> readMarkerRows(rt::Tensor const& t)
+{
+    auto const shape = t.getShape();
+    std::vector<half> host(static_cast<size_t>(shape.volume()));
+    CUDA_CHECK(cudaMemcpy(host.data(), t.rawPointer(), host.size() * sizeof(half), cudaMemcpyDeviceToHost));
+    std::vector<int32_t> rows(shape[0]);
+    for (int64_t r = 0; r < shape[0]; ++r)
+    {
+        rows[r] = static_cast<int32_t>(__half2float(host[r * shape[1]]));
+    }
+    return rows;
+}
+
+TEST(DartPruner, CompactAuxiliaryInputsMatchesKeepLists)
+{
+    // Two slots: one prunable image request, one text-only passthrough. After the pruning pass,
+    // compactAuxiliaryInputs must shorten each slot's token ids to its keep list and gather the
+    // kept visual feature rows at their original global ordinals.
+    rt::VisualPrunerConfig cfg;
+    cfg.enabled = true;
+    cfg.reductionRatio = 0.5F;
+    std::vector<std::vector<int32_t>> tokens = {makeTokens(20, 200, 30), makeTokens(120, 0, 0)};
+    BatchPrunerHarness h(tokens, /*numDeepstack=*/1, /*seed=*/808);
+    auto pruner = rt::createVisualTokenPruner(cfg, h.engineConfig);
+
+    std::vector<int32_t> effectiveLens = h.lens;
+    std::vector<int32_t> prunedPerSlot;
+    int32_t const newMaxLen
+        = pruner->pruneBatchForPrefill(h.tokenIds, h.io, effectiveLens, h.maxLen, prunedPerSlot, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    ASSERT_GT(prunedPerSlot[0], 0);
+    ASSERT_EQ(prunedPerSlot[1], 0);
+
+    // Expected keep list for slot 0 from the CPU reference.
+    std::vector<int32_t> const expected
+        = referenceSelect(h.embedsFloat[0], h.lens[0], BatchPrunerHarness::kHidden, tokens[0], cfg);
+    ASSERT_EQ(effectiveLens[0], static_cast<int32_t>(expected.size()));
+
+    // Raw feature tensors: 200 visual rows (all from slot 0), marker = row index.
+    rt::Tensor const visualSrc = makeMarkerFeatures(200, BatchPrunerHarness::kHidden);
+    rt::OptionalInputTensor visual{std::cref(visualSrc)};
+
+    auto tokenIds = tokens; // copy: compacted in place
+    pruner->compactAuxiliaryInputs(tokenIds, h.batch, prunedPerSlot, visual, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Token ids compacted to the keep list; text-only slot untouched.
+    ASSERT_EQ(static_cast<int32_t>(tokenIds[0].size()), effectiveLens[0]);
+    for (size_t k = 0; k < expected.size(); ++k)
+    {
+        ASSERT_EQ(tokenIds[0][k], tokens[0][expected[k]]);
+    }
+    ASSERT_EQ(tokenIds[1], tokens[1]);
+
+    // Feature refs rebound to compacted rows holding the kept original ordinals (span [20, 220)
+    // of the sequence maps to feature rows 0..200).
+    ASSERT_NE(&visual->get(), &visualSrc);
+    std::vector<int32_t> expectedOrdinals;
+    for (int32_t pos : expected)
+    {
+        if (tokens[0][pos] == kImageTokenId)
+        {
+            expectedOrdinals.push_back(pos - 20);
+        }
+    }
+    EXPECT_EQ(readMarkerRows(visual->get()), expectedOrdinals);
+
+    // Nothing-pruned request: refs and ids stay untouched.
+    std::vector<std::vector<int32_t>> textTokens = {makeTokens(64, 0, 0)};
+    PrunerHarness textOnly(textTokens[0], 0, 9);
+    auto textPruner = rt::createVisualTokenPruner(cfg, textOnly.engineConfig);
+    EXPECT_EQ(textPruner->pruneForPrefill(textOnly.tokenIds, textOnly.io, textOnly.seqLen, nullptr), textOnly.seqLen);
+    rt::OptionalInputTensor noVisual{std::cref(visualSrc)};
+    std::vector<int32_t> const noPruned = {0};
+    textPruner->compactAuxiliaryInputs(textTokens, 1, noPruned, noVisual, nullptr);
+    EXPECT_EQ(&noVisual->get(), &visualSrc);
+    EXPECT_EQ(textTokens[0], std::vector<int32_t>(64, kTextTokenId));
+    (void) newMaxLen;
+}
+
+TEST(DartPruner, CompactAuxiliaryInputsTwoImageSlots)
+{
+    // Two image-bearing slots plus a text-only slot: the kept feature ordinals of the second
+    // image slot must be offset by the FIRST slot's ORIGINAL (unpruned) visual count, matching
+    // the batch-major running image-token count the embedding kernel recomputes after
+    // compaction.
+    rt::VisualPrunerConfig cfg;
+    cfg.enabled = true;
+    cfg.reductionRatio = 0.5F;
+    std::vector<std::vector<int32_t>> tokens = {makeTokens(20, 60, 10), makeTokens(5, 80, 15), makeTokens(90, 0, 0)};
+    BatchPrunerHarness h(tokens, /*numDeepstack=*/1, /*seed=*/4242);
+    auto pruner = rt::createVisualTokenPruner(cfg, h.engineConfig);
+    // Exercise the preallocated path (spec-decode deployments size the buffers up front);
+    // the sibling test covers the lazily-grown path.
+    pruner->preallocateAuxiliaryBuffers();
+
+    std::vector<int32_t> effectiveLens = h.lens;
+    std::vector<int32_t> prunedPerSlot;
+    pruner->pruneBatchForPrefill(h.tokenIds, h.io, effectiveLens, h.maxLen, prunedPerSlot, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    ASSERT_GT(prunedPerSlot[0], 0);
+    ASSERT_GT(prunedPerSlot[1], 0);
+    ASSERT_EQ(prunedPerSlot[2], 0);
+
+    rt::Tensor const visualSrc = makeMarkerFeatures(60 + 80, BatchPrunerHarness::kHidden);
+    rt::OptionalInputTensor visual{std::cref(visualSrc)};
+    auto tokenIds = tokens;
+    pruner->compactAuxiliaryInputs(tokenIds, h.batch, prunedPerSlot, visual, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Expected global feature ordinals: slot 0 kept visual positions map to [0, 60) via
+    // (pos - 20); slot 1 kept visual positions map to [60, 140) via 60 + (pos - 5).
+    std::vector<int32_t> expectedOrdinals;
+    struct SlotSpan
+    {
+        int32_t slot;
+        int32_t visualBegin;
+        int32_t ordinalBase;
+    };
+    for (auto const& span : {SlotSpan{0, 20, 0}, SlotSpan{1, 5, 60}})
+    {
+        std::vector<int32_t> const keep = referenceSelect(
+            h.embedsFloat[span.slot], h.lens[span.slot], BatchPrunerHarness::kHidden, tokens[span.slot], cfg);
+        ASSERT_EQ(effectiveLens[span.slot], static_cast<int32_t>(keep.size()));
+        for (size_t k = 0; k < keep.size(); ++k)
+        {
+            ASSERT_EQ(tokenIds[span.slot][k], tokens[span.slot][keep[k]]);
+            if (tokens[span.slot][keep[k]] == kImageTokenId)
+            {
+                expectedOrdinals.push_back(span.ordinalBase + keep[k] - span.visualBegin);
+            }
+        }
+    }
+    ASSERT_EQ(tokenIds[2], tokens[2]); // text-only slot untouched
+    EXPECT_EQ(readMarkerRows(visual->get()), expectedOrdinals);
+}
+
 TEST(DartPruner, BatchMatchesPerSlotReference)
 {
     // Three slots with mixed lengths and content: image-heavy, text-only (passthrough), and a

@@ -817,17 +817,18 @@ void LLMRankRuntime::setVisualPrunerConfig(VisualPrunerConfig const& config)
         LOG_WARNING("Visual-token pruning requires an mRoPE VLM engine (image token id present); leaving it disabled.");
         return;
     }
-    if (mDeployment.specConfig.has_value())
-    {
-        LOG_WARNING("Visual-token pruning is not supported together with speculative decoding; leaving it disabled.");
-        return;
-    }
     if (mActionRunner)
     {
         LOG_WARNING("Visual-token pruning is not supported together with an action runner; leaving it disabled.");
         return;
     }
     mVisualPruner = createVisualTokenPruner(config, mDeployment.base);
+    if (mDeployment.specConfig.has_value())
+    {
+        // Spec-decode prefill compacts the auxiliary inputs (compactAuxiliaryInputs); size its
+        // buffers now so no allocation ever happens on the prefill path.
+        mVisualPruner->preallocateAuxiliaryBuffers();
+    }
     LOG_INFO("Visual-token pruning enabled: algorithm=%s, reductionRatio=%.3f, minVisualTokens=%d",
         mVisualPruner->name(), config.reductionRatio, config.minVisualTokens);
 }
@@ -2469,13 +2470,6 @@ bool LLMRankRuntime::runBaseModelPrefill(
         check::check(mPipelineIO->outputLogits.reshape({activeBatchSize, mDeployment.base.outputVocabSize}),
             "Tensor reshape failed");
     }
-    if (mDeployment.specConfig.has_value())
-    {
-        // SpecDecode base engines emit target features that feed the draft engine.
-        check::check(mPipelineIO->baseHiddenStates.reshape({activeBatchSize, inputIdsLength, baseOutputHiddenDim}),
-            "Tensor reshape failed");
-    }
-
     // Populate host-side context lengths with effective (unpadded) prefill lengths and pack tokens.
     int32_t* hostCtxLenData = mPipelineIO->hostContextLengths.dataPointer<int32_t>();
     check::check(mHostPackedTokenIds.reshape({activeBatchSize, inputIdsLength}), "Tensor reshape failed");
@@ -2528,7 +2522,7 @@ bool LLMRankRuntime::runBaseModelPrefill(
 
     // Visual-token pruning compacts the assembled embeddings before the engine runs, pruning each
     // request in the batch independently. The coordinator currently rejects multi-device pruning,
-    // and setVisualPrunerConfig excludes spec decode and action execution.
+    // and setVisualPrunerConfig excludes action execution.
     if (mVisualPruner && baseKVAllEmpty && !mDeployment.base.isDiffusionBackbone && !context.outputThinkerEmbeddings
         && context.layerDebugger == nullptr)
     {
@@ -2545,6 +2539,14 @@ bool LLMRankRuntime::runBaseModelPrefill(
                 hostCtxLenData[i] = context.effectivePrefillLengths[i];
             }
             inputIdsLength = newMaxLen;
+            if (mDeployment.specConfig.has_value())
+            {
+                // Spec-decode draft prefill re-embeds the prompt from host token ids and the raw
+                // visual feature rows; compact them to the same keep lists so the draft sees
+                // exactly the pruned sequence the base KV cache holds.
+                mVisualPruner->compactAuxiliaryInputs(context.tokenIds, activeBatchSize, context.prunedPrefillTokens,
+                    context.visualEmbeddings, context.stream);
+            }
         }
     }
 
@@ -2553,6 +2555,15 @@ bool LLMRankRuntime::runBaseModelPrefill(
     if (managedKVCacheRequest != nullptr && !managedKVCacheRequest->prepareSwaPrefill(context.effectivePrefillLengths))
     {
         return false;
+    }
+
+    if (mDeployment.specConfig.has_value())
+    {
+        // SpecDecode base engines emit target features that feed the draft engine. Sized after
+        // visual-token pruning so shape[1] always equals the executed (possibly pruned) prefill
+        // length — draft strategies derive or assert their prefill length from it.
+        check::check(mPipelineIO->baseHiddenStates.reshape({activeBatchSize, inputIdsLength, baseOutputHiddenDim}),
+            "Tensor reshape failed");
     }
 
     // Dispatch per-step sequence prep (context lengths H2D, selectTokenIndices).
