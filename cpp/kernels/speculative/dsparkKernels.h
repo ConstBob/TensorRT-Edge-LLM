@@ -125,6 +125,53 @@ void dsparkBuildMarkovLogits(rt::Tensor const& backboneLogits, rt::Tensor const&
     int32_t batchSize, int32_t step, int32_t proposalLen, int32_t vocabSize, int32_t markovRank, cudaStream_t stream);
 
 /*!
+ * @brief True when the fused greedy Markov step kernel supports this markov rank.
+ */
+bool dsparkFusedGreedySupported(int32_t markovRank);
+
+/*!
+ * @brief Fused greedy Markov proposal step: correction + exact top-1 in one launch.
+ *
+ * Reads the previous step's winner from greedySlots (packed orderable-float key,
+ * ties resolve to the lowest vocab index), so no host-visible token round trip is
+ * needed between steps. greedySlots is [batch, proposalLen] UINT64 and must be
+ * zeroed once per round before step 0. When stackedLogits is non-null, the
+ * corrected full-vocab row is also written to depth row stackedDepthRow of the
+ * [batch, proposalLen + 1, vocab] tree candidate buffer; chain mode passes null
+ * and never materializes the row.
+ */
+void dsparkMarkovGreedyFusedStep(rt::Tensor const& backboneLogits, rt::Tensor const& markovW1,
+    rt::Tensor const& markovW2, rt::Tensor const& firstPrevTokens, rt::Tensor& greedySlots, rt::Tensor* stackedLogits,
+    int32_t stackedDepthRow, int32_t batchSize, int32_t step, int32_t proposalLen, int32_t vocabSize,
+    int32_t markovRank, cudaStream_t stream);
+
+/*!
+ * @brief Unpack the per-step greedy winners in greedySlots into draftTokenIds [batch, proposalLen].
+ */
+void dsparkFinalizeGreedyDraftTokens(
+    rt::Tensor const& greedySlots, rt::Tensor& draftTokenIds, int32_t totalSteps, cudaStream_t stream);
+
+/*!
+ * @brief Quantize markov_w2 [V, R] FP16 to FP8 E4M3 with one FP16 scale per row.
+ *
+ * w2Fp8 is [V, R] UINT8 (E4M3 bytes of w / rowScale); w2RowScales is [V] FP16 with
+ * rowScale = rowAbsMax / 448 so each row spans the full E4M3 range. Requires R % 16 == 0.
+ */
+void dsparkQuantizeMarkovW2Fp8(rt::Tensor const& markovW2, rt::Tensor& w2Fp8, rt::Tensor& w2RowScales,
+    int32_t vocabSize, int32_t markovRank, cudaStream_t stream);
+
+/*!
+ * @brief FP8-W2 variant of the fused greedy Markov step (same contract as
+ * dsparkMarkovGreedyFusedStep). Two tokens per warp, one 16-byte load per lane,
+ * hardware fp8x2 -> half2 conversion. Requires markovRank == 16 * 2^k so the
+ * per-token lane groups tile a warp exactly.
+ */
+void dsparkMarkovGreedyFusedStepFp8(rt::Tensor const& backboneLogits, rt::Tensor const& markovW1,
+    rt::Tensor const& w2Fp8, rt::Tensor const& w2RowScales, rt::Tensor const& firstPrevTokens, rt::Tensor& greedySlots,
+    rt::Tensor* stackedLogits, int32_t stackedDepthRow, int32_t batchSize, int32_t step, int32_t proposalLen,
+    int32_t vocabSize, int32_t markovRank, cudaStream_t stream);
+
+/*!
  * @brief Sample one token per row from probabilityScratch [B, vocabSize].
  */
 void dsparkSampleProbabilityRows(rt::Tensor const& probabilityScratch, rt::Tensor const& proposalUniforms,

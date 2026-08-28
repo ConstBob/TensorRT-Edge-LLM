@@ -16,6 +16,7 @@
  */
 
 #include "common/checkMacros.h"
+#include "common/cudaMacros.h"
 #include "kernels/speculative/dsparkKernels.h"
 
 #include <cfloat>
@@ -813,6 +814,261 @@ __global__ void dsparkBuildMarkovLogitsKernel(float const* __restrict__ backbone
     }
 }
 
+namespace
+{
+constexpr int32_t kMarkovFusedWarpsPerBlock = 8;
+constexpr int32_t kMarkovFusedTokensPerWarp = 8;
+constexpr int32_t kMarkovFusedBlockTokens = kMarkovFusedWarpsPerBlock * kMarkovFusedTokensPerWarp;
+constexpr int32_t kMarkovFusedMaxRank = 256; // shared W1 staging bound; also lanes * 8
+
+//! Orderable-float key in the high bits, (0xFFFFFFFF - vocabIdx) in the low bits so
+//! exact ties resolve to the lowest vocab index under unsigned max. Zero is a valid
+//! floor: even -inf packs to a nonzero key.
+__device__ inline unsigned long long dsparkPackGreedyCandidate(float value, int32_t vocabIdx)
+{
+    uint32_t bits = __float_as_uint(value);
+    bits = (bits & 0x80000000U) ? ~bits : (bits | 0x80000000U);
+    return (static_cast<unsigned long long>(bits) << 32)
+        | static_cast<unsigned long long>(0xFFFFFFFFU - static_cast<uint32_t>(vocabIdx));
+}
+
+__device__ inline int32_t dsparkUnpackGreedyIndex(unsigned long long packed)
+{
+    return static_cast<int32_t>(0xFFFFFFFFU - static_cast<uint32_t>(packed & 0xFFFFFFFFULL));
+}
+} // namespace
+
+__global__ void dsparkMarkovGreedyFusedKernel(float const* __restrict__ backboneLogits, // [B, P, V]
+    half const* __restrict__ markovW1,                                                  // [V, R]
+    half const* __restrict__ markovW2,                                                  // [V, R]
+    int32_t const* __restrict__ firstPrevTokens,                                        // [B]
+    unsigned long long* __restrict__ greedySlots,                                       // [B, P], zeroed per round
+    float* __restrict__ stackedOut,                                                     // depth row base or nullptr
+    int64_t outBatchStride, int32_t step, int32_t proposalLen, int32_t vocabSize, int32_t markovRank)
+{
+    __shared__ half w1Shared[kMarkovFusedMaxRank];
+    __shared__ unsigned long long warpBest[kMarkovFusedWarpsPerBlock];
+
+    int32_t const batchIdx = blockIdx.y;
+    int32_t const prevToken = (step == 0) ? firstPrevTokens[batchIdx]
+                                          : dsparkUnpackGreedyIndex(greedySlots[batchIdx * proposalLen + step - 1]);
+    half const* w1Row = markovW1 + static_cast<int64_t>(prevToken) * markovRank;
+    for (int32_t i = threadIdx.x; i < markovRank; i += blockDim.x)
+    {
+        w1Shared[i] = w1Row[i];
+    }
+    __syncthreads();
+
+    int32_t const warpId = threadIdx.x / 32;
+    int32_t const laneId = threadIdx.x % 32;
+    int32_t const lanesUsed = markovRank / 8; // one 8-rank vector per lane
+    float const* stepLogits = backboneLogits + (static_cast<int64_t>(batchIdx) * proposalLen + step) * vocabSize;
+    int32_t const wordsPerRow = markovRank / 8;
+
+    unsigned long long best = 0ULL;
+    int32_t const tokenBase = blockIdx.x * kMarkovFusedBlockTokens + warpId * kMarkovFusedTokensPerWarp;
+    for (int32_t t = 0; t < kMarkovFusedTokensPerWarp; ++t)
+    {
+        int32_t const vocabIdx = tokenBase + t;
+        if (vocabIdx >= vocabSize)
+        {
+            break;
+        }
+        float partial = 0.0F;
+        if (laneId < lanesUsed)
+        {
+            int32_t const rankBase = laneId * 8;
+            uint4 const packed
+                = reinterpret_cast<uint4 const*>(markovW2)[static_cast<int64_t>(vocabIdx) * wordsPerRow + laneId];
+            half2 const* w2h2 = reinterpret_cast<half2 const*>(&packed);
+            half2 const* w1h2 = reinterpret_cast<half2 const*>(w1Shared + rankBase);
+            float sum = 0.0F;
+#pragma unroll
+            for (int32_t j = 0; j < 4; ++j)
+            {
+                float2 const a = __half22float2(w2h2[j]);
+                float2 const b = __half22float2(w1h2[j]);
+                sum += a.x * b.x + a.y * b.y;
+            }
+            partial = sum;
+        }
+        for (int32_t offset = 16; offset > 0; offset >>= 1)
+        {
+            partial += __shfl_down_sync(0xFFFFFFFF, partial, offset);
+        }
+        if (laneId == 0)
+        {
+            float const corrected = stepLogits[vocabIdx] + partial;
+            if (stackedOut != nullptr)
+            {
+                stackedOut[static_cast<int64_t>(batchIdx) * outBatchStride + vocabIdx] = corrected;
+            }
+            unsigned long long const candidate = dsparkPackGreedyCandidate(corrected, vocabIdx);
+            best = (candidate > best) ? candidate : best;
+        }
+    }
+    if (laneId == 0)
+    {
+        warpBest[warpId] = best;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        unsigned long long blockBest = warpBest[0];
+        for (int32_t w = 1; w < kMarkovFusedWarpsPerBlock; ++w)
+        {
+            blockBest = max(blockBest, warpBest[w]);
+        }
+        if (blockBest != 0ULL)
+        {
+            atomicMax(&greedySlots[batchIdx * proposalLen + step], blockBest);
+        }
+    }
+}
+
+#if SUPPORTS_FP8
+__global__ void dsparkQuantizeMarkovW2Fp8Kernel(half const* __restrict__ markovW2, // [V, R]
+    uint8_t* __restrict__ w2Fp8,                                                   // [V, R] E4M3 bytes
+    half* __restrict__ w2RowScales,                                                // [V]
+    int32_t vocabSize, int32_t markovRank)
+{
+    int32_t const rowIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (rowIdx >= vocabSize)
+    {
+        return;
+    }
+    half const* row = markovW2 + static_cast<int64_t>(rowIdx) * markovRank;
+    float absMax = 0.0F;
+    for (int32_t r = 0; r < markovRank; ++r)
+    {
+        absMax = fmaxf(absMax, fabsf(__half2float(row[r])));
+    }
+    // Rows with absMax < ~0.027 yield a subnormal half scale; the precision loss
+    // is proportional to the (already tiny) row magnitude, so no clamp is needed.
+    float const scale = (absMax > 0.0F) ? absMax / 448.0F : 1.0F;
+    float const invScale = 1.0F / scale;
+    w2RowScales[rowIdx] = __float2half(scale);
+    uint8_t* outRow = w2Fp8 + static_cast<int64_t>(rowIdx) * markovRank;
+    for (int32_t r = 0; r < markovRank; ++r)
+    {
+        __nv_fp8_e4m3 const q(__half2float(row[r]) * invScale);
+        outRow[r] = *reinterpret_cast<uint8_t const*>(&q);
+    }
+}
+
+//! FP8-W2 fused greedy step. Layout: 16 lanes per token (each lane one 16-byte load of
+//! 16 E4M3 values), two consecutive tokens per warp so the 32 x 16 B loads are linear in
+//! laneId. Hardware fp8x2 -> half2 conversion keeps the unpack cost near the FP16 path's.
+//! Requires markovRank == 16 * 2^k <= kMarkovFusedMaxRank: lanesPerToken must divide the
+//! warp exactly or the tail lane group would alias the next iteration's token and the
+//! partial-width shuffle reduce would span an incomplete subwarp.
+__global__ void dsparkMarkovGreedyFusedFp8Kernel(float const* __restrict__ backboneLogits, // [B, P, V]
+    half const* __restrict__ markovW1,                                                     // [V, R]
+    uint4 const* __restrict__ w2Fp8,      // [V, R/16] uint4 rows of E4M3 bytes
+    half const* __restrict__ w2RowScales, // [V]
+    int32_t const* __restrict__ firstPrevTokens, unsigned long long* __restrict__ greedySlots,
+    float* __restrict__ stackedOut, int64_t outBatchStride, int32_t step, int32_t proposalLen, int32_t vocabSize,
+    int32_t markovRank)
+{
+    __shared__ half w1Shared[kMarkovFusedMaxRank];
+    __shared__ unsigned long long warpBest[kMarkovFusedWarpsPerBlock];
+
+    int32_t const batchIdx = blockIdx.y;
+    int32_t const prevToken = (step == 0) ? firstPrevTokens[batchIdx]
+                                          : dsparkUnpackGreedyIndex(greedySlots[batchIdx * proposalLen + step - 1]);
+    half const* w1Row = markovW1 + static_cast<int64_t>(prevToken) * markovRank;
+    for (int32_t i = threadIdx.x; i < markovRank; i += blockDim.x)
+    {
+        w1Shared[i] = w1Row[i];
+    }
+    __syncthreads();
+
+    int32_t const warpId = threadIdx.x / 32;
+    int32_t const laneId = threadIdx.x % 32;
+    int32_t const lanesPerToken = markovRank / 16;
+    int32_t const tokensPerWarpIter = 32 / lanesPerToken;
+    int32_t const laneInGroup = laneId % lanesPerToken;
+    int32_t const groupIdx = laneId / lanesPerToken;
+    int32_t const rankBase = laneInGroup * 16;
+    int32_t const vecsPerRow = lanesPerToken;
+    float const* stepLogits = backboneLogits + (static_cast<int64_t>(batchIdx) * proposalLen + step) * vocabSize;
+
+    int32_t const warpTokens = tokensPerWarpIter * kMarkovFusedTokensPerWarp;
+    int32_t const warpTokenBase = blockIdx.x * (kMarkovFusedWarpsPerBlock * warpTokens) + warpId * warpTokens;
+
+    unsigned long long best = 0ULL;
+    for (int32_t t = 0; t < kMarkovFusedTokensPerWarp; ++t)
+    {
+        int32_t const vocabIdx = warpTokenBase + t * tokensPerWarpIter + groupIdx;
+        float partial = 0.0F;
+        if (vocabIdx < vocabSize)
+        {
+            uint4 const packed = w2Fp8[static_cast<int64_t>(vocabIdx) * vecsPerRow + laneInGroup];
+            __nv_fp8x2_storage_t const* pairs = reinterpret_cast<__nv_fp8x2_storage_t const*>(&packed);
+            half2 const* w1h2 = reinterpret_cast<half2 const*>(w1Shared + rankBase);
+            float sum = 0.0F;
+#pragma unroll
+            for (int32_t j = 0; j < 8; ++j)
+            {
+                __half2_raw const hr = __nv_cvt_fp8x2_to_halfraw2(pairs[j], __NV_E4M3);
+                float2 const a = __half22float2(*reinterpret_cast<half2 const*>(&hr));
+                float2 const b = __half22float2(w1h2[j]);
+                sum += a.x * b.x + a.y * b.y;
+            }
+            partial = sum * __half2float(w2RowScales[vocabIdx]);
+        }
+        for (int32_t offset = lanesPerToken / 2; offset > 0; offset >>= 1)
+        {
+            partial += __shfl_down_sync(0xFFFFFFFF, partial, offset, lanesPerToken);
+        }
+        if (laneInGroup == 0 && vocabIdx < vocabSize)
+        {
+            float const corrected = stepLogits[vocabIdx] + partial;
+            if (stackedOut != nullptr)
+            {
+                stackedOut[static_cast<int64_t>(batchIdx) * outBatchStride + vocabIdx] = corrected;
+            }
+            unsigned long long const candidate = dsparkPackGreedyCandidate(corrected, vocabIdx);
+            best = (candidate > best) ? candidate : best;
+        }
+    }
+    for (int32_t offset = 16; offset > 0; offset >>= 1)
+    {
+        unsigned long long const other = __shfl_down_sync(0xFFFFFFFF, best, offset);
+        best = (other > best) ? other : best;
+    }
+    if (laneId == 0)
+    {
+        warpBest[warpId] = best;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        unsigned long long blockBest = warpBest[0];
+        for (int32_t w = 1; w < kMarkovFusedWarpsPerBlock; ++w)
+        {
+            blockBest = max(blockBest, warpBest[w]);
+        }
+        if (blockBest != 0ULL)
+        {
+            atomicMax(&greedySlots[batchIdx * proposalLen + step], blockBest);
+        }
+    }
+}
+
+#endif // SUPPORTS_FP8
+
+__global__ void dsparkFinalizeGreedyTokensKernel(
+    unsigned long long const* __restrict__ greedySlots, int32_t* __restrict__ draftTokenIds, int32_t totalSteps)
+{
+    int32_t const idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= totalSteps)
+    {
+        return;
+    }
+    draftTokenIds[idx] = dsparkUnpackGreedyIndex(greedySlots[idx]);
+}
+
 __global__ void dsparkSampleProbabilityRowsKernel(float const* __restrict__ probabilities, // [B, V]
     float const* __restrict__ proposalUniforms,                                            // [B, P]
     int32_t* __restrict__ draftTokenIds,                                                   // [B, P]
@@ -1314,6 +1570,105 @@ void dsparkBuildMarkovLogits(rt::Tensor const& backboneLogits, rt::Tensor const&
         static_cast<half const*>(markovW2.rawPointer()), static_cast<int32_t const*>(firstPrevTokens.rawPointer()),
         static_cast<int32_t const*>(draftTokenIds.rawPointer()),
         static_cast<float*>(correctedLogitsScratch.rawPointer()), step, proposalLen, vocabSize, markovRank);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+bool dsparkFusedGreedySupported(int32_t markovRank)
+{
+    return markovRank > 0 && markovRank % 8 == 0 && markovRank <= kMarkovFusedMaxRank;
+}
+
+void dsparkMarkovGreedyFusedStep(rt::Tensor const& backboneLogits, rt::Tensor const& markovW1,
+    rt::Tensor const& markovW2, rt::Tensor const& firstPrevTokens, rt::Tensor& greedySlots, rt::Tensor* stackedLogits,
+    int32_t stackedDepthRow, int32_t batchSize, int32_t step, int32_t proposalLen, int32_t vocabSize,
+    int32_t markovRank, cudaStream_t stream)
+{
+    check::check(dsparkFusedGreedySupported(markovRank), "fused greedy Markov step: unsupported markov rank");
+    int32_t const numTokenBlocks = (vocabSize + kMarkovFusedBlockTokens - 1) / kMarkovFusedBlockTokens;
+    dim3 const grid(numTokenBlocks, batchSize);
+    int32_t const blockSize = kMarkovFusedWarpsPerBlock * 32;
+
+    float* stackedOut = nullptr;
+    int64_t outBatchStride = 0;
+    if (stackedLogits != nullptr)
+    {
+        // Stacked layout is [batch, proposalLen + 1, vocab]; point at this step's depth row.
+        outBatchStride = static_cast<int64_t>(proposalLen + 1) * vocabSize;
+        stackedOut
+            = static_cast<float*>(stackedLogits->rawPointer()) + static_cast<int64_t>(stackedDepthRow) * vocabSize;
+    }
+
+    dsparkMarkovGreedyFusedKernel<<<grid, blockSize, 0, stream>>>(
+        static_cast<float const*>(backboneLogits.rawPointer()), static_cast<half const*>(markovW1.rawPointer()),
+        static_cast<half const*>(markovW2.rawPointer()), static_cast<int32_t const*>(firstPrevTokens.rawPointer()),
+        static_cast<unsigned long long*>(greedySlots.rawPointer()), stackedOut, outBatchStride, step, proposalLen,
+        vocabSize, markovRank);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void dsparkQuantizeMarkovW2Fp8(rt::Tensor const& markovW2, rt::Tensor& w2Fp8, rt::Tensor& w2RowScales,
+    int32_t vocabSize, int32_t markovRank, cudaStream_t stream)
+{
+    check::check(markovRank % 16 == 0, "FP8 markov_w2 requires markovRank divisible by 16");
+    int32_t const numThreads = 128;
+    int32_t const numBlocks = (vocabSize + numThreads - 1) / numThreads;
+#if SUPPORTS_FP8
+    dsparkQuantizeMarkovW2Fp8Kernel<<<numBlocks, numThreads, 0, stream>>>(
+        static_cast<half const*>(markovW2.rawPointer()), static_cast<uint8_t*>(w2Fp8.rawPointer()),
+        static_cast<half*>(w2RowScales.rawPointer()), vocabSize, markovRank);
+    CUDA_CHECK(cudaGetLastError());
+#else
+    check::check(false, "FP8 markov_w2 requires CUDA >= 11.8 (cuda_fp8.h unavailable).");
+#endif
+}
+
+void dsparkMarkovGreedyFusedStepFp8(rt::Tensor const& backboneLogits, rt::Tensor const& markovW1,
+    rt::Tensor const& w2Fp8, rt::Tensor const& w2RowScales, rt::Tensor const& firstPrevTokens, rt::Tensor& greedySlots,
+    rt::Tensor* stackedLogits, int32_t stackedDepthRow, int32_t batchSize, int32_t step, int32_t proposalLen,
+    int32_t vocabSize, int32_t markovRank, cudaStream_t stream)
+{
+    // lanesPerToken = markovRank / 16 must be a power of two: the kernel tiles a warp into
+    // 32 / lanesPerToken lane groups and uses lanesPerToken-wide shuffle reductions, both of
+    // which require the groups to cover the warp exactly.
+    int32_t const lanesPerToken = markovRank / 16;
+    check::check(
+        markovRank % 16 == 0 && markovRank <= kMarkovFusedMaxRank && (lanesPerToken & (lanesPerToken - 1)) == 0,
+        "FP8 fused greedy Markov step: unsupported markov rank");
+    int32_t const warpTokens = (32 / lanesPerToken) * kMarkovFusedTokensPerWarp;
+    int32_t const blockTokens = kMarkovFusedWarpsPerBlock * warpTokens;
+    dim3 const grid((vocabSize + blockTokens - 1) / blockTokens, batchSize);
+    int32_t const blockSize = kMarkovFusedWarpsPerBlock * 32;
+
+    float* stackedOut = nullptr;
+    int64_t outBatchStride = 0;
+    if (stackedLogits != nullptr)
+    {
+        outBatchStride = static_cast<int64_t>(proposalLen + 1) * vocabSize;
+        stackedOut
+            = static_cast<float*>(stackedLogits->rawPointer()) + static_cast<int64_t>(stackedDepthRow) * vocabSize;
+    }
+
+#if SUPPORTS_FP8
+    dsparkMarkovGreedyFusedFp8Kernel<<<grid, blockSize, 0, stream>>>(
+        static_cast<float const*>(backboneLogits.rawPointer()), static_cast<half const*>(markovW1.rawPointer()),
+        static_cast<uint4 const*>(w2Fp8.rawPointer()), static_cast<half const*>(w2RowScales.rawPointer()),
+        static_cast<int32_t const*>(firstPrevTokens.rawPointer()),
+        static_cast<unsigned long long*>(greedySlots.rawPointer()), stackedOut, outBatchStride, step, proposalLen,
+        vocabSize, markovRank);
+    CUDA_CHECK(cudaGetLastError());
+#else
+    check::check(false, "EDGELLM_DSPARK_W2_FP8 requires CUDA >= 11.8 (cuda_fp8.h unavailable).");
+#endif
+}
+
+void dsparkFinalizeGreedyDraftTokens(
+    rt::Tensor const& greedySlots, rt::Tensor& draftTokenIds, int32_t totalSteps, cudaStream_t stream)
+{
+    int32_t const numThreads = 128;
+    int32_t const numBlocks = (totalSteps + numThreads - 1) / numThreads;
+    dsparkFinalizeGreedyTokensKernel<<<numBlocks, numThreads, 0, stream>>>(
+        static_cast<unsigned long long const*>(greedySlots.rawPointer()),
+        static_cast<int32_t*>(draftTokenIds.rawPointer()), totalSteps);
     CUDA_CHECK(cudaGetLastError());
 }
 

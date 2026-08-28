@@ -180,7 +180,7 @@ def main():
             fuse_gdn_qkvzba_scales=args.fuse_gdn_qkvzba_scales,
         )
     elif args.command == "draft":
-        if _is_dflash_or_jetspec_draft(args.draft_model_dir):
+        if _is_dflash_family_draft(args.draft_model_dir):
             _validate_dflash_quant_args(parser, args)
             from ..quantization.models.dflash_draft import \
                 quantize_and_export_dflash_draft
@@ -213,13 +213,19 @@ def main():
             )
 
 
-def _is_dflash_or_jetspec_draft(draft_model_dir: str) -> bool:
+def _is_dflash_family_draft(draft_model_dir: str) -> bool:
     cfg_path = os.path.join(draft_model_dir, "config.json")
     if not os.path.isfile(cfg_path):
         return False
     with open(cfg_path, encoding="utf-8") as f:
         cfg = json.load(f)
-    return bool(cfg.get("dflash_config") or cfg.get("jetspec_config"))
+    # DSpark drafts share the DFlash backbone; the Markov/confidence sidecar
+    # tensors pass through the same quantization path unquantized.
+    is_dspark = bool(
+        cfg.get("dspark_config") or cfg.get("markov_head_type")
+        or "Qwen3DSparkModel" in (cfg.get("architectures") or []))
+    return bool(
+        cfg.get("dflash_config") or cfg.get("jetspec_config") or is_dspark)
 
 
 def _validate_dflash_quant_args(parser, args) -> None:

@@ -153,12 +153,16 @@ private:
     Tensor mAcceptedTokenIndices; //!< [maxBatch, verifySize] INT32 accepted verify-node indices
 
     //! DSpark Markov/confidence sidecars
-    Tensor mMarkovW1;         //!< [vocabSize, markovRank] FP16
-    Tensor mMarkovW2;         //!< [vocabSize, markovRank] FP16
-    Tensor mConfidenceWeight; //!< [hiddenSize + optional markovRank] FP16
-    Tensor mConfidenceBias;   //!< [1] FP16
+    Tensor mMarkovW1;          //!< [vocabSize, markovRank] FP16
+    Tensor mMarkovW2;          //!< [vocabSize, markovRank] FP16
+    Tensor mMarkovW2Fp8;       //!< [vocabSize, markovRank] E4M3 bytes (EDGELLM_DSPARK_W2_FP8=1)
+    Tensor mMarkovW2RowScales; //!< [vocabSize] FP16 per-row scales for the FP8 layout
+    Tensor mMarkovGreedySlots; //!< [maxBatch, proposalLen] packed per-step greedy winners (fused kernel)
+    Tensor mConfidenceWeight;  //!< [hiddenSize + optional markovRank] FP16
+    Tensor mConfidenceBias;    //!< [1] FP16
     bool mHasConfidenceHead{false};
     bool mConfidenceHeadWithMarkov{false};
+    bool mUseFp8W2{false}; //!< EDGELLM_DSPARK_W2_FP8=1: FP8 E4M3 markov_w2 in the fused greedy path
 
     //! System prompt KV cache for draft target KV
     hash_utils::HashMap<SystemPromptCacheKey, SystemPromptKVCache> mSystemPromptKVCacheDraft;

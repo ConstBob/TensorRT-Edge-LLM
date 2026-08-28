@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <string>
@@ -242,6 +243,8 @@ DSparkDecoder::DSparkDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
         nvinfer1::DataType::kFLOAT, "DSpark::draftProbabilities");
     mDraftStepLogits
         = Tensor({maxBatch, mDraftVocabSize}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "DSpark::stepLogits");
+    mMarkovGreedySlots
+        = Tensor({maxBatch, mProposalLen}, DeviceType::kGPU, nvinfer1::DataType::kINT64, "DSpark::markovGreedySlots");
     mDraftStepProbabilities = Tensor(
         {maxBatch, mDraftVocabSize}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "DSpark::stepProbabilities");
     mDraftStepTopKValues = Tensor(
@@ -337,6 +340,20 @@ void DSparkDecoder::loadHeadSidecars(std::filesystem::path const& engineDir, cud
     mMarkovW2 = takeRequiredTensor(tensors, "markov_w2");
     validateMatrix(mMarkovW1, "markov_w1", mDraftVocabSize, mMarkovRank);
     validateMatrix(mMarkovW2, "markov_w2", mDraftVocabSize, mMarkovRank);
+
+    char const* fp8Env = std::getenv("EDGELLM_DSPARK_W2_FP8");
+    if (fp8Env != nullptr && std::string(fp8Env) == "1")
+    {
+        ELLM_CHECK(mMarkovRank % 16 == 0, "EDGELLM_DSPARK_W2_FP8 requires markov_rank divisible by 16");
+        mMarkovW2Fp8 = Tensor(
+            {mDraftVocabSize, mMarkovRank}, DeviceType::kGPU, nvinfer1::DataType::kUINT8, "DSpark::markovW2Fp8");
+        mMarkovW2RowScales
+            = Tensor({mDraftVocabSize}, DeviceType::kGPU, nvinfer1::DataType::kHALF, "DSpark::markovW2RowScales");
+        kernel::dsparkQuantizeMarkovW2Fp8(
+            mMarkovW2, mMarkovW2Fp8, mMarkovW2RowScales, mDraftVocabSize, mMarkovRank, stream);
+        mUseFp8W2 = true;
+        LOG_INFO("DSparkDecoder: markov_w2 converted to FP8 E4M3 (per-row scales).");
+    }
 
     if (mHasConfidenceHead)
     {
@@ -670,37 +687,69 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
         else
         {
             // Greedy, chain and tree alike: per-step Markov-corrected row + top-1. Shared
-            // code makes tree candidateTopK=1 reproduce the chain structurally, and this
-            // path outruns the old fused batch-tile argmax kernel at every batch size.
+            // code makes tree candidateTopK=1 reproduce the chain structurally.
             int32_t const proposalDepthSize = proposalLen + 1;
-            check::check(mDraftStepLogits.reshape({activeBatchSize, mDraftVocabSize}), "Tensor reshape failed");
-            check::check(mDraftStepTopKValues.reshape({activeBatchSize, 1}), "Tensor reshape failed");
-            check::check(mDraftStepTopKIndices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
             if (mUseTree)
             {
                 check::check(mStackedMarkovLogits.reshape({activeBatchSize, proposalDepthSize, mDraftVocabSize}),
                     "Tensor reshape failed");
             }
-            size_t const rowBytes = static_cast<size_t>(mDraftVocabSize) * sizeof(float);
-            for (int32_t step = 0; step < proposalLen; ++step)
+            if (kernel::dsparkFusedGreedySupported(mMarkovRank))
             {
-                kernel::dsparkBuildMarkovLogits(mDraftOutputLogits, mMarkovW1, mMarkovW2, mLastAcceptedTokens,
-                    mDraftTokenIds, mDraftStepLogits, activeBatchSize, step, proposalLen, mDraftVocabSize, mMarkovRank,
-                    context.stream);
-                if (mUseTree)
+                // Fused correction + exact top-1: one kernel per step, winner carried on-device in
+                // packed slots; tree rows are written straight into the stacked candidate buffer and
+                // chain mode never materializes the full corrected row.
+                check::check(mMarkovGreedySlots.reshape({activeBatchSize, proposalLen}), "Tensor reshape failed");
+                CUDA_CHECK(cudaMemsetAsync(mMarkovGreedySlots.rawPointer(), 0,
+                    static_cast<size_t>(activeBatchSize) * proposalLen * sizeof(uint64_t), context.stream));
+                if (mUseFp8W2)
                 {
-                    // Step logits become the depth-(step+1) candidate row (row 0 is the root placeholder).
-                    CUDA_CHECK(cudaMemcpy2DAsync(static_cast<char*>(mStackedMarkovLogits.rawPointer())
-                            + static_cast<size_t>(step + 1) * rowBytes,
-                        static_cast<size_t>(proposalDepthSize) * rowBytes, mDraftStepLogits.rawPointer(), rowBytes,
-                        rowBytes, activeBatchSize, cudaMemcpyDeviceToDevice, context.stream));
+                    for (int32_t step = 0; step < proposalLen; ++step)
+                    {
+                        kernel::dsparkMarkovGreedyFusedStepFp8(mDraftOutputLogits, mMarkovW1, mMarkovW2Fp8,
+                            mMarkovW2RowScales, mLastAcceptedTokens, mMarkovGreedySlots,
+                            mUseTree ? &mStackedMarkovLogits : nullptr, step + 1, activeBatchSize, step, proposalLen,
+                            mDraftVocabSize, mMarkovRank, context.stream);
+                    }
                 }
-                selectAllTopK(mDraftStepLogits, std::ref(mDraftStepTopKValues), mDraftStepTopKIndices, /*topK=*/1,
-                    mRuntime.sampling.workspace, context.stream);
-                CUDA_CHECK(cudaMemcpy2DAsync(
-                    static_cast<char*>(mDraftTokenIds.rawPointer()) + static_cast<size_t>(step) * sizeof(int32_t),
-                    static_cast<size_t>(proposalLen) * sizeof(int32_t), mDraftStepTopKIndices.rawPointer(),
-                    sizeof(int32_t), sizeof(int32_t), activeBatchSize, cudaMemcpyDeviceToDevice, context.stream));
+                else
+                {
+                    for (int32_t step = 0; step < proposalLen; ++step)
+                    {
+                        kernel::dsparkMarkovGreedyFusedStep(mDraftOutputLogits, mMarkovW1, mMarkovW2,
+                            mLastAcceptedTokens, mMarkovGreedySlots, mUseTree ? &mStackedMarkovLogits : nullptr,
+                            step + 1, activeBatchSize, step, proposalLen, mDraftVocabSize, mMarkovRank, context.stream);
+                    }
+                }
+                kernel::dsparkFinalizeGreedyDraftTokens(
+                    mMarkovGreedySlots, mDraftTokenIds, activeBatchSize * proposalLen, context.stream);
+            }
+            else
+            {
+                check::check(mDraftStepLogits.reshape({activeBatchSize, mDraftVocabSize}), "Tensor reshape failed");
+                check::check(mDraftStepTopKValues.reshape({activeBatchSize, 1}), "Tensor reshape failed");
+                check::check(mDraftStepTopKIndices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
+                size_t const rowBytes = static_cast<size_t>(mDraftVocabSize) * sizeof(float);
+                for (int32_t step = 0; step < proposalLen; ++step)
+                {
+                    kernel::dsparkBuildMarkovLogits(mDraftOutputLogits, mMarkovW1, mMarkovW2, mLastAcceptedTokens,
+                        mDraftTokenIds, mDraftStepLogits, activeBatchSize, step, proposalLen, mDraftVocabSize,
+                        mMarkovRank, context.stream);
+                    if (mUseTree)
+                    {
+                        // Step logits become the depth-(step+1) candidate row (row 0 is the root placeholder).
+                        CUDA_CHECK(cudaMemcpy2DAsync(static_cast<char*>(mStackedMarkovLogits.rawPointer())
+                                + static_cast<size_t>(step + 1) * rowBytes,
+                            static_cast<size_t>(proposalDepthSize) * rowBytes, mDraftStepLogits.rawPointer(), rowBytes,
+                            rowBytes, activeBatchSize, cudaMemcpyDeviceToDevice, context.stream));
+                    }
+                    selectAllTopK(mDraftStepLogits, std::ref(mDraftStepTopKValues), mDraftStepTopKIndices, /*topK=*/1,
+                        mRuntime.sampling.workspace, context.stream);
+                    CUDA_CHECK(cudaMemcpy2DAsync(
+                        static_cast<char*>(mDraftTokenIds.rawPointer()) + static_cast<size_t>(step) * sizeof(int32_t),
+                        static_cast<size_t>(proposalLen) * sizeof(int32_t), mDraftStepTopKIndices.rawPointer(),
+                        sizeof(int32_t), sizeof(int32_t), activeBatchSize, cudaMemcpyDeviceToDevice, context.stream));
+                }
             }
         }
     }
