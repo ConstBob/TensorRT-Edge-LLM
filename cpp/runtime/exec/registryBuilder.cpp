@@ -448,6 +448,7 @@ TensorRegistry buildRegistryForDFlashDraft(DeploymentConfig const& bundle)
 
     TensorRegistry reg;
     LLMEngineConfig const& cfg = *bundle.draft;
+    bool const isDFlash2 = cfg.dflashVersion == DFlashVersion::kV2;
     int32_t const draftHiddenSize = bundle.specConfig->draftHiddenSize;
     int32_t const baseOutputHiddenDim = bundle.specConfig->baseOutputHiddenDim;
     int32_t const draftVocabSize = cfg.outputVocabSize;
@@ -460,9 +461,25 @@ TensorRegistry buildRegistryForDFlashDraft(DeploymentConfig const& bundle)
     reg.addTensor({binding_names::kDFlashTargetHiddenConcat, TensorIO::kInput, nvinfer1::DataType::kHALF,
         {sym(&InferenceDims::batch), sym(&InferenceDims::selectLen), fixed(baseOutputHiddenDim)}});
 
-    // logits: [batch, seq_len, draftVocabSize] FLOAT
-    reg.addTensor({binding_names::kLogits, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
-        {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(draftVocabSize)}});
+    if (isDFlash2)
+    {
+        int32_t const proposalLen = bundle.specConfig->dflashBlockSize - 1;
+        int32_t const selectorTopK = cfg.specSelectorTopK;
+        check::check(proposalLen >= 1 && proposalLen <= 15 && selectorTopK == 16,
+            "DFlash2 draft registry requires runtime block_size in [2, 16] and selector_top_k=16");
+        reg.addTensor({binding_names::kSpecProposalSupportIds, TensorIO::kOutput, nvinfer1::DataType::kINT32,
+            {sym(&InferenceDims::batch), fixed(proposalLen), fixed(selectorTopK)}});
+        reg.addTensor({binding_names::kSpecProposalUnaryValues, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
+            {sym(&InferenceDims::batch), fixed(proposalLen), fixed(selectorTopK)}});
+        reg.addTensor({binding_names::kSpecProposalProjectedHidden, TensorIO::kOutput, nvinfer1::DataType::kHALF,
+            {sym(&InferenceDims::batch), fixed(proposalLen), fixed(cfg.specSelectorRank)}});
+    }
+    else
+    {
+        // logits: [batch, seq_len, draftVocabSize] FLOAT
+        reg.addTensor({binding_names::kLogits, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
+            {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(draftVocabSize)}});
+    }
 
     // context_lengths: [batch] INT32
     reg.addTensor(

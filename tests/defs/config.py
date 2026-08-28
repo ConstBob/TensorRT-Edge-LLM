@@ -1494,7 +1494,9 @@ class TestConfig:
 
         parts = self.param_str.split('-')
         spec_idx = -1
-        spec_tokens = {"dflash", "dspark", "eagle", "jetspec", "mtp"}
+        spec_tokens = {
+            "dflash", "dflash2", "dspark", "eagle", "jetspec", "mtp"
+        }
         for i, part in enumerate(parts):
             if part.lower() in spec_tokens:
                 spec_idx = i

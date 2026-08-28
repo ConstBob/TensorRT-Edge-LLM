@@ -30,6 +30,8 @@ from typing import Optional, Tuple
 import numpy as np
 import tensorrt as trt
 
+from tensorrt_edgellm.dflash import DFlashVersion
+
 from ..ops.backend import Net
 from ..ops.functional.attention import KV_PAGE_SIZE
 from . import contracts, quantization, weight_policy
@@ -72,6 +74,7 @@ class BuildArgs:
     component: str = contracts.Component.LLM.value
     spec_role: str = contracts.SpecRole.NONE.value
     spec_type: str = "none"
+    dflash_version: DFlashVersion = DFlashVersion.V1
     max_input_len: int = 1024
     max_kv_cache_capacity: int = 4096
     max_batch_size: int = 4
@@ -201,11 +204,18 @@ class BuildArgs:
                                    and self.spec_type in ("mtp", "dflash")):
             raise ValueError(
                 "--tree-base is only valid for an MTP or DFlash base engine")
+        if (self.tree_base and self.spec_type == "dflash"
+                and self.dflash_version == DFlashVersion.V2):
+            raise ValueError("--tree-base is not supported by DFlash V2")
         if self.draft_reduced_vocab_dir and not (
                 self.resolved_spec_role == contracts.SpecRole.DRAFT
                 and self.spec_type == "dflash"):
             raise ValueError(
                 "--draft-reduced-vocab-dir is only valid for a DFlash draft")
+        if (self.draft_reduced_vocab_dir and self.spec_type == "dflash"
+                and self.dflash_version == DFlashVersion.V2):
+            raise ValueError(
+                "DFlash V2 does not support reduced draft vocabulary")
         paired_base = (self.resolved_spec_role == contracts.SpecRole.BASE
                        and self.spec_type in ("eagle3", "dflash", "dspark"))
         if paired_base and not self.draft_model_dir:
@@ -227,6 +237,14 @@ class BuildArgs:
                 and self.spec_type in ("dflash", "dspark", "gemma4_mtp")):
             raise ValueError(
                 f"{self.spec_type} base engines require the full vocabulary")
+        if (self.spec_type == "dflash"
+                and self.dflash_version == DFlashVersion.V2
+                and (self.max_verify_tree_size != self.max_draft_tree_size
+                     or self.max_draft_tree_size < 2
+                     or self.max_draft_tree_size > 16)):
+            raise ValueError(
+                "DFlash V2 verify and draft profile sizes must match in [2, 16]"
+            )
         if self.fp8_embedding and self.resolved_spec_role == contracts.SpecRole.DRAFT:
             raise ValueError("draft engines use the base embedding sidecar")
 
@@ -309,7 +327,8 @@ def build_engine(args: BuildArgs,
     from ..models import registry as model_registry
 
     weight_conversion = model_registry.weight_conversion_for(
-        bundle.root_model_type, args.spec_type, args.resolved_spec_role)
+        bundle.root_model_type, args.spec_type, args.resolved_spec_role,
+        args.dflash_version)
     component_quant = (cfg.quant if cfg else quantization.parse_quantization(
         args.model_dir, bundle.root,
         bundle.component_dict(args.resolved_component), weight_conversion))
@@ -589,14 +608,20 @@ def _setup_llm_profiles(builder, config, network, cfg: DeviceConfig,
     embed_width = fixed_dim("inputs_embeds", -1, H)
     generation_sequence_max = args.profile_limits.generation_sequence_max(
         args.resolved_spec_role)
+    dflash_v2_draft = (args.resolved_spec_role == contracts.SpecRole.DRAFT
+                       and args.spec_type == "dflash"
+                       and args.dflash_version == DFlashVersion.V2)
     if (args.resolved_spec_role == contracts.SpecRole.DRAFT
             and args.spec_type in ("dflash", "dspark")):
         draft = args.max_draft_tree_size
-        set_profile_shapes("inputs_embeds", (1, 1, embed_width),
+        draft_min = 2 if dflash_v2_draft else 1
+        draft_opt = (min(cfg.dflash2_block_size, draft)
+                     if dflash_v2_draft else draft)
+        set_profile_shapes("inputs_embeds", (1, draft_min, embed_width),
+                           (maxB, draft_opt, embed_width),
                            (maxB, draft, embed_width),
-                           (maxB, draft, embed_width),
-                           generation_min=(1, 1, embed_width),
-                           generation_opt=(maxB, draft, embed_width),
+                           generation_min=(1, draft_min, embed_width),
+                           generation_opt=(maxB, draft_opt, embed_width),
                            generation_max=(maxB, draft, embed_width))
     else:
         set_profile_shapes("inputs_embeds", (1, 1, embed_width),
@@ -623,8 +648,14 @@ def _setup_llm_profiles(builder, config, network, cfg: DeviceConfig,
     # context_lengths [B]
     set_profile_shapes("context_lengths", (1, ), (maxB, ), (maxB, ))
 
-    # kvcache_start_index [B] -- context min 0 (prefill from empty), gen min 1
-    set_profile_shapes("kvcache_start_index", (0, ), (maxB, ), (maxB, ),
+    # Cached-block drafts update target K/V through a plugin whose delta and
+    # page-table inputs are always batch-shaped, including their context MIN.
+    # Ordinary base-model prefill keeps the zero-length cache-start binding.
+    cached_block_draft = (args.resolved_spec_role == contracts.SpecRole.DRAFT
+                          and args.spec_type in ("dflash", "dspark"))
+    context_cache_min = (1, ) if cached_block_draft else (0, )
+    set_profile_shapes("kvcache_start_index",
+                       context_cache_min, (maxB, ), (maxB, ),
                        generation_min=(1, ),
                        generation_opt=(maxB, ),
                        generation_max=(maxB, ))
@@ -687,15 +718,22 @@ def _setup_llm_profiles(builder, config, network, cfg: DeviceConfig,
     verify = args.max_verify_tree_size
     tree_size = (args.max_draft_tree_size if args.resolved_spec_role
                  == contracts.SpecRole.DRAFT else verify)
-    set_profile_shapes("attention_pos_id", (1, 1), (maxB, 1),
-                       (maxB, tree_size))
+    position_min = 2 if dflash_v2_draft else 1
+    position_opt = (min(cfg.dflash2_block_size, tree_size)
+                    if dflash_v2_draft else position_min)
+    set_profile_shapes("attention_pos_id", (1, position_min),
+                       (maxB, position_opt), (maxB, tree_size))
     if (args.resolved_spec_role == contracts.SpecRole.DRAFT
             and args.spec_type in ("dflash", "dspark")):
         draft = args.max_draft_tree_size
-        set_profile_shapes(
-            "attention_mask", (1, 1, 1),
-            (maxB, max(1, draft // 2), max(1, (draft // 2 + 31) // 32)),
-            (maxB, draft, (draft + 31) // 32))
+        mask_min_seq = 2 if dflash_v2_draft else 1
+        mask_min_width = (mask_min_seq + 31) // 32
+        mask_opt_seq = min(cfg.dflash2_block_size,
+                           draft) if dflash_v2_draft else max(1, draft // 2)
+        mask_opt_width = max(1, (mask_opt_seq + 31) // 32)
+        set_profile_shapes("attention_mask", (1, mask_min_seq, mask_min_width),
+                           (maxB, mask_opt_seq, mask_opt_width),
+                           (maxB, draft, (draft + 31) // 32))
     else:
         set_profile_shapes("attention_mask", (1, 1, 1), (maxB, 1, 1),
                            (maxB, tree_size, maxKV + tree_size))

@@ -73,6 +73,8 @@ constexpr bool shouldUseHybridMtpEndpointReuse(DecodingStrategyKind selectedStra
 struct DecodingStrategyCapabilities
 {
     bool ownsBaseVerificationCudaGraphs{false};
+    bool supportsLosslessSampling{false};
+    int32_t maxSamplingSupport{0}; //!< 0 when the decoder does not require a bounded sampling support.
 };
 
 struct SamplingBuffers
@@ -87,6 +89,8 @@ struct SamplingBuffers
     //! engine's output vocabulary. Grammar matchers live in that space (see GuidedDecoder),
     //! so they must be advanced with these rather than the remapped full IDs.
     Tensor& hostOutputSpaceIds;
+    Tensor& uniforms;
+    Tensor& hostUniforms;
 };
 
 /*!

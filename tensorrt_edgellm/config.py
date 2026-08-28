@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     import torch
 
 from .checkpoint.checkpoint_utils import load_checkpoint_config_dicts
+from .dflash import DFlashVersion, resolve_dflash_contract
 
 # ---------------------------------------------------------------------------
 # Quantization type constants
@@ -762,11 +763,22 @@ class ModelConfig:
     dflash_target_layer_ids: List[int] = field(default_factory=list)
     dflash_block_size: int = 16
     dflash_mask_token_id: int = 248070
+    dflash_version: DFlashVersion = DFlashVersion.V1
     # Run the fc feature projector at the checkpoint's native precision (e.g.
     # NVFP4) instead of the default dense-FP16 + FP32 projection. Enabled only
     # for targets measured to keep target-hidden well inside FP16 range
     # (Nemotron-3.5). Qwen3-8B keeps the FP32 guard (target-hidden ~abs 2e4).
     dflash_fc_native_precision: bool = False
+    # DFlash2 is a distinct linear-path proposal architecture. Its checkpoint
+    # block size is the runtime default; an engine may profile a larger block.
+    dflash2_target_layer_ids: List[int] = field(default_factory=list)
+    dflash2_block_size: int = 8
+    dflash2_mask_token_id: int = 248070
+    dflash2_is_causal: bool = False
+    dflash2_conv_kernel_size: int = 2
+    dflash2_conv_group_size: int = 16
+    dflash2_selector_rank: int = 256
+    dflash2_selector_top_k: int = 16
     # ------------------------------------------ JetSpec config
     # JetSpec uses the DFlash/DDTree cached-draft contract with causal proposal
     # attention inside the draft block. The DFlash-prefixed fields are still
@@ -1666,6 +1678,39 @@ def make_dflash_draft_config(
                 "mask_token_id",
                 llm_dict.get("mask_token_id", default_mask_token_id))),
         quant=quant,
+    )
+
+
+def make_dflash2_draft_config(
+        draft_dir: str,
+        default_attention_scale: Callable[[int], float]) -> ModelConfig:
+    """Build and validate the production DFlash2 draft contract."""
+    root_dict, llm_dict = load_checkpoint_config_dicts(draft_dir)
+    resolved = resolve_dflash_contract(root_dict, llm_dict)
+    if resolved.version != DFlashVersion.V2:
+        raise ValueError(
+            "DFlash2 draft checkpoint requires architecture DFlash2DraftModel")
+
+    config = make_dflash_draft_config(draft_dir, default_attention_scale)
+    if config.num_hidden_layers != 5:
+        raise ValueError(
+            "DFlash2 production checkpoint requires exactly five draft layers")
+
+    return replace(
+        config,
+        dflash_version=resolved.version,
+        dflash_target_layer_ids=list(resolved.target_layer_ids),
+        dflash_block_size=resolved.block_size,
+        dflash_mask_token_id=resolved.mask_token_id,
+        is_dflash_draft_flag=True,
+        dflash2_target_layer_ids=list(resolved.target_layer_ids),
+        dflash2_block_size=resolved.block_size,
+        dflash2_mask_token_id=resolved.mask_token_id,
+        dflash2_is_causal=resolved.is_causal,
+        dflash2_conv_kernel_size=resolved.conv_kernel_size,
+        dflash2_conv_group_size=resolved.conv_group_size,
+        dflash2_selector_rank=resolved.selector_rank,
+        dflash2_selector_top_k=resolved.selector_top_k,
     )
 
 

@@ -288,7 +288,9 @@ bool applyEngineSpecDecodeDefaults(LLMInferenceArgs& args)
             }
             if (!specArgs.verifySizeSet)
             {
-                specArgs.verifySize = specArgs.draftTopK > 1 ? maxVerifySizeOrDefault(baseConfig, 128) : blockSize;
+                specArgs.verifySize = baseConfig.dflashVersion == rt::DFlashVersion::kV2
+                    ? blockSize
+                    : (specArgs.draftTopK > 1 ? maxVerifySizeOrDefault(baseConfig, 128) : blockSize);
             }
             break;
         }
@@ -371,8 +373,9 @@ void printUsage(char const* programName)
     std::cerr
         << "  --numLogprobs             Number of top log-probabilities to return per token (0 = disabled, max 50)"
         << std::endl;
-    std::cerr << "  --specDecode              Enable speculative decoding (EAGLE, MTP, DFlash, JetSpec, or DSpark)"
-              << std::endl;
+    std::cerr
+        << "  --specDecode              Enable speculative decoding (EAGLE, MTP, DFlash, DFlash2, JetSpec, or DSpark)"
+        << std::endl;
     std::cerr << "  --specDraftTopK           Number of tokens selected per drafting step (default: 10)" << std::endl;
     std::cerr << "                            DFlash/JetSpec/DSpark default to 1 when omitted" << std::endl;
     std::cerr
@@ -1269,6 +1272,18 @@ int runParallelInference(LLMInferenceArgs const& args,
             responseJson["formatted_system_prompt"] = formattedRequest ? formattedRequest->formattedSystemPrompt : "";
             responseJson["formatted_complete_request"]
                 = formattedRequest ? formattedRequest->formattedCompleteRequest : "";
+            if (batchIdx < response.outputIds.size())
+            {
+                responseJson["generated_token_count"] = response.outputIds[batchIdx].size();
+            }
+            if (batchIdx < response.specVerifyCounts.size())
+            {
+                responseJson["spec_verify_count"] = response.specVerifyCounts[batchIdx];
+            }
+            if (batchIdx < response.specAcceptanceLengths.size())
+            {
+                responseJson["spec_acceptance_length"] = response.specAcceptanceLengths[batchIdx];
+            }
             outputData["responses"].push_back(responseJson);
 
             if (requestOk && batchIdx < response.outputIds.size())
@@ -2084,6 +2099,18 @@ int main(int argc, char* argv[])
             responseJson["formatted_system_prompt"] = formattedRequest ? formattedRequest->formattedSystemPrompt : "";
             responseJson["formatted_complete_request"]
                 = formattedRequest ? formattedRequest->formattedCompleteRequest : "";
+            if (batchIdx < response.outputIds.size())
+            {
+                responseJson["generated_token_count"] = response.outputIds[batchIdx].size();
+            }
+            if (batchIdx < response.specVerifyCounts.size())
+            {
+                responseJson["spec_verify_count"] = response.specVerifyCounts[batchIdx];
+            }
+            if (batchIdx < response.specAcceptanceLengths.size())
+            {
+                responseJson["spec_acceptance_length"] = response.specAcceptanceLengths[batchIdx];
+            }
             // Serialize logprobs if present: logprobs[step] = [{token_id, token, bytes, logprob}, ...]
             // `token` is the UTF-8-sanitized piece string (invalid bytes -> U+FFFD, required so
             // nlohmann::json::dump does not throw); `bytes` carries the raw token bytes losslessly.

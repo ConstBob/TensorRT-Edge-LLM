@@ -128,6 +128,15 @@ char const* guideTypeName(GuideType type);
 
 /*! \brief LLM Generation Request structure
  */
+enum class SpecProposalSampling : uint8_t
+{
+    kAuto,
+    kGreedy,
+    kProbabilistic,
+};
+
+inline constexpr uint64_t kDefaultSamplingSeed = 0xED6E5EED20260001ULL;
+
 struct LLMGenerationRequest
 {
     //! \cond INTERNAL
@@ -160,6 +169,8 @@ struct LLMGenerationRequest
         //! Independent of `logitBias`: that is a soft preference applied to every
         //! step alike, this is a hard per-step constraint recomputed from grammar state.
         std::optional<GuidedDecodingParams> guidedDecoding;
+        //! Stable seed for this logical request; independent of its active batch slot.
+        std::optional<uint64_t> samplingSeed;
 
         mutable FormattedRequest formatted; //!< Formatted request (populated by tokenizer or user-provided)
     };
@@ -172,6 +183,8 @@ struct LLMGenerationRequest
     float topP;                                             //!< Top-p (nucleus) sampling parameter
     int64_t topK;                                           //!< Top-k sampling parameter
     int64_t maxGenerateLength;                              //!< Max length of the generated tokens
+    std::optional<uint64_t> samplingSeed;                   //!< Stable request-level sampling seed
+    SpecProposalSampling proposalSampling{SpecProposalSampling::kAuto}; //!< Draft proposal sampling policy
     int32_t diffusionMaxDenoisingSteps{0}; //!< Optional DiffusionGemma denoise-step override (0 = runtime default)
     std::string loraWeightsName{""};       //!< Name of the LoRA weights. Default to empty string for no LoRA weights
 
@@ -242,6 +255,12 @@ struct LLMGenerationResponse
 
     //! Prompt length per request, counted after chat templating and media expansion.
     std::vector<int32_t> inputTokenCounts;
+
+    //! Speculative verification iterations per request; zero for vanilla decoding.
+    std::vector<int32_t> specVerifyCounts;
+
+    //! Per-request generated tokens divided by speculative verification iterations.
+    std::vector<float> specAcceptanceLengths;
 };
 
 /*! \brief RoPE (Rotary Position Embedding) type enumeration

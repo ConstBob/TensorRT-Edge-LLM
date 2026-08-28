@@ -38,6 +38,22 @@ namespace trt_edgellm
 namespace builder
 {
 
+inline bool isDFlashV2DraftConfig(Json const& config)
+{
+    if (config.value("engine_role", "llm") != "draft")
+    {
+        return false;
+    }
+    std::string const specType = config.value("spec_decode_type", "none");
+    if (specType == "dflash2")
+    {
+        return true;
+    }
+    auto const dflashConfig = config.find("dflash_config");
+    return specType == "dflash" && dflashConfig != config.end() && dflashConfig->is_object()
+        && dflashConfig->value("version", 1) == 2;
+}
+
 //! Configuration structure for LLM model building.
 //! Contains all parameters needed to configure the TensorRT engine building process
 //! for Large Language Models, including standard and speculative-decoding engines.
@@ -478,6 +494,10 @@ private:
     //! Copy DSpark Markov/confidence head sidecars to the engine directory.
     //! @return true if copying was successful or this is not a DSpark draft.
     bool copyDSparkFiles();
+
+    //! Copy DFlash2 selector sidecars to the engine directory.
+    //! @return true if copying was successful or this is not a DFlash2 draft.
+    bool copyDFlash2Files();
 
     //! Copy vocabulary mapping files to the engine directory.
     //! Copies vocab_map.safetensors file if reduced vocabulary is used.

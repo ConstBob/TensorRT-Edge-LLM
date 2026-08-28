@@ -227,7 +227,11 @@ EAGLE3, DFlash, DSpark, and Gemma4 MTP use paired checkpoints:
   --plugin-path /path/to/build/libNvInfer_edgellm_plugin.so
 ```
 
-Replace `eagle3` with `dflash`, `dspark`, or `gemma4_mtp` as appropriate.
+Replace `eagle3` with `dflash`, `dflash2`, `dspark`, or `gemma4_mtp` as
+appropriate. DFlash2 is distinct from DFlash DDTree and rejects `--tree-base`.
+It is supported by this checkpoint-native direct builder only. The legacy ONNX
+`llm_build` compatibility path intentionally rejects `dflash2` rather than
+routing it through the DFlash v1 graph.
 Qwen3.5 native MTP reads draft layers from the target checkpoint:
 
 ```bash
@@ -269,8 +273,8 @@ build/examples/llm/llm_inference \
   --specDecode
 ```
 
-`--draftCheckpointDir` applies to EAGLE3, DFlash, DSpark, and Gemma4 MTP. It is
-rejected for native Qwen MTP because its draft layers are in
+`--draftCheckpointDir` applies to EAGLE3, DFlash, DFlash2, DSpark, and Gemma4
+MTP. It is rejected for native Qwen MTP because its draft layers are in
 `--checkpointDir`.
 
 ## Optional Features
@@ -320,7 +324,7 @@ CI coverage. An implemented row can still have model-specific restrictions.
 | FP8 KV cache | Implemented from checkpoint metadata | Not yet |
 | FP8 embedding and reduced vocabulary | Implemented | Not yet |
 | Runtime LoRA inputs | Implemented | Not yet |
-| EAGLE3, Qwen3.5 MTP, DFlash, DSpark, and Gemma4 MTP | Implemented | EAGLE3 with Qwen3 on A30 |
+| EAGLE3, Qwen3.5 MTP, DFlash, DFlash2, DSpark, and Gemma4 MTP | Implemented | EAGLE3 with Qwen3 on A30 |
 | DiffusionGemma block diffusion | Implemented | Not yet |
 | Visual, audio, TTS, omni, action, and Cosmos3 policy components | Implemented for registered families | Not yet |
 | Tensor parallel graph generation | Implemented per rank | Not yet |

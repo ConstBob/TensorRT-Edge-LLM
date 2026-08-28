@@ -500,6 +500,36 @@ def _(k_delta, v_delta, past_key_value, rope_cos_sin, delta_start_positions,
 
 
 # ---------------------------------------------------------------------------
+# DFlash2 fixed linear-path proposal plugins
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt_edgellm::dflash2_grouped_dynamic_conv",
+                         mutates_args=())
+def dflash2_grouped_dynamic_conv(hidden_states: torch.Tensor,
+                                 delta: torch.Tensor,
+                                 base_kernel: torch.Tensor,
+                                 residual: Optional[torch.Tensor],
+                                 block_size: int, kernel_size: int,
+                                 group_size: int,
+                                 fuse_residual: int) -> torch.Tensor:
+    """Trace-time proxy for DFlash2GroupedDynamicConvPlugin."""
+    del delta, base_kernel, block_size, kernel_size, group_size, fuse_residual
+    if residual is not None:
+        return torch.empty_like(residual)
+    return torch.empty_like(hidden_states)
+
+
+@dflash2_grouped_dynamic_conv.register_fake
+def _(hidden_states, delta, base_kernel, residual, block_size, kernel_size,
+      group_size, fuse_residual):
+    del delta, base_kernel, block_size, kernel_size, group_size, fuse_residual
+    if residual is not None:
+        return torch.empty_like(residual)
+    return torch.empty_like(hidden_states)
+
+
+# ---------------------------------------------------------------------------
 # FP8 fake-quant eager helpers (numeric-validation golden)
 #
 # As with the NVFP4 helpers above, the eager bodies of the FP8 ops were zero

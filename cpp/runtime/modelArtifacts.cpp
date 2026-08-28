@@ -36,10 +36,15 @@ namespace rt
 namespace
 {
 
-bool needsCachedBlockDraftDDTreeHybridBindings(DeploymentConfig const& deployment)
+bool needsCachedBlockDraftTreeHybridBindings(DeploymentConfig const& deployment)
 {
-    return deployment.specConfig.has_value() && isCachedBlockDraftMode(deployment.specDecodeMode())
-        && deployment.specConfig->draftingTopK > 1 && deployment.base.numLinearAttnLayers > 0;
+    if (!deployment.specConfig.has_value() || deployment.base.numLinearAttnLayers == 0)
+    {
+        return false;
+    }
+    SpecDecodeMode const mode = deployment.specDecodeMode();
+    return mode == SpecDecodeMode::kDFlash
+        || (mode == SpecDecodeMode::kJetSpec && deployment.specConfig->draftingTopK > 1);
 }
 
 void validateCachedBlockDraftTreeMetadataBindings(
@@ -50,16 +55,13 @@ void validateCachedBlockDraftTreeMetadataBindings(
         return;
     }
 
-    char const* modeName = deployment.specDecodeMode() == SpecDecodeMode::kJetSpec ? "JetSpec" : "DFlash";
+    char const* modeName = specDecodeModeName(deployment.specDecodeMode());
     char const* treeBaseFlag
-        = deployment.specDecodeMode() == SpecDecodeMode::kJetSpec ? "--jetspec-tree-base" : "--dflash-tree-base";
-    char const* linearBaseFlag
-        = deployment.specDecodeMode() == SpecDecodeMode::kJetSpec ? "--jetspec-base" : "--dflash-base";
+        = deployment.specDecodeMode() == SpecDecodeMode::kJetSpec ? "--jetspec-tree-base" : "--dflash-base";
 
     bool const hasTreeParentIds = baseExecutor.hasIOTensor(binding_names::kTreeParentIds);
     bool const hasTreeDepths = baseExecutor.hasIOTensor(binding_names::kTreeDepths);
     bool const hasTreeMetadata = hasTreeParentIds || hasTreeDepths;
-    bool const usesDDTree = deployment.specConfig->draftingTopK > 1;
     if (hasTreeMetadata)
     {
         ELLM_CHECK(hasTreeParentIds && hasTreeDepths,
@@ -69,20 +71,15 @@ void validateCachedBlockDraftTreeMetadataBindings(
                 && baseExecutor.getBindingDataType(binding_names::kTreeDepths) == nvinfer1::DataType::kINT32,
             std::string(modeName) + " tree-base engine tree metadata bindings must be INT32: '"
                 + binding_names::kTreeParentIds + "' and '" + binding_names::kTreeDepths + "'.");
-        ELLM_CHECK(usesDDTree,
-            std::string(modeName) + " base engine was exported with " + treeBaseFlag
-                + ", but runtime is configured for linear mode because specDraftTopK=1. "
-                  "Use --specDraftTopK > 1 for DDTree, or re-export the base model with "
-                + linearBaseFlag + ".");
     }
 
-    if (!needsCachedBlockDraftDDTreeHybridBindings(deployment))
+    if (!needsCachedBlockDraftTreeHybridBindings(deployment))
     {
         return;
     }
 
     ELLM_CHECK(hasTreeParentIds && hasTreeDepths,
-        std::string(modeName) + " DDTree hybrid base engine requires INT32 tree metadata bindings '"
+        std::string(modeName) + " hybrid base engine requires INT32 tree metadata bindings '"
             + binding_names::kTreeParentIds + "' and '" + binding_names::kTreeDepths
             + "'. Re-export the base model with " + treeBaseFlag + ", then rebuild spec_base.engine.");
 }

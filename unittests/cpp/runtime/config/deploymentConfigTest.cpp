@@ -194,6 +194,33 @@ Json makeDFlashDraftConfig(int32_t maxDraftTreeSize, int32_t maxBatchSize = 2)
     return config;
 }
 
+Json makeDFlash2ConfigSection()
+{
+    return Json{{"version", 2}, {"block_size", 8}, {"mask_token_id", 248070}, {"is_causal", false},
+        {"conv_kernel_size", 2}, {"conv_group_size", 16}, {"selector_rank", 256}, {"selector_top_k", 16},
+        {"supports_probabilistic_sampling", true}, {"target_layer_ids", Json::array({1, 3, 5, 8, 11})}};
+}
+
+Json makeDFlash2BaseConfig(int32_t maxVerifyTreeSize, int32_t maxBatchSize = 2)
+{
+    Json config = makeBaseConfig(maxVerifyTreeSize, /*maxDraft=*/0, maxBatchSize);
+    config["spec_decode_type"] = "dflash";
+    config["engine_role"] = "base";
+    config["dflash_config"] = makeDFlash2ConfigSection();
+    return config;
+}
+
+Json makeDFlash2DraftConfig(int32_t maxDraftTreeSize, int32_t maxBatchSize = 2)
+{
+    Json config = makeDraftConfig(/*maxVerify=*/0, maxDraftTreeSize, maxBatchSize);
+    config["spec_decode_type"] = "dflash";
+    config["engine_role"] = "draft";
+    config["num_hidden_layers"] = 5;
+    config["base_model_hidden_size"] = config["hidden_size"].get<int32_t>() * 5;
+    config["dflash_config"] = makeDFlash2ConfigSection();
+    return config;
+}
+
 Json makeDSparkConfigSection(int32_t blockSize)
 {
     return Json{{"block_size", blockSize}, {"mask_token_id", 31999}, {"markov_head_type", "vanilla"},
@@ -1711,4 +1738,95 @@ TEST_F(DeploymentConfigTest, DSparkTreeSurvivalThresholdOfOneThrows)
     EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
                      std::optional<SpecDecodeDraftingConfig>{drafting}),
         std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, DFlash2LinearContractValidates)
+{
+    auto const basePath = writeJsonToTempFile(makeDFlash2BaseConfig(/*maxVerify=*/8), "base");
+    auto const draftPath = writeJsonToTempFile(makeDFlash2DraftConfig(/*maxDraft=*/8), "draft");
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 1;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 8;
+
+    DeploymentConfig bundle = createDeploymentConfig(
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting});
+    EXPECT_EQ(bundle.specDecodeMode(), SpecDecodeMode::kDFlash);
+    EXPECT_EQ(bundle.specConfig->dflashBlockSize, 8);
+    EXPECT_EQ(bundle.specConfig->verifySize, 8);
+    EXPECT_EQ(bundle.maxAcceptedTokensPerRound(), 8);
+}
+
+TEST_F(DeploymentConfigTest, DFlashRejectsVersionMismatchWithoutDraftingOverrides)
+{
+    auto const basePath = writeJsonToTempFile(makeDFlash2BaseConfig(/*maxVerify=*/8), "base");
+    auto const draftPath = writeJsonToTempFile(makeDFlashDraftConfig(/*maxDraft=*/8), "draft");
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath}, std::nullopt),
+        std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, DFlash2RejectsMismatchedProductionPair)
+{
+    auto expectInvalid = [&](Json const& draft) {
+        auto const basePath = writeJsonToTempFile(makeDFlash2BaseConfig(/*maxVerify=*/8), "base");
+        auto const draftPath = writeJsonToTempFile(draft, "draft");
+        SpecDecodeDraftingConfig drafting{};
+        drafting.draftingTopK = 1;
+        drafting.draftingStep = 1;
+        drafting.verifySize = 8;
+        EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath}, drafting),
+            std::runtime_error);
+    };
+
+    Json targetMismatch = makeDFlash2DraftConfig(/*maxDraft=*/8);
+    targetMismatch["dflash_config"]["target_layer_ids"] = Json::array({1, 3, 5, 9, 11});
+    expectInvalid(targetMismatch);
+
+    Json layerCountMismatch = makeDFlash2DraftConfig(/*maxDraft=*/8);
+    layerCountMismatch["num_hidden_layers"] = 4;
+    expectInvalid(layerCountMismatch);
+
+    Json conditioningMismatch = makeDFlash2DraftConfig(/*maxDraft=*/8);
+    conditioningMismatch["base_model_hidden_size"] = 768;
+    expectInvalid(conditioningMismatch);
+
+    Json hiddenMismatch = makeDFlash2DraftConfig(/*maxDraft=*/8);
+    hiddenMismatch["hidden_size"] = 512;
+    expectInvalid(hiddenMismatch);
+
+    Json vocabMismatch = makeDFlash2DraftConfig(/*maxDraft=*/8);
+    vocabMismatch["draft_vocab_size"] = 31999;
+    expectInvalid(vocabMismatch);
+}
+
+TEST_F(DeploymentConfigTest, DFlash2RejectsDDTreeFanout)
+{
+    auto const basePath = writeJsonToTempFile(makeDFlash2BaseConfig(/*maxVerify=*/8), "base");
+    auto const draftPath = writeJsonToTempFile(makeDFlash2DraftConfig(/*maxDraft=*/8), "draft");
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 2;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 8;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, DFlash2AcceptsRuntimeBlockOverrideWithinEngineProfiles)
+{
+    auto const basePath = writeJsonToTempFile(makeDFlash2BaseConfig(/*maxVerify=*/16), "base");
+    auto const draftPath = writeJsonToTempFile(makeDFlash2DraftConfig(/*maxDraft=*/16), "draft");
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 1;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 0;
+    drafting.dflashBlockSize = 16;
+
+    DeploymentConfig bundle = createDeploymentConfig(
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting});
+    EXPECT_EQ(bundle.specConfig->dflashBlockSize, 16);
+    EXPECT_EQ(bundle.specConfig->verifySize, 16);
+    EXPECT_EQ(bundle.maxAcceptedTokensPerRound(), 16);
 }

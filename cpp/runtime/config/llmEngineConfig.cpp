@@ -220,6 +220,11 @@ void parseDFlashFields(
     Json const empty = Json::object();
     Json const& dflashConfig = configJson.contains("dflash_config") ? configJson["dflash_config"] : empty;
 
+    int32_t const version = dflashConfig.value("version", 1);
+    ELLM_CHECK(version == 1 || version == 2,
+        "parseEngineConfig: unsupported dflash_config.version " + std::to_string(version));
+    cfg.dflashVersion = static_cast<DFlashVersion>(version);
+
     cfg.specDraftBlockSize = dflashConfig.value("block_size", 16);
     cfg.specDraftMaskTokenId = dflashConfig.value("mask_token_id", 248070);
     ELLM_CHECK(cfg.specDraftBlockSize > 0,
@@ -229,9 +234,46 @@ void parseDFlashFields(
         "parseEngineConfig: invalid DFlash mask_token_id: " + std::to_string(cfg.specDraftMaskTokenId)
             + " (must be non-negative)");
 
+    if (cfg.dflashVersion == DFlashVersion::kV2)
+    {
+        cfg.specDraftCausalHead = getRequired<bool>(dflashConfig, "is_causal");
+        cfg.specConvKernelSize = getRequired<int32_t>(dflashConfig, "conv_kernel_size");
+        cfg.specConvGroupSize = getRequired<int32_t>(dflashConfig, "conv_group_size");
+        cfg.specSelectorRank = getRequired<int32_t>(dflashConfig, "selector_rank");
+        cfg.specSelectorTopK = getRequired<int32_t>(dflashConfig, "selector_top_k");
+        cfg.dflash2SelectorFile
+            = dflashConfig.value("selector_file", std::string(binding_names::kDFlash2SelectorFileName));
+        cfg.specSupportsProbabilistic = dflashConfig.value("supports_probabilistic_sampling", false);
+        ELLM_CHECK(cfg.specDraftBlockSize >= 2 && cfg.specDraftBlockSize <= 16,
+            "parseEngineConfig: DFlash V2 block_size must be in [2, 16]");
+        ELLM_CHECK(!cfg.specDraftCausalHead, "parseEngineConfig: DFlash V2 requires is_causal=false");
+        ELLM_CHECK(cfg.specConvKernelSize == 2, "parseEngineConfig: DFlash V2 conv_kernel_size must be 2");
+        ELLM_CHECK(cfg.specConvGroupSize == 16, "parseEngineConfig: DFlash V2 conv_group_size must be 16");
+        ELLM_CHECK(cfg.specSelectorRank == 256, "parseEngineConfig: DFlash V2 selector_rank must be 256");
+        ELLM_CHECK(cfg.specSelectorTopK == 16, "parseEngineConfig: DFlash V2 selector_top_k must be 16");
+        ELLM_CHECK(
+            cfg.specSupportsProbabilistic, "parseEngineConfig: DFlash V2 requires probabilistic sampling support");
+    }
+
     parseSpecTargetLayerIds(dflashConfig, "dflash_config", cfg);
     ELLM_CHECK(
         !cfg.specTargetLayerIds.empty(), "parseEngineConfig: DFlash requires non-empty dflash_config.target_layer_ids");
+    if (cfg.dflashVersion == DFlashVersion::kV2)
+    {
+        constexpr size_t kDFlashV2ProductionLayers{5};
+        ELLM_CHECK(cfg.specTargetLayerIds.size() == kDFlashV2ProductionLayers,
+            "parseEngineConfig: DFlash V2 production contract requires exactly five target layer IDs");
+        std::vector<int32_t> sortedTargetLayerIds = cfg.specTargetLayerIds;
+        std::sort(sortedTargetLayerIds.begin(), sortedTargetLayerIds.end());
+        ELLM_CHECK(
+            std::adjacent_find(sortedTargetLayerIds.begin(), sortedTargetLayerIds.end()) == sortedTargetLayerIds.end(),
+            "parseEngineConfig: DFlash V2 target layer IDs must be unique");
+        if (!targetLayerValidationUpperBound.has_value())
+        {
+            ELLM_CHECK(cfg.numDecoderLayers == static_cast<int32_t>(kDFlashV2ProductionLayers),
+                "parseDraftEngineConfig: DFlash V2 production draft requires exactly five decoder layers");
+        }
+    }
     if (targetLayerValidationUpperBound.has_value())
     {
         validateSpecTargetLayerIds(cfg.specTargetLayerIds, *targetLayerValidationUpperBound, "DFlash", "base");
@@ -751,7 +793,8 @@ LLMEngineConfig parseEngineConfig(
     if (cfg.isSpecDecodeBase)
     {
         ELLM_CHECK(cfg.specDecodeType != SpecDecodeMode::kNONE,
-            "parseEngineConfig: engine_role=base requires spec_decode_type to be mtp, eagle3, dflash, jetspec, "
+            "parseEngineConfig: engine_role=base requires spec_decode_type to be mtp, eagle3, dflash, "
+            "jetspec, "
             "dspark, or gemma4_mtp.");
     }
     else
@@ -964,7 +1007,8 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
     std::string const engineRole = parseEngineRole(configJson);
     ELLM_CHECK(engineRole == "draft", "parseDraftEngineConfig: draft config must set engine_role=draft.");
     ELLM_CHECK(cfg.specDecodeType != SpecDecodeMode::kNONE,
-        "parseDraftEngineConfig: engine_role=draft requires spec_decode_type to be mtp, eagle3, dflash, jetspec, "
+        "parseDraftEngineConfig: engine_role=draft requires spec_decode_type to be mtp, eagle3, dflash, "
+        "jetspec, "
         "dspark, or gemma4_mtp.");
 
     // Shared core fields (layers, kv heads, head_dim, hidden_size, kv_cache_dtype,
@@ -1468,16 +1512,17 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
 
     if (isCachedBlockDraftDraft(config))
     {
-        char const* modeName = config.specDecodeType == SpecDecodeMode::kJetSpec ? "JetSpec" : "DFlash";
+        char const* modeName = config.specDecodeType == SpecDecodeMode::kJetSpec
+            ? "JetSpec"
+            : (config.dflashVersion == DFlashVersion::kV2 ? "DFlash V2" : "DFlash");
         // Cached draft engines require KV cache bindings (cached-KV path).
         // Validate required bindings exist and have correct dtype.
         LOG_INFO("%s draft engine (%s): validating cached-path bindings.", modeName, engineLabel);
 
         // Required cached-path bindings (fail if missing → old explicit DFlash engine)
-        static char const* const kRequiredBindings[] = {
+        static char const* const kRequiredCommonBindings[] = {
             binding_names::kInputsEmbeds,
             binding_names::kDFlashTargetHiddenConcat,
-            binding_names::kLogits,
             binding_names::kContextLengths,
             binding_names::kKVCacheStartIndex,
             binding_names::kDFlashDeltaLengths,
@@ -1485,11 +1530,37 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
             binding_names::kAttentionMask,
             binding_names::kAttentionPosId,
         };
-        for (auto const* name : kRequiredBindings)
+        for (auto const* name : kRequiredCommonBindings)
         {
             ELLM_CHECK(executor.hasIOTensor(name),
                 std::string(modeName) + " cached draft engine (" + engineLabel + ") is missing required binding '"
                     + name + "'. This engine may be from the old explicit cached-draft path. Re-export and rebuild.");
+        }
+
+        if (config.specDecodeType == SpecDecodeMode::kDFlash && config.dflashVersion == DFlashVersion::kV2)
+        {
+            static char const* const kRequiredDFlash2Bindings[] = {
+                binding_names::kSpecProposalSupportIds,
+                binding_names::kSpecProposalUnaryValues,
+                binding_names::kSpecProposalProjectedHidden,
+            };
+            for (auto const* name : kRequiredDFlash2Bindings)
+            {
+                ELLM_CHECK(executor.hasIOTensor(name),
+                    std::string("DFlash2 cached draft engine (") + engineLabel
+                        + ") is missing required sparse-proposal binding '" + name
+                        + "'. Re-export and rebuild the draft engine.");
+            }
+            ELLM_CHECK(!executor.hasIOTensor(binding_names::kLogits),
+                std::string("DFlash2 cached draft engine (") + engineLabel
+                    + ") must not expose the legacy full-vocabulary logits binding.");
+        }
+        else
+        {
+            ELLM_CHECK(executor.hasIOTensor(binding_names::kLogits),
+                std::string(modeName) + " cached draft engine (" + engineLabel + ") is missing required binding '"
+                    + binding_names::kLogits
+                    + "'. This engine may be from the old explicit cached-draft path. Re-export and rebuild.");
         }
 
         // Require KV cache layer 0

@@ -28,6 +28,7 @@
 #include "common/bindingNames.h"
 #include "common/cudaUtils.h"
 #include "common/pagedKvTypes.h"
+#include "common/safetensorsUtils.h"
 #include "runtime/config/inferenceDims.h"
 #include "runtime/modelArtifacts.h"
 #include "runtime/streaming.h"
@@ -38,10 +39,13 @@
 
 #include <unistd.h>
 
+#include <deque>
 #include <fstream>
 #include <ostream>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 //! gmock falls back to a raw byte dump for types it cannot print, which buries the interesting part of a failed
@@ -719,6 +723,409 @@ TEST_F(MtpAssemblyTest, RunsTheDraftChainThenOneBaseVerificationPerRound)
     // overshot, and the tokens are still the ones the substitute engines produced.
     EXPECT_THAT(response.outputIds[0], AllOf(SizeIs(kVerifySize), Each(kZeroLogitsToken)));
     EXPECT_EQ(response.finishReasons[0], rt::FinishReason::kLength);
+}
+
+// --------------------------------------------------------------------------
+// DFlash2: production decoder assembly, sparse linear acceptance, compaction,
+// and decoder-owned CUDA graphs.
+// --------------------------------------------------------------------------
+
+constexpr int32_t kDFlash2BlockSize{8};
+constexpr int32_t kDFlash2SelectorTopK{16};
+constexpr int32_t kDFlash2ProposalToken{10};
+constexpr int32_t kDFlash2TargetToken{20};
+
+Json makeDFlash2ConfigSection()
+{
+    return Json{{"version", 2}, {"block_size", kDFlash2BlockSize}, {"mask_token_id", 3}, {"is_causal", false},
+        {"conv_kernel_size", 2}, {"conv_group_size", 16}, {"selector_rank", 256},
+        {"selector_top_k", kDFlash2SelectorTopK}, {"supports_probabilistic_sampling", true},
+        {"target_layer_ids", Json::array({0, 1, 2, 3, 4})}};
+}
+
+void addDFlash2Contract(Json& config)
+{
+    config["spec_decode_type"] = "dflash";
+    config["dflash_config"] = makeDFlash2ConfigSection();
+}
+
+Json makeDFlash2BaseConfig()
+{
+    Json config = makeTinyVanillaConfig();
+    config["num_hidden_layers"] = 5;
+    addDFlash2Contract(config);
+    config["engine_role"] = "base";
+    config["builder_config"]["spec_base"] = true;
+    config["builder_config"]["max_verify_tree_size"] = kDFlash2BlockSize;
+    sizeSpeculativeKvPool(config);
+    return config;
+}
+
+Json makeDFlash2DraftConfig()
+{
+    Json config = makeTinyVanillaConfig();
+    config["num_hidden_layers"] = 5;
+    addDFlash2Contract(config);
+    config["engine_role"] = "draft";
+    config["base_model_hidden_size"] = 128 * 5;
+    config["builder_config"].erase("spec_base");
+    config["builder_config"]["max_draft_tree_size"] = kDFlash2BlockSize;
+    sizeSpeculativeKvPool(config);
+    return config;
+}
+
+std::filesystem::path writeDFlash2ModelDir(cudaStream_t stream)
+{
+    auto const dir = freshModelDir("edgellm_runtime_dflash2_assembly_test");
+    std::ofstream(dir / "base_config.json") << makeDFlash2BaseConfig().dump(2);
+    std::ofstream(dir / "draft_config.json") << makeDFlash2DraftConfig().dump(2);
+    writeTokenizerFiles(dir);
+    std::vector<rt::Tensor> selectorTensors;
+    selectorTensors.emplace_back(
+        rt::Coords{kVocabSize, 256}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "predecessor_codebook");
+    selectorTensors.emplace_back(
+        rt::Coords{kVocabSize, 256}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "successor_codebook");
+    for (auto& tensor : selectorTensors)
+    {
+        CUDA_CHECK(cudaMemsetAsync(tensor.rawPointer(), 0, tensor.getMemoryCapacity(), stream));
+    }
+    EXPECT_TRUE(
+        rt::safetensors::saveSafetensors(dir / binding_names::kDFlash2SelectorFileName, selectorTensors, stream));
+    return dir;
+}
+
+rt::SpecDecodeDraftingConfig makeDFlash2Drafting()
+{
+    rt::SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 1;
+    drafting.draftingStep = 1;
+    drafting.verifySize = kDFlash2BlockSize;
+    return drafting;
+}
+
+rt::ModelArtifacts makeDFlash2Artifacts(std::filesystem::path const& modelDir,
+    std::unique_ptr<rt::EngineExecutor> baseEngine, std::unique_ptr<rt::EngineExecutor> draftEngine,
+    cudaStream_t stream)
+{
+    rt::ModelArtifacts artifacts;
+    artifacts.deployment = rt::createDeploymentConfig(
+        modelDir / "base_config.json", modelDir / "draft_config.json", makeDFlash2Drafting());
+    artifacts.baseExecutor = std::move(baseEngine);
+    artifacts.draftExecutor = std::move(draftEngine);
+
+    artifacts.weights.load(modelDir, modelDir / "base_config.json", stream);
+    artifacts.weights.validateAgainstEngine(*artifacts.baseExecutor, "base");
+    artifacts.draftWeights.load(modelDir, modelDir / "draft_config.json", stream);
+    artifacts.draftWeights.validateAgainstEngine(*artifacts.draftExecutor, "draft");
+
+    artifacts.embedding.table = rt::Tensor({artifacts.deployment.base.vocabSize, artifacts.deployment.base.hiddenSize},
+        rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "test::dflash2Embedding");
+    CUDA_CHECK(cudaMemsetAsync(artifacts.embedding.table.rawPointer(), 0,
+        static_cast<size_t>(artifacts.embedding.table.getShape().volume()) * sizeof(half), stream));
+
+    artifacts.tokenizer = std::make_unique<tokenizer::Tokenizer>();
+    if (!artifacts.tokenizer->loadFromHF(modelDir.string()))
+    {
+        throw std::runtime_error("DFlash2 test tokenizer failed to load");
+    }
+    return artifacts;
+}
+
+//! State deliberately kept outside the mock executor. The runtime owns and destroys the executor, while assertions
+//! need to inspect every prepared/captured shape after handleRequest() returns.
+struct DFlash2EngineTrace
+{
+    int32_t profile{-1};
+    rt::InferenceDims dims{};
+    rt::Tensor* logits{nullptr};
+    rt::Tensor* proposalSupportIds{nullptr};
+    rt::Tensor* proposalUnaryValues{nullptr};
+    rt::Tensor* proposalProjectedHidden{nullptr};
+    std::vector<std::pair<int32_t, rt::InferenceDims>> prepares;
+    std::vector<rt::InferenceDims> captures;
+    int32_t executions{0};
+};
+
+void writeDFlash2Proposals(DFlash2EngineTrace const& trace, cudaStream_t stream)
+{
+    ASSERT_NE(trace.proposalSupportIds, nullptr);
+    ASSERT_NE(trace.proposalUnaryValues, nullptr);
+    ASSERT_NE(trace.proposalProjectedHidden, nullptr);
+
+    auto const supportElements = static_cast<size_t>(trace.proposalSupportIds->getShape().volume());
+    std::vector<int32_t> supportIds(supportElements, kDFlash2ProposalToken + 1);
+    std::vector<float> unaryValues(supportElements, 0.0F);
+    for (size_t offset = 0; offset < supportElements; offset += kDFlash2SelectorTopK)
+    {
+        supportIds[offset] = kDFlash2ProposalToken;
+        unaryValues[offset] = 1.0F;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(trace.proposalSupportIds->rawPointer(), supportIds.data(),
+        supportIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(trace.proposalUnaryValues->rawPointer(), unaryValues.data(),
+        unaryValues.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        trace.proposalProjectedHidden->rawPointer(), 0, trace.proposalProjectedHidden->getMemoryCapacity(), stream));
+}
+
+std::vector<int32_t> verificationPlan(int32_t acceptanceLength, int32_t replacementToken)
+{
+    EXPECT_GE(acceptanceLength, 1);
+    EXPECT_LE(acceptanceLength, kDFlash2BlockSize);
+    std::vector<int32_t> plan(kDFlash2BlockSize, replacementToken);
+    std::fill_n(plan.begin(), acceptanceLength - 1, kDFlash2ProposalToken);
+    return plan;
+}
+
+class DFlash2AssemblyTest : public ::testing::TestWithParam<int32_t>
+{
+protected:
+    void SetUp() override
+    {
+        CUDA_CHECK(cudaStreamCreate(&mStream));
+        mModelDir = writeDFlash2ModelDir(mStream);
+    }
+
+    void TearDown() override
+    {
+        CUDA_CHECK(cudaStreamDestroy(mStream));
+        std::filesystem::remove_all(mModelDir);
+    }
+
+    std::unique_ptr<::testing::NiceMock<MockEngineExecutor>> makeBaseEngine(bool captureSucceeds = false)
+    {
+        using ::testing::_;
+        using ::testing::Return;
+
+        auto engine = std::make_unique<::testing::NiceMock<MockEngineExecutor>>();
+        ON_CALL(*engine, getRequiredContextMemorySize()).WillByDefault(Return(4096));
+        ON_CALL(*engine, setContextMemory(_)).WillByDefault(Return(true));
+        ON_CALL(*engine, hasIOTensor(_)).WillByDefault(Return(false));
+        ON_CALL(*engine, getBindingDataType(_)).WillByDefault(Return(nvinfer1::DataType::kHALF));
+        ON_CALL(*engine, prepare(_, _, _, _))
+            .WillByDefault(
+                [this](int32_t profile, rt::InferenceDims const& dims, rt::TensorMap const& map, cudaStream_t) {
+                    mBaseTrace.profile = profile;
+                    mBaseTrace.dims = dims;
+                    mBaseTrace.prepares.emplace_back(profile, dims);
+                    mBaseTrace.logits = map.get(binding_names::kLogits);
+                    return true;
+                });
+        ON_CALL(*engine, execute(_)).WillByDefault([this](cudaStream_t stream) {
+            ++mBaseTrace.executions;
+            if (mBaseTrace.profile == kPrefillProfile)
+            {
+                writeLogits(*mBaseTrace.logits, kVocabSize,
+                    std::vector<int32_t>(static_cast<size_t>(mBaseTrace.dims.batch), kDFlash2TargetToken), stream);
+                return true;
+            }
+            if (mVerificationPlans.empty())
+            {
+                ADD_FAILURE() << "DFlash2 base verification executed without a queued logits plan";
+                return false;
+            }
+            auto plan = std::move(mVerificationPlans.front());
+            mVerificationPlans.pop_front();
+            writeLogits(*mBaseTrace.logits, kVocabSize, plan, stream);
+            return true;
+        });
+        ON_CALL(*engine, captureGraph(_)).WillByDefault([this, captureSucceeds](cudaStream_t) {
+            mBaseTrace.captures.push_back(mBaseTrace.dims);
+            return captureSucceeds;
+        });
+        return engine;
+    }
+
+    std::unique_ptr<::testing::NiceMock<MockEngineExecutor>> makeDraftEngine(bool captureSucceeds = false)
+    {
+        using ::testing::_;
+        using ::testing::Return;
+
+        auto engine = std::make_unique<::testing::NiceMock<MockEngineExecutor>>();
+        ON_CALL(*engine, getRequiredContextMemorySize()).WillByDefault(Return(4096));
+        ON_CALL(*engine, setContextMemory(_)).WillByDefault(Return(true));
+        ON_CALL(*engine, hasIOTensor(_)).WillByDefault(Return(false));
+        ON_CALL(*engine, getBindingDataType(_)).WillByDefault(Return(nvinfer1::DataType::kHALF));
+        ON_CALL(*engine, prepare(_, _, _, _))
+            .WillByDefault(
+                [this](int32_t profile, rt::InferenceDims const& dims, rt::TensorMap const& map, cudaStream_t) {
+                    mDraftTrace.profile = profile;
+                    mDraftTrace.dims = dims;
+                    mDraftTrace.prepares.emplace_back(profile, dims);
+                    mDraftTrace.proposalSupportIds = map.get(binding_names::kSpecProposalSupportIds);
+                    mDraftTrace.proposalUnaryValues = map.get(binding_names::kSpecProposalUnaryValues);
+                    mDraftTrace.proposalProjectedHidden = map.get(binding_names::kSpecProposalProjectedHidden);
+                    return true;
+                });
+        ON_CALL(*engine, execute(_)).WillByDefault([this](cudaStream_t stream) {
+            ++mDraftTrace.executions;
+            writeDFlash2Proposals(mDraftTrace, stream);
+            return true;
+        });
+        ON_CALL(*engine, captureGraph(_)).WillByDefault([this, captureSucceeds](cudaStream_t) {
+            mDraftTrace.captures.push_back(mDraftTrace.dims);
+            return captureSucceeds;
+        });
+        return engine;
+    }
+
+    std::unique_ptr<rt::LLMInferenceRuntime> makeRuntime(bool captureSucceeds = false)
+    {
+        auto artifacts = makeDFlash2Artifacts(
+            mModelDir, makeBaseEngine(captureSucceeds), makeDraftEngine(captureSucceeds), mStream);
+        return std::make_unique<rt::LLMInferenceRuntime>(std::move(artifacts), mModelDir.string(),
+            /*multimodalEngineDir=*/"", std::unordered_map<std::string, std::string>{}, makeDFlash2Drafting(), mStream);
+    }
+
+    std::vector<rt::InferenceDims> draftDecodePrepares() const
+    {
+        std::vector<rt::InferenceDims> result;
+        for (auto const& [profile, dims] : mDraftTrace.prepares)
+        {
+            if (profile == kDecodeProfile)
+            {
+                result.push_back(dims);
+            }
+        }
+        return result;
+    }
+
+    cudaStream_t mStream{};
+    std::filesystem::path mModelDir;
+    DFlash2EngineTrace mBaseTrace;
+    DFlash2EngineTrace mDraftTrace;
+    std::deque<std::vector<int32_t>> mVerificationPlans;
+};
+
+TEST_P(DFlash2AssemblyTest, PropagatesAcceptanceLengthIntoTheNextDraftDelta)
+{
+    int32_t const acceptanceLength = GetParam();
+    mVerificationPlans.push_back(verificationPlan(acceptanceLength, kDFlash2TargetToken));
+    mVerificationPlans.push_back(verificationPlan(/*acceptanceLength=*/1, /*replacementToken=*/1));
+
+    auto runtime = makeRuntime();
+    EXPECT_TRUE(runtime->hasDraftModel());
+    EXPECT_STREQ(runtime->getSpeculativeDecodingStrategyName(), "dflash");
+
+    auto const request = makeGreedyRequest("a", /*maxGenerateLength=*/20);
+    rt::LLMGenerationResponse response;
+    ASSERT_TRUE(runtime->handleRequest(request, response, mStream));
+
+    auto const draftDecode = draftDecodePrepares();
+    ASSERT_EQ(draftDecode.size(), 1U);
+    EXPECT_EQ(draftDecode[0].batch, 1);
+    EXPECT_EQ(draftDecode[0].seqLen, kDFlash2BlockSize);
+    EXPECT_EQ(draftDecode[0].selectLen, acceptanceLength);
+    ASSERT_EQ(response.outputIds.size(), 1U);
+    EXPECT_EQ(response.outputIds[0].size(), static_cast<size_t>(acceptanceLength + 2));
+    EXPECT_EQ(response.outputIds[0].back(), 1);
+    EXPECT_EQ(response.finishReasons[0], rt::FinishReason::kEndId);
+}
+
+INSTANTIATE_TEST_SUITE_P(AcceptanceLengths, DFlash2AssemblyTest, ::testing::Values(1, 4, 8));
+
+TEST_F(DFlash2AssemblyTest, ClampsAcceptedBlockToTheRemainingGenerationBudget)
+{
+    mVerificationPlans.push_back(verificationPlan(/*acceptanceLength=*/8, kDFlash2TargetToken));
+    auto runtime = makeRuntime();
+
+    auto const request = makeGreedyRequest("a", /*maxGenerateLength=*/3);
+    rt::LLMGenerationResponse response;
+    ASSERT_TRUE(runtime->handleRequest(request, response, mStream));
+
+    ASSERT_EQ(response.outputIds.size(), 1U);
+    EXPECT_EQ(response.outputIds[0],
+        (std::vector<int32_t>{kDFlash2TargetToken, kDFlash2ProposalToken, kDFlash2ProposalToken}));
+    EXPECT_EQ(response.finishReasons[0], rt::FinishReason::kLength);
+}
+
+TEST_F(DFlash2AssemblyTest, StopsOnEosInsideAnAcceptedBlock)
+{
+    constexpr int32_t kEosAcceptanceLength{4};
+    mVerificationPlans.push_back(verificationPlan(kEosAcceptanceLength, /*replacementToken=*/1));
+    auto runtime = makeRuntime();
+
+    auto const request = makeGreedyRequest("a", /*maxGenerateLength=*/20);
+    rt::LLMGenerationResponse response;
+    ASSERT_TRUE(runtime->handleRequest(request, response, mStream));
+
+    EXPECT_TRUE(draftDecodePrepares().empty());
+    ASSERT_EQ(response.outputIds.size(), 1U);
+    EXPECT_EQ(response.outputIds[0],
+        (std::vector<int32_t>{
+            kDFlash2TargetToken, kDFlash2ProposalToken, kDFlash2ProposalToken, kDFlash2ProposalToken, 1}));
+    EXPECT_EQ(response.finishReasons[0], rt::FinishReason::kEndId);
+}
+
+TEST_F(DFlash2AssemblyTest, BatchCompactionPreservesTheSurvivorsAcceptedState)
+{
+    std::vector<int32_t> firstBatchPlan(2 * kDFlash2BlockSize, kDFlash2TargetToken);
+    // Slot 0 exits immediately. Slot 1 accepts three proposals and one target replacement.
+    firstBatchPlan[0] = 1;
+    std::fill_n(firstBatchPlan.begin() + kDFlash2BlockSize, 3, kDFlash2ProposalToken);
+    mVerificationPlans.push_back(std::move(firstBatchPlan));
+    mVerificationPlans.push_back(verificationPlan(/*acceptanceLength=*/1, /*replacementToken=*/1));
+    auto runtime = makeRuntime();
+
+    auto request = makeGreedyRequest("a", /*maxGenerateLength=*/20);
+    request.requests.push_back(request.requests.front());
+    rt::LLMGenerationResponse response;
+    ASSERT_TRUE(runtime->handleRequest(request, response, mStream));
+
+    auto const draftDecode = draftDecodePrepares();
+    ASSERT_EQ(draftDecode.size(), 1U);
+    EXPECT_EQ(draftDecode[0].batch, 1);
+    EXPECT_EQ(draftDecode[0].selectLen, 4);
+    ASSERT_EQ(response.outputIds.size(), 2U);
+    EXPECT_EQ(response.outputIds[0], (std::vector<int32_t>{kDFlash2TargetToken, 1}));
+    EXPECT_EQ(response.outputIds[1].size(), 6U);
+    EXPECT_EQ(response.outputIds[1].back(), 1);
+    EXPECT_EQ(response.finishReasons[0], rt::FinishReason::kEndId);
+    EXPECT_EQ(response.finishReasons[1], rt::FinishReason::kEndId);
+}
+
+TEST_F(DFlash2AssemblyTest, CapturesOwnedShapeMatrixThenRunsNormally)
+{
+    auto runtime = makeRuntime(/*captureSucceeds=*/true);
+    ASSERT_TRUE(runtime->captureDecodingCUDAGraph(mStream));
+
+    std::set<std::pair<int64_t, int64_t>> draftShapes;
+    for (auto const& dims : mDraftTrace.captures)
+    {
+        EXPECT_EQ(dims.seqLen, kDFlash2BlockSize);
+        draftShapes.emplace(dims.batch, dims.selectLen);
+    }
+    std::set<std::pair<int64_t, int64_t>> expectedDraftShapes;
+    for (int64_t batch = 1; batch <= kMaxBatchSize; ++batch)
+    {
+        for (int64_t delta = 1; delta <= kDFlash2BlockSize; ++delta)
+        {
+            expectedDraftShapes.emplace(batch, delta);
+        }
+    }
+    EXPECT_EQ(draftShapes, expectedDraftShapes);
+    EXPECT_EQ(mDraftTrace.captures.size(), expectedDraftShapes.size());
+
+    ASSERT_EQ(mBaseTrace.captures.size(), static_cast<size_t>(kMaxBatchSize));
+    for (int64_t batch = 1; batch <= kMaxBatchSize; ++batch)
+    {
+        auto const& dims = mBaseTrace.captures[static_cast<size_t>(batch - 1)];
+        EXPECT_EQ(dims.batch, batch);
+        EXPECT_EQ(dims.seqLen, kDFlash2BlockSize);
+        EXPECT_EQ(dims.selectLen, kDFlash2BlockSize);
+    }
+
+    // Capture mutates binding shapes and simulated cache lengths. A real request afterwards checks teardown restored
+    // both engines to executable state rather than merely reporting successful capture calls.
+    mVerificationPlans.push_back(verificationPlan(/*acceptanceLength=*/1, /*replacementToken=*/1));
+    auto const request = makeGreedyRequest("a", /*maxGenerateLength=*/20);
+    rt::LLMGenerationResponse response;
+    ASSERT_TRUE(runtime->handleRequest(request, response, mStream));
+    ASSERT_EQ(response.outputIds.size(), 1U);
+    EXPECT_EQ(response.outputIds[0], (std::vector<int32_t>{kDFlash2TargetToken, 1}));
+    EXPECT_EQ(response.finishReasons[0], rt::FinishReason::kEndId);
+    EXPECT_GT(mBaseTrace.executions, 0);
+    EXPECT_GT(mDraftTrace.executions, 0);
 }
 
 } // namespace

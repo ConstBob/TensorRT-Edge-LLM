@@ -59,13 +59,46 @@ def hidden_state_feedback(hidden_states,
 
 def update_dflash_target_cache(key_delta: Tensor, value_delta: Tensor,
                                past_key_value: Tensor, rope_cos_sin: Tensor,
-                               delta_start: Tensor, delta_lengths: Tensor, *,
+                               delta_start: Tensor, delta_lengths: Tensor,
+                               kv_page_table: Tensor, *,
                                pages_per_slot: int) -> Tensor:
     """Write target-hidden K/V deltas into the persistent draft cache."""
     if pages_per_slot <= 0:
         raise ValueError("pages_per_slot must be positive")
     return operation("dflash_target_cache_update", [
         key_delta, value_delta, past_key_value, rope_cos_sin, delta_start,
-        delta_lengths
+        delta_lengths, kv_page_table
     ],
                      pages_per_slot=pages_per_slot)
+
+
+def dflash2_grouped_dynamic_conv(hidden_states: Tensor,
+                                 delta: Tensor,
+                                 base_kernel: Tensor,
+                                 residual: Tensor = None,
+                                 *,
+                                 block_size: int,
+                                 kernel_size: int,
+                                 group_size: int) -> Tensor:
+    """Apply one production DFlash2 dynamic grouped depthwise convolution.
+
+    The post-conv form fuses an FP32 residual add and emits FP32; RMSNorm
+    remains a native TensorRT graph operation. The pre-conv form emits the
+    activation dtype.
+    """
+    if block_size <= 0:
+        raise ValueError("DFlash2 dynamic conv block_size must be positive")
+    if kernel_size not in (1, 2, 3, 4):
+        raise ValueError("DFlash2 dynamic conv kernel_size must be in [1, 4]")
+    if group_size <= 0 or group_size % 2:
+        raise ValueError(
+            "DFlash2 dynamic conv group_size must be positive and even")
+    inputs = [hidden_states, delta, base_kernel]
+    if residual is not None:
+        inputs.append(residual)
+    return operation("dflash2_grouped_dynamic_conv",
+                     inputs,
+                     block_size=block_size,
+                     kernel_size=kernel_size,
+                     group_size=group_size,
+                     fuse_residual=int(residual is not None))

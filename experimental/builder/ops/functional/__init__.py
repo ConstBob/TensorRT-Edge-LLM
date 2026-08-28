@@ -38,7 +38,8 @@ from .core import (
 from .distributed import all_reduce
 from .moe import MoeActivation, MoeRouting, fp16_moe, int4_moe, nvfp4_moe
 from .recurrent import causal_conv1d, gated_delta_net, update_ssm_state
-from .speculative import hidden_state_feedback, update_dflash_target_cache
+from .speculative import (dflash2_grouped_dynamic_conv, hidden_state_feedback,
+                          update_dflash_target_cache)
 
 __all__ = [
     "Dimension",
@@ -68,6 +69,7 @@ __all__ = [
     "gather_last_tokens",
     "gather_nd",
     "gemma4_attention",
+    "dflash2_grouped_dynamic_conv",
     "hidden_state_feedback",
     "int4_moe",
     "kv_cache_update",

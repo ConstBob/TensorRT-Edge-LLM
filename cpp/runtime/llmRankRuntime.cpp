@@ -36,6 +36,7 @@
 #include "runtime/debug/layerDebugger.h"
 #include "runtime/decoding/decoderRegistry.h"
 #include "runtime/decoding/decoderUtils.h"
+#include "runtime/decoding/requestStableRng.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/managedKVCacheRequest.h"
 #include "runtime/state/boundedSwaKVPageManager.h"
@@ -95,10 +96,15 @@ std::vector<int32_t> LLMRankRuntime::countPromptTokens(LLMGenerationRequest cons
 
 namespace
 {
-bool needsCachedBlockDraftDDTreeHybridBindings(DeploymentConfig const& deployment)
+bool needsCachedBlockDraftTreeHybridBindings(DeploymentConfig const& deployment)
 {
-    return deployment.specConfig.has_value() && isCachedBlockDraftMode(deployment.specDecodeMode())
-        && deployment.specConfig->draftingTopK > 1 && deployment.base.numLinearAttnLayers > 0;
+    if (!deployment.specConfig.has_value() || deployment.base.numLinearAttnLayers == 0)
+    {
+        return false;
+    }
+    SpecDecodeMode const mode = deployment.specDecodeMode();
+    return mode == SpecDecodeMode::kDFlash
+        || (mode == SpecDecodeMode::kJetSpec && deployment.specConfig->draftingTopK > 1);
 }
 
 void validateCachedBlockDraftTreeMetadataBindings(
@@ -109,16 +115,13 @@ void validateCachedBlockDraftTreeMetadataBindings(
         return;
     }
 
-    char const* modeName = deployment.specDecodeMode() == SpecDecodeMode::kJetSpec ? "JetSpec" : "DFlash";
+    char const* modeName = specDecodeModeName(deployment.specDecodeMode());
     char const* treeBaseFlag
-        = deployment.specDecodeMode() == SpecDecodeMode::kJetSpec ? "--jetspec-tree-base" : "--dflash-tree-base";
-    char const* linearBaseFlag
-        = deployment.specDecodeMode() == SpecDecodeMode::kJetSpec ? "--jetspec-base" : "--dflash-base";
+        = deployment.specDecodeMode() == SpecDecodeMode::kJetSpec ? "--jetspec-tree-base" : "--dflash-base";
 
     bool const hasTreeParentIds = baseExecutor.hasIOTensor(binding_names::kTreeParentIds);
     bool const hasTreeDepths = baseExecutor.hasIOTensor(binding_names::kTreeDepths);
     bool const hasTreeMetadata = hasTreeParentIds || hasTreeDepths;
-    bool const usesDDTree = deployment.specConfig->draftingTopK > 1;
     if (hasTreeMetadata)
     {
         ELLM_CHECK(hasTreeParentIds && hasTreeDepths,
@@ -128,20 +131,15 @@ void validateCachedBlockDraftTreeMetadataBindings(
                 && baseExecutor.getBindingDataType(binding_names::kTreeDepths) == DataType::kINT32,
             std::string(modeName) + " tree-base engine tree metadata bindings must be INT32: '"
                 + binding_names::kTreeParentIds + "' and '" + binding_names::kTreeDepths + "'.");
-        ELLM_CHECK(usesDDTree,
-            std::string(modeName) + " base engine was exported with " + treeBaseFlag
-                + ", but runtime is configured for linear mode because specDraftTopK=1. "
-                  "Use --specDraftTopK > 1 for DDTree, or re-export the base model with "
-                + linearBaseFlag + ".");
     }
 
-    if (!needsCachedBlockDraftDDTreeHybridBindings(deployment))
+    if (!needsCachedBlockDraftTreeHybridBindings(deployment))
     {
         return;
     }
 
     ELLM_CHECK(hasTreeParentIds && hasTreeDepths,
-        std::string(modeName) + " DDTree hybrid base engine requires INT32 tree metadata bindings '"
+        std::string(modeName) + " hybrid base engine requires INT32 tree metadata bindings '"
             + binding_names::kTreeParentIds + "' and '" + binding_names::kTreeDepths
             + "'. Re-export the base model with " + treeBaseFlag + ", then rebuild spec_base.engine.");
 }
@@ -467,6 +465,7 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
         : getTopKtopPSamplingWorkspaceSize(vanillaSamplingRows, mDeployment.base.outputVocabSize,
               SamplingParams(vanillaSamplingRows, mDeployment.base.outputVocabSize, 1.0f, 0, 0.9f));
     bool const isDSparkDraft = hasDraft && mDeployment.specDecodeMode() == SpecDecodeMode::kDSpark;
+    bool const isDFlash2Draft = hasDraft && mDeployment.draft->dflashVersion == DFlashVersion::kV2;
     constexpr int32_t kDSparkMaxSparseTopK = 128;
     bool const isLinearBlockDraft = hasDraft
         && (isCachedBlockDraftMode(mDeployment.specDecodeMode())
@@ -475,9 +474,13 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
                                                          : mMaxRuntimeBatchSize * effectiveDraftTopK;
     int32_t const draftSamplingTopK
         = isLinearBlockDraft ? (isDSparkDraft ? kDSparkMaxSparseTopK : 1) : effectiveDraftTopK;
-    size_t const dsparkBaseTopKWorkspaceSize = isDSparkDraft
+    size_t const dsparkBaseTopKWorkspaceSize = (isDSparkDraft || isDFlash2Draft)
         ? getSelectAllTopKWorkspaceSize(mMaxRuntimeBatchSize * mDeployment.specConfig->verifySize,
               mDeployment.base.outputVocabSize, kDSparkMaxSparseTopK)
+        : 0;
+    size_t const dflash2TopPWorkspaceSize = isDFlash2Draft
+        ? getTopPProbabilitiesWorkspaceSize(
+              mMaxRuntimeBatchSize * mDeployment.specConfig->verifySize, mDeployment.base.outputVocabSize)
         : 0;
     // DiffusionGemma logprobs require B*canvasLen rows, which is a GiB-scale log-softmax workspace for 26B.
     // Keep that allocation off the default serving path and grow it lazily only for numLogprobs requests.
@@ -490,7 +493,7 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
         ? std::max({vanillaSamplingWorkspaceSize,
               getSelectAllTopKWorkspaceSize(vanillaSamplingRows, mDeployment.base.outputVocabSize, 1),
               getSelectAllTopKWorkspaceSize(draftSamplingRows, mDeployment.draft->outputVocabSize, draftSamplingTopK),
-              dsparkBaseTopKWorkspaceSize, logprobsWorkspaceSize})
+              dsparkBaseTopKWorkspaceSize, dflash2TopPWorkspaceSize, logprobsWorkspaceSize})
         : std::max(vanillaSamplingWorkspaceSize, logprobsWorkspaceSize);
     check::check(maxSamplingWorkspaceSize <= static_cast<size_t>(std::numeric_limits<int64_t>::max()),
         "Sampling workspace size exceeds tensor dimension range");
@@ -507,6 +510,8 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
             = rt::Tensor({maxSamplingSize}, rt::DeviceType::kGPU, DataType::kINT32, "LLMRankRuntime::mSamplingIndices");
         mSamplingScores
             = rt::Tensor({maxSamplingSize}, rt::DeviceType::kGPU, DataType::kFLOAT, "LLMRankRuntime::mSamplingScores");
+        mSamplingUniforms = rt::Tensor(
+            {mMaxRuntimeBatchSize}, rt::DeviceType::kGPU, DataType::kFLOAT, "LLMRankRuntime::mSamplingUniforms");
         allocateLogitBias(mLogitBias, mMaxRuntimeBatchSize);
 
         // Batch mapping tensor for batch eviction.
@@ -526,6 +531,8 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
             {maxSamplingSize}, rt::DeviceType::kCPU, DataType::kINT32, "LLMRankRuntime::mHostSelectedTokenIds");
         mHostOutputSpaceIds = rt::Tensor(
             {maxSamplingSize}, rt::DeviceType::kCPU, DataType::kINT32, "LLMRankRuntime::mHostOutputSpaceIds");
+        mHostSamplingUniforms = rt::Tensor(
+            {mMaxRuntimeBatchSize}, rt::DeviceType::kCPU, DataType::kFLOAT, "LLMRankRuntime::mHostSamplingUniforms");
         mHostReuseKVCacheLengths = rt::Tensor(
             {mMaxRuntimeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32, "LLMRankRuntime::mHostReuseKVCacheLengths");
 
@@ -780,7 +787,7 @@ void LLMRankRuntime::buildDecodingRuntimeContext()
     PreprocessResources preprocessResources{
         *mStepPreparer, *mEmbeddingPre, mEmbedding, mIdsInput, mDeepstack.get(), mGemma4Ple.get()};
     SamplingBuffers sampling{mSamplingWorkspace, mSamplingIndices, mSamplingScores, mBaseVocabMappingTable,
-        mHostPackedTokenIds, mHostSelectedTokenIds, mHostOutputSpaceIds};
+        mHostPackedTokenIds, mHostSelectedTokenIds, mHostOutputSpaceIds, mSamplingUniforms, mHostSamplingUniforms};
     LogprobsBuffers logprobs{
         mDeviceLogprobsValues, mDeviceLogprobsIndices, mHostLogprobsValues, mHostLogprobsIndices, mGatheredLogits};
     mDecodingRuntimeContext.reset(
@@ -932,13 +939,16 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
     mLastPrefillLength = 0;
     mLastInputTokenIds.clear();
 
-    // Clear per-request response state. On failure (early return) the four vectors
+    // Clear per-request response state. On failure (early return) the vectors
     // stay empty; on success they are repopulated together below to matched sizes.
     response.outputIds.clear();
     response.outputTexts.clear();
     response.logprobs.clear();
     response.outputTrajectories.clear();
     response.finishReasons.clear();
+    response.inputTokenCounts.clear();
+    response.specVerifyCounts.clear();
+    response.specAcceptanceLengths.clear();
 
     int32_t const activeBatchSize = static_cast<int32_t>(request.requests.size());
     std::string const& loraWeightsName = request.loraWeightsName;
@@ -964,8 +974,9 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
     // DSpark implements the paper-equivalent probabilistic verifier and can keep non-greedy sampling params.
     // Other speculative decoders still run greedy-compatible verification.
     bool const hasNonGreedySampling = shouldUseNonGreedySampling(request.temperature, request.topK, request.topP);
-    bool const dsparkSpecDecode = enableSpecDecode && decodingStrategy.kind() == DecodingStrategyKind::kDSpark;
-    if (enableSpecDecode && hasNonGreedySampling && !dsparkSpecDecode)
+    DecodingStrategyCapabilities const decodingCapabilities = decodingStrategy.capabilities();
+    bool const losslessSamplingSpecDecode = enableSpecDecode && decodingCapabilities.supportsLosslessSampling;
+    if (enableSpecDecode && hasNonGreedySampling && !losslessSamplingSpecDecode)
     {
         LOG_WARNING("Spec-decode active: overriding sampling params to greedy (ignoring temp/topK/topP).");
     }
@@ -1072,11 +1083,24 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
         }
     }
 
-    // Forward sampling params to context; non-DSpark speculative decoders run greedy.
-    bool const forceGreedySpecDecode = enableSpecDecode && !dsparkSpecDecode;
+    // Lossless speculative decoders keep non-greedy parameters. Requests outside a decoder's exact support
+    // are routed to the default decoder before this point.
+    bool const forceGreedySpecDecode = enableSpecDecode && !losslessSamplingSpecDecode;
     context.temperature = forceGreedySpecDecode ? 1.0f : request.temperature;
     context.topP = forceGreedySpecDecode ? 1.0f : request.topP;
     context.topK = forceGreedySpecDecode ? 0 : request.topK;
+    bool const hasExplicitSamplingSeed = request.samplingSeed.has_value()
+        || std::any_of(request.requests.begin(), request.requests.end(),
+            [](LLMGenerationRequest::Request const& slot) { return slot.samplingSeed.has_value(); });
+    context.useRequestStableSampling
+        = shouldUseRequestStableSampling(losslessSamplingSpecDecode, hasExplicitSamplingSeed);
+    context.samplingSeeds.resize(activeBatchSize);
+    for (int32_t i = 0; i < activeBatchSize; ++i)
+    {
+        context.samplingSeeds[i]
+            = request.requests[i].samplingSeed.value_or(request.samplingSeed.value_or(kDefaultSamplingSeed));
+    }
+    context.proposalSampling = request.proposalSampling;
     context.diffusionMaxDenoisingSteps = request.diffusionMaxDenoisingSteps;
     context.outputThinkerEmbeddings = outputThinkerEmbeddings;
     context.onTokenGenerated = request.onTokenGenerated;
@@ -1686,6 +1710,8 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
     response.outputTrajectories.resize(context.completedBatches.size());
     response.finishReasons.resize(context.completedBatches.size(), FinishReason::kNotFinished);
     response.inputTokenCounts.assign(context.completedBatches.size(), 0);
+    response.specVerifyCounts.assign(context.completedBatches.size(), 0);
+    response.specAcceptanceLengths.assign(context.completedBatches.size(), 0.0F);
 
     // Add outputs from completed batches (using saved original indices)
     for (auto const& [originalIdx, batchResult] : context.completedBatches)
@@ -1719,6 +1745,13 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
         response.finishReasons[originalIdx] = batchResult.terminalReason;
         // Prompt length after chat templating and media expansion (OpenAI usage).
         response.inputTokenCounts[originalIdx] = static_cast<int32_t>(batchResult.rawBatchedInputIds.size());
+        if (enableSpecDecode)
+        {
+            response.specVerifyCounts[originalIdx] = batchResult.actualIterations;
+            response.specAcceptanceLengths[originalIdx] = batchResult.actualIterations > 0
+                ? static_cast<float>(batchResult.generateLength) / static_cast<float>(batchResult.actualIterations)
+                : 0.0F;
+        }
 
         // Trim this slot's own stop strings from its output text by delegating
         // to applyStopStringMatch with isFinal=true — single source of truth
@@ -2603,15 +2636,34 @@ bool LLMRankRuntime::runBaseModelPrefill(
     }
 
     // Sampling from the prefill stage logits follows the same policy as vanilla decoding.
-    // DSpark keeps non-greedy params; other speculative decoders are normalized to greedy
-    // before decoding.
+    // DFlash2 and DSpark keep non-greedy params; other speculative decoders are
+    // normalized to greedy before decoding.
     check::check(mSamplingIndices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
     if (shouldUseNonGreedySampling(context.temperature, context.topK, context.topP))
     {
+        constexpr uint64_t kPREFILL_SAMPLING_SEED = 42U;
+        constexpr uint64_t kPREFILL_SAMPLING_OFFSET = 0U;
+        constexpr uint64_t kPREFILL_RANDOM_LANE = 0U;
         SamplingParams params(activeBatchSize, mDeployment.base.outputVocabSize, context.temperature,
             static_cast<int32_t>(context.topK), context.topP);
-        topKtopPSamplingFromLogits(
-            mPipelineIO->outputLogits, mSamplingIndices, params, mSamplingWorkspace, context.stream);
+        rt::Tensor const* rowUniforms{nullptr};
+        if (context.useRequestStableSampling)
+        {
+            check::check(mHostSamplingUniforms.reshape({activeBatchSize}), "Tensor reshape failed");
+            check::check(mSamplingUniforms.reshape({activeBatchSize}), "Tensor reshape failed");
+            for (int32_t batch = 0; batch < activeBatchSize; ++batch)
+            {
+                uint64_t const position = requestStableNextAbsolutePosition(
+                    context.rawBatchedInputIds[batch].size(), context.currentGenerateLengths[batch]);
+                mHostSamplingUniforms.dataPointer<float>()[batch] = requestStableUniform(
+                    context.samplingSeeds[batch], position, SpecRandomPurpose::kTarget, kPREFILL_RANDOM_LANE);
+            }
+            CUDA_CHECK(cudaMemcpyAsync(mSamplingUniforms.rawPointer(), mHostSamplingUniforms.rawPointer(),
+                activeBatchSize * sizeof(float), cudaMemcpyHostToDevice, context.stream));
+            rowUniforms = &mSamplingUniforms;
+        }
+        topKtopPSamplingFromLogits(mPipelineIO->outputLogits, mSamplingIndices, params, mSamplingWorkspace,
+            context.stream, kPREFILL_SAMPLING_SEED, kPREFILL_SAMPLING_OFFSET, rowUniforms);
     }
     else
     {
@@ -3290,6 +3342,7 @@ bool LLMRankRuntime::performBatchEvict(
     mGuidedDecoder.compactSlots(batchMapping);
     context.hasGuidedDecoding = mGuidedDecoder.hasAnyGrammar();
     rt::compactVector(batchMapping, context.currentGenerateLengths);
+    rt::compactVector(batchMapping, context.samplingSeeds);
     rt::compactVector(batchMapping, context.tokenIds);
     rt::compactVector(batchMapping, context.systemPrompts);
     rt::compactVector(batchMapping, context.rawBatchedInputIds);

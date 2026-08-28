@@ -796,7 +796,8 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readwrite("audio_buffers", &LLMGenerationRequest::Request::audioBuffers)
         .def_readwrite("stop_strings", &LLMGenerationRequest::Request::stopStrings)
         .def_readwrite("logit_bias", &LLMGenerationRequest::Request::logitBias)
-        .def_readwrite("guided_decoding", &LLMGenerationRequest::Request::guidedDecoding);
+        .def_readwrite("guided_decoding", &LLMGenerationRequest::Request::guidedDecoding)
+        .def_readwrite("sampling_seed", &LLMGenerationRequest::Request::samplingSeed);
 
     // ========================================================================
     // Streaming
@@ -878,6 +879,11 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .value("INCLUDING_GENERATED_TOKENS", ContextCacheCommitPolicy::kIncludingGeneratedTokens)
         .value("PREFILL_STATE_ONLY", ContextCacheCommitPolicy::kPrefillStateOnly);
 
+    py::enum_<SpecProposalSampling>(m, "SpecProposalSampling")
+        .value("AUTO", SpecProposalSampling::kAuto)
+        .value("GREEDY", SpecProposalSampling::kGreedy)
+        .value("PROBABILISTIC", SpecProposalSampling::kProbabilistic);
+
     py::class_<LLMGenerationRequest>(m, "LLMGenerationRequest")
         .def(py::init<>())
         .def_readwrite("requests", &LLMGenerationRequest::requests)
@@ -885,6 +891,8 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readwrite("temperature", &LLMGenerationRequest::temperature)
         .def_readwrite("top_p", &LLMGenerationRequest::topP)
         .def_readwrite("top_k", &LLMGenerationRequest::topK)
+        .def_readwrite("sampling_seed", &LLMGenerationRequest::samplingSeed)
+        .def_readwrite("spec_proposal_sampling", &LLMGenerationRequest::proposalSampling)
         .def_readwrite("max_generate_length", &LLMGenerationRequest::maxGenerateLength)
         .def_readwrite("lora_weights_name", &LLMGenerationRequest::loraWeightsName)
         .def_readwrite("save_system_prompt_kv_cache", &LLMGenerationRequest::saveSystemPromptKVCache)

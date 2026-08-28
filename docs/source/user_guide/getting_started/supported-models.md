@@ -237,6 +237,17 @@ The model class names were checked against the installed `transformers==5.9.0` p
 | [z-lab/Qwen3.5-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.5-35B-A3B-DFlash) | [Qwen/Qwen3.5-35B-A3B-GPTQ-Int4](https://huggingface.co/Qwen/Qwen3.5-35B-A3B-GPTQ-Int4) |
 | [nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash) | [nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4) |
 
+### DFlash2 Draft Models
+
+DFlash2 uses the public DFlash engine/runtime mode. The draft checkpoint
+selects the versioned contract, while the runtime may choose any block size
+covered by the engine profile. The published Qwen3.8 checkpoint defaults to
+block 8, block 16 is also supported, and DFlash2 does not support DDTree.
+
+| Draft checkpoint | Base model |
+|---|---|
+| [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) | [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B), including matched NVFP4 or INT4 quantized checkpoints |
+
 ### DSpark Draft Models
 
 | Draft checkpoint | Base model |

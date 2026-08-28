@@ -14,11 +14,12 @@
 # limitations under the License.
 """Quantization recipe configurations for ModelOpt.
 
-``quant_cfg`` is an ordered list of rule entries
-(``{"quantizer_name": <glob>, "cfg": <attrs>?, "enable": <bool>?}``) applied
-last-match-wins. We start from a stock named config (``mtq.FP8_DEFAULT_CFG`` /
-``NVFP4_DEFAULT_CFG`` / ...) and append the overrides Edge-LLM needs, deriving
-per-submodule precision from that same config so bit-widths are never restated.
+ModelOpt represents ``quant_cfg`` as either an insertion-ordered mapping or a
+list of rule entries, depending on the installed release. Both schemas apply
+rules last-match-wins. We start from a stock named config
+(``mtq.FP8_DEFAULT_CFG`` / ``NVFP4_DEFAULT_CFG`` / ...) and append the
+overrides Edge-LLM needs, deriving per-submodule precision from that same
+config so bit-widths are never restated.
 """
 
 import copy
@@ -99,16 +100,58 @@ def _method_weight_input_cfgs(
     named = _BACKBONE_CFG_MAP[method]
     weight_cfg: Optional[Dict[str, Any]] = None
     input_cfg: Optional[Dict[str, Any]] = None
-    for entry in named["quant_cfg"]:
-        name = entry.get("quantizer_name")
-        if name == "*weight_quantizer" and "cfg" in entry:
-            weight_cfg = entry["cfg"]
-        elif name == "*input_quantizer" and "cfg" in entry:
-            input_cfg = entry["cfg"]
+    quant_cfg = named["quant_cfg"]
+    if isinstance(quant_cfg, dict):
+        weight = copy.deepcopy(quant_cfg.get("*weight_quantizer"))
+        input_ = copy.deepcopy(quant_cfg.get("*input_quantizer"))
+        if weight is not None:
+            weight.pop("enable", None)
+            weight_cfg = weight
+        if input_ is not None and input_.get("enable", True):
+            input_.pop("enable", None)
+            input_cfg = input_
+    else:
+        for entry in quant_cfg:
+            name = entry.get("quantizer_name")
+            if name == "*weight_quantizer" and "cfg" in entry:
+                weight_cfg = entry["cfg"]
+            elif name == "*input_quantizer" and "cfg" in entry:
+                input_cfg = entry["cfg"]
     if weight_cfg is None:
         raise ValueError(
             f"ModelOpt config for {method!r} has no '*weight_quantizer' cfg.")
     return weight_cfg, input_cfg
+
+
+class _QuantCfgAppender:
+    """Append ordered overrides to either ModelOpt quant_cfg representation."""
+
+    def __init__(self, quant_cfg) -> None:
+        self.quant_cfg = quant_cfg
+
+    def append(self, entry: QuantCfgEntry) -> None:
+        if isinstance(self.quant_cfg, list):
+            self.quant_cfg.append(entry)
+            return
+        pattern = entry["quantizer_name"]
+        value = copy.deepcopy(entry.get("cfg", {}))
+        if "enable" in entry:
+            value["enable"] = entry["enable"]
+        # Reinsert existing patterns so their override retains last-match-wins.
+        self.quant_cfg.pop(pattern, None)
+        self.quant_cfg[pattern] = value
+
+    def __iadd__(self, entries):
+        for entry in entries:
+            self.append(entry)
+        return self
+
+
+def append_quant_cfg_entries(quant_cfg: Dict[str, Any],
+                             entries: List[QuantCfgEntry]) -> None:
+    """Append last-match-wins rules across ModelOpt dict/list schemas."""
+    appender = _QuantCfgAppender(quant_cfg["quant_cfg"])
+    appender += entries
 
 
 def _enable_entries(method: str, weight_pattern: str,
@@ -201,7 +244,7 @@ def build_quant_config(
 ) -> Dict[str, Any]:
     """Build a composite ModelOpt quantization config from method names.
 
-    Returns ``{"quant_cfg": [<ordered rules>], "algorithm": ...}`` for
+    Returns a ModelOpt-version-compatible ``quant_cfg`` for
     :func:`mtq.quantize`. Overrides are appended on top of the stock backbone
     config and rely on last-match-wins ordering.
 
@@ -228,11 +271,17 @@ def build_quant_config(
                                fuse all four projections into a single GEMM.
     """
     if quantization is None:
-        cfg: Dict[str, Any] = {
-            "quant_cfg": [{
-                "quantizer_name": "*",
+        disabled = ({
+            "*": {
                 "enable": False
-            }],
+            }
+        } if isinstance(_BACKBONE_CFG_MAP["fp8"]["quant_cfg"], dict) else
+                    [{
+                        "quantizer_name": "*",
+                        "enable": False
+                    }])
+        cfg: Dict[str, Any] = {
+            "quant_cfg": disabled,
             "algorithm": "max",
         }
     elif quantization in _BACKBONE_CFG_MAP:
@@ -251,7 +300,7 @@ def build_quant_config(
             f"Unsupported kv_cache_quantization: {kv_cache_quantization}. "
             "Choose from: ['fp8']")
 
-    entries: List[QuantCfgEntry] = cfg["quant_cfg"]
+    entries = _QuantCfgAppender(cfg["quant_cfg"])
 
     if kv_cache_quantization == "fp8":
         entries.append({

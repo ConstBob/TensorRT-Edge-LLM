@@ -103,6 +103,11 @@ void launchDFlashPrepareBaseVerifyInputs(int32_t const* baseKVCacheLengths, int3
     int32_t* packedAttentionMask, int32_t* attentionPosId, int64_t* selectTokenIndices, int32_t* contextLengths,
     int32_t batchSize, cudaStream_t stream);
 
+/// Populate tree metadata for a linear verification path.
+/// Node zero is the root; every later node has the previous node as its parent.
+void launchDFlashBuildLinearTreeMetadata(
+    int32_t* treeParentIds, int32_t* treeDepths, int32_t batchSize, int32_t verifySize, cudaStream_t stream);
+
 /// Launch kernel to build DFlash linear verification inputs for EAGLE accept.
 ///
 /// verifyTokenIds[b, 0] = lastAcceptedTokens[b];

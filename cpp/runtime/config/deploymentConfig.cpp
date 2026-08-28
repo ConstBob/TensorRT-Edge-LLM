@@ -349,10 +349,20 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
         validateEagleConfig(cfg.base, *cfg.draft);
     }
 
+    if (cfg.base.specDecodeType == SpecDecodeMode::kDFlash && cfg.draft.has_value())
+    {
+        ELLM_CHECK(cfg.draft->specDecodeType == SpecDecodeMode::kDFlash,
+            "DFlash base and draft speculative decoding modes must match.");
+        ELLM_CHECK(cfg.base.dflashVersion == cfg.draft->dflashVersion,
+            "DFlash base and draft dflash_config.version values must match.");
+    }
+
     if (isCachedBlockDraftMode(cfg.base.specDecodeType) && cfg.draft.has_value())
     {
-        validateCachedDraftTargetLayerIds(
-            cfg.base, *cfg.draft, cfg.base.specDecodeType == SpecDecodeMode::kJetSpec ? "JetSpec" : "DFlash");
+        char const* modeName = cfg.base.specDecodeType == SpecDecodeMode::kJetSpec
+            ? "JetSpec"
+            : (cfg.base.dflashVersion == DFlashVersion::kV2 ? "DFlash V2" : "DFlash");
+        validateCachedDraftTargetLayerIds(cfg.base, *cfg.draft, modeName);
     }
     if (cfg.base.specDecodeType == SpecDecodeMode::kGemma4MTP && cfg.draft.has_value())
     {
@@ -374,7 +384,6 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
             "drafting configuration was provided but base config is not a speculative decoding base engine.");
         ELLM_CHECK(cfg.draft.has_value() && cfg.draft->specDecodeType == cfg.base.specDecodeType,
             "base and draft speculative decoding modes must match.");
-
         // Positivity: each drafting field must be >= 1. Rejecting zero/negative
         // up front gives downstream shape arithmetic a clean invariant and
         // produces a clearer error than a far-away bind-time mismatch.
@@ -415,11 +424,45 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
 
         if (isCachedBlockDraft)
         {
+            bool const isDFlash2
+                = cfg.base.specDecodeType == SpecDecodeMode::kDFlash && cfg.base.dflashVersion == DFlashVersion::kV2;
             static constexpr int32_t kDFlashJetSpecDDTreeMaxAcceptedPathLength = 32;
             static constexpr int32_t kDFlashJetSpecHybridMaxBlockSize = 16;
-            char const* modeName = cfg.base.specDecodeType == SpecDecodeMode::kJetSpec ? "JetSpec" : "DFlash";
+            char const* modeName
+                = cfg.base.specDecodeType == SpecDecodeMode::kJetSpec ? "JetSpec" : (isDFlash2 ? "DFlash2" : "DFlash");
             char const* configName
                 = cfg.base.specDecodeType == SpecDecodeMode::kJetSpec ? "jetspec_config" : "dflash_config";
+
+            if (isDFlash2)
+            {
+                ELLM_CHECK(
+                    cfg.draft->reducedVocabSize == 0, "DFlash V2 does not support reduced-vocabulary draft engines.");
+                ELLM_CHECK(specConfig.draftingTopK == 1,
+                    "DFlash2 selector_top_k is checkpoint-owned and does not use DDTree; draftingTopK must be 1.");
+                ELLM_CHECK(
+                    cfg.base.dflashVersion == DFlashVersion::kV2 && cfg.draft->dflashVersion == DFlashVersion::kV2,
+                    "DFlash V2 base and draft must both use dflash_config.version=2.");
+                constexpr int32_t kDFlash2ProductionLayers{5};
+                ELLM_CHECK(cfg.base.specTargetLayerIds == cfg.draft->specTargetLayerIds,
+                    "DFlash2 base and draft target layer IDs must match exactly.");
+                ELLM_CHECK(cfg.draft->numDecoderLayers == kDFlash2ProductionLayers,
+                    "DFlash2 production draft must contain exactly five decoder layers.");
+                ELLM_CHECK(
+                    cfg.base.hiddenSize == cfg.draft->hiddenSize, "DFlash2 base and draft hidden sizes must match.");
+                int64_t const expectedConditioningSize
+                    = static_cast<int64_t>(cfg.base.hiddenSize) * kDFlash2ProductionLayers;
+                ELLM_CHECK(static_cast<int64_t>(cfg.draft->baseModelHiddenSize) == expectedConditioningSize,
+                    "DFlash2 draft base_model_hidden_size must equal base hidden_size times five target layers.");
+                ELLM_CHECK(
+                    cfg.base.vocabSize == cfg.draft->vocabSize, "DFlash2 base and draft vocabulary sizes must match.");
+                ELLM_CHECK(cfg.base.specDraftBlockSize == cfg.draft->specDraftBlockSize,
+                    "DFlash2 base and draft must declare the same checkpoint block_size.");
+                ELLM_CHECK(cfg.base.specSelectorTopK == cfg.draft->specSelectorTopK
+                        && cfg.base.specSelectorRank == cfg.draft->specSelectorRank
+                        && cfg.base.specConvKernelSize == cfg.draft->specConvKernelSize
+                        && cfg.base.specConvGroupSize == cfg.draft->specConvGroupSize,
+                    "DFlash2 base/draft selector and dynamic-convolution contracts must match.");
+            }
 
             specConfig.dflashBlockSize = resolveDFlashBlockSize(cfg.base, *cfg.draft, *draftingConfig);
             ELLM_CHECK(specConfig.dflashBlockSize > 0,
@@ -503,7 +546,7 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
                     + " exceeds draft.maxDraftTreeSize=" + std::to_string(specConfig.maxDraftProposalSize)
                     + ". Drafting configuration exceeds engine proposal size capability.");
             ELLM_CHECK(specConfig.dflashBlockSize == 0,
-                "dflashBlockSize can only be set when spec_decode_type=dflash or jetspec.");
+                "dflashBlockSize can only be set for a cached-block speculative mode.");
 
             if (cfg.base.specDecodeType == SpecDecodeMode::kMTP)
             {

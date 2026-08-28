@@ -235,6 +235,25 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
     float temperature = inputData.value("temperature", 1.0f);
     float topP = inputData.value("top_p", 0.8f);
     int64_t topK = inputData.value("top_k", 50);
+    std::optional<uint64_t> defaultSamplingSeed;
+    if (inputData.contains("sampling_seed") && !inputData["sampling_seed"].is_null())
+    {
+        defaultSamplingSeed = inputData["sampling_seed"].get<uint64_t>();
+    }
+    std::string const proposalSamplingValue = inputData.value("spec_proposal_sampling", std::string{"auto"});
+    rt::SpecProposalSampling proposalSampling = rt::SpecProposalSampling::kAuto;
+    if (proposalSamplingValue == "greedy")
+    {
+        proposalSampling = rt::SpecProposalSampling::kGreedy;
+    }
+    else if (proposalSamplingValue == "probabilistic")
+    {
+        proposalSampling = rt::SpecProposalSampling::kProbabilistic;
+    }
+    else
+    {
+        check::check(proposalSamplingValue == "auto", "spec_proposal_sampling must be auto, greedy, or probabilistic");
+    }
     int64_t maxGenerateLength
         = (maxGenerateLengthOverride != -1) ? maxGenerateLengthOverride : inputData.value("max_generate_length", 256);
     check::check(maxGenerateLength > 0,
@@ -304,6 +323,8 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
         batchRequest.topP = topP;
         batchRequest.topK = topK;
         batchRequest.maxGenerateLength = maxGenerateLength;
+        batchRequest.samplingSeed = defaultSamplingSeed;
+        batchRequest.proposalSampling = proposalSampling;
         batchRequest.diffusionMaxDenoisingSteps = diffusionMaxDenoisingSteps;
         batchRequest.applyChatTemplate = applyChatTemplate;
         batchRequest.addGenerationPrompt = addGenerationPrompt;
@@ -517,6 +538,9 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
             }
 
             rt::LLMGenerationRequest::Request request;
+            request.samplingSeed = requestItem.contains("sampling_seed") && !requestItem["sampling_seed"].is_null()
+                ? std::optional<uint64_t>{requestItem["sampling_seed"].get<uint64_t>()}
+                : defaultSamplingSeed;
             request.messages = std::move(chatMessages);
             request.imageBuffers = std::move(imageBuffers);
             request.audioBuffers = std::move(audioBuffers);

@@ -18,6 +18,8 @@ import importlib
 from dataclasses import dataclass
 from typing import Dict, FrozenSet, Mapping, Tuple
 
+from tensorrt_edgellm.dflash import DFlashVersion
+
 from ..core import contracts
 
 Component = contracts.Component
@@ -561,6 +563,8 @@ SPECULATIVE_DRAFTS = {
     _component("qwen3_5.modeling_qwen3_5_mtp", "Qwen35MtpDraftModel"),
     "dflash":
     _component("dflash.modeling_dflash_draft", "DFlashDraftModel"),
+    "dflash2":
+    _component("dflash2.modeling_dflash2_draft", "DFlash2DraftModel"),
     "dspark":
     _component("dspark.modeling_dspark_draft", "DSparkDraftModel"),
     "gemma4_mtp":
@@ -572,6 +576,7 @@ SPECULATIVE_WEIGHT_CONVERSIONS = {
     "eagle3": "eagle3.weights",
     "mtp": "qwen3_5.weights",
     "dflash": "dflash.weights",
+    "dflash2": "dflash2.weights",
     "dspark": "dspark.weights",
     "gemma4_mtp": "gemma4.weights",
 }
@@ -580,11 +585,13 @@ SPECULATIVE_CONFIGURATIONS = {
     "eagle3": "eagle3.configuration",
     "mtp": "qwen3_5.configuration",
     "dflash": "dflash.configuration",
+    "dflash2": "dflash2.configuration",
     "dspark": "dspark.configuration",
     "gemma4_mtp": "gemma4.configuration",
 }
 
 SPECULATIVE_ARTIFACT_WRITERS = {
+    "dflash2": "dflash2.artifacts",
     "dspark": "dspark.artifacts",
 }
 
@@ -631,17 +638,30 @@ def components_for(root_model_type: str) -> FrozenSet[Component]:
     return _registration(root_model_type)[1]
 
 
-def definition_for(root_model_type: str, component: Component, spec_type: str,
-                   spec_role: contracts.SpecRole) -> ComponentDefinition:
+def _spec_implementation(spec_type: str, dflash_version: DFlashVersion) -> str:
+    if spec_type == "dflash" and dflash_version == DFlashVersion.V2:
+        return "dflash2"
+    return spec_type
+
+
+def definition_for(
+        root_model_type: str,
+        component: Component,
+        spec_type: str,
+        spec_role: contracts.SpecRole,
+        dflash_version: DFlashVersion = DFlashVersion.V1
+) -> ComponentDefinition:
     """Resolve one concrete model class for a component build."""
     if spec_role == contracts.SpecRole.DRAFT:
         if component != Component.LLM:
             raise ValueError(
                 "speculative draft builds require --component llm")
         family = family_for(root_model_type)
+        implementation = _spec_implementation(spec_type, dflash_version)
         try:
-            return FAMILY_SPECULATIVE_DRAFTS.get((family.name, spec_type),
-                                                 SPECULATIVE_DRAFTS[spec_type])
+            return FAMILY_SPECULATIVE_DRAFTS.get(
+                (family.name, implementation),
+                SPECULATIVE_DRAFTS[implementation])
         except KeyError as error:
             raise ValueError(
                 f"unsupported speculative draft type {spec_type!r}") from error
@@ -668,10 +688,12 @@ def configuration_module_for(root_model_type: str):
 def artifact_writer_for(
         root_model_type: str,
         spec_type: str = "none",
-        spec_role: contracts.SpecRole = contracts.SpecRole.NONE):
+        spec_role: contracts.SpecRole = contracts.SpecRole.NONE,
+        dflash_version: DFlashVersion = DFlashVersion.V1):
     """Import the runtime artifact writer owned by one model family."""
     if spec_role == contracts.SpecRole.DRAFT:
-        module_name = SPECULATIVE_ARTIFACT_WRITERS.get(spec_type)
+        implementation = _spec_implementation(spec_type, dflash_version)
+        module_name = SPECULATIVE_ARTIFACT_WRITERS.get(implementation)
         if module_name is not None:
             return importlib.import_module(f".{module_name}", __package__)
     family = family_for(root_model_type)
@@ -682,14 +704,16 @@ def artifact_writer_for(
 def weight_conversion_for(
         root_model_type: str,
         spec_type: str = "none",
-        spec_role: contracts.SpecRole = contracts.SpecRole.NONE):
+        spec_role: contracts.SpecRole = contracts.SpecRole.NONE,
+        dflash_version: DFlashVersion = DFlashVersion.V1):
     """Import checkpoint conversion rules owned by a model family."""
     if spec_role == contracts.SpecRole.DRAFT:
         family = family_for(root_model_type)
+        implementation = _spec_implementation(spec_type, dflash_version)
         try:
             module_name = FAMILY_SPECULATIVE_WEIGHT_CONVERSIONS.get(
-                (family.name, spec_type),
-                SPECULATIVE_WEIGHT_CONVERSIONS[spec_type])
+                (family.name, implementation),
+                SPECULATIVE_WEIGHT_CONVERSIONS[implementation])
         except KeyError as error:
             raise ValueError(
                 f"unsupported speculative draft type {spec_type!r}") from error
@@ -716,9 +740,13 @@ def configure_for_build(cfg,
     if role == contracts.SpecRole.NONE:
         return cfg
     family = family_for(cfg.root_model_type)
+    dflash_version = (getattr(build_args, "dflash_version", DFlashVersion.V1)
+                      if build_args is not None else cfg.dflash_version)
+    implementation = _spec_implementation(spec_type, dflash_version)
     try:
         module_name = FAMILY_SPECULATIVE_CONFIGURATIONS.get(
-            (family.name, spec_type), SPECULATIVE_CONFIGURATIONS[spec_type])
+            (family.name, implementation),
+            SPECULATIVE_CONFIGURATIONS[implementation])
     except KeyError as error:
         raise ValueError(
             f"unsupported speculative configuration {spec_type!r}") from error

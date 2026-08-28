@@ -704,7 +704,8 @@ def _is_spec_tree_base_export(config: ModelConfig) -> bool:
     DFlash, JetSpec, and MTP tree bases consume the same
     ``tree_parent_ids`` / ``tree_depths`` verify inputs.
     """
-    return (bool(getattr(config, "dflash_tree_base", False))
+    return (bool(getattr(config, "dflash_base", False))
+            or bool(getattr(config, "dflash_tree_base", False))
             or bool(getattr(config, "jetspec_tree_base", False))
             or bool(getattr(config, "mtp_tree_base", False)))
 
@@ -995,6 +996,16 @@ class Qwen3_5CausalLM(nn.Module):
         embed_weight = self.model.embed_tokens.weight
         self.lm_head.weight = nn.Parameter(embed_weight.detach().clone(),
                                            requires_grad=False)
+
+    def materialize_checkpoint_defaults(self, device: str) -> None:
+        for layer in self.model.layers:
+            mixer = getattr(layer, "linear_attn", None)
+            if mixer is None or mixer.conv1d.bias.device.type != "meta":
+                continue
+            bias = mixer.conv1d.bias
+            mixer.conv1d.bias = torch.zeros(bias.shape,
+                                            dtype=bias.dtype,
+                                            device=device)
 
     def onnx_export_spec(self) -> OnnxSpec:
         """Return all model-specific parameters needed for ONNX export."""

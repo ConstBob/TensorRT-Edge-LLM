@@ -744,27 +744,33 @@ def build_runtime_llm_config_dict(
             list(config.kv_sharing_map),
         })
 
-    if config.is_dflash_draft:
-        out.update({
-            "draft_vocab_size":
-            config.vocab_size,
-            "base_model_hidden_size":
-            len(config.dflash_target_layer_ids) * config.hidden_size,
-            "dflash_config": {
-                "target_layer_ids": list(config.dflash_target_layer_ids),
-                "block_size": config.dflash_block_size,
-                "mask_token_id": config.dflash_mask_token_id,
-            },
-        })
-
-    if config.dflash_base:
-        out.update({
-            "dflash_config": {
-                "target_layer_ids": list(config.dflash_target_layer_ids),
-                "block_size": config.dflash_block_size,
-                "mask_token_id": config.dflash_mask_token_id,
-            },
-        })
+    is_dflash = config.is_dflash_draft or config.dflash_base
+    if is_dflash:
+        version = int(config.dflash_version)
+        dflash = {
+            "version": version,
+            "target_layer_ids": list(config.dflash_target_layer_ids),
+            "block_size": config.dflash_block_size,
+            "mask_token_id": config.dflash_mask_token_id,
+            "supports_probabilistic_sampling": version == 2,
+        }
+        if version == 2:
+            dflash.update({
+                "is_causal": bool(config.dflash2_is_causal),
+                "conv_kernel_size": config.dflash2_conv_kernel_size,
+                "conv_group_size": config.dflash2_conv_group_size,
+                "selector_rank": config.dflash2_selector_rank,
+                "selector_top_k": config.dflash2_selector_top_k,
+                "selector_file": "dflash2_selector.safetensors",
+            })
+        out["dflash_config"] = dflash
+        if config.is_dflash_draft:
+            out.update({
+                "draft_vocab_size":
+                config.vocab_size,
+                "base_model_hidden_size":
+                len(config.dflash_target_layer_ids) * config.hidden_size,
+            })
 
     if config.is_jetspec_draft:
         out.update({

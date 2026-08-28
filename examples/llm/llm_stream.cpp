@@ -181,7 +181,9 @@ bool applyEngineSpecDecodeDefaults(Args& args)
             }
             if (!args.specVerifySizeSet)
             {
-                args.specVerifySize = args.specDraftTopK > 1 ? maxVerifySizeOrDefault(baseConfig, 128) : blockSize;
+                args.specVerifySize = baseConfig.dflashVersion == rt::DFlashVersion::kV2
+                    ? blockSize
+                    : (args.specDraftTopK > 1 ? maxVerifySizeOrDefault(baseConfig, 128) : blockSize);
             }
             break;
         }

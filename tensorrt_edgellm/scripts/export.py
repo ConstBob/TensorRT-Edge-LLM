@@ -1083,6 +1083,7 @@ def _export_llm(model_dir: str,
                 tp_rank=rank,
                 num_decoder_layers=num_decoder_layers,
                 extra_configs=_extra_configs,
+                low_cpu_mem_usage=dflash_base,
             )
             if world > 1 and _is_speculative_model_config(model.config):
                 raise ValueError(
@@ -1381,11 +1382,43 @@ def _export_gemma4_mtp_draft(target_dir: str, draft_out_dir: str,
     logger.info("[Gemma4 MTP Draft] Done: %s", output_path)
 
 
+def _export_dflash2_selector_sidecar(model, draft_out_dir: str) -> None:
+    from tensorrt_edgellm._safetensors_io import save_file
+
+    selector = model.candidate_selector
+    expected_shape = (model.config.vocab_size,
+                      model.config.dflash2_selector_rank)
+    tensors = {
+        "predecessor_codebook":
+        selector.predecessor_codebook.detach().cpu().to(
+            torch.float16).contiguous(),
+        "successor_codebook":
+        selector.successor_codebook.detach().cpu().to(
+            torch.float16).contiguous(),
+    }
+    for name, tensor in tensors.items():
+        if tuple(tensor.shape) != expected_shape:
+            raise ValueError(
+                f"DFlash2 selector tensor {name!r} must have shape "
+                f"{expected_shape}, got {tuple(tensor.shape)}")
+
+    selector_path = os.path.join(draft_out_dir, "dflash2_selector.safetensors")
+    save_file(tensors, selector_path)
+    logger.info("[DFlash Draft] Wrote selector sidecar: %s", selector_path)
+
+
 def _export_dflash_draft(model_dir: str,
                          draft_out_dir: str,
                          dflash_draft_dir: str,
                          draft_reduced_vocab_dir: str = "") -> None:
     """Export the DFlash draft model, optionally with reduced vocabulary."""
+    from ..checkpoint.checkpoint_utils import load_checkpoint_config_dicts
+    from ..dflash import DFlashVersion, resolve_dflash_contract
+
+    draft_root, draft_llm = load_checkpoint_config_dicts(dflash_draft_dir)
+    contract = resolve_dflash_contract(draft_root, draft_llm)
+    if (contract.version == DFlashVersion.V2 and draft_reduced_vocab_dir):
+        raise ValueError("DFlash V2 does not support reduced draft vocabulary")
     os.makedirs(draft_out_dir, exist_ok=True)
     output_path = os.path.join(draft_out_dir, "model.onnx")
 
@@ -1424,6 +1457,9 @@ def _export_dflash_draft(model_dir: str,
     except (OSError, ValueError, RuntimeError) as exc:
         logger.exception("[DFlash Draft] ONNX export failed")
         raise SystemExit(1) from exc
+
+    if contract.version == DFlashVersion.V2:
+        _export_dflash2_selector_sidecar(model, draft_out_dir)
 
     # FP16/FP32 RoPE fix is handled automatically by export_onnx() which
     # reads DFlashDraftModel.match_fp32_elementwise_initializers = True

@@ -346,6 +346,34 @@ void launchDFlashPrepareBaseVerifyInputs(int32_t const* baseKVCacheLengths, int3
     CUDA_CHECK(cudaGetLastError());
 }
 
+__global__ void dflashBuildLinearTreeMetadataKernel(
+    int32_t* __restrict__ treeParentIds, int32_t* __restrict__ treeDepths, int32_t verifySize, int32_t elements)
+{
+    int32_t const idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= elements)
+    {
+        return;
+    }
+    int32_t const node = idx % verifySize;
+    treeParentIds[idx] = node == 0 ? -1 : node - 1;
+    treeDepths[idx] = node;
+}
+
+void launchDFlashBuildLinearTreeMetadata(
+    int32_t* treeParentIds, int32_t* treeDepths, int32_t batchSize, int32_t verifySize, cudaStream_t stream)
+{
+    if (batchSize == 0 || verifySize == 0)
+    {
+        return;
+    }
+    int32_t const elements = batchSize * verifySize;
+    constexpr int32_t kThreadsPerBlock{256};
+    int32_t const blocks = (elements + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    dflashBuildLinearTreeMetadataKernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
+        treeParentIds, treeDepths, verifySize, elements);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // -----------------------------------------------------------------------
 // DFlash linear verification tree input builder
 // -----------------------------------------------------------------------

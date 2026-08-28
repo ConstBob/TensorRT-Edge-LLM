@@ -16,6 +16,7 @@
  */
 
 #include "runtime/decoding/dflashDecoder.h"
+
 #include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
@@ -26,9 +27,11 @@
 #include "kernels/gdnKernels/gdnTreeChunkKernels.h"
 #include "kernels/posEncoding/applyRopeWriteKV.h"
 #include "kernels/speculative/ddtreeKernels.h"
+#include "kernels/speculative/dflash2CandidateSelector.h"
 #include "kernels/speculative/dflashRuntimeKernels.h"
 #include "kernels/speculative/eagleAcceptKernels.h"
 #include "kernels/speculative/eagleUtilKernels.h"
+#include "kernels/speculative/requestStableRngKernels.h"
 #include "profiling/metrics.h"
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
@@ -36,6 +39,7 @@
 #include "runtime/decoding/decoderUtils.h"
 #include "runtime/decoding/dflashDecodeUtils.h"
 #include "runtime/decoding/logitBias.h"
+#include "runtime/decoding/requestStableRng.h"
 #include "sampler/sampling.h"
 
 #include <algorithm>
@@ -78,6 +82,7 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
     ExternalWeightManager draftWeights, cudaStream_t stream)
     : mRuntime(runtime)
     , mDraftCacheManager(*runtime.base.sharedResources.cacheManagers[1])
+    , mVersion(runtime.deployment.base.dflashVersion)
     , mBlockDraft(std::move(blockDraftConfig))
     , mDraftExecutor(std::move(draftExecutor))
 {
@@ -89,6 +94,12 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
         "DFlashDecoder requires a base engine exported with spec_decode_type=dflash or jetspec.");
     ELLM_CHECK(baseCfg.specDecodeType == mBlockDraft.userMode,
         "DFlashDecoder normalized user mode does not match the base engine config.");
+
+    if (mVersion == DFlashVersion::kV2)
+    {
+        initializeDFlash2(engineDir, std::move(draftWeights), stream);
+        return;
+    }
 
     int32_t const maxBatch = deployment.maxRuntimeBatchSize();
 
@@ -176,7 +187,7 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
     mVerifyTreeMask = Tensor({maxBatch, mBlockDraft.verifySize, mBlockDraft.verifySize}, DeviceType::kGPU,
         nvinfer1::DataType::kINT8, "DFlash::verifyTreeMask");
     int32_t const maxAcceptBufferSize
-        = useDDTree() ? std::min(mBlockDraft.blockSize, mBlockDraft.verifySize) : mBlockDraft.verifySize;
+        = useTreeVerification() ? std::min(mBlockDraft.blockSize, mBlockDraft.verifySize) : mBlockDraft.verifySize;
     mAcceptedTokenIds = Tensor(
         {maxBatch, maxAcceptBufferSize}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "DFlash::acceptedTokenIds");
     mAcceptedTokenIndices = Tensor(
@@ -186,7 +197,7 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
     mHostAcceptedTokenIds = Tensor(
         {maxBatch, maxAcceptBufferSize}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "DFlash::hostAcceptedIds");
 
-    size_t const buildWorkspaceSize = useDDTree()
+    size_t const buildWorkspaceSize = useTreeVerification()
         ? kernel::getDDTreeBuildWorkspaceSize(maxBatch, mBlockDraft.blockSize, mBlockDraft.verifySize,
               deployment.draft->outputVocabSize, mBlockDraft.candidateTopK)
         : 1U;
@@ -318,6 +329,52 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
     CUDA_CHECK(cudaMemcpyAsync(mLastAcceptedTokens.rawPointer(), mHostLastAcceptedTokens.rawPointer(),
         activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
 
+    if (isV2())
+    {
+        bool const targetNonGreedy
+            = ::trt_edgellm::shouldUseNonGreedySampling(context.temperature, context.topK, context.topP);
+        bool proposalGreedy = !targetNonGreedy;
+        if (context.proposalSampling == SpecProposalSampling::kGreedy)
+        {
+            proposalGreedy = true;
+        }
+        else if (context.proposalSampling == SpecProposalSampling::kProbabilistic)
+        {
+            proposalGreedy = false;
+        }
+        check::check(mHostRequestSeeds.reshape({activeBatchSize}), "Tensor reshape failed");
+        check::check(mHostNextPositions.reshape({activeBatchSize}), "Tensor reshape failed");
+        check::check(mHostTemperatures.reshape({activeBatchSize}), "Tensor reshape failed");
+        check::check(mHostGreedyMask.reshape({activeBatchSize}), "Tensor reshape failed");
+        for (int32_t b = 0; b < activeBatchSize; ++b)
+        {
+            mHostRequestSeeds.dataPointer<int64_t>()[b] = static_cast<int64_t>(context.samplingSeeds[b]);
+            mHostNextPositions.dataPointer<int64_t>()[b] = static_cast<int64_t>(requestStableNextAbsolutePosition(
+                context.rawBatchedInputIds[b].size(), context.currentGenerateLengths[b]));
+            mHostTemperatures.dataPointer<float>()[b] = context.temperature;
+            mHostGreedyMask.dataPointer<int32_t>()[b] = proposalGreedy ? 1 : 0;
+        }
+        check::check(mRequestSeeds.reshape({activeBatchSize}), "Tensor reshape failed");
+        check::check(mNextAbsolutePositions.reshape({activeBatchSize}), "Tensor reshape failed");
+        check::check(mSamplingTemperatures.reshape({activeBatchSize}), "Tensor reshape failed");
+        check::check(mProposalGreedyMask.reshape({activeBatchSize}), "Tensor reshape failed");
+        check::check(mProposalUniforms.reshape({activeBatchSize, mBlockDraft.proposalLen}), "Tensor reshape failed");
+        check::check(
+            mAcceptUniforms.reshape({activeBatchSize, 2 * mBlockDraft.proposalLen + 1}), "Tensor reshape failed");
+        CUDA_CHECK(cudaMemcpyAsync(mRequestSeeds.rawPointer(), mHostRequestSeeds.rawPointer(),
+            activeBatchSize * sizeof(int64_t), cudaMemcpyHostToDevice, context.stream));
+        CUDA_CHECK(cudaMemcpyAsync(mNextAbsolutePositions.rawPointer(), mHostNextPositions.rawPointer(),
+            activeBatchSize * sizeof(int64_t), cudaMemcpyHostToDevice, context.stream));
+        CUDA_CHECK(cudaMemcpyAsync(mSamplingTemperatures.rawPointer(), mHostTemperatures.rawPointer(),
+            activeBatchSize * sizeof(float), cudaMemcpyHostToDevice, context.stream));
+        CUDA_CHECK(cudaMemcpyAsync(mProposalGreedyMask.rawPointer(), mHostGreedyMask.rawPointer(),
+            activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
+        kernel::launchRequestStableSpecUniforms(reinterpret_cast<uint64_t const*>(mRequestSeeds.rawPointer()),
+            reinterpret_cast<uint64_t const*>(mNextAbsolutePositions.rawPointer()),
+            mProposalUniforms.dataPointer<float>(), mAcceptUniforms.dataPointer<float>(), activeBatchSize,
+            mBlockDraft.proposalLen, context.stream);
+    }
+
     // Step 2: Embed the draft inputs.
     check::check(
         mDraftInputsEmbeds.reshape({activeBatchSize, BS, mBlockDraft.draftHiddenSize}), "Tensor reshape failed");
@@ -372,8 +429,27 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
         activeBatchSize, context.stream);
 
     // Step 5: Execute the DFlash draft engine.
-    check::check(
-        mDraftOutputLogits.reshape({activeBatchSize, BS, mBlockDraft.draftVocabSize}), "Tensor reshape failed");
+    if (isV2())
+    {
+        check::check(mDraftTokenIds.reshape({activeBatchSize, mBlockDraft.proposalLen}), "Tensor reshape failed");
+        check::check(mProposalSupportIds.reshape(
+                         {activeBatchSize, mBlockDraft.proposalLen, mRuntime.deployment.draft->specSelectorTopK}),
+            "Tensor reshape failed");
+        check::check(mProposalSupportProbs.reshape(
+                         {activeBatchSize, mBlockDraft.proposalLen, mRuntime.deployment.draft->specSelectorTopK}),
+            "Tensor reshape failed");
+        check::check(mProposalUnaryValues.reshape(
+                         {activeBatchSize, mBlockDraft.proposalLen, mRuntime.deployment.draft->specSelectorTopK}),
+            "Tensor reshape failed");
+        check::check(mProposalProjectedHidden.reshape(
+                         {activeBatchSize, mBlockDraft.proposalLen, mRuntime.deployment.draft->specSelectorRank}),
+            "Tensor reshape failed");
+    }
+    else
+    {
+        check::check(
+            mDraftOutputLogits.reshape({activeBatchSize, BS, mBlockDraft.draftVocabSize}), "Tensor reshape failed");
+    }
     int32_t const draftKVCapacity = mRuntime.deployment.draft->maxKVCacheCapacity;
     InferenceDims const draftDims{
         /*.batch=*/activeBatchSize,
@@ -402,6 +478,13 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
         return false;
     }
 
+    if (isV2())
+    {
+        kernel::launchDFlash2CandidateSelector(mProposalSupportIds, mProposalUnaryValues, mProposalProjectedHidden,
+            mLastAcceptedTokens, mSelectorPredecessorCodebook, mSelectorSuccessorCodebook, mProposalUniforms,
+            mSamplingTemperatures, mProposalGreedyMask, mDraftTokenIds, mProposalSupportProbs, context.stream);
+    }
+
     // Step 6: Commit per-batch delta lengths to the draft cache manager.
     if (context.generationRound == 0)
     {
@@ -421,6 +504,10 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
 
 bool DFlashDecoder::prepareBlockDraftVerifyInputs(DecodingInferenceContext& context)
 {
+    if (isV2())
+    {
+        return prepareV2Proposal(context);
+    }
     NVTX_SCOPED_RANGE(
         nvtx_dflash_prepare_verify, "DFlashDecoder::prepareBlockDraftVerifyInputs", nvtx_colors::LIGHT_ORANGE);
 
@@ -429,24 +516,19 @@ bool DFlashDecoder::prepareBlockDraftVerifyInputs(DecodingInferenceContext& cont
     check::check(mVerifyTokenIds.reshape({activeBatchSize, verifySize}), "Tensor reshape failed");
     check::check(mVerifyTreeMask.reshape({activeBatchSize, verifySize, verifySize}), "Tensor reshape failed");
 
-    if (!useDDTree())
+    if (!useTreeVerification())
     {
-        // Linear DFlash uses candidateTopK == 1: select one draft token per block
-        // position, then build a causal verify tree in the shared verify buffers.
         check::check(mDraftOutputLogits.reshape({activeBatchSize * mBlockDraft.blockSize, mBlockDraft.draftVocabSize}),
             "Tensor reshape failed");
         check::check(mDraftTokenIds.reshape({activeBatchSize * mBlockDraft.blockSize, 1}), "Tensor reshape failed");
         selectAllTopK(mDraftOutputLogits, std::nullopt, mDraftTokenIds, 1, mRuntime.sampling.workspace, context.stream);
         check::check(mDraftTokenIds.reshape({activeBatchSize, mBlockDraft.blockSize}), "Tensor reshape failed");
-
-        // Remap reduced-vocab draft IDs to full-vocab IDs before base verify.
         if (mHasDraftVocabMap)
         {
             check::check(mDraftTokenIds.reshape({activeBatchSize * mBlockDraft.blockSize}), "Tensor reshape failed");
             mapReducedVocabToFullVocab(mDraftTokenIds, mDraftVocabMappingTable, context.stream);
             check::check(mDraftTokenIds.reshape({activeBatchSize, mBlockDraft.blockSize}), "Tensor reshape failed");
         }
-
         kernel::launchDFlashBuildLinearVerifyInputs(mLastAcceptedTokens.dataPointer<int32_t>(),
             mDraftTokenIds.dataPointer<int32_t>(), mVerifyTokenIds.dataPointer<int32_t>(),
             mVerifyTreeMask.dataPointer<int8_t>(), activeBatchSize, mBlockDraft.proposalLen, mBlockDraft.blockSize,
@@ -527,8 +609,23 @@ bool DFlashDecoder::captureDraftCudaGraphs(cudaStream_t stream)
                              {batchSize, static_cast<int64_t>(simDeltaLen), mBlockDraft.baseOutputHiddenDim}),
                 "Tensor reshape failed");
             mDraftTensorMap.set(binding_names::kDFlashTargetHiddenConcat, mDraftTargetHidden);
-            check::check(
-                mDraftOutputLogits.reshape({batchSize, BS, mBlockDraft.draftVocabSize}), "Tensor reshape failed");
+            if (isV2())
+            {
+                check::check(mProposalSupportIds.reshape(
+                                 {batchSize, mBlockDraft.proposalLen, mRuntime.deployment.draft->specSelectorTopK}),
+                    "Tensor reshape failed");
+                check::check(mProposalUnaryValues.reshape(
+                                 {batchSize, mBlockDraft.proposalLen, mRuntime.deployment.draft->specSelectorTopK}),
+                    "Tensor reshape failed");
+                check::check(mProposalProjectedHidden.reshape(
+                                 {batchSize, mBlockDraft.proposalLen, mRuntime.deployment.draft->specSelectorRank}),
+                    "Tensor reshape failed");
+            }
+            else
+            {
+                check::check(
+                    mDraftOutputLogits.reshape({batchSize, BS, mBlockDraft.draftVocabSize}), "Tensor reshape failed");
+            }
             check::check(mDraftPackedAttentionMask.reshape({batchSize, BS, pmLen}), "Tensor reshape failed");
             check::check(mDraftAttentionPosId.reshape({batchSize, BS}), "Tensor reshape failed");
             check::check(mDraftContextLengths.reshape({batchSize}), "Tensor reshape failed");
@@ -583,7 +680,7 @@ bool DFlashDecoder::runBaseVerification(DecodingInferenceContext& context)
     int32_t const activeBatchSize = context.activeBatchSize;
     int32_t const BS = mBlockDraft.blockSize;
     int32_t const verifySize = mBlockDraft.verifySize;
-    int32_t const maxAcceptLength = useDDTree() ? std::min(BS, verifySize) : verifySize;
+    int32_t const maxAcceptLength = useTreeVerification() ? std::min(BS, verifySize) : verifySize;
 
     cudaGetLastError();
     bool const verifySuccess = executeBaseVerification(context, verifySize);
@@ -606,34 +703,40 @@ bool DFlashDecoder::runBaseVerification(DecodingInferenceContext& context)
     }
     // GCOVR_EXCL_STOP
 
-    Tensor const& acceptTokenIds = useDDTree() ? mTreeTokenIds : mVerifyTokenIds;
-    // DFlash reuses the EAGLE accept utility for both linear-tree and branching-tree verification:
-    // Step 1: compute base top-1 tokens for every verify node from base logits.
-    // Step 2: accept the selected token and record the verify-node index.
-    // Step 3: follow the next matching child through the verify tree mask.
-    kernel::eagleAccept(mRuntime.base.pipelineIO.outputLogits, acceptTokenIds, mVerifyTreeMask, mAcceptedTokenIds,
-        mAcceptedTokenIndices, mAcceptLength, std::nullopt, mRuntime.sampling.workspace.rawPointer(),
-        mRuntime.sampling.workspace.getMemoryCapacity(), context.stream);
-    if (!checkCudaLastError("accept"))
+    if (isV2())
     {
-        return false;
-    }
-
-    decoder_utils::clampAcceptLengthsToRemainingGeneration(context, mHostAcceptLengths, mAcceptLength, context.stream);
-
-    if (useDDTree())
-    {
-        commitAcceptedTreePath(context, verifySize, maxAcceptLength);
+        if (!runV2Acceptance(context, verifySize, maxAcceptLength))
+        {
+            return false;
+        }
     }
     else
     {
-        mRuntime.base.cacheManager.commitSequenceLength(mAcceptLength, context.stream);
+        Tensor const& acceptTokenIds = useTreeVerification() ? mTreeTokenIds : mVerifyTokenIds;
+        kernel::eagleAccept(mRuntime.base.pipelineIO.outputLogits, acceptTokenIds, mVerifyTreeMask, mAcceptedTokenIds,
+            mAcceptedTokenIndices, mAcceptLength, std::nullopt, mRuntime.sampling.workspace.rawPointer(),
+            mRuntime.sampling.workspace.getMemoryCapacity(), context.stream);
+        if (!checkCudaLastError("accept"))
+        {
+            return false;
+        }
 
-        check::check(mRuntime.base.pipelineIO.baseHiddenStates.reshape(
-                         {activeBatchSize, maxAcceptLength, mBlockDraft.baseOutputHiddenDim}),
-            "Tensor reshape failed");
+        decoder_utils::clampAcceptLengthsToRemainingGeneration(
+            context, mHostAcceptLengths, mAcceptLength, context.stream);
 
-        mRuntime.base.cacheManager.getMambaCacheManager().scatterAcceptedLinearStates(mAcceptLength, context.stream);
+        if (useTreeVerification())
+        {
+            commitAcceptedTreePath(context, verifySize, maxAcceptLength);
+        }
+        else
+        {
+            mRuntime.base.cacheManager.commitSequenceLength(mAcceptLength, context.stream);
+            check::check(mRuntime.base.pipelineIO.baseHiddenStates.reshape(
+                             {activeBatchSize, maxAcceptLength, mBlockDraft.baseOutputHiddenDim}),
+                "Tensor reshape failed");
+            mRuntime.base.cacheManager.getMambaCacheManager().scatterAcceptedLinearStates(
+                mAcceptLength, context.stream);
+        }
     }
 
     // Enqueue logprobs device work + D2H before appendAcceptedTokens so everything rides
@@ -771,6 +874,16 @@ void DFlashDecoder::prepareLinearBaseVerificationMetadata(int32_t batchSize, int
         mRuntime.base.pipelineIO.specDecodePositionIds.dataPointer<int32_t>(),
         mRuntime.base.pipelineIO.selectTokenIndices.dataPointer<int64_t>(),
         mRuntime.base.pipelineIO.contextLengths.dataPointer<int32_t>(), batchSize, stream);
+}
+
+void DFlashDecoder::prepareLinearTreeBaseVerificationMetadata(
+    int32_t batchSize, int32_t verifySize, cudaStream_t stream)
+{
+    prepareLinearBaseVerificationMetadata(batchSize, verifySize, stream);
+    check::check(mRuntime.base.pipelineIO.specTreeParentIds.reshape({batchSize, verifySize}), "Tensor reshape failed");
+    check::check(mRuntime.base.pipelineIO.specTreeDepths.reshape({batchSize, verifySize}), "Tensor reshape failed");
+    kernel::launchDFlashBuildLinearTreeMetadata(mRuntime.base.pipelineIO.specTreeParentIds.dataPointer<int32_t>(),
+        mRuntime.base.pipelineIO.specTreeDepths.dataPointer<int32_t>(), batchSize, verifySize, stream);
 }
 
 void DFlashDecoder::runBaseVerificationEmbeddingLookup(
@@ -939,75 +1052,86 @@ bool DFlashDecoder::captureCudaGraphs(cudaStream_t stream)
         mRuntime.base.cacheManager.resetForNewSequences(simCacheLensTensor, stream);
         mDraftCacheManager.resetForNewSequences(simCacheLensTensor, stream);
 
+        if (isV2())
+        {
+            reshapeBaseVerificationForCapture(batchSize, verifySize, /*includeTreeMetadata=*/true);
+            prepareLinearTreeBaseVerificationMetadata(batchSize, verifySize, stream);
+            baseVerificationCaptureStatus &= capturePreparedBaseVerification(batchSize, verifySize, stream);
+            continue;
+        }
+
+        if (!useTreeVerification())
+        {
+            reshapeBaseVerificationForCapture(batchSize, verifySize, /*includeTreeMetadata=*/false);
+            prepareLinearBaseVerificationMetadata(batchSize, verifySize, stream);
+            baseVerificationCaptureStatus &= capturePreparedBaseVerification(batchSize, verifySize, stream);
+            continue;
+        }
+
         // --- Base verification CUDA graph capture ---
         {
-            if (useDDTree())
+            int32_t const selectTokenSize = batchSize * verifySize;
+            std::vector<int32_t> idsInput(static_cast<size_t>(selectTokenSize), 0);
+            std::vector<int32_t> treeParentIds(static_cast<size_t>(selectTokenSize), -1);
+            std::vector<int32_t> treeDepths(static_cast<size_t>(selectTokenSize), 0);
+            std::vector<int32_t> positionIds(static_cast<size_t>(selectTokenSize), kSimulateCacheLength);
+            std::vector<int64_t> selectTokenIndices(static_cast<size_t>(selectTokenSize), 0);
+            std::vector<int32_t> contextLengths(static_cast<size_t>(batchSize), kSimulateCacheLength + verifySize);
+            std::vector<int32_t> validCounts(static_cast<size_t>(batchSize), verifySize);
+            std::vector<int32_t> packedAncestorMask(static_cast<size_t>(batchSize) * verifySize * packedMaskLen, 0);
+
+            reshapeBaseVerificationForCapture(batchSize, verifySize, /*includeTreeMetadata=*/true);
+            check::check(mTreeTokenIds.reshape({batchSize, verifySize}), "Tensor reshape failed");
+            check::check(mVerifyTokenIds.reshape({batchSize, verifySize}), "Tensor reshape failed");
+            check::check(mValidCounts.reshape({batchSize}), "Tensor reshape failed");
+
+            for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
             {
-                int32_t const selectTokenSize = batchSize * verifySize;
-                std::vector<int32_t> idsInput(static_cast<size_t>(selectTokenSize), 0);
-                std::vector<int32_t> treeParentIds(static_cast<size_t>(selectTokenSize), -1);
-                std::vector<int32_t> treeDepths(static_cast<size_t>(selectTokenSize), 0);
-                std::vector<int32_t> positionIds(static_cast<size_t>(selectTokenSize), kSimulateCacheLength);
-                std::vector<int64_t> selectTokenIndices(static_cast<size_t>(selectTokenSize), 0);
-                std::vector<int32_t> contextLengths(static_cast<size_t>(batchSize), kSimulateCacheLength + verifySize);
-                std::vector<int32_t> validCounts(static_cast<size_t>(batchSize), verifySize);
-                std::vector<int32_t> packedAncestorMask(static_cast<size_t>(batchSize) * verifySize * packedMaskLen, 0);
-
-                int32_t const childDepth = mBlockDraft.blockSize > 1 ? 1 : 0;
-                reshapeBaseVerificationForCapture(batchSize, verifySize, /*includeTreeMetadata=*/true);
-                check::check(mTreeTokenIds.reshape({batchSize, verifySize}), "Tensor reshape failed");
-                check::check(mVerifyTokenIds.reshape({batchSize, verifySize}), "Tensor reshape failed");
-                check::check(mValidCounts.reshape({batchSize}), "Tensor reshape failed");
-
-                for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+                int32_t const batchOffset = batchIdx * verifySize;
+                for (int32_t nodeIdx = 0; nodeIdx < verifySize; ++nodeIdx)
                 {
-                    int32_t const batchOffset = batchIdx * verifySize;
-                    for (int32_t nodeIdx = 0; nodeIdx < verifySize; ++nodeIdx)
+                    int32_t const flatIdx = batchOffset + nodeIdx;
+                    selectTokenIndices[flatIdx] = nodeIdx;
+                    if (nodeIdx > 0)
                     {
-                        int32_t const flatIdx = batchOffset + nodeIdx;
-                        selectTokenIndices[flatIdx] = nodeIdx;
-                        if (nodeIdx > 0 && childDepth > 0)
+                        bool const linearTree = mBlockDraft.candidateTopK == 1;
+                        treeParentIds[flatIdx] = linearTree ? nodeIdx - 1 : 0;
+                        treeDepths[flatIdx] = linearTree ? nodeIdx : 1;
+                        positionIds[flatIdx] = kSimulateCacheLength + treeDepths[flatIdx];
+                        int32_t const ancestorCount = linearTree ? nodeIdx : 1;
+                        for (int32_t ancestorIdx = 0; ancestorIdx < ancestorCount; ++ancestorIdx)
                         {
-                            treeParentIds[flatIdx] = 0;
-                            treeDepths[flatIdx] = childDepth;
-                            positionIds[flatIdx] = kSimulateCacheLength + childDepth;
-                            setPackedAncestorBit(packedAncestorMask, batchIdx, nodeIdx, 0, verifySize);
+                            setPackedAncestorBit(packedAncestorMask, batchIdx, nodeIdx, ancestorIdx, verifySize);
                         }
-                        setPackedAncestorBit(packedAncestorMask, batchIdx, nodeIdx, nodeIdx, verifySize);
                     }
+                    setPackedAncestorBit(packedAncestorMask, batchIdx, nodeIdx, nodeIdx, verifySize);
                 }
-
-                CUDA_CHECK(cudaMemcpyAsync(mVerifyTokenIds.rawPointer(), idsInput.data(),
-                    idsInput.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-                CUDA_CHECK(cudaMemcpyAsync(mTreeTokenIds.rawPointer(), idsInput.data(),
-                    idsInput.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-                copyVerifyTokenIdsToBaseInput(batchSize, verifySize, stream);
-                CUDA_CHECK(cudaMemcpyAsync(mRuntime.base.pipelineIO.specTreeParentIds.rawPointer(),
-                    treeParentIds.data(), treeParentIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-                CUDA_CHECK(cudaMemcpyAsync(mRuntime.base.pipelineIO.specTreeDepths.rawPointer(), treeDepths.data(),
-                    treeDepths.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-                CUDA_CHECK(cudaMemcpyAsync(mRuntime.base.pipelineIO.specDecodePositionIds.rawPointer(),
-                    positionIds.data(), positionIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-                CUDA_CHECK(
-                    cudaMemcpyAsync(mRuntime.base.pipelineIO.selectTokenIndices.rawPointer(), selectTokenIndices.data(),
-                        selectTokenIndices.size() * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
-                CUDA_CHECK(cudaMemcpyAsync(mRuntime.base.pipelineIO.contextLengths.rawPointer(), contextLengths.data(),
-                    contextLengths.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-                CUDA_CHECK(cudaMemcpyAsync(mValidCounts.rawPointer(), validCounts.data(),
-                    validCounts.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-                CUDA_CHECK(cudaMemcpyAsync(mRuntime.base.pipelineIO.packedAttentionMask.rawPointer(),
-                    packedAncestorMask.data(), packedAncestorMask.size() * sizeof(int32_t), cudaMemcpyHostToDevice,
-                    stream));
-
-                runBaseVerificationEmbeddingLookup(batchSize, verifySize, stream, /*reshapeGemmaPleOutputs=*/true);
-                baseVerificationCaptureStatus &= capturePreparedBaseVerification(batchSize, verifySize, stream);
             }
-            else
-            {
-                reshapeBaseVerificationForCapture(batchSize, verifySize, /*includeTreeMetadata=*/false);
-                prepareLinearBaseVerificationMetadata(batchSize, verifySize, stream);
-                baseVerificationCaptureStatus &= capturePreparedBaseVerification(batchSize, verifySize, stream);
-            }
+
+            CUDA_CHECK(cudaMemcpyAsync(mVerifyTokenIds.rawPointer(), idsInput.data(), idsInput.size() * sizeof(int32_t),
+                cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(mTreeTokenIds.rawPointer(), idsInput.data(), idsInput.size() * sizeof(int32_t),
+                cudaMemcpyHostToDevice, stream));
+            copyVerifyTokenIdsToBaseInput(batchSize, verifySize, stream);
+            CUDA_CHECK(cudaMemcpyAsync(mRuntime.base.pipelineIO.specTreeParentIds.rawPointer(), treeParentIds.data(),
+                treeParentIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(mRuntime.base.pipelineIO.specTreeDepths.rawPointer(), treeDepths.data(),
+                treeDepths.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(mRuntime.base.pipelineIO.specDecodePositionIds.rawPointer(), positionIds.data(),
+                positionIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(
+                cudaMemcpyAsync(mRuntime.base.pipelineIO.selectTokenIndices.rawPointer(), selectTokenIndices.data(),
+                    selectTokenIndices.size() * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(mRuntime.base.pipelineIO.contextLengths.rawPointer(), contextLengths.data(),
+                contextLengths.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(mValidCounts.rawPointer(), validCounts.data(),
+                validCounts.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(
+                cudaMemcpyAsync(mRuntime.base.pipelineIO.packedAttentionMask.rawPointer(), packedAncestorMask.data(),
+                    packedAncestorMask.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+
+            runBaseVerificationEmbeddingLookup(batchSize, verifySize, stream, /*reshapeGemmaPleOutputs=*/true);
+            baseVerificationCaptureStatus &= capturePreparedBaseVerification(batchSize, verifySize, stream);
         }
     }
 
@@ -1043,6 +1167,11 @@ void DFlashDecoder::restoreSystemPromptKVCache(SystemPromptCacheKey const& key, 
 
 bool DFlashDecoder::runSystemPromptPrefill(DecodingInferenceContext& context)
 {
+    if (isV2())
+    {
+        return runDraftForward(context);
+    }
+
     int32_t const activeBatchSize = context.activeBatchSize;
     int64_t const prefillLen = mRuntime.base.pipelineIO.baseHiddenStates.getShape()[1];
     int32_t const BS = mBlockDraft.blockSize;
@@ -1191,7 +1320,17 @@ void DFlashDecoder::onBatchEvict(std::vector<int32_t> const& batchMapping, int32
     compactDeviceTensor(mRuntime.base.pipelineIO.baseHiddenStates);
     if (mCommonStateTracker.draftPrefillOutputsPending())
     {
-        compactDeviceTensor(mDraftOutputLogits);
+        if (isV2())
+        {
+            compactDeviceTensor(mDraftTokenIds);
+            compactDeviceTensor(mProposalSupportIds);
+            compactDeviceTensor(mProposalSupportProbs);
+            compactDeviceTensor(mAcceptUniforms);
+        }
+        else
+        {
+            compactDeviceTensor(mDraftOutputLogits);
+        }
         compactDeviceTensor(mLastAcceptedTokens);
     }
     else

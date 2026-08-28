@@ -70,8 +70,8 @@ bool isSpecDecodeDraft(Json const& config, char const* type)
 
 bool isValidSpecDecodeType(std::string const& type)
 {
-    return type == "none" || type == "mtp" || type == "eagle3" || type == "dflash" || type == "jetspec"
-        || type == "dspark" || type == "gemma4_mtp";
+    return type == "none" || type == "mtp" || type == "eagle3" || type == "dflash" || type == "dflash2"
+        || type == "jetspec" || type == "dspark" || type == "gemma4_mtp";
 }
 
 bool isValidEngineRole(std::string const& role)
@@ -303,7 +303,8 @@ bool LLMBuilder::build()
     bool const hasExtraRetainedPages = kvPoolPages > minimumActivePages;
     std::string const mode = specDecodeType(mModelConfig);
     bool const attentionOnlyReusableSpec = mNumLinearAttnLayers == 0
-        && (mode == "eagle3" || mode == "gemma4_mtp" || mode == "dflash" || mode == "jetspec" || mode == "dspark");
+        && (mode == "eagle3" || mode == "gemma4_mtp" || mode == "dflash" || mode == "dflash2" || mode == "jetspec"
+            || mode == "dspark");
     bool const supportsCrossRequestRetention = mNbKVCacheInputs > 0 && (mode == "none" || attentionOnlyReusableSpec);
     if (hasExtraRetainedPages && !supportsCrossRequestRetention)
     {
@@ -435,6 +436,11 @@ bool LLMBuilder::build()
             return false;
         }
 
+        if (!copyDFlash2Files())
+        {
+            return false;
+        }
+
         if (!copyVocabMappingFiles())
         {
             return false;
@@ -481,7 +487,8 @@ bool LLMBuilder::parseConfig()
     if (!isValidSpecDecodeType(specType))
     {
         LOG_ERROR(
-            "Invalid spec_decode_type='%s'. Expected one of: none, mtp, eagle3, dflash, jetspec, dspark, gemma4_mtp.",
+            "Invalid spec_decode_type='%s'. Expected one of: none, mtp, eagle3, dflash, jetspec, dspark, "
+            "gemma4_mtp.",
             specType.c_str());
         return false;
     }
@@ -533,8 +540,8 @@ bool LLMBuilder::parseConfig()
         mTargetModelOutputHiddenDim = mHiddenSize;
     }
     else if ((isSpecDecodeDraft(mModelConfig, "eagle3") || isSpecDecodeDraft(mModelConfig, "dflash")
-                 || isSpecDecodeDraft(mModelConfig, "jetspec") || isSpecDecodeDraft(mModelConfig, "dspark")
-                 || isSpecDecodeDraft(mModelConfig, "gemma4_mtp"))
+                 || isSpecDecodeDraft(mModelConfig, "dflash2") || isSpecDecodeDraft(mModelConfig, "jetspec")
+                 || isSpecDecodeDraft(mModelConfig, "dspark") || isSpecDecodeDraft(mModelConfig, "gemma4_mtp"))
         && mModelConfig.contains("base_model_hidden_size"))
     {
         mTargetModelOutputHiddenDim = mModelConfig["base_model_hidden_size"].get<int32_t>();
@@ -734,12 +741,13 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
 
     bool result = true;
 
-    if (isSpecDecodeDraft(mModelConfig, "dflash") || isSpecDecodeDraft(mModelConfig, "jetspec"))
+    if (isSpecDecodeDraft(mModelConfig, "dflash") || isSpecDecodeDraft(mModelConfig, "dflash2")
+        || isSpecDecodeDraft(mModelConfig, "jetspec"))
     {
         result &= setupDFlashDraftProfiles(*contextProfile, *generationProfile);
         if (!result)
         {
-            LOG_ERROR("Failed to setup DFlash/JetSpec draft optimization profiles");
+            LOG_ERROR("Failed to setup DFlash/DFlash2/JetSpec draft optimization profiles");
             return false;
         }
         LOG_DEBUG("%s", printOptimizationProfile(contextProfile, "context_profile", &network).c_str());
@@ -799,7 +807,8 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
 
     // Setup hybrid state profiles for MTP/DFlash/JetSpec/DSpark base models.
     if (isSpecDecodeBase(mModelConfig, "mtp") || isSpecDecodeBase(mModelConfig, "dflash")
-        || isSpecDecodeBase(mModelConfig, "jetspec") || isSpecDecodeBase(mModelConfig, "dspark"))
+        || isSpecDecodeBase(mModelConfig, "dflash2") || isSpecDecodeBase(mModelConfig, "jetspec")
+        || isSpecDecodeBase(mModelConfig, "dspark"))
     {
         result &= setupIntermediateRecurrentStateProfiles(*contextProfile, *generationProfile);
         result &= setupIntermediateConvStateProfiles(*contextProfile, *generationProfile);
@@ -1116,15 +1125,21 @@ bool LLMBuilder::setupDFlashDraftProfiles(
 {
     bool result = true;
 
+    bool const isDFlash2 = isDFlashV2DraftConfig(mModelConfig);
     int64_t const maxDraftTokens = std::max<int64_t>(1, mBuilderConfig.maxDraftTreeSize);
+    if (isDFlash2 && (maxDraftTokens < 2 || maxDraftTokens > 16))
+    {
+        LOG_ERROR("DFlash2 requires maxDraftTreeSize in [2, 16]");
+        return false;
+    }
     int64_t const optDraftTokens = maxDraftTokens;
     int64_t const maxPrefillTargetHiddenLen = std::max<int64_t>(1, mBuilderConfig.maxInputLen);
     int64_t const optPrefillTargetHiddenLen = std::max<int64_t>(1, maxPrefillTargetHiddenLen / 2);
     // DFlash verifies [anchor] + proposal tokens and can accept the base
     // bonus token, so the next draft round may need one more target-hidden row
     // than the proposal block.
-    int64_t const maxDecodeTargetHiddenLen = maxDraftTokens + 1;
-    int64_t const optDecodeTargetHiddenLen = maxDraftTokens + 1;
+    int64_t const maxDecodeTargetHiddenLen = isDFlash2 ? maxDraftTokens : maxDraftTokens + 1;
+    int64_t const optDecodeTargetHiddenLen = maxDecodeTargetHiddenLen;
 
     int64_t const packedMaskLen = static_cast<int64_t>(divUp(maxDraftTokens, 32));
     int64_t const optPackedMaskLen = static_cast<int64_t>(divUp(optDraftTokens, 32));
@@ -1135,7 +1150,9 @@ bool LLMBuilder::setupDFlashDraftProfiles(
                                int64_t maxTargetHiddenLen) {
         bool ok = true;
         // inputs_embeds: [batch, block_seq, hiddenSize]
-        ok &= setOptimizationProfile(&profile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
+        int64_t const minDraftTokens = isDFlash2 ? 2 : 1;
+        ok &= setOptimizationProfile(&profile, binding_names::kInputsEmbeds,
+            createDims({1, minDraftTokens, mHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, optDraftTokens, mHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, maxDraftTokens, mHiddenSize}));
         // dflash_target_hidden_concat: [batch, delta_seq, baseOutputHiddenDim]
@@ -1163,11 +1180,11 @@ bool LLMBuilder::setupDFlashDraftProfiles(
         ok &= setOptimizationProfile(&profile, binding_names::kDFlashDeltaLengths, createDims({1}),
             createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
         // attention_mask: [batch, block_seq, packed_mask_len]
-        ok &= setOptimizationProfile(&profile, binding_names::kAttentionMask, createDims({1, 1, 1}),
+        ok &= setOptimizationProfile(&profile, binding_names::kAttentionMask, createDims({1, minDraftTokens, 1}),
             createDims({mBuilderConfig.maxBatchSize, optDraftTokens, optPackedMaskLen}),
             createDims({mBuilderConfig.maxBatchSize, maxDraftTokens, packedMaskLen}));
         // attention_pos_id: [batch, block_seq]
-        ok &= setOptimizationProfile(&profile, binding_names::kAttentionPosId, createDims({1, 1}),
+        ok &= setOptimizationProfile(&profile, binding_names::kAttentionPosId, createDims({1, minDraftTokens}),
             createDims({mBuilderConfig.maxBatchSize, optDraftTokens}),
             createDims({mBuilderConfig.maxBatchSize, maxDraftTokens}));
         // DFlash draft KV cache uses the paged-pool contract shared with the AttentionPlugin binding:
@@ -2041,6 +2058,36 @@ bool LLMBuilder::copyDSparkFiles()
         else
         {
             LOG_ERROR("Failed to copy DSpark sidecar %s from %s to %s", filename, srcPath.c_str(), dstPath.c_str());
+            allSuccess = false;
+        }
+    }
+    return allSuccess;
+}
+
+bool LLMBuilder::copyDFlash2Files()
+{
+    if (!isDFlashV2DraftConfig(mModelConfig))
+    {
+        return true;
+    }
+
+    bool allSuccess = true;
+    Json const& dflashConfig = mModelConfig.at("dflash_config");
+    std::string const requiredFiles[] = {
+        dflashConfig.value("selector_file", std::string(binding_names::kDFlash2SelectorFileName)),
+    };
+    for (auto const& filename : requiredFiles)
+    {
+        std::string const srcPath = (mOnnxDir / filename).string();
+        std::string const dstPath = (mEngineDir / filename).string();
+        if (file_io::copyFile(srcPath, dstPath))
+        {
+            LOG_INFO("Copied DFlash2 sidecar %s to %s", filename.c_str(), dstPath.c_str());
+        }
+        else
+        {
+            LOG_ERROR(
+                "Failed to copy DFlash2 sidecar %s from %s to %s", filename.c_str(), srcPath.c_str(), dstPath.c_str());
             allSuccess = false;
         }
     }

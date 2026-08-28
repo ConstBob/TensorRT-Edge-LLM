@@ -238,3 +238,21 @@ TEST(DFlashRuntimeKernels, BuildLinearVerifyInputsUsesDraftStrideForBatchRows)
     }
     EXPECT_EQ(copyDeviceToHost<int8_t>(verifyTreeMask), expectedMask);
 }
+
+TEST(DFlashRuntimeKernels, BuildLinearTreeMetadataUsesChainParentsAndDepths)
+{
+    cudaStream_t stream = nullptr;
+    constexpr int32_t batchSize = 2;
+    constexpr int32_t verifySize = 4;
+    auto parentIds = rt::Tensor({batchSize, verifySize}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto depths = rt::Tensor({batchSize, verifySize}, rt::DeviceType::kGPU, DataType::kINT32);
+
+    kernel::launchDFlashBuildLinearTreeMetadata(
+        parentIds.dataPointer<int32_t>(), depths.dataPointer<int32_t>(), batchSize, verifySize, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<int32_t> const expectedParents{-1, 0, 1, 2, -1, 0, 1, 2};
+    std::vector<int32_t> const expectedDepths{0, 1, 2, 3, 0, 1, 2, 3};
+    EXPECT_EQ(copyDeviceToHost<int32_t>(parentIds), expectedParents);
+    EXPECT_EQ(copyDeviceToHost<int32_t>(depths), expectedDepths);
+}

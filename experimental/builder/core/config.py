@@ -24,6 +24,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from tensorrt_edgellm.dflash import DFlashVersion, resolve_dflash_contract
+
 from . import contracts, quantization
 from .bundle import LLM_COMPONENTS, BundleConfig
 
@@ -157,6 +159,15 @@ class DeviceConfig:
     dflash_target_layer_ids: List[int] = field(default_factory=list)
     dflash_block_size: int = 16
     dflash_mask_token_id: int = 248070
+    dflash_version: DFlashVersion = DFlashVersion.V1
+    dflash2_target_layer_ids: List[int] = field(default_factory=list)
+    dflash2_block_size: int = 0
+    dflash2_mask_token_id: int = -1
+    dflash2_is_causal: bool = True
+    dflash2_conv_kernel_size: int = 0
+    dflash2_conv_group_size: int = 0
+    dflash2_selector_rank: int = 0
+    dflash2_selector_top_k: int = 0
     dspark_base: bool = False
     dspark_target_layer_ids: List[int] = field(default_factory=list)
     dspark_block_size: int = 7
@@ -363,6 +374,7 @@ class DeviceConfig:
         mtp_num_hidden_layers = llm.get("mtp_num_hidden_layers",
                                         llm.get("num_nextn_predict_layers"))
 
+        dflash_contract = resolve_dflash_contract(root, llm)
         result = cls(
             model_type=model_type,
             model_dir=model_dir,
@@ -462,6 +474,22 @@ class DeviceConfig:
                 (llm.get("dflash_config")
                  or {}).get("mask_token_id",
                             llm.get("dflash_mask_token_id", 248070))),
+            dflash_version=dflash_contract.version,
+            dflash2_target_layer_ids=list((llm.get("dflash_config")
+                                           or {}).get("target_layer_ids", [])),
+            dflash2_block_size=int((llm.get("dflash_config")
+                                    or {}).get("block_size", 0)),
+            dflash2_mask_token_id=int((llm.get("dflash_config")
+                                       or {}).get("mask_token_id", -1)),
+            dflash2_is_causal=bool(llm.get("is_causal", True)),
+            dflash2_conv_kernel_size=int((llm.get("dflash_config")
+                                          or {}).get("conv_kernel_size", 0)),
+            dflash2_conv_group_size=int((llm.get("dflash_config")
+                                         or {}).get("conv_group_size", 0)),
+            dflash2_selector_rank=int((llm.get("dflash_config")
+                                       or {}).get("selector_rank", 0)),
+            dflash2_selector_top_k=int((llm.get("dflash_config")
+                                        or {}).get("selector_top_k", 0)),
             dspark_base=bool(llm.get("dspark_base", False)),
             dspark_target_layer_ids=list((llm.get("dspark_config") or {}).get(
                 "target_layer_ids",

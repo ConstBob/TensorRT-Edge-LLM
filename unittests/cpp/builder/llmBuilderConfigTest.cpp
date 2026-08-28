@@ -167,3 +167,31 @@ TEST(LLMBuilderConfigTest, SwaCapableProfileOptimizesForFullWhenBoundedDoesNotSa
     EXPECT_EQ(config.resolveKVPoolPageProfile(kWINDOW_SIZE),
         (std::array<int64_t, 3>{boundedPages, boundedPages, boundedPages}));
 }
+
+TEST(LLMBuilderConfigTest, UnifiedDFlashTypeDetectsVersionTwoDraft)
+{
+    Json const config = {
+        {"spec_decode_type", "dflash"},
+        {"engine_role", "draft"},
+        {"dflash_config", {{"version", 2}}},
+    };
+
+    EXPECT_TRUE(isDFlashV2DraftConfig(config));
+}
+
+TEST(LLMBuilderConfigTest, UnifiedDFlashTypeDoesNotPromoteVersionOneOrBase)
+{
+    Json const versionOne = {
+        {"spec_decode_type", "dflash"},
+        {"engine_role", "draft"},
+        {"dflash_config", {{"version", 1}}},
+    };
+    Json const base = {
+        {"spec_decode_type", "dflash"},
+        {"engine_role", "base"},
+        {"dflash_config", {{"version", 2}}},
+    };
+
+    EXPECT_FALSE(isDFlashV2DraftConfig(versionOne));
+    EXPECT_FALSE(isDFlashV2DraftConfig(base));
+}
