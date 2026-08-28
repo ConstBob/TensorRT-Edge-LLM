@@ -306,11 +306,20 @@ class DFlashCalibDraftModel(nn.Module):
         if hasattr(config, "text_config"):
             config = config.text_config
 
-        # Attach dflash_config to the config object
+        # Attach dflash_config to the config object. DSpark drafts share the
+        # DFlash backbone; their raw checkpoints (and some raw DFlash ones)
+        # publish target_layer_ids/block_size/mask_token_id at the top level.
         cfg_path = os.path.join(draft_model_dir, "config.json")
         with open(cfg_path) as f:
             cfg_dict = json.load(f)
-        config.dflash_config = cfg_dict.get("dflash_config", {})
+        raw_spec_cfg = cfg_dict.get("dflash_config")
+        if raw_spec_cfg is None:
+            raw_spec_cfg = cfg_dict.get("dspark_config")
+        spec_cfg = dict(raw_spec_cfg or {})
+        for key in ("target_layer_ids", "block_size", "mask_token_id"):
+            if key not in spec_cfg and key in cfg_dict:
+                spec_cfg[key] = cfg_dict[key]
+        config.dflash_config = spec_cfg
 
         model = cls(config)
 
@@ -494,6 +503,15 @@ def quantize_and_export_dflash_draft(
 
     # Remove rotary_emb from saved state
     sd = {k: v for k, v in sd.items() if not k.startswith("rotary_emb")}
+
+    # Pass DSpark sidecar heads through unquantized: the exporter reads
+    # markov/confidence tensors from this checkpoint's safetensors.
+    passthrough_prefixes = ("markov_head.", "confidence_head.")
+    for sf_path in sorted(Path(draft_model_dir).glob("*.safetensors")):
+        with safe_open(str(sf_path), framework="pt", device="cpu") as f:
+            for key in f.keys():
+                if key.startswith(passthrough_prefixes) and key not in sd:
+                    sd[key] = f.get_tensor(key)
 
     save_file(sd, os.path.join(output_dir, "model.safetensors"))
 

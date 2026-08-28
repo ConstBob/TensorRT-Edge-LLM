@@ -330,6 +330,13 @@ use a greedy input (`"temperature": 0.0`, `"top_k": 1`), and run with
 `--specDraftTopK 4 --specVerifySize 16`. Tree mode accepts
 `--dsparkScheduler off` or `threshold`; `sps` applies only to chain mode.
 
+Setting the environment variable `EDGELLM_DSPARK_W2_FP8=1` converts the Markov
+correction weight (`markov_w2`) to FP8 E4M3 with per-row scales at load time,
+reducing the greedy proposal cost on bandwidth-bound devices. It applies to the
+greedy path only (non-greedy sampling keeps FP16 weights), requires a Markov
+rank of `16 * 2^k`, and costs about 0.04 acceptance length; startup fails
+loudly on unsupported ranks rather than silently falling back.
+
 ## JetSpec
 
 JetSpec is a paired-draft speculative decoding method that uses a dedicated

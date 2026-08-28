@@ -24,7 +24,9 @@
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <vector>
@@ -697,4 +699,164 @@ TEST(DSparkKernels, ProbabilisticAcceptSupportsDynamicVerifyLength)
 
     EXPECT_EQ(copyDeviceToHost<int32_t>(acceptLength), (std::vector<int32_t>{2}));
     EXPECT_EQ(copyDeviceToHost<int32_t>(acceptedTokenIds), (std::vector<int32_t>{1, 3}));
+}
+
+TEST(DSparkKernels, FusedGreedyStepMatchesCpuReference)
+{
+    cudaStream_t stream = nullptr;
+    constexpr int32_t batchSize = 2;
+    constexpr int32_t proposalLen = 3;
+    constexpr int32_t vocabSize = 131; // multiple fused blocks + tail
+    constexpr int32_t markovRank = 16;
+    constexpr int32_t depthSize = proposalLen + 1;
+
+    ASSERT_TRUE(dsparkFusedGreedySupported(markovRank));
+
+    std::vector<float> backboneHost(batchSize * proposalLen * vocabSize);
+    std::vector<float> w1Host(vocabSize * markovRank);
+    std::vector<float> w2Host(vocabSize * markovRank);
+    for (size_t i = 0; i < backboneHost.size(); ++i)
+    {
+        backboneHost[i] = std::sin(static_cast<float>(i) * 0.61F) * 5.0F;
+    }
+    for (size_t i = 0; i < w1Host.size(); ++i)
+    {
+        w1Host[i] = std::cos(static_cast<float>(i) * 0.29F);
+        w2Host[i] = std::sin(static_cast<float>(i) * 0.83F) * 0.4F;
+    }
+
+    auto backboneLogits = rt::Tensor({batchSize, proposalLen, vocabSize}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    auto markovW1 = rt::Tensor({vocabSize, markovRank}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto markovW2 = rt::Tensor({vocabSize, markovRank}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto firstPrevTokens = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto greedySlots = rt::Tensor({batchSize, proposalLen}, rt::DeviceType::kGPU, DataType::kINT64);
+    auto draftTokenIds = rt::Tensor({batchSize, proposalLen}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto stackedLogits = rt::Tensor({batchSize, depthSize, vocabSize}, rt::DeviceType::kGPU, DataType::kFLOAT);
+
+    copyHostToDevice<float>(backboneLogits, backboneHost);
+    copyHostToDevice<half>(markovW1, toHalf(w1Host));
+    copyHostToDevice<half>(markovW2, toHalf(w2Host));
+    copyHostToDevice<int32_t>(firstPrevTokens, {3, 77});
+    CUDA_CHECK(cudaMemsetAsync(greedySlots.rawPointer(), 0, batchSize * proposalLen * sizeof(uint64_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(stackedLogits.rawPointer(), 0, stackedLogits.getMemoryCapacity(), stream));
+
+    for (int32_t step = 0; step < proposalLen; ++step)
+    {
+        dsparkMarkovGreedyFusedStep(backboneLogits, markovW1, markovW2, firstPrevTokens, greedySlots, &stackedLogits,
+            step + 1, batchSize, step, proposalLen, vocabSize, markovRank, stream);
+    }
+    dsparkFinalizeGreedyDraftTokens(greedySlots, draftTokenIds, batchSize * proposalLen, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    auto const gpuTokens = copyDeviceToHost<int32_t>(draftTokenIds);
+    auto const gpuStacked = copyDeviceToHost<float>(stackedLogits);
+
+    // CPU reference: fp16-rounded weights, greedy chain.
+    std::vector<int32_t> cpuPrev = {3, 77};
+    for (int32_t step = 0; step < proposalLen; ++step)
+    {
+        for (int32_t b = 0; b < batchSize; ++b)
+        {
+            int32_t best = 0;
+            float bestVal = -1e30F;
+            for (int32_t v = 0; v < vocabSize; ++v)
+            {
+                float bias = 0.0F;
+                for (int32_t r = 0; r < markovRank; ++r)
+                {
+                    bias += __half2float(__float2half(w1Host[cpuPrev[b] * markovRank + r]))
+                        * __half2float(__float2half(w2Host[v * markovRank + r]));
+                }
+                float const corrected = backboneHost[(b * proposalLen + step) * vocabSize + v] + bias;
+                EXPECT_NEAR(gpuStacked[(b * depthSize + step + 1) * vocabSize + v], corrected, 2e-3F)
+                    << "stacked mismatch step=" << step << " b=" << b << " v=" << v;
+                if (corrected > bestVal)
+                {
+                    bestVal = corrected;
+                    best = v;
+                }
+            }
+            // Tolerate FP reassociation on near-ties: GPU winner must be within epsilon of the CPU max.
+            int32_t const gpuTok = gpuTokens[b * proposalLen + step];
+            float cpuBias = 0.0F;
+            for (int32_t r = 0; r < markovRank; ++r)
+            {
+                cpuBias += __half2float(__float2half(w1Host[cpuPrev[b] * markovRank + r]))
+                    * __half2float(__float2half(w2Host[gpuTok * markovRank + r]));
+            }
+            float const gpuVal = backboneHost[(b * proposalLen + step) * vocabSize + gpuTok] + cpuBias;
+            EXPECT_NEAR(gpuVal, bestVal, 2e-3F) << "argmax mismatch step=" << step << " b=" << b;
+            cpuPrev[b] = gpuTok;
+        }
+    }
+}
+
+TEST(DSparkKernels, FusedGreedyStepFp8MatchesFp16Closely)
+{
+    cudaStream_t stream = nullptr;
+    constexpr int32_t batchSize = 2;
+    constexpr int32_t proposalLen = 2;
+    constexpr int32_t vocabSize = 103; // exercises the fp8 kernel's vocab tail
+    constexpr int32_t markovRank = 32; // R % 16 == 0
+    constexpr int32_t depthSize = proposalLen + 1;
+
+    std::vector<float> backboneHost(batchSize * proposalLen * vocabSize);
+    std::vector<float> w1Host(vocabSize * markovRank);
+    std::vector<float> w2Host(vocabSize * markovRank);
+    for (size_t i = 0; i < backboneHost.size(); ++i)
+    {
+        backboneHost[i] = std::cos(static_cast<float>(i) * 0.41F) * 3.0F;
+    }
+    for (size_t i = 0; i < w1Host.size(); ++i)
+    {
+        w1Host[i] = std::sin(static_cast<float>(i) * 0.67F);
+        w2Host[i] = std::cos(static_cast<float>(i) * 1.19F) * 0.4F;
+    }
+
+    auto backboneLogits = rt::Tensor({batchSize, proposalLen, vocabSize}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    auto markovW1 = rt::Tensor({vocabSize, markovRank}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto markovW2 = rt::Tensor({vocabSize, markovRank}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto w2Fp8 = rt::Tensor({vocabSize, markovRank}, rt::DeviceType::kGPU, DataType::kUINT8);
+    auto w2RowScales = rt::Tensor({vocabSize}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto firstPrevTokens = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto greedySlots = rt::Tensor({batchSize, proposalLen}, rt::DeviceType::kGPU, DataType::kINT64);
+    auto draftTokenIds = rt::Tensor({batchSize, proposalLen}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto stackedFp16 = rt::Tensor({batchSize, depthSize, vocabSize}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    auto stackedFp8 = rt::Tensor({batchSize, depthSize, vocabSize}, rt::DeviceType::kGPU, DataType::kFLOAT);
+
+    copyHostToDevice<float>(backboneLogits, backboneHost);
+    copyHostToDevice<half>(markovW1, toHalf(w1Host));
+    copyHostToDevice<half>(markovW2, toHalf(w2Host));
+    copyHostToDevice<int32_t>(firstPrevTokens, {9, 55});
+    dsparkQuantizeMarkovW2Fp8(markovW2, w2Fp8, w2RowScales, vocabSize, markovRank, stream);
+
+    CUDA_CHECK(cudaMemsetAsync(greedySlots.rawPointer(), 0, batchSize * proposalLen * sizeof(uint64_t), stream));
+    for (int32_t step = 0; step < proposalLen; ++step)
+    {
+        dsparkMarkovGreedyFusedStep(backboneLogits, markovW1, markovW2, firstPrevTokens, greedySlots, &stackedFp16,
+            step + 1, batchSize, step, proposalLen, vocabSize, markovRank, stream);
+    }
+    CUDA_CHECK(cudaMemsetAsync(greedySlots.rawPointer(), 0, batchSize * proposalLen * sizeof(uint64_t), stream));
+    for (int32_t step = 0; step < proposalLen; ++step)
+    {
+        dsparkMarkovGreedyFusedStepFp8(backboneLogits, markovW1, w2Fp8, w2RowScales, firstPrevTokens, greedySlots,
+            &stackedFp8, step + 1, batchSize, step, proposalLen, vocabSize, markovRank, stream);
+    }
+    dsparkFinalizeGreedyDraftTokens(greedySlots, draftTokenIds, batchSize * proposalLen, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    auto const rowsFp16 = copyDeviceToHost<float>(stackedFp16);
+    auto const rowsFp8 = copyDeviceToHost<float>(stackedFp8);
+    // E4M3 relative error is ~2^-4 per element; over a rank-R dot with |w1| <= 1 a
+    // conservative bound is R * maxAbsW2 * 2^-3.
+    float maxAbsW2 = 0.0F;
+    for (auto v : w2Host)
+    {
+        maxAbsW2 = std::max(maxAbsW2, std::fabs(v));
+    }
+    float const bound = static_cast<float>(markovRank) * maxAbsW2 * 0.125F;
+    for (size_t i = 0; i < rowsFp16.size(); ++i)
+    {
+        EXPECT_NEAR(rowsFp8[i], rowsFp16[i], bound) << "i=" << i;
+    }
 }
