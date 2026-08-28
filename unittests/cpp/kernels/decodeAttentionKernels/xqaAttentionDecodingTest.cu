@@ -399,6 +399,13 @@ TEST(XQAAttentionDecodingTest, accuracyKVRatio8HeadDim256)
     TestXQAAttentionDecodingAccuracy(2, 16, 2, 256, 512);
 }
 
+TEST(XQAAttentionDecodingTest, accuracyKVRatio16HeadDim256)
+{
+    TestXQAAttentionDecodingAccuracy(1, 16, 1, 256, 1024);
+    TestXQAAttentionDecodingAccuracy(2, 16, 1, 256, 512);
+    TestXQAAttentionDecodingAccuracy(1, 32, 2, 256, 512, false, 0, std::nullopt, 274);
+}
+
 TEST(XQAAttentionDecodingTest, accuracyKVRatio8HeadDim512)
 {
     TestXQAAttentionDecodingAccuracy(1, 16, 2, 512, 256);
