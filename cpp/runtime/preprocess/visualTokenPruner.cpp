@@ -47,6 +47,7 @@ VisualTokenPruner::VisualTokenPruner(VisualPrunerConfig const& config, LLMEngine
     , mRotaryDim(engineConfig.rotaryDim)
     , mMaxKVCacheCapacity(engineConfig.maxKVCacheCapacity)
     , mMaxBatchSize(std::max(1, engineConfig.maxSupportedBatchSize))
+    , mMaxInputLength(engineConfig.maxSupportedInputLength)
 {
     check::check(mConfig.reductionRatio > 0.0F && mConfig.reductionRatio < 1.0F, "reductionRatio must be in (0, 1)");
     check::check(mImageTokenId >= 0, "visual-token pruning requires a VLM engine with an image token id");
@@ -74,6 +75,18 @@ VisualTokenPruner::VisualTokenPruner(VisualPrunerConfig const& config, LLMEngine
     mTextPositions.reserve(maxInputLen);
 }
 
+void VisualTokenPruner::preallocateAuxiliaryBuffers()
+{
+    // Upper bound on raw feature rows: every token of every slot is visual.
+    int64_t const maxRows = static_cast<int64_t>(mMaxBatchSize) * mMaxInputLength;
+    mFeatureIdxPinned
+        = Tensor({maxRows}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "VisualTokenPruner::featureIdxPinned");
+    mFeatureIdxDevice
+        = Tensor({maxRows}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "VisualTokenPruner::featureIdxDevice");
+    mCompactVisualFeatures = Tensor(
+        {maxRows, mHiddenSize}, DeviceType::kGPU, nvinfer1::DataType::kHALF, "VisualTokenPruner::compactFeatures");
+}
+
 int32_t VisualTokenPruner::pruneForPrefill(
     std::vector<int32_t> const& hostTokenIds, PipelineIO& io, int32_t origLen, cudaStream_t stream)
 {
@@ -81,6 +94,8 @@ int32_t VisualTokenPruner::pruneForPrefill(
     check::check(io.inputsEmbeds.getShape()[0] == 1, "pruneForPrefill expects batch size 1");
     check::check(io.inputsEmbeds.getShape()[1] == origLen, "inputsEmbeds length mismatch");
 
+    mCurrentSlot = 0;
+    mSlotKeepLists[0].clear(); // stale keep lists must not leak into compactAuxiliaryInputs()
     Tensor const embedsView(
         io.inputsEmbeds.rawPointer(), {origLen, mHiddenSize}, DeviceType::kGPU, nvinfer1::DataType::kHALF);
     return selectForSlot(hostTokenIds, embedsView, io, origLen, stream);
@@ -264,12 +279,14 @@ int32_t VisualTokenPruner::compactToKeepList(
     {
         return origLen;
     }
+    // Record the slot's keep list — the batched flow consumes it in executeBatchCompaction(),
+    // and compactAuxiliaryInputs() (spec-decode draft re-embedding) reads it in both flows.
+    // assign() reuses the constructor-reserved capacity, keeping this allocation-free.
+    mSlotKeepLists[mCurrentSlot].assign(mKeepIndicesHost.begin(), mKeepIndicesHost.end());
     if (mDeferCompaction)
     {
-        // Batched flow: record the slot's keep list; executeBatchCompaction() performs the
-        // gathers for all slots at once after every slot has been selected. assign() reuses
-        // the constructor-reserved capacity, keeping this allocation-free.
-        mSlotKeepLists[mCurrentSlot].assign(mKeepIndicesHost.begin(), mKeepIndicesHost.end());
+        // Batched flow: executeBatchCompaction() performs the gathers for all slots at once
+        // after every slot has been selected.
         return prunedLen;
     }
     int32_t const numPruned = origLen - prunedLen;
@@ -413,6 +430,114 @@ void VisualTokenPruner::executeBatchCompaction(PipelineIO& io, std::vector<int32
     {
         check::check(deepstack.reshape({batch, newMaxLen, mHiddenSize}), "Tensor reshape failed");
     }
+}
+
+void VisualTokenPruner::compactAuxiliaryInputs(std::vector<std::vector<int32_t>>& hostTokenIds, int32_t batch,
+    std::vector<int32_t> const& prunedTokens, OptionalInputTensor& visualFeatures, cudaStream_t stream)
+{
+    check::check(batch >= 1 && batch <= mMaxBatchSize && static_cast<int32_t>(hostTokenIds.size()) >= batch
+            && static_cast<int32_t>(prunedTokens.size()) >= batch,
+        "compactAuxiliaryInputs batch mismatch");
+    if (std::none_of(prunedTokens.begin(), prunedTokens.begin() + batch, [](int32_t n) { return n > 0; }))
+    {
+        return;
+    }
+
+    // Pass 1: per slot, compact the host token ids in place and collect the kept feature
+    // ordinals. Feature rows are indexed by the running image-token count over the packed
+    // batch grid, so ordinals are offset by the preceding slots' original visual counts.
+    // Ordinal 0 == the batch's first image token only when embedding runs with zero
+    // multimodal base offsets; the fresh-KV-cache gate on pruning guarantees that (prefix
+    // reuse would start the count at a nonzero base offset).
+    mFeatureKeepHost.clear();
+    int32_t slotBase = 0;
+    for (int32_t i = 0; i < batch; ++i)
+    {
+        std::vector<int32_t>& ids = hostTokenIds[i];
+        std::vector<int32_t> const& keep = mSlotKeepLists[i];
+        int32_t const len = static_cast<int32_t>(ids.size());
+        if (prunedTokens[i] == 0)
+        {
+            // Unpruned slot: all of its feature rows stay, in order.
+            for (int32_t pos = 0; pos < len; ++pos)
+            {
+                if (ids[pos] == mImageTokenId)
+                {
+                    mFeatureKeepHost.push_back(slotBase);
+                    ++slotBase;
+                }
+            }
+            continue;
+        }
+        // A pruned slot without a recorded keep list means the algorithm rewrote the buffers
+        // directly (merge-style) — its token-id/feature mapping is unknowable here.
+        check::check(static_cast<int32_t>(keep.size()) == len - prunedTokens[i],
+            std::string(name()) + " pruned a request without recording a keep list; "
+                                  "auxiliary-input compaction (spec decode) is unavailable");
+        size_t k = 0;
+        int32_t ordinal = 0;
+        for (int32_t pos = 0; pos < len; ++pos)
+        {
+            bool const isVisual = ids[pos] == mImageTokenId;
+            if (k < keep.size() && pos == keep[k])
+            {
+                if (isVisual)
+                {
+                    mFeatureKeepHost.push_back(slotBase + ordinal);
+                }
+                ids[k] = ids[pos]; // keep is ascending, so k <= pos: safe in place
+                ++k;
+            }
+            ordinal += isVisual;
+        }
+        ids.resize(keep.size());
+        slotBase += ordinal;
+    }
+
+    int64_t const totalOrig = slotBase;
+    int64_t const totalKept = static_cast<int64_t>(mFeatureKeepHost.size());
+    if (totalKept == totalOrig || !visualFeatures.has_value())
+    {
+        return;
+    }
+
+    // Buffers grow lazily to the request's raw feature-row count when preallocateAuxiliaryBuffers()
+    // was not called (once per request, not per step).
+    if (mFeatureIdxPinned.isEmpty() || mFeatureIdxPinned.getShape().volume() < totalOrig)
+    {
+        mFeatureIdxPinned
+            = Tensor({totalOrig}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "VisualTokenPruner::featureIdxPinned");
+        mFeatureIdxDevice
+            = Tensor({totalOrig}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "VisualTokenPruner::featureIdxDevice");
+    }
+    std::copy(mFeatureKeepHost.begin(), mFeatureKeepHost.end(), mFeatureIdxPinned.dataPointer<int32_t>());
+    CUDA_CHECK(cudaMemcpyAsync(mFeatureIdxDevice.rawPointer(), mFeatureIdxPinned.rawPointer(),
+        static_cast<size_t>(totalKept) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+
+    auto const compactFeaturePlane = [&](Tensor const& src, Tensor& owned) {
+        auto const& shape = src.getShape();
+        // The ordinal math above requires exactly one feature row per image token in the
+        // request (Qwen-VL packing) — anything else would desync rows from placeholders.
+        check::check(shape.getNumDims() == 2 && shape[0] == totalOrig,
+            "feature rows do not match the request's visual token count");
+        int64_t const rowBytes = shape[1] * static_cast<int64_t>(utils::getTypeSize(src.getDataType()));
+        if (owned.isEmpty() || owned.getDataType() != src.getDataType() || owned.getShape()[1] != shape[1]
+            || static_cast<int64_t>(owned.getMemoryCapacity()) < totalOrig * rowBytes)
+        {
+            owned = Tensor(
+                {totalOrig, shape[1]}, DeviceType::kGPU, src.getDataType(), "VisualTokenPruner::compactFeatures");
+        }
+        kernel::gatherRows(owned.rawPointer(), src.rawPointer(), mFeatureIdxDevice.dataPointer<int32_t>(), totalKept,
+            rowBytes, stream);
+        check::check(owned.reshape({totalKept, shape[1]}), "Tensor reshape failed");
+    };
+
+    // Deepstack feature rows are deliberately NOT compacted: no draft strategy consumes them
+    // (draft prefill embeds without deepstack and every decoder zero-fills its deepstack
+    // target), and the base's deepstack planes were already compacted in PipelineIO. A future
+    // draft that re-assembles deepstack from raw features would need the same gather here.
+    compactFeaturePlane(visualFeatures->get(), mCompactVisualFeatures);
+    visualFeatures = std::cref(mCompactVisualFeatures);
 }
 
 // ---------------------------------------------------------------------------

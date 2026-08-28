@@ -103,7 +103,7 @@ struct PruneRequest
 //!
 //! Instances are created through createVisualTokenPruner() and reused across requests, so
 //! per-request device work buffers should be preallocated in the constructor. The caller is
-//! responsible for the runtime gates (fresh KV cache, mRoPE engine, no spec decode, ...) and
+//! responsible for the runtime gates (fresh KV cache, mRoPE engine, ...) and
 //! for shrinking the context lengths to the returned pruned lengths.
 class VisualTokenPruner
 {
@@ -150,6 +150,38 @@ public:
         std::vector<int32_t>& effectiveLens, int32_t maxLen, std::vector<int32_t>& prunedTokensOut,
         cudaStream_t stream);
 
+    //! Compact the auxiliary prompt inputs that downstream consumers use to re-embed the
+    //! prompt — required when the pruned request continues into a speculative-decoding draft
+    //! prefill, which re-embeds host token ids and re-inserts the raw visual feature rows.
+    //! (Deepstack features are not compacted: no draft strategy consumes them.)
+    //!
+    //! Must be called right after a pruning pass on the same request. Per slot (using the keep
+    //! lists recorded by that pass): compacts `hostTokenIds[i]` in place, and gathers the kept
+    //! visual feature rows into a pruner-owned buffer, rebinding the reference.
+    //! Feature rows are indexed by the running image-token count over the packed batch grid,
+    //! so the compacted grid's k-th image token is served by the original ordinal of the k-th
+    //! kept one. This assumes ordinal 0 is the batch's first image token, i.e. embedding runs
+    //! with zero multimodal base offsets — guaranteed by the fresh-KV-cache gate on pruning
+    //! (prefix reuse would start the running count at a nonzero base offset). No-op when
+    //! nothing was pruned.
+    //!
+    //! \param hostTokenIds Per-slot expanded token ids (compacted in place).
+    //! \param batch Number of active slots.
+    //! \param prunedTokens Per-slot removed counts from the pruning pass (validated against
+    //!                     the recorded keep lists).
+    //! \param visualFeatures Raw visual feature rows, one row per image token in the request
+    //!                       ([totalImageTokens, dim] — Qwen-VL packing); rebound on return.
+    //! \param stream CUDA stream the gathers run on.
+    void compactAuxiliaryInputs(std::vector<std::vector<int32_t>>& hostTokenIds, int32_t batch,
+        std::vector<int32_t> const& prunedTokens, OptionalInputTensor& visualFeatures, cudaStream_t stream);
+
+    //! Preallocate the compactAuxiliaryInputs() buffers to their upper bound (feature rows are
+    //! bounded by maxBatchSize x maxSupportedInputLength), so no allocation happens on the
+    //! prefill path. Call once at setup when the deployment will use auxiliary compaction
+    //! (spec decode); without this call the buffers grow lazily on first use instead — the
+    //! feature plane is too large to always reserve for deployments that never need it.
+    void preallocateAuxiliaryBuffers();
+
     VisualPrunerConfig const& config() const noexcept
     {
         return mConfig;
@@ -192,6 +224,7 @@ private:
     int32_t mRotaryDim{0};
     int32_t mMaxKVCacheCapacity{0};
     int32_t mMaxBatchSize{1};
+    int32_t mMaxInputLength{0};
 
     //! Batched-flow state: while set, compactToKeepList() validates and records the current
     //! slot's keep list into mSlotKeepLists instead of compacting immediately. All batched-flow
@@ -203,6 +236,14 @@ private:
     std::vector<std::vector<int32_t>> mSlotKeepLists;
     std::vector<int32_t> mOldLens; //!< per-request scratch (reused)
     std::vector<int32_t> mNewLens; //!< per-request scratch (reused)
+
+    //! compactAuxiliaryInputs state. Sized up front by preallocateAuxiliaryBuffers() on
+    //! deployments that use auxiliary compaction; otherwise grown lazily on first use (the
+    //! feature planes are too large to always reserve for deployments that never need them).
+    std::vector<int32_t> mFeatureKeepHost; //!< global kept feature ordinals (reused)
+    Tensor mFeatureIdxDevice;              //!< device mirror of mFeatureKeepHost
+    Tensor mFeatureIdxPinned;              //!< pinned staging for the H2D upload
+    Tensor mCompactVisualFeatures;         //!< owned compacted visual feature rows
 
     std::vector<int32_t> mImagePositions;  //!< per-request scratch (reused)
     std::vector<int32_t> mTextPositions;   //!< per-request scratch (reused)
