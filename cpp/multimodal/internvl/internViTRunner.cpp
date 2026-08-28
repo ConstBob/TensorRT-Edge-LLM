@@ -133,30 +133,12 @@ bool InternViTRunner::allocateBuffer(cudaStream_t stream)
         return false;
     }
 
-    // Copy image mean and std to device to be used in normalizeImage
-    int64_t const channels = static_cast<int64_t>(mConfig.imageMean.size());
-    mImageMean
-        = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "InternViTRunner::mImageMean");
-    mImageStd = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "InternViTRunner::mImageStd");
-    CUDA_CHECK(cudaMemcpyAsync(
-        mImageMean.rawPointer(), mConfig.imageMean.data(), channels * sizeof(float), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(
-        mImageStd.rawPointer(), mConfig.imageStd.data(), channels * sizeof(float), cudaMemcpyHostToDevice, stream));
+    mImageMean = mConfig.imageMean;
+    mImageStd = mConfig.imageStd;
 
-    // Pre-allocate temporary image buffers for preprocessing
     int64_t const maxImagePixels = mVitInput.getShape().volume();
-    mImageDevice = rt::Tensor(
-        {maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "InternViTRunner::mImageDevice");
     mNormalizedImageDevice = rt::Tensor(
         {maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "InternViTRunner::mNormalizedImageDevice");
-
-    // GPU image-resize scratch.
-    // Horizontal-pass scratch holds [rawH, outW, C] floats. computeBestBlockGridForResize snaps to a
-    // block grid and does NOT preserve aspect ratio, so bound each dimension independently: rawH by the
-    // raw cap and outW by the widest single-row block grid (maxNumBlocks * blockImageSizeW).
-    int64_t const kMaxResizeTmpElems
-        = kernel::kGpuResizeMaxRawDim * mConfig.maxNumBlocks * mConfig.blockImageSizeW * channels;
-    kernel::allocateResizeScratch(channels, kMaxResizeTmpElems, mRawImageDevice, mResizeTmpDevice);
 
     return true;
 }
@@ -195,10 +177,8 @@ void InternViTRunner::formatPatch(imageUtils::ImageData const& image, std::vecto
         ++numImages;
     }
 
-    // mImageDevice already holds the [1, height, width, channels] resized image, written by the shared GPU
-    // resize helper.
+    // mNormalizedImageDevice already holds the [1, height, width, channels] preprocessed image.
     check::check(mNormalizedImageDevice.reshape({1, height, width, channels}), "Tensor reshape failed");
-    kernel::normalizeImage(mImageDevice, mImageMean, mImageStd, mNormalizedImageDevice, stream);
 
     // Transpose to patch
     int64_t offset = totalNumBlocks * mConfig.numChannels * mConfig.blockImageSizeH * mConfig.blockImageSizeW;
@@ -276,10 +256,9 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
                 int64_t const outWidth = image.doResize ? mConfig.blockImageSizeW : image.width;
                 for (int64_t t = 0; t < image.frames; ++t)
                 {
-                    // Resize source frame t straight into mImageDevice; formatPatch reads its pixels from there.
-                    kernel::copyImageToDeviceAndResize(image.data() + t * image.bytesPerFrame(), 1, image.height,
-                        image.width, image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, outHeight,
-                        outWidth, stream);
+                    // Preprocess source frame t on its own; formatPatch reads the result from there.
+                    rt::imageUtils::resizeAndNormalizeToRgb(
+                        image, t, 1, mImageMean, mImageStd, mNormalizedImageDevice, outHeight, outWidth, stream);
                     formatPatch(image.resizedMeta(outHeight, outWidth), imageTokenLengths, numImage, totalNumBlocks,
                         /*isThumbnail=*/t > 0, stream);
                 }
@@ -291,17 +270,16 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
                 auto [resizedHeight, resizedWidth] = imageUtils::computeBestBlockGridForResize(image.height,
                     image.width, mConfig.minImageTokensPerImage, mConfig.maxImageTokensPerImage,
                     mConfig.blockImageSizeH, mConfig.blockImageSizeW);
-                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
-                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, resizedHeight, resizedWidth,
-                    stream);
+                rt::imageUtils::resizeAndNormalizeToRgb(image, 0, image.frames, mImageMean, mImageStd,
+                    mNormalizedImageDevice, resizedHeight, resizedWidth, stream);
                 formatPatch(image.resizedMeta(resizedHeight, resizedWidth), imageTokenLengths, numImage, totalNumBlocks,
                     false, stream);
             }
             else
             {
                 LOG_DEBUG("Skipping resize for pre-resized image %ldx%ld", image.height, image.width);
-                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
-                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, image.height, image.width, stream);
+                rt::imageUtils::resizeAndNormalizeToRgb(image, 0, image.frames, mImageMean, mImageStd,
+                    mNormalizedImageDevice, image.height, image.width, stream);
                 formatPatch(image, imageTokenLengths, numImage, totalNumBlocks, false, stream);
             }
 
@@ -314,9 +292,8 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
             int64_t const mainImageBlocks = totalNumBlocks - blocksBeforePatch;
             if (mainImageBlocks > 1 || mConfig.minNumBlocks > 1)
             {
-                kernel::copyImageToDeviceAndResize(image.data(), 1, image.height, image.width, image.channels,
-                    mRawImageDevice, mResizeTmpDevice, mImageDevice, mConfig.blockImageSizeH, mConfig.blockImageSizeW,
-                    stream);
+                rt::imageUtils::resizeAndNormalizeToRgb(image, 0, 1, mImageMean, mImageStd, mNormalizedImageDevice,
+                    mConfig.blockImageSizeH, mConfig.blockImageSizeW, stream);
                 formatPatch(image.resizedMeta(mConfig.blockImageSizeH, mConfig.blockImageSizeW), imageTokenLengths,
                     numImage, totalNumBlocks, true, stream);
             }
@@ -478,8 +455,8 @@ bool InternViTRunner::preprocess(rt::LLMGenerationRequest const& request,
         {
             LOG_ERROR("Failed: %s", e.what());
         }
-        // Drain async H2D copies that may still read the request's image buffers, so the caller can
-        // safely release them after the failure -- including when the error propagates.
+        // Preprocessing reads the request's image buffers in place, so drain the stream before the
+        // caller may release them after the failure -- including when the error propagates.
         cudaStreamSynchronize(stream);
         if (actionable)
         {

@@ -131,12 +131,9 @@ private:
 
     InternViTConfig mConfig;             //!< InternViT configuration
     rt::Tensor mVitInput{};              //!< Vision encoder input tensor
-    rt::Tensor mImageMean{};             //!< Image mean tensor
-    rt::Tensor mImageStd{};              //!< Image standard deviation tensor
-    rt::Tensor mImageDevice{};           //!< Device image buffer (resized image)
-    rt::Tensor mNormalizedImageDevice{}; //!< Temporary normalized image buffer
-    rt::Tensor mRawImageDevice{};        //!< Raw (pre-resize) image device buffer for the GPU resize path
-    rt::Tensor mResizeTmpDevice{};       //!< Float scratch (horizontal pass) for the GPU resize
+    std::array<float, 3> mImageMean{};   //!< Per-channel normalisation mean, RGB
+    std::array<float, 3> mImageStd{};    //!< Per-channel normalisation standard deviation, RGB
+    rt::Tensor mNormalizedImageDevice{}; //!< Preprocessed frame, [1, H, W, 3] HALF
 };
 
 } // namespace rt

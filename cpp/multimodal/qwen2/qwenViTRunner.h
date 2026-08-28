@@ -222,8 +222,8 @@ protected:
         std::vector<int64_t> const& spansPerRequest, trt_edgellm::tokenizer::Tokenizer const* tokenizer);
     //! @}
 
-    //! \brief Append this buffer's spans, then normalize and patchify its resized frame stack.
-    //!        Source frames are already resized into mImageDevice; the last frame is replicated into the
+    //! \brief Append this buffer's spans, then patchify its preprocessed frame stack.
+    //!        Source frames are already preprocessed into mNormalizedImageDevice; the last one is replicated into the
     //!        temporal-padding slots before patchify.
     //! \param[in] image Resized-dimension view of the buffer (post-resize width/height; source frames/fps)
     //! \param[in,out] spans Vision spans (flattened, global order); this buffer's spans are appended
@@ -260,7 +260,7 @@ protected:
     //! \throws std::runtime_error if aspect ratio is invalid
     //! \throws std::runtime_error if image dimensions are incompatible with patch size, or sequence length is out of
     //! range
-    //! \throws std::runtime_error if a raw frame exceeds the GPU-resize scratch budget
+    //! \throws std::runtime_error if a frame exceeds the preprocessing kernel's 32-bit addressing
     //! \throws std::runtime_error if a CUDA error occurs
     void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<VisionSpan>& spans,
         std::vector<int64_t>& spansPerRequest, cudaStream_t stream);
@@ -278,12 +278,9 @@ protected:
     rt::Tensor mKvLengths{};              //!< KV lengths for TRT-native attention (separate copy of cu_seqlens)
     rt::Tensor mKvLengthsWindow{};        //!< KV lengths for Qwen2.5-VL window attention (TRT-native)
     rt::Tensor mMaxSeqLenCarrier{};       //!< Shape-only input carrying max sequence length for FMHA launch
-    rt::Tensor mImageMean{};              //!< Image mean tensor
-    rt::Tensor mImageStd{};               //!< Image standard deviation tensor
-    rt::Tensor mImageDevice{};            //!< Temporary image buffer for preprocessing
-    rt::Tensor mNormalizedImageDevice{};  //!< Temporary normalized image buffer for preprocessing
-    rt::Tensor mRawImageDevice{};         //!< Raw (pre-resize) image device buffer for the GPU resize path
-    rt::Tensor mResizeTmpDevice{};        //!< Float scratch (horizontal pass) for the GPU resize
+    std::array<float, 3> mImageMean{};    //!< Per-channel normalisation mean, RGB
+    std::array<float, 3> mImageStd{};     //!< Per-channel normalisation standard deviation, RGB
+    rt::Tensor mNormalizedImageDevice{};  //!< Preprocessed frames, [T, H, W, 3] HALF
     rt::Tensor mMropePositionIdsHost{};   //!< MRoPE position IDs host tensor
     rt::Tensor mMropePositionIdsDevice{}; //!< MRoPE position IDs device tensor
     // Model-specific ViT-input tensors live in the per-model subclasses.

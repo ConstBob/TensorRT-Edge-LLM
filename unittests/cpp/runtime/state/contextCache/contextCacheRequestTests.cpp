@@ -23,6 +23,7 @@
 #include "runtime/config/deploymentConfig.h"
 #include "runtime/decoding/decodingStrategy.h"
 #include "runtime/hybridCacheManager.h"
+#include "runtime/imageUtils.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/state/contextCache/contextCacheDeployment.h"
 #include "runtime/state/contextCache/hybridSnapshotStorage.h"
@@ -34,6 +35,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstring>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -57,6 +59,30 @@ std::vector<int32_t> makeTokens(int32_t count)
     std::vector<int32_t> tokens(static_cast<size_t>(count));
     std::iota(tokens.begin(), tokens.end(), 1);
     return tokens;
+}
+
+constexpr int32_t kIMAGE_TOKEN_ID{4242};
+constexpr int64_t kIMAGE_EXTENT{2};
+
+//! One contiguous placeholder run, so the single image buffer covers every media position.
+std::vector<int32_t> makeImageTokens()
+{
+    return {1, 2, kIMAGE_TOKEN_ID, kIMAGE_TOKEN_ID, 3, 4, 5, 6};
+}
+
+LLMGenerationRequest makeImageRequest(rt::DeviceType device)
+{
+    Tensor pixels({1, kIMAGE_EXTENT, kIMAGE_EXTENT, 3}, device, DataType::kUINT8);
+    if (device == rt::DeviceType::kCPU)
+    {
+        std::memset(pixels.dataPointer<unsigned char>(), 0x5A, static_cast<size_t>(kIMAGE_EXTENT * kIMAGE_EXTENT * 3));
+    }
+
+    LLMGenerationRequest::Request sequence;
+    sequence.imageBuffers.emplace_back(std::move(pixels));
+    LLMGenerationRequest request;
+    request.requests.push_back(std::move(sequence));
+    return request;
 }
 
 LLMEngineConfig makeAttentionConfig(char const* modelType, int32_t layers = 1)
@@ -332,6 +358,34 @@ TEST_F(ContextCacheRequestTests, AdmissionUsesValidatedCoordinatorContract)
     auto vanilla = begin(context);
     ASSERT_TRUE(vanilla.has_value());
     ASSERT_TRUE(vanilla->finish());
+}
+
+TEST_F(ContextCacheRequestTests, HostImageKeysThePlaceholderRunOnItsPixels)
+{
+    DecodingInferenceContext context = makeContext({makeImageTokens()}, mStream);
+    LLMGenerationRequest const request = makeImageRequest(rt::DeviceType::kCPU);
+
+    std::optional<ContextCacheRequest> admitted = ContextCacheRequest::begin(
+        *mCoordinator, request, context, false, DecodingKvHeadroom{1, 0}, {kIMAGE_TOKEN_ID});
+    ASSERT_TRUE(admitted.has_value());
+    EXPECT_EQ(mCoordinator->metrics().mediaAwareSequences, 1U);
+    EXPECT_EQ(mCoordinator->metrics().lookupBypassSequences, 0U);
+    ASSERT_TRUE(admitted->finish());
+}
+
+TEST_F(ContextCacheRequestTests, ImageTheHostCannotReadBypassesRatherThanFails)
+{
+    DecodingInferenceContext context = makeContext({makeImageTokens()}, mStream);
+    LLMGenerationRequest const request = makeImageRequest(rt::DeviceType::kGPU);
+
+    // Admitted rather than thrown out of, and bypassed rather than keyed on the placeholder run,
+    // which every image shares.
+    std::optional<ContextCacheRequest> admitted = ContextCacheRequest::begin(
+        *mCoordinator, request, context, false, DecodingKvHeadroom{1, 0}, {kIMAGE_TOKEN_ID});
+    ASSERT_TRUE(admitted.has_value());
+    EXPECT_EQ(mCoordinator->metrics().lookupBypassSequences, 1U);
+    EXPECT_EQ(mCoordinator->metrics().mediaAwareSequences, 0U);
+    ASSERT_TRUE(admitted->finish());
 }
 
 class ContextCacheRequestHybridTests : public ::testing::Test

@@ -451,13 +451,14 @@ private:
 
 imageUtils::ImageData loadImageFromPath(std::string const& path)
 {
-    return imageUtils::loadImageFromFile(path);
+    return imageUtils::loadRgbImageFromFile(path);
 }
 
 imageUtils::ImageData loadImageFromBytes(py::bytes const& data)
 {
     std::string dataStr = data;
-    return imageUtils::loadImageFromMemory(reinterpret_cast<unsigned char const*>(dataStr.data()), dataStr.size());
+    return imageUtils::loadRgbImageFromEncodedBytes(
+        reinterpret_cast<unsigned char const*>(dataStr.data()), dataStr.size());
 }
 
 //! \brief Build an AudioData from raw encoded audio bytes (wav / mp3 / flac).
@@ -657,7 +658,7 @@ PYBIND11_MODULE(_edgellm_runtime, m)
             {
                 check::check(std::isfinite(ts), "timestamps must be finite");
             }
-            imageUtils::ImageData video = imageUtils::loadVideoFromFrames(framePaths, fps);
+            imageUtils::ImageData video = imageUtils::loadRgbVideoFromFrames(framePaths, fps);
             video.timestamps = timestamps;
             return video;
         },

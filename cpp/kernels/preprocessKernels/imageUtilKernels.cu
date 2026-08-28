@@ -15,10 +15,17 @@
  * limitations under the License.
  */
 
+/* Fused image preprocessing adapted from
+ * https://github.com/NVIDIA-AI-IOT/Lidar_AI_Solution/tree/7c1623f/libraries/YUVToRGB
+ * SPDX-License-Identifier: MIT
+ * SPDX-FileCopyrightText: Copyright (c) NVIDIA CORPORATION & AFFILIATES
+ */
+
 #include "common/checkMacros.h"
 #include "imageUtilKernels.h"
 #include "kernels/common/vectorizedTypes.cuh"
 #include <cmath>
+#include <cstdint>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <string>
@@ -29,53 +36,6 @@ namespace trt_edgellm
 {
 namespace kernel
 {
-
-__global__ void normalizeImageKernel(unsigned char const* originalImage, float const* mean, float const* std,
-    half* normalizedImage, int64_t const batch, int64_t const height, int64_t const width, int64_t const channels)
-{
-    // Each thread processes one pixel
-    // originalImage format: [batch, height, width, channels]
-    // normalizedImage format: [batch, height, width, channels]
-    int64_t const tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t const totalPixels = batch * height * width * channels;
-    if (tid >= totalPixels)
-        return;
-
-    auto const channel = tid % channels;
-    unsigned char val = originalImage[tid];
-    float normalized = (val / 255.0f - mean[channel]) / std[channel];
-    normalizedImage[tid] = __float2half(normalized);
-}
-
-void normalizeImage(rt::Tensor const& originalImage, rt::Tensor const& mean, rt::Tensor const& std,
-    rt::Tensor& normalizedImage, cudaStream_t stream)
-{
-    check::check(originalImage.getDeviceType() == rt::DeviceType::kGPU && mean.getDeviceType() == rt::DeviceType::kGPU
-            && std.getDeviceType() == rt::DeviceType::kGPU && normalizedImage.getDeviceType() == rt::DeviceType::kGPU,
-        "Device type shall all be GPU for these tensors.");
-    check::check(originalImage.getDataType() == DataType::kUINT8 && mean.getDataType() == DataType::kFLOAT
-            && std.getDataType() == DataType::kFLOAT && normalizedImage.getDataType() == DataType::kHALF,
-        "Data type check failed for the input tensors.");
-    check::check(originalImage.getShape().getNumDims() == 4 && normalizedImage.getShape().getNumDims() == 4,
-        "Input and output tensor shapes shall be [batch, height, width, channels] and [batch, height, width, channels] "
-        "respectively.");
-
-    int64_t const batch = originalImage.getShape()[0];
-    int64_t const height = originalImage.getShape()[1];
-    int64_t const width = originalImage.getShape()[2];
-    int64_t const channels = originalImage.getShape()[3];
-    int64_t const totalPixels = batch * height * width * channels;
-    check::check(
-        channels == mean.getShape()[0] && channels == std.getShape()[0], "Channels mismatch for mean and std.");
-
-    // Each CTA get assigned 256 threads.
-    uint32_t const blockSize = 256;
-    uint32_t const gridSize = static_cast<uint32_t>((totalPixels + blockSize - 1) / blockSize);
-
-    normalizeImageKernel<<<gridSize, blockSize, 0, stream>>>(originalImage.dataPointer<unsigned char>(),
-        mean.dataPointer<float>(), std.dataPointer<float>(), normalizedImage.dataPointer<half>(), batch, height, width,
-        channels);
-}
 
 __global__ void transposeToPatchQwenKernel(half const* originalImage, half* inputPatches, int64_t const T,
     int64_t const H, int64_t const W, int64_t const C, int64_t const temporalPatchSize, int64_t const patchSize,
@@ -725,179 +685,6 @@ void initFastPosEmbedQwenViT(rt::Tensor& fastPosEmbedIdx, rt::Tensor& fastPosEmb
     }
 }
 
-// ---------------------------------------------------------------------------
-// GPU bicubic (Catmull-Rom) image resize, anti-aliased for downscaling. For
-// downscaling the filter is widened by the scale factor (fscale) so it
-// low-passes instead of applying a fixed 4-tap cubic.
-// ---------------------------------------------------------------------------
-__device__ __forceinline__ float catmullRomWeight(float x)
-{
-    x = fabsf(x);
-    if (x < 1.0f)
-        return 1.5f * x * x * x - 2.5f * x * x + 1.0f;
-    if (x < 2.0f)
-        return -0.5f * x * x * x + 2.5f * x * x - 4.0f * x + 2.0f;
-    return 0.0f;
-}
-
-__global__ void resizeCatmullRomHorizKernel(
-    unsigned char const* in, float* out, int const Hin, int const Win, int const Wout, int const C)
-{
-    int64_t const tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t const total = static_cast<int64_t>(Hin) * Wout * C;
-    if (tid >= total)
-        return;
-    int const c = static_cast<int>(tid % C);
-    int const xo = static_cast<int>((tid / C) % Wout);
-    int const h = static_cast<int>(tid / (static_cast<int64_t>(Wout) * C));
-
-    float const scale = static_cast<float>(Win) / static_cast<float>(Wout);
-    float const fscale = scale > 1.0f ? scale : 1.0f;
-    float const center = (xo + 0.5f) * scale;
-    int const xs = static_cast<int>(ceilf(center - 2.0f * fscale - 0.5f));
-    int const xe = static_cast<int>(floorf(center + 2.0f * fscale - 0.5f));
-
-    float acc = 0.0f;
-    float wsum = 0.0f;
-    int64_t const rowOff = static_cast<int64_t>(h) * Win * C;
-    for (int xin = xs; xin <= xe; ++xin)
-    {
-        float const w = catmullRomWeight((xin + 0.5f - center) / fscale);
-        int const xc = xin < 0 ? 0 : (xin >= Win ? Win - 1 : xin);
-        acc += w * static_cast<float>(in[rowOff + static_cast<int64_t>(xc) * C + c]);
-        wsum += w;
-    }
-    out[tid] = wsum > 0.0f ? acc / wsum : 0.0f;
-}
-
-__global__ void resizeCatmullRomVertKernel(
-    float const* in, unsigned char* out, int const Hin, int const Hout, int const Wout, int const C)
-{
-    int64_t const tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t const total = static_cast<int64_t>(Hout) * Wout * C;
-    if (tid >= total)
-        return;
-    int const c = static_cast<int>(tid % C);
-    int const x = static_cast<int>((tid / C) % Wout);
-    int const yo = static_cast<int>(tid / (static_cast<int64_t>(Wout) * C));
-
-    float const scale = static_cast<float>(Hin) / static_cast<float>(Hout);
-    float const fscale = scale > 1.0f ? scale : 1.0f;
-    float const center = (yo + 0.5f) * scale;
-    int const ys = static_cast<int>(ceilf(center - 2.0f * fscale - 0.5f));
-    int const ye = static_cast<int>(floorf(center + 2.0f * fscale - 0.5f));
-
-    float acc = 0.0f;
-    float wsum = 0.0f;
-    int64_t const colOff = static_cast<int64_t>(x) * C + c;
-    int64_t const stride = static_cast<int64_t>(Wout) * C;
-    for (int yin = ys; yin <= ye; ++yin)
-    {
-        float const w = catmullRomWeight((yin + 0.5f - center) / fscale);
-        int const yc = yin < 0 ? 0 : (yin >= Hin ? Hin - 1 : yin);
-        acc += w * in[static_cast<int64_t>(yc) * stride + colOff];
-        wsum += w;
-    }
-    float v = wsum > 0.0f ? acc / wsum : 0.0f;
-    v = v < 0.0f ? 0.0f : (v > 255.0f ? 255.0f : v);
-    out[tid] = static_cast<unsigned char>(v + 0.5f);
-}
-
-void resizeImage(rt::Tensor const& rawImage, rt::Tensor& tmp, rt::Tensor& resizedImage, int64_t const outHeight,
-    int64_t const outWidth, InterpolationMode const mode, cudaStream_t stream)
-{
-    ELLM_CHECK(mode == InterpolationMode::kBICUBIC,
-        "GPU resizeImage supports only InterpolationMode::kBICUBIC (Catmull-Rom) for now.");
-    ELLM_CHECK(rawImage.getDeviceType() == rt::DeviceType::kGPU && tmp.getDeviceType() == rt::DeviceType::kGPU
-            && resizedImage.getDeviceType() == rt::DeviceType::kGPU,
-        "Device type shall all be GPU for resize tensors.");
-    ELLM_CHECK(rawImage.getDataType() == DataType::kUINT8 && tmp.getDataType() == DataType::kFLOAT
-            && resizedImage.getDataType() == DataType::kUINT8,
-        "Data type check failed for resize tensors (raw u8, tmp f32, out u8).");
-    ELLM_CHECK(rawImage.getShape().getNumDims() == 3 && resizedImage.getShape().getNumDims() == 3,
-        "rawImage and resizedImage shall be [H, W, C].");
-
-    int const Hin = static_cast<int>(rawImage.getShape()[0]);
-    int const Win = static_cast<int>(rawImage.getShape()[1]);
-    int const C = static_cast<int>(rawImage.getShape()[2]);
-    int const Hout = static_cast<int>(outHeight);
-    int const Wout = static_cast<int>(outWidth);
-
-    ELLM_CHECK(tmp.getShape().volume() >= static_cast<int64_t>(Hin) * Wout * C,
-        "tmp scratch smaller than Hin * outWidth * C for resize tensors.");
-    ELLM_CHECK(resizedImage.getShape().volume() >= static_cast<int64_t>(Hout) * Wout * C,
-        "resizedImage smaller than outHeight * outWidth * C for resize tensors.");
-
-    uint32_t const blockSize = 256;
-    int64_t const totalH = static_cast<int64_t>(Hin) * Wout * C;
-    resizeCatmullRomHorizKernel<<<static_cast<uint32_t>((totalH + blockSize - 1) / blockSize), blockSize, 0, stream>>>(
-        rawImage.dataPointer<unsigned char>(), tmp.dataPointer<float>(), Hin, Win, Wout, C);
-    int64_t const totalV = static_cast<int64_t>(Hout) * Wout * C;
-    resizeCatmullRomVertKernel<<<static_cast<uint32_t>((totalV + blockSize - 1) / blockSize), blockSize, 0, stream>>>(
-        tmp.dataPointer<float>(), resizedImage.dataPointer<unsigned char>(), Hin, Hout, Wout, C);
-}
-
-void copyImageToDeviceAndResize(unsigned char const* rawHostImage, int64_t const numFrames, int64_t const rawHeight,
-    int64_t const rawWidth, int64_t const channels, rt::Tensor& rawScratch, rt::Tensor& tmp, rt::Tensor& dstImage,
-    int64_t const outHeight, int64_t const outWidth, cudaStream_t stream)
-{
-    ELLM_CHECK(rawHostImage != nullptr, "copyImageToDeviceAndResize: raw host image pointer is null.");
-    ELLM_CHECK(rawHeight > 0 && rawWidth > 0 && outHeight > 0 && outWidth > 0,
-        "copyImageToDeviceAndResize: raw and output dimensions shall be positive.");
-    ELLM_CHECK(dstImage.getDeviceType() == rt::DeviceType::kGPU,
-        "copyImageToDeviceAndResize: destination image shall be on the GPU.");
-    ELLM_CHECK(
-        dstImage.getDataType() == DataType::kUINT8, "copyImageToDeviceAndResize: destination image shall be UINT8.");
-    ELLM_CHECK(dstImage.reshape({numFrames, outHeight, outWidth, channels}),
-        "copyImageToDeviceAndResize destination too small for " + std::to_string(numFrames) + " frames of "
-            + std::to_string(outHeight) + "x" + std::to_string(outWidth) + "x" + std::to_string(channels) + ".");
-
-    int64_t const rawFrameBytes = rawHeight * rawWidth * channels;
-    int64_t const outFrameBytes = outHeight * outWidth * channels;
-    bool const identity = (rawHeight == outHeight && rawWidth == outWidth);
-
-    if (!identity)
-    {
-        // Each raw side carries its own cap (the engine budget bounds only the resized size); this also
-        // bounds the horizontal-pass scratch [rawHeight, outWidth, channels].
-        ELLM_CHECK(rawHeight <= kGpuResizeMaxRawDim && rawWidth <= kGpuResizeMaxRawDim,
-            "Raw image " + std::to_string(rawHeight) + "x" + std::to_string(rawWidth)
-                + " exceeds the GPU-resize budget of " + std::to_string(kGpuResizeMaxRawDim) + "x"
-                + std::to_string(kGpuResizeMaxRawDim) + " pixels; downscale the input image.");
-        ELLM_CHECK(rawScratch.reshape({rawHeight, rawWidth, channels}),
-            "GPU-resize raw scratch too small for a " + std::to_string(rawHeight) + "x" + std::to_string(rawWidth) + "x"
-                + std::to_string(channels) + " raw image.");
-        ELLM_CHECK(tmp.reshape({rawHeight, outWidth, channels}),
-            "GPU-resize horizontal-pass scratch for raw " + std::to_string(rawHeight) + "x" + std::to_string(rawWidth)
-                + " resized to " + std::to_string(outHeight) + "x" + std::to_string(outWidth) + " exceeds its budget.");
-    }
-
-    auto* const dstBase = static_cast<unsigned char*>(dstImage.rawPointer());
-    for (int64_t t = 0; t < numFrames; ++t)
-    {
-        unsigned char const* srcFrame = rawHostImage + t * rawFrameBytes;
-        unsigned char* dstFrame = dstBase + t * outFrameBytes;
-        if (identity)
-        {
-            CUDA_CHECK(cudaMemcpyAsync(dstFrame, srcFrame, rawFrameBytes, cudaMemcpyHostToDevice, stream));
-            continue;
-        }
-        // rawScratch and tmp are reused per frame on the same stream, so the upload-then-resize chain
-        // serializes safely; the 3-D view aliases this frame's slot of the 4-D dst.
-        CUDA_CHECK(cudaMemcpyAsync(rawScratch.rawPointer(), srcFrame, rawFrameBytes, cudaMemcpyHostToDevice, stream));
-        rt::Tensor dstView(dstFrame, {outHeight, outWidth, channels}, rt::DeviceType::kGPU, DataType::kUINT8,
-            "kernel::copyImageToDeviceAndResize.dstView");
-        resizeImage(rawScratch, tmp, dstView, outHeight, outWidth, InterpolationMode::kBICUBIC, stream);
-    }
-}
-
-void allocateResizeScratch(int64_t const channels, int64_t const tmpElems, rt::Tensor& rawScratch, rt::Tensor& tmp)
-{
-    int64_t const rawElems = kGpuResizeMaxRawDim * kGpuResizeMaxRawDim * channels;
-    rawScratch = rt::Tensor({rawElems}, rt::DeviceType::kGPU, DataType::kUINT8, "kernel::resizeScratch.rawImage");
-    tmp = rt::Tensor({tmpElems}, rt::DeviceType::kGPU, DataType::kFLOAT, "kernel::resizeScratch.tmp");
-}
-
 __global__ void transposeToPatchNemotronKernel(half const* blockPixels, half* inputPatches, int64_t const T,
     int64_t const C, int64_t const H, int64_t const W, int64_t const P, int64_t const totalElements)
 {
@@ -1078,6 +865,546 @@ void evsScoresNemotronViT(
     int64_t const hidden = embeds.getShape()[1];
     evsScoresNemotronKernel<<<static_cast<uint32_t>(numTokens), 256, 0, stream>>>(
         embeds.dataPointer<half>(), scores.dataPointer<float>(), tokensPerGroup, hidden);
+}
+
+template <PixelDataType dtype>
+struct AsPODType
+{
+};
+template <>
+struct AsPODType<PixelDataType::kHALF>
+{
+    typedef __half type;
+};
+enum class Parallel : unsigned int
+{
+    kSINGLE_PIXEL = 1
+};
+
+template <typename Scalar>
+static __forceinline__ __device__ Scalar limit(Scalar value, Scalar low, Scalar high)
+{
+    return value < low ? low : (value > high ? high : value);
+}
+
+template <typename Scalar>
+static __device__ __forceinline__ uint8_t u8cast(Scalar value)
+{
+    return value < 0 ? 0 : (value >= 255 ? 255 : uint8_t(value));
+}
+
+template <typename Scalar>
+struct Saturate
+{
+};
+template <>
+struct Saturate<__half>
+{
+    __device__ __forceinline__ static __half cast(float x)
+    {
+        return __half(x);
+    }
+};
+
+template <typename OutDType, Parallel parallel, PixelLayout layout>
+struct DataLayoutInvoker
+{
+};
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////// NHWC RGB
+template <typename OutDType>
+struct DataLayoutInvoker<OutDType, Parallel::kSINGLE_PIXEL, PixelLayout::kNHWC_RGB>
+{
+    static __device__ __forceinline__ void call(
+        OutDType* pdst, OutDType r, OutDType g, OutDType b, int ib, int x, int y, int stride, int height)
+    {
+        OutDType* p = pdst + (ib * height + y) * stride + x * 3;
+        p[0] = r;
+        p[1] = g;
+        p[2] = b;
+    }
+};
+
+// Two divisions in this order: folding them into one multiply by 1 / (255 * std) is algebraically
+// equal but differs in the last bit.
+template <typename Scalar>
+static __device__ void __forceinline__ normalize_rgb(uint8_t r0, uint8_t g0, uint8_t b0, Scalar& r, Scalar& g,
+    Scalar& b, float mean0, float mean1, float mean2, float std0, float std1, float std2)
+{
+    r = Saturate<Scalar>::cast((r0 / 255.0f - mean0) / std0);
+    g = Saturate<Scalar>::cast((g0 / 255.0f - mean1) / std1);
+    b = Saturate<Scalar>::cast((b0 / 255.0f - mean2) / std2);
+}
+
+static __device__ void __forceinline__ yuv2rgb(
+    int y, int u, int v, YuvToRgbCoeffs const& coeffs, uint8_t& r, uint8_t& g, uint8_t& b)
+{
+    float const luma = coeffs.yScale * ((float) y - coeffs.yOffset);
+    float const cb = (float) u - 128.0f;
+    float const cr = (float) v - 128.0f;
+
+    float const rf = luma + coeffs.crToR * cr;
+    float const gf = luma + coeffs.cbToG * cb + coeffs.crToG * cr;
+    float const bf = luma + coeffs.cbToB * cb;
+
+    r = u8cast(limit(rf, 0.0f, 255.0f) + 0.5f);
+    g = u8cast(limit(gf, 0.0f, 255.0f) + 0.5f);
+    b = u8cast(limit(bf, 0.0f, 255.0f) + 0.5f);
+}
+
+// Taps are returned unconverted: the conversion runs once on the filtered result, not per tap.
+template <SourceFormat format>
+static __device__ uint8_t __forceinline__ load_luma_sample(void const* luma, int x, int y, int stride);
+
+template <>
+__device__ uint8_t __forceinline__ load_luma_sample<SourceFormat::kNV12PL>(void const* luma, int x, int y, int stride)
+{
+    return *((unsigned char const*) luma + (int64_t) y * stride + x);
+}
+
+template <>
+__device__ uint8_t __forceinline__ load_luma_sample<SourceFormat::kNV12BL>(void const* luma, int x, int y, int stride)
+{
+    return tex2D<uint8_t>((cudaTextureObject_t) luma, x, y);
+}
+
+// Indexed on the chroma grid: x and y are chroma sample coordinates, not luma ones. The chroma plane
+// carries its own row stride; sharing the luma stride reads the wrong rows on a padded frame.
+template <SourceFormat format>
+static __device__ uchar2 __forceinline__ load_chroma_sample(void const* chroma, int x, int y, int stride);
+
+template <>
+__device__ uchar2 __forceinline__ load_chroma_sample<SourceFormat::kNV12PL>(
+    void const* chroma, int x, int y, int stride)
+{
+    unsigned char const* p = (unsigned char const*) chroma + (int64_t) y * stride + (int64_t) x * 2;
+    return make_uchar2(p[0], p[1]);
+}
+
+template <>
+__device__ uchar2 __forceinline__ load_chroma_sample<SourceFormat::kNV12BL>(
+    void const* chroma, int x, int y, int stride)
+{
+    return tex2D<uchar2>((cudaTextureObject_t) chroma, x, y);
+}
+
+template <SourceFormat format>
+static __device__ uchar3 __forceinline__ load_rgb_sample(void const* pixels, int x, int y, int stride);
+
+template <>
+__device__ uchar3 __forceinline__ load_rgb_sample<SourceFormat::kRGB8>(void const* pixels, int x, int y, int stride)
+{
+    unsigned char const* p = (unsigned char const*) pixels + (int64_t) y * stride + (int64_t) x * 3;
+    return make_uchar3(p[0], p[1], p[2]);
+}
+
+// Source components per pixel, read by the host to size the shared memory stage and by the device to
+// index it.
+template <SourceFormat format>
+constexpr int kPixelComponents = format == SourceFormat::kRGB8 ? 3 : 1;
+
+// The tile is one warp wide; its height trades the halo rows its neighbour re-filters against the
+// shared memory stage it needs.
+constexpr int kTileWidth = 32;
+constexpr int kTileHeight = 16;
+
+// Shared memory for the staged rows. A vertical support taller than this is consumed in several
+// chunks, so a steeper downscale costs more chunks rather than more shared memory.
+constexpr int kTileStageBytes = 32 * 1024;
+
+// Number of staged rows that fit the budget, at least one.
+static inline int stage_rows_per_chunk(int const componentsPerRow)
+{
+    int const rows = kTileStageBytes / (int) (componentsPerRow * sizeof(float));
+    return rows > 1 ? rows : 1;
+}
+
+// Rows the widest vertical support over a tile of this height reaches, used to size the stage.
+static inline int tile_row_span(int const tileHeight, float const scale)
+{
+    float const fscale = scale > 1.0f ? scale : 1.0f;
+    return (int) ceilf((tileHeight - 1) * scale + 4.0f * fscale) + 3;
+}
+
+// Catmull-Rom cubic. When downscaling, the support widens by the scale factor so the filter
+// low-passes instead of applying a fixed four-tap kernel.
+static __device__ float __forceinline__ catmull_rom_weight(float x)
+{
+    x = fabsf(x);
+    if (x < 1.0f)
+        return 1.5f * x * x * x - 2.5f * x * x + 1.0f;
+    if (x < 2.0f)
+        return -0.5f * x * x * x + 2.5f * x * x - 4.0f * x + 2.0f;
+    return 0.0f;
+}
+
+// One axis of the separable support: the source indices [first, last] that contribute to an output
+// sample, the centre they are weighted around, and the widening factor.
+struct SampleSupport
+{
+    int first;
+    int last;
+    float center;
+    float fscale;
+};
+
+static __device__ SampleSupport __forceinline__ catmull_rom_support(int o, float scale, float shift)
+{
+    SampleSupport s;
+    s.fscale = scale > 1.0f ? scale : 1.0f;
+    s.center = (o + 0.5f) * scale + shift;
+    s.first = (int) ceilf(s.center - 2.0f * s.fscale - 0.5f);
+    s.last = (int) floorf(s.center + 2.0f * s.fscale - 0.5f);
+    return s;
+}
+
+static __device__ uint8_t __forceinline__ quantize_u8(float v)
+{
+    return u8cast(limit(v, 0.0f, 255.0f) + 0.5f);
+}
+
+// Source rows [first, last] that output rows [y0, y0 + tileHeight) reach through the vertical support.
+static __device__ void __forceinline__ tile_source_rows(
+    int y0, int tileHeight, float scale, float fscale, int& first, int& last)
+{
+    first = (int) ceilf((y0 + 0.5f) * scale - 2.0f * fscale - 0.5f);
+    last = (int) floorf((y0 + tileHeight - 1 + 0.5f) * scale + 2.0f * fscale - 0.5f);
+}
+
+// Horizontal half of the separable filter for one chunk of source rows, cooperatively over the block.
+// Row r of the chunk holds source row chunkFirst + r filtered along x, normalised by its own weight
+// sum; a row outside the frame carries the clamped edge row, which is what the vertical half expects.
+template <SourceFormat format, int components>
+static __device__ void __forceinline__ stage_rows(void const* plane, float* stage, int chunkFirst, int chunkRows,
+    int x0, int cols, int outWidth, float scale, float shift, int srcWidth, int srcHeight, int stride, int batchOffset,
+    int tid, int nthreads)
+{
+    for (int i = tid; i < chunkRows * cols; i += nthreads)
+    {
+        int const row = i / cols;
+        int const col = i % cols;
+        int const o = x0 + col;
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        float acc2 = 0.0f;
+        if (o < outWidth)
+        {
+            SampleSupport const h = catmull_rom_support(o, scale, shift);
+            int const sy = limit(chunkFirst + row, 0, srcHeight - 1) + batchOffset;
+            float wsum = 0.0f;
+            for (int ix = h.first; ix <= h.last; ++ix)
+            {
+                float const w = catmull_rom_weight((ix + 0.5f - h.center) / h.fscale);
+                int const sx = limit(ix, 0, srcWidth - 1);
+                if constexpr (components == 3)
+                {
+                    uchar3 const s = load_rgb_sample<format>(plane, sx, sy, stride);
+                    acc0 += w * (float) s.x;
+                    acc1 += w * (float) s.y;
+                    acc2 += w * (float) s.z;
+                }
+                else if constexpr (components == 2)
+                {
+                    uchar2 const s = load_chroma_sample<format>(plane, sx, sy, stride);
+                    acc0 += w * (float) s.x;
+                    acc1 += w * (float) s.y;
+                }
+                else
+                {
+                    acc0 += w * (float) load_luma_sample<format>(plane, sx, sy, stride);
+                }
+                wsum += w;
+            }
+            float const inv = wsum > 0.0f ? 1.0f / wsum : 0.0f;
+            acc0 *= inv;
+            acc1 *= inv;
+            acc2 *= inv;
+        }
+        stage[i * components] = acc0;
+        if constexpr (components >= 2)
+            stage[i * components + 1] = acc1;
+        if constexpr (components == 3)
+            stage[i * components + 2] = acc2;
+    }
+}
+
+// Vertical half over one staged chunk: adds the taps of this thread's support that the chunk holds.
+template <int components>
+static __device__ void __forceinline__ accumulate_column(float const* stage, SampleSupport const& v, int chunkFirst,
+    int chunkRows, int cols, int col, float& acc0, float& acc1, float& acc2, float& wsum)
+{
+    int const from = v.first > chunkFirst ? v.first : chunkFirst;
+    int const to = v.last < chunkFirst + chunkRows - 1 ? v.last : chunkFirst + chunkRows - 1;
+    for (int iy = from; iy <= to; ++iy)
+    {
+        float const w = catmull_rom_weight((iy + 0.5f - v.center) / v.fscale);
+        int const o = ((iy - chunkFirst) * cols + col) * components;
+        acc0 += w * stage[o];
+        if constexpr (components >= 2)
+            acc1 += w * stage[o + 1];
+        if constexpr (components == 3)
+            acc2 += w * stage[o + 2];
+        wsum += w;
+    }
+}
+
+// What a YUV source has and a packed source has no equivalent of: the chroma plane, the addressing
+// the luma extent and a single stride cannot describe, its chunk height, and the conversion matrix.
+// Scales are against the output chroma grid ((out + 1) / 2), which is what the sampler indexes.
+struct YuvSource
+{
+    void const* chroma;
+    int chromaStride;
+    int chromaWidth;
+    int chromaHeight;
+    float chromaScaleX;
+    float chromaScaleY;
+    float chromaShift; // horizontal sampling phase, in chroma samples
+    int chromaChunkRows;
+    YuvToRgbCoeffs coeffs;
+};
+
+struct NoYuvSource
+{
+};
+
+template <SourceFormat format>
+struct YuvSourceFor
+{
+    typedef YuvSource type;
+};
+template <>
+struct YuvSourceFor<SourceFormat::kRGB8>
+{
+    typedef NoYuvSource type;
+};
+
+// Resize, convert and normalise one batch in a single launch, filtering separably through a shared
+// memory stage: the block filters the source rows its output tile reaches along x, then each thread
+// filters its own column along y. Quantising once after both halves keeps the [0, 255] saturation off
+// the individual taps.
+//
+// A YUV source stages its two planes in turn and they share the buffer, so its size follows the wider.
+template <SourceFormat source_format, typename OutDType, PixelLayout layout>
+static __global__ void preprocess_image_kernel_1x(void const* src_plane, OutDType* pdst, float sx, float sy,
+    int src_height, int src_width, int src_stride, typename YuvSourceFor<source_format>::type yuv, float mean0,
+    float mean1, float mean2, float scale0, float scale1, float scale2, int dst_width, int dst_stride, int dst_height,
+    int nbatch, int chunk_rows)
+{
+    extern __shared__ float stage[];
+
+    constexpr bool is_rgb = source_format == SourceFormat::kRGB8;
+    constexpr int pixel_components = kPixelComponents<source_format>;
+
+    int const tile_height = blockDim.y;
+    int const x0 = blockIdx.x * kTileWidth;
+    int const y0 = blockIdx.y * tile_height;
+    int const x = x0 + threadIdx.x;
+    int const y = y0 + threadIdx.y;
+    bool const active = x < dst_width && y < dst_height;
+
+    int const tid = threadIdx.y * kTileWidth + threadIdx.x;
+    int const nthreads = kTileWidth * tile_height;
+    float const fsy = sy > 1.0f ? sy : 1.0f;
+
+    SampleSupport const v = catmull_rom_support(y, sy, 0.0f);
+    int srcFirst = 0;
+    int srcLast = 0;
+    tile_source_rows(y0, tile_height, sy, fsy, srcFirst, srcLast);
+
+    for (int ib = blockIdx.z; ib < nbatch; ib += gridDim.z)
+    {
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        float acc2 = 0.0f;
+        float wsum = 0.0f;
+        for (int chunk = srcFirst; chunk <= srcLast; chunk += chunk_rows)
+        {
+            int const rows = min(chunk_rows, srcLast - chunk + 1);
+            __syncthreads();
+            stage_rows<source_format, pixel_components>(src_plane, stage, chunk, rows, x0, kTileWidth, dst_width, sx,
+                0.0f, src_width, src_height, src_stride, ib * src_height, tid, nthreads);
+            __syncthreads();
+            if (active)
+                accumulate_column<pixel_components>(
+                    stage, v, chunk, rows, kTileWidth, threadIdx.x, acc0, acc1, acc2, wsum);
+        }
+        float const inv = wsum > 0.0f ? 1.0f / wsum : 0.0f;
+
+        uint8_t r0 = 0;
+        uint8_t g0 = 0;
+        uint8_t b0 = 0;
+        if constexpr (is_rgb)
+        {
+            r0 = quantize_u8(acc0 * inv);
+            g0 = quantize_u8(acc1 * inv);
+            b0 = quantize_u8(acc2 * inv);
+        }
+        else
+        {
+            // Chroma is filtered on the output chroma grid, so the 2x2 luma block that shared a chroma
+            // sample before the resize still shares one after it. x0 is a multiple of kTileWidth, so the
+            // tile's output columns cover exactly kTileWidth / 2 output chroma columns.
+            int const chroma_cols = kTileWidth / 2;
+            float const cfsy = yuv.chromaScaleY > 1.0f ? yuv.chromaScaleY : 1.0f;
+            int const co0 = y0 >> 1;
+            int const coLast = (y0 + tile_height - 1) >> 1;
+            int chromaFirst = 0;
+            int chromaLast = 0;
+            tile_source_rows(co0, coLast - co0 + 1, yuv.chromaScaleY, cfsy, chromaFirst, chromaLast);
+            SampleSupport const cv = catmull_rom_support(y >> 1, yuv.chromaScaleY, 0.0f);
+
+            float cb = 0.0f;
+            float cr = 0.0f;
+            float unused = 0.0f;
+            float cwsum = 0.0f;
+            for (int chunk = chromaFirst; chunk <= chromaLast; chunk += yuv.chromaChunkRows)
+            {
+                int const rows = min(yuv.chromaChunkRows, chromaLast - chunk + 1);
+                __syncthreads();
+                stage_rows<source_format, 2>(yuv.chroma, stage, chunk, rows, x0 >> 1, chroma_cols, (dst_width + 1) / 2,
+                    yuv.chromaScaleX, yuv.chromaShift, yuv.chromaWidth, yuv.chromaHeight, yuv.chromaStride,
+                    ib * yuv.chromaHeight, tid, nthreads);
+                __syncthreads();
+                if (active)
+                    accumulate_column<2>(
+                        stage, cv, chunk, rows, chroma_cols, (x >> 1) - (x0 >> 1), cb, cr, unused, cwsum);
+            }
+            float const cinv = cwsum > 0.0f ? 1.0f / cwsum : 0.0f;
+            yuv2rgb(quantize_u8(acc0 * inv), quantize_u8(cb * cinv), quantize_u8(cr * cinv), yuv.coeffs, r0, g0, b0);
+        }
+
+        if (active)
+        {
+            OutDType r, g, b;
+            normalize_rgb(r0, g0, b0, r, g, b, mean0, mean1, mean2, scale0, scale1, scale2);
+            DataLayoutInvoker<OutDType, Parallel::kSINGLE_PIXEL, layout>::call(
+                pdst, r, g, b, ib, x, y, dst_stride, dst_height);
+        }
+    }
+}
+
+template <SourceFormat source_format, PixelDataType out_dtype, PixelLayout layout>
+void batched_preprocess_image_impl(void const* plane0, void const* plane1, int input_width, int stride0,
+    int input_height, int input_batch, int stride1, float chroma_shift, YuvToRgbCoeffs coeffs, void* out_ptr,
+    int out_width, int out_stride, int out_height, float mean0, float mean1, float mean2, float scale0, float scale1,
+    float scale2, cudaStream_t stream)
+{
+    float sx = input_width / (float) out_width;
+    float sy = input_height / (float) out_height;
+
+    using OutDType = typename AsPODType<out_dtype>::type;
+    constexpr int pixel_components = kPixelComponents<source_format>;
+
+    // A chunk holds as many staged rows as the budget allows, capped at the rows the tile reaches.
+    int const chunk_rows = min(tile_row_span(kTileHeight, sy), stage_rows_per_chunk(kTileWidth * pixel_components));
+    int stage_floats = chunk_rows * kTileWidth * pixel_components;
+
+    typename YuvSourceFor<source_format>::type yuv;
+    if constexpr (source_format != SourceFormat::kRGB8)
+    {
+        int const chroma_cols = kTileWidth / 2;
+        yuv.chroma = plane1;
+        yuv.chromaStride = stride1;
+        yuv.chromaWidth = (input_width + 1) / 2;
+        yuv.chromaHeight = (input_height + 1) / 2;
+        yuv.chromaScaleX = yuv.chromaWidth / (float) ((out_width + 1) / 2);
+        yuv.chromaScaleY = yuv.chromaHeight / (float) ((out_height + 1) / 2);
+        yuv.chromaShift = chroma_shift;
+        yuv.chromaChunkRows
+            = min(tile_row_span((kTileHeight + 1) / 2, yuv.chromaScaleY), stage_rows_per_chunk(chroma_cols * 2));
+        yuv.coeffs = coeffs;
+        stage_floats = max(stage_floats, yuv.chromaChunkRows * chroma_cols * 2);
+    }
+
+    int grid_z = input_batch >= 32 ? 32 : input_batch;
+    dim3 dim_block(kTileWidth, kTileHeight);
+    dim3 dim_grid((out_width + kTileWidth - 1) / kTileWidth, (out_height + kTileHeight - 1) / kTileHeight, grid_z);
+    preprocess_image_kernel_1x<source_format, OutDType, layout>
+        <<<dim_grid, dim_block, stage_floats * sizeof(float), stream>>>(plane0, (OutDType*) out_ptr, sx, sy,
+            input_height, input_width, stride0, yuv, mean0, mean1, mean2, scale0, scale1, scale2, out_width, out_stride,
+            out_height, input_batch, chunk_rows);
+    CUDA_CHECK(cudaPeekAtLastError());
+}
+typedef void (*batched_preprocess_image_impl_function)(void const* plane0, void const* plane1, int input_width,
+    int stride0, int input_height, int input_batch, int stride1, float chroma_shift, YuvToRgbCoeffs coeffs,
+    void* out_ptr, int out_width, int out_stride, int out_height, float mean0, float mean1, float mean2, float scale0,
+    float scale1, float scale2, cudaStream_t stream);
+
+static_assert(static_cast<int>(SourceFormat::kNV12BL) == 1 && static_cast<int>(SourceFormat::kNV12PL) == 2
+        && static_cast<int>(SourceFormat::kRGB8) == 3,
+    "func_list is indexed by SourceFormat - 1; DefineSourceFormat lists the formats in that order.");
+
+#define DefineSourceFormat(...)                                                                                        \
+    batched_preprocess_image_impl<SourceFormat::kNV12BL, __VA_ARGS__>,                                                 \
+        batched_preprocess_image_impl<SourceFormat::kNV12PL, __VA_ARGS__>,                                             \
+        batched_preprocess_image_impl<SourceFormat::kRGB8, __VA_ARGS__>,
+
+#define DefineDType(...) DefineSourceFormat(PixelDataType::kHALF, __VA_ARGS__)
+
+#define DefineLayout DefineDType(PixelLayout::kNHWC_RGB)
+
+#define DefineAllFunction DefineLayout
+
+template <typename T>
+struct EnumCount
+{
+};
+template <>
+struct EnumCount<SourceFormat>
+{
+    static int const value = 3;
+};
+template <>
+struct EnumCount<PixelDataType>
+{
+    static int const value = 1;
+};
+template <>
+struct EnumCount<PixelLayout>
+{
+    static int const value = 1;
+};
+template <>
+struct EnumCount<Interpolation>
+{
+    static int const value = 1;
+};
+
+static batched_preprocess_image_impl_function const func_list[] = {DefineAllFunction nullptr};
+
+static_assert(sizeof(func_list) / sizeof(func_list[0]) - 1
+        == EnumCount<Interpolation>::value * EnumCount<PixelLayout>::value * EnumCount<PixelDataType>::value
+            * EnumCount<SourceFormat>::value,
+    "func_list holds one instantiation per (interpolation, layout, dtype, source format) combination.");
+
+void batchedPreprocessImage(void const* const plane0, void const* const plane1, int const input_width,
+    int const stride0, int const input_height, int const input_batch, SourceFormat const source_format,
+    int const stride1, float const chroma_shift, YuvToRgbCoeffs const coeffs, void* const out_ptr, int const out_width,
+    int const out_stride, int const out_height, PixelDataType const out_dtype, PixelLayout const out_layout,
+    Interpolation const interp, float const mean0, float const mean1, float const mean2, float const scale0,
+    float const scale1, float const scale2, cudaStream_t stream)
+{
+    int const iformat = (int) source_format - 1;
+    int const odtype = (int) out_dtype - 1;
+    int const olayout = (int) out_layout - 1;
+    int const iinterp = (int) interp - 1;
+    int const index = ((iinterp * EnumCount<PixelLayout>::value + olayout) * EnumCount<PixelDataType>::value + odtype)
+            * EnumCount<SourceFormat>::value
+        + iformat;
+    int const instantiated = (int) (sizeof(func_list) / sizeof(func_list[0])) - 1;
+    if (iformat < 0 || iformat >= EnumCount<SourceFormat>::value || odtype < 0
+        || odtype >= EnumCount<PixelDataType>::value || olayout < 0 || olayout >= EnumCount<PixelLayout>::value
+        || iinterp < 0 || iinterp >= EnumCount<Interpolation>::value || index < 0 || index >= instantiated)
+    {
+        ELLM_CHECK(
+            false, "batchedPreprocessImage: no kernel instantiated for dispatch index " + std::to_string(index) + ".");
+    }
+
+    batched_preprocess_image_impl_function func = func_list[index];
+    func(plane0, plane1, input_width, stride0, input_height, input_batch, stride1, chroma_shift, coeffs, out_ptr,
+        out_width, out_stride, out_height, mean0, mean1, mean2, scale0, scale1, scale2, stream);
 }
 
 } // namespace kernel

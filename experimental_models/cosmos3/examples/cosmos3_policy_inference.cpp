@@ -514,7 +514,7 @@ int main(int argc, char** argv)
             LOG_INFO("Video input: %zu observation frame(s); conditioning i2v on the most-recent frame %s.",
                 frames.size(), condFramePath.c_str());
         }
-        rt::imageUtils::ImageData const img = rt::imageUtils::loadImageFromFile(condFramePath);
+        rt::imageUtils::ImageData const img = rt::imageUtils::loadRgbImageFromFile(condFramePath);
         LOG_INFO("Loaded conditioning frame %s (%ldx%ld), resizing to %dx%d and normalizing to pixel_values.",
             condFramePath.c_str(), img.width, img.height, clipW, clipH);
         rt::imageUtils::ImageData resized(

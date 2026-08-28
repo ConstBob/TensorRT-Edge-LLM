@@ -61,11 +61,11 @@ struct AudioData
 //! Decode raw audio bytes (wav / mp3 / flac via miniaudio) into an
 //! ``AudioData`` container ready for the audio runner. Wraps
 //! ``audio::loadAudioBytes`` + ``AudioData`` field plumbing so callers don't
-//! repeat the staging boilerplate. Mirrors ``imageUtils::loadImageFromMemory``.
+//! repeat the staging boilerplate. Mirrors ``imageUtils::loadRgbImageFromEncodedBytes``.
 bool loadAudioDataFromBytes(uint8_t const* bytes, size_t size, int32_t targetSampleRate, AudioData& out);
 
 //! Load a local audio file (wav / mp3 / flac via miniaudio) into an
-//! ``AudioData`` container. Mirrors ``imageUtils::loadImageFromFile``.
+//! ``AudioData`` container. Mirrors ``imageUtils::loadRgbImageFromFile``.
 bool loadAudioDataFromFile(std::filesystem::path const& path, int32_t targetSampleRate, AudioData& out);
 
 } // namespace audioUtils

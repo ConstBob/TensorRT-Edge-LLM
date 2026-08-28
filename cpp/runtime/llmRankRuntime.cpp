@@ -2055,10 +2055,13 @@ bool LLMRankRuntime::multiModalRuntimePreprocess(
             {
                 for (auto const& img : req.imageBuffers)
                 {
-                    if (img.buffer && !img.buffer->isEmpty())
+                    // The key is the pixel bytes, so every image in the request has to be readable on
+                    // the host; one that is not drops the whole request out of the cache below.
+                    if (img.buffer != nullptr && img.buffer->getDeviceType() == rt::DeviceType::kCPU
+                        && !img.buffer->isEmpty())
                     {
-                        auto const* rawPtr = reinterpret_cast<char const*>(img.data());
-                        size_t const rawBytes = static_cast<size_t>(img.bytesPerFrame()) * img.frames;
+                        auto const* rawPtr = reinterpret_cast<char const*>(img.buffer->dataPointer<unsigned char>());
+                        size_t const rawBytes = static_cast<size_t>(img.addressedBytes());
                         imageHashes.push_back(hashOpaqueIdentity(std::string_view(rawPtr, rawBytes)));
                     }
                     else

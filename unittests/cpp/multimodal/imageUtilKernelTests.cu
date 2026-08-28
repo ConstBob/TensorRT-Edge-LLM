@@ -15,17 +15,21 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <gtest/gtest.h>
+#include <limits>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <vector>
 
 #include "common/cudaUtils.h"
 #include "kernels/preprocessKernels/imageUtilKernels.h"
+#include "multimodal/common/imageUtils.h"
 #include "references.h"
 #include "runtime/imageUtils.h"
 #include "testUtils.h"
@@ -183,116 +187,6 @@ static void BuildPhi4mmBatchedInputs(std::vector<std::pair<int32_t, int32_t>> co
         // Advance raw pointer start
         inStartTok += (1LL + static_cast<int64_t>(hb) * wb) * 256LL;
     }
-}
-
-void TestNormalizeImage(int32_t const batch, int32_t const height, int32_t const width, int32_t const channels = 3)
-{
-    cudaStream_t stream{nullptr};
-
-    std::vector<unsigned char> originalImage(batch * height * width * channels);
-    std::vector<half> normalizedImageRef(batch * height * width * channels);
-    std::vector<float> mean(channels);
-    std::vector<float> std(channels);
-    uniformIntInitialization<unsigned char>(originalImage, 0, 255);
-    uniformFloatInitialization<float>(mean, 0, 1);
-    uniformFloatInitialization<float>(std, 0, 1);
-
-    for (int32_t i = 0; i < batch * height * width; ++i)
-    {
-        for (int32_t j = 0; j < channels; ++j)
-        {
-            float normalized = (originalImage[i * channels + j] / 255.0f - mean[j]) / std[j];
-            normalizedImageRef[i * channels + j] = __float2half(normalized);
-        }
-    }
-
-    // GPU tensors
-    rt::Tensor originalImageDevice({batch, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    rt::Tensor normalizedImageDevice({batch, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    rt::Tensor meanDevice({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    rt::Tensor stdDevice({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-
-    CUDA_CHECK(cudaMemcpyAsync(originalImageDevice.rawPointer(), originalImage.data(),
-        originalImage.size() * sizeof(int8_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(
-        meanDevice.rawPointer(), mean.data(), mean.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(
-        stdDevice.rawPointer(), std.data(), std.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
-
-    kernel::normalizeImage(originalImageDevice, meanDevice, stdDevice, normalizedImageDevice, stream);
-    std::vector<half> normalizedImage(batch * height * width * channels);
-    CUDA_CHECK(cudaMemcpyAsync(normalizedImage.data(), normalizedImageDevice.rawPointer(),
-        normalizedImage.size() * sizeof(half), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    // Compare data
-    for (int32_t i = 0; i < batch * height * width * channels; ++i)
-    {
-        EXPECT_TRUE(isclose(normalizedImage[i], normalizedImageRef[i], 1e-5, 1e-5));
-    }
-
-    std::cout << "NormalizeImage Accuracy: batch=" << batch << ", height=" << height << ", width=" << width
-              << ", channels=" << channels << std::endl;
-}
-
-void BenchmarkNormalizeImage(int32_t const batch, int32_t const height, int32_t const width, int32_t const channels = 3)
-{
-    cudaStream_t stream{nullptr};
-
-    std::vector<int8_t> originalImage(batch * height * width * channels);
-    std::vector<float> mean(channels);
-    std::vector<float> std(channels);
-    uniformIntInitialization<int8_t>(originalImage, 0, 255);
-    uniformFloatInitialization<float>(mean, 0, 1);
-    uniformFloatInitialization<float>(std, 0, 1);
-
-    rt::Tensor originalImageDevice({batch, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    rt::Tensor normalizedImageDevice({batch, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    rt::Tensor meanDevice({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    rt::Tensor stdDevice({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    CUDA_CHECK(cudaMemcpyAsync(originalImageDevice.rawPointer(), originalImage.data(),
-        originalImage.size() * sizeof(int8_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(
-        meanDevice.rawPointer(), mean.data(), mean.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(
-        stdDevice.rawPointer(), std.data(), std.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
-
-    auto launch
-        = [&]() { kernel::normalizeImage(originalImageDevice, meanDevice, stdDevice, normalizedImageDevice, stream); };
-
-    constexpr int32_t numWarmup = 10;
-    for (int32_t i = 0; i < numWarmup; i++)
-    {
-        launch();
-    }
-
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    constexpr int32_t numBenchIter = 100;
-
-    cudaEventRecord(start, stream);
-    for (int32_t i = 0; i < numBenchIter; i++)
-    {
-        launch();
-    }
-    cudaEventRecord(stop, stream);
-    cudaEventSynchronize(stop);
-
-    float elapsedTime{0.0f};
-    cudaEventElapsedTime(&elapsedTime, start, stop);
-    std::cout << "NormalizeImage Benchmark: batch=" << batch << ", height=" << height << ", width=" << width
-              << ", channels=" << channels << ", time=" << elapsedTime / numBenchIter << " ms" << std::endl;
-}
-
-TEST(NormalizeImage, Accuracy)
-{
-    TestNormalizeImage(4, 720, 1280);
-}
-
-TEST(NormalizeImage, Benchmark)
-{
-    BenchmarkNormalizeImage(4, 720, 1280);
 }
 
 void TestTransposeToPatchQwenViT(int32_t const height, int32_t const width, int32_t const channels = 3,
@@ -720,7 +614,7 @@ TEST(phi4mmPostprocessVisionTokens, Accuracy)
               << ", totalOutTokens=" << totalOutTokens << std::endl;
 }
 
-// Fill patterns for the resize tests; checkerboard (2x2 cells) is the highest-frequency case.
+// Fill patterns for the preprocessing tests; checkerboard (2x2 cells) is the highest-frequency case.
 enum class ResizeFillPattern
 {
     kRANDOM,
@@ -770,640 +664,1769 @@ static void FillResizeInput(std::vector<unsigned char>& data, int32_t const heig
     }
 }
 
-// GPU bicubic resize vs the CPU rt::imageUtils::resizeImage golden (stbir CATMULLROM + EDGE_CLAMP).
-// The float summation order differs, so u8 outputs aren't bit-exact; asserted on the |diff| distribution.
-void TestResizeBicubicCatmullRom(int32_t const inHeight, int32_t const inWidth, int32_t const outHeight,
-    int32_t const outWidth, ResizeFillPattern const pattern, int32_t const channels = 3)
+namespace
+{
+
+//! Identity normalisation, so a fused output byte is exactly (resized u8) / 255 and can be read back
+//! in u8 code units for comparison against a u8 golden.
+constexpr std::array<float, 3> kUnitMean{0.0F, 0.0F, 0.0F};
+constexpr std::array<float, 3> kUnitStd{1.0F, 1.0F, 1.0F};
+
+//! Wrap a host image as pinned packed RGB8. rt::Tensor's kCPU allocation is cudaMallocHost, which is
+//! what the fused path requires of a host source.
+rt::imageUtils::ImageData MakePinnedRgbImage(
+    std::vector<unsigned char> const& pixels, int64_t const frames, int64_t const height, int64_t const width)
+{
+    rt::Tensor tensor({frames, height, width, 3}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8);
+    std::memcpy(tensor.rawPointer(), pixels.data(), pixels.size());
+    return rt::imageUtils::ImageData(std::move(tensor));
+}
+
+//! Read a fused output frame back as u8 code units, undoing the normalisation the call applied. The
+//! kernel quantises the filtered value to u8 before normalising, so `value * std + mean` recovers that
+//! code unit up to the fp16 store, which is at most 255 * 2^-11 = 0.125 of a unit whatever the std.
+//! Elements are RGB interleaved, so element i carries channel i % 3.
+std::vector<unsigned char> ReadBackAsU8(rt::Tensor const& dst, size_t const elems, size_t const offset = 0,
+    std::array<float, 3> const& imageMean = kUnitMean, std::array<float, 3> const& imageStd = kUnitStd)
+{
+    std::vector<half> raw(elems);
+    CUDA_CHECK(cudaMemcpy(
+        raw.data(), static_cast<half const*>(dst.rawPointer()) + offset, elems * sizeof(half), cudaMemcpyDeviceToHost));
+    std::vector<unsigned char> out(elems);
+    for (size_t i = 0; i < elems; ++i)
+    {
+        size_t const channel = i % 3;
+        float const code = (__half2float(raw[i]) * imageStd[channel] + imageMean[channel]) * 255.0F;
+        out[i] = static_cast<unsigned char>(std::lround(std::min(std::max(code, 0.0F), 255.0F)));
+    }
+    return out;
+}
+
+//! |diff| distribution against a u8 golden: the share within one code unit, the worst single
+//! deviation, and the signed mean that exposes a systematic rounding bias.
+struct DiffStats
+{
+    double within1Lsb;
+    double meanSignedDiff;
+    int32_t maxDiff;
+    std::array<int64_t, 256> histogram;
+};
+
+DiffStats CompareU8(std::vector<unsigned char> const& got, unsigned char const* ref)
+{
+    DiffStats s{0.0, 0.0, 0, {}};
+    int64_t signedDiffSum = 0;
+    for (size_t i = 0; i < got.size(); ++i)
+    {
+        int32_t const signedDiff = static_cast<int32_t>(got[i]) - static_cast<int32_t>(ref[i]);
+        int32_t const diff = std::abs(signedDiff);
+        ++s.histogram[diff];
+        s.maxDiff = std::max(s.maxDiff, diff);
+        signedDiffSum += signedDiff;
+    }
+    s.within1Lsb = static_cast<double>(s.histogram[0] + s.histogram[1]) / static_cast<double>(got.size());
+    s.meanSignedDiff = static_cast<double>(signedDiffSum) / static_cast<double>(got.size());
+    return s;
+}
+
+void PrintDiffStats(char const* label, DiffStats const& s)
+{
+    std::cout << label << ": within1Lsb=" << s.within1Lsb * 100.0 << "%, maxDiff=" << s.maxDiff
+              << ", bias=" << s.meanSignedDiff << ", hist=[";
+    for (int32_t d = 0; d <= s.maxDiff; ++d)
+    {
+        std::cout << (d == 0 ? "" : " ") << d << ":" << s.histogram[d];
+    }
+    std::cout << "]" << std::endl;
+}
+
+} // namespace
+
+// Fused RGB8 preprocessing vs the CPU rt::imageUtils::resizeImage golden (stbir CATMULLROM +
+// EDGE_CLAMP). The float summation order differs, so u8 outputs aren't bit-exact; asserted on the
+// |diff| distribution.
+void TestFusedResizeRgb(int32_t const inHeight, int32_t const inWidth, int32_t const outHeight, int32_t const outWidth,
+    ResizeFillPattern const pattern, std::array<float, 3> const& imageMean = kUnitMean,
+    std::array<float, 3> const& imageStd = kUnitStd)
 {
     cudaStream_t stream{nullptr};
+    constexpr int32_t channels = 3;
 
     std::vector<unsigned char> input(static_cast<size_t>(inHeight) * inWidth * channels);
     FillResizeInput(input, inHeight, inWidth, channels, pattern);
 
-    rt::Tensor inputTensor({1, inHeight, inWidth, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8);
-    std::memcpy(inputTensor.rawPointer(), input.data(), input.size());
-    rt::imageUtils::ImageData inputImage(std::move(inputTensor));
+    rt::imageUtils::ImageData inputImage = MakePinnedRgbImage(input, 1, inHeight, inWidth);
     rt::Tensor refTensor({1, outHeight, outWidth, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8);
     rt::imageUtils::ImageData resizedRef(std::move(refTensor));
     auto const& resizedRefView = rt::imageUtils::resizeImage(
         inputImage, resizedRef, outWidth, outHeight, rt::imageUtils::InterpolationMode::kBICUBIC);
 
-    rt::Tensor rawImageDevice({inHeight, inWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    rt::Tensor resizeTmpDevice({inHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    rt::Tensor resizedImageDevice({outHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    CUDA_CHECK(
-        cudaMemcpyAsync(rawImageDevice.rawPointer(), input.data(), input.size(), cudaMemcpyHostToDevice, stream));
-    kernel::resizeImage(rawImageDevice, resizeTmpDevice, resizedImageDevice, outHeight, outWidth,
-        kernel::InterpolationMode::kBICUBIC, stream);
-
-    std::vector<unsigned char> output(static_cast<size_t>(outHeight) * outWidth * channels);
-    CUDA_CHECK(
-        cudaMemcpyAsync(output.data(), resizedImageDevice.rawPointer(), output.size(), cudaMemcpyDeviceToHost, stream));
+    rt::Tensor dst({1, outHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::imageUtils::resizeAndNormalizeToRgb(inputImage, 0, 1, imageMean, imageStd, dst, outHeight, outWidth, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    std::array<int64_t, 256> histogram{};
-    int32_t maxDiff = 0;
-    int64_t signedDiffSum = 0;
-    unsigned char const* ref = resizedRefView.data();
-    for (size_t i = 0; i < output.size(); ++i)
-    {
-        int32_t const signedDiff = static_cast<int32_t>(output[i]) - static_cast<int32_t>(ref[i]);
-        int32_t const diff = std::abs(signedDiff);
-        ++histogram[diff];
-        maxDiff = std::max(maxDiff, diff);
-        signedDiffSum += signedDiff;
-    }
-    double const within1Lsb = static_cast<double>(histogram[0] + histogram[1]) / static_cast<double>(output.size());
-    double const meanSignedDiff = static_cast<double>(signedDiffSum) / static_cast<double>(output.size());
+    size_t const elems = static_cast<size_t>(outHeight) * outWidth * channels;
+    DiffStats const s = CompareU8(ReadBackAsU8(dst, elems, 0, imageMean, imageStd), resizedRefView.data());
 
     // Bounds carry a margin over stbir: the GPU's float summation order differs, so bytes aren't exact.
-    EXPECT_GE(within1Lsb, 0.995);
-    EXPECT_LE(maxDiff, 2);
+    EXPECT_GE(s.within1Lsb, 0.995);
+    EXPECT_LE(s.maxDiff, 2);
     if (pattern != ResizeFillPattern::kCHECKERBOARD)
     {
         // The mean-signed-diff bound catches systematic rounding bias (e.g. truncation vs round-to-nearest).
         // Checkerboard is exempt: its exact-halfway values (127.5) tie-break differently between stbir and
         // the GPU, which the |diff| bounds above already cap at 1 LSB.
-        EXPECT_LE(std::abs(meanSignedDiff), 0.05);
+        EXPECT_LE(std::abs(s.meanSignedDiff), 0.05);
     }
 
-    std::cout << "ResizeBicubicCatmullRom Accuracy: in=" << inHeight << "x" << inWidth << ", out=" << outHeight << "x"
-              << outWidth << ", pattern=" << ResizeFillPatternName(pattern) << ", within1Lsb=" << within1Lsb * 100.0
-              << "%, maxDiff=" << maxDiff << ", bias=" << meanSignedDiff << ", hist=[";
-    for (int32_t d = 0; d <= maxDiff; ++d)
-    {
-        std::cout << (d == 0 ? "" : " ") << d << ":" << histogram[d];
-    }
-    std::cout << "]" << std::endl;
+    std::cout << "FusedPreprocessRgb Accuracy: in=" << inHeight << "x" << inWidth << ", out=" << outHeight << "x"
+              << outWidth << ", pattern=" << ResizeFillPatternName(pattern) << " -- ";
+    PrintDiffStats("stats", s);
 }
 
-void BenchmarkResizeBicubicCatmullRom(int32_t const inHeight, int32_t const inWidth, int32_t const outHeight,
-    int32_t const outWidth, int32_t const channels = 3)
+//! Milliseconds per call of `fn`, after a warmup, measured with events on `stream`.
+template <typename Fn>
+float TimePerCall(cudaStream_t stream, Fn const& fn)
 {
-    cudaStream_t stream{nullptr};
-
-    std::vector<unsigned char> input(static_cast<size_t>(inHeight) * inWidth * channels);
-    uniformIntInitialization<unsigned char>(input, 0, 255);
-
-    rt::Tensor rawImageDevice({inHeight, inWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    rt::Tensor resizeTmpDevice({inHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    rt::Tensor resizedImageDevice({outHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    CUDA_CHECK(
-        cudaMemcpyAsync(rawImageDevice.rawPointer(), input.data(), input.size(), cudaMemcpyHostToDevice, stream));
-
-    auto launch = [&]() {
-        kernel::resizeImage(rawImageDevice, resizeTmpDevice, resizedImageDevice, outHeight, outWidth,
-            kernel::InterpolationMode::kBICUBIC, stream);
-    };
-
     constexpr int32_t numWarmup = 10;
+    constexpr int32_t numBenchIter = 100;
     for (int32_t i = 0; i < numWarmup; i++)
     {
-        launch();
+        fn();
     }
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
-    constexpr int32_t numBenchIter = 100;
-
     cudaEventRecord(start, stream);
     for (int32_t i = 0; i < numBenchIter; i++)
     {
-        launch();
+        fn();
     }
     cudaEventRecord(stop, stream);
     cudaEventSynchronize(stop);
 
     float elapsedTime{0.0f};
     cudaEventElapsedTime(&elapsedTime, start, stop);
-    std::cout << "ResizeBicubicCatmullRom Benchmark: in=" << inHeight << "x" << inWidth << ", out=" << outHeight << "x"
-              << outWidth << ", time=" << elapsedTime / numBenchIter << " ms" << std::endl;
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    return elapsedTime / numBenchIter;
+}
+
+void BenchmarkFusedResizeRgb(
+    int32_t const inHeight, int32_t const inWidth, int32_t const outHeight, int32_t const outWidth)
+{
+    cudaStream_t stream{nullptr};
+    constexpr int32_t channels = 3;
+
+    std::vector<unsigned char> input(static_cast<size_t>(inHeight) * inWidth * channels);
+    uniformIntInitialization<unsigned char>(input, 0, 255);
+    rt::imageUtils::ImageData inputImage = MakePinnedRgbImage(input, 1, inHeight, inWidth);
+    rt::Tensor dst({1, outHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    float const elapsedTime = TimePerCall(stream, [&]() {
+        rt::imageUtils::resizeAndNormalizeToRgb(
+            inputImage, 0, 1, kUnitMean, kUnitStd, dst, outHeight, outWidth, stream);
+    });
+    std::cout << "FusedPreprocessRgb Benchmark: in=" << inHeight << "x" << inWidth << ", out=" << outHeight << "x"
+              << outWidth << ", time=" << elapsedTime << " ms" << std::endl;
+}
+
+//! One batched call against the same frames one launch at a time, which is what a source whose frame
+//! stride exceeds the plane's footprint still costs.
+void BenchmarkFusedResizeRgbVideo(int32_t const inHeight, int32_t const inWidth, int32_t const outHeight,
+    int32_t const outWidth, int32_t const frames)
+{
+    cudaStream_t stream{nullptr};
+    constexpr int32_t channels = 3;
+
+    std::vector<unsigned char> input(static_cast<size_t>(frames) * inHeight * inWidth * channels);
+    uniformIntInitialization<unsigned char>(input, 0, 255);
+    rt::imageUtils::ImageData video = MakePinnedRgbImage(input, frames, inHeight, inWidth);
+    rt::Tensor dst({frames, outHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor slot({1, outHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    float const batched = TimePerCall(stream, [&]() {
+        rt::imageUtils::resizeAndNormalizeToRgb(
+            video, 0, frames, kUnitMean, kUnitStd, dst, outHeight, outWidth, stream);
+    });
+    float const perFrame = TimePerCall(stream, [&]() {
+        for (int32_t f = 0; f < frames; ++f)
+        {
+            rt::imageUtils::resizeAndNormalizeToRgb(
+                video, f, 1, kUnitMean, kUnitStd, slot, outHeight, outWidth, stream);
+        }
+    });
+
+    std::cout << "FusedPreprocessRgb VideoBenchmark: in=" << inHeight << "x" << inWidth << ", out=" << outHeight << "x"
+              << outWidth << ", frames=" << frames << ", batched=" << batched << " ms, per-frame=" << perFrame
+              << " ms, speedup=" << perFrame / batched << "x" << std::endl;
 }
 
 constexpr std::array<ResizeFillPattern, 3> kResizeFillPatterns{
     ResizeFillPattern::kRANDOM, ResizeFillPattern::kGRADIENT, ResizeFillPattern::kCHECKERBOARD};
 
-TEST(ResizeBicubicCatmullRom, AccuracyUpscale)
+TEST(FusedPreprocessRgb, AccuracyUpscale)
 {
     for (auto const pattern : kResizeFillPatterns)
     {
-        TestResizeBicubicCatmullRom(320, 480, 640, 960, pattern);
+        TestFusedResizeRgb(320, 480, 640, 960, pattern);
     }
 }
 
-TEST(ResizeBicubicCatmullRom, AccuracyDownscale)
+TEST(FusedPreprocessRgb, AccuracyDownscale)
 {
     for (auto const pattern : kResizeFillPatterns)
     {
-        TestResizeBicubicCatmullRom(1024, 1024, 512, 512, pattern);
+        TestFusedResizeRgb(1024, 1024, 512, 512, pattern);
     }
 }
 
-TEST(ResizeBicubicCatmullRom, AccuracyNonIntegerRatio)
+TEST(FusedPreprocessRgb, AccuracyNonIntegerRatio)
 {
     for (auto const pattern : kResizeFillPatterns)
     {
-        TestResizeBicubicCatmullRom(747, 1000, 608, 832, pattern);
+        TestFusedResizeRgb(747, 1000, 608, 832, pattern);
     }
 }
 
-TEST(ResizeBicubicCatmullRom, AccuracyAsymmetricAxes)
+TEST(FusedPreprocessRgb, AccuracyAsymmetricAxes)
 {
     // Height upscales 1.5x while width downscales 2x.
     for (auto const pattern : kResizeFillPatterns)
     {
-        TestResizeBicubicCatmullRom(512, 1536, 768, 768, pattern);
+        TestFusedResizeRgb(512, 1536, 768, 768, pattern);
     }
 }
 
-TEST(ResizeBicubicCatmullRom, AccuracyExtremeAspect)
+TEST(FusedPreprocessRgb, AccuracyExtremeAspect)
 {
     // ~6:1 aspect ratio (wide-banner-shaped input).
     for (auto const pattern : kResizeFillPatterns)
     {
-        TestResizeBicubicCatmullRom(294, 1790, 160, 960, pattern);
+        TestFusedResizeRgb(294, 1790, 160, 960, pattern);
     }
 }
 
-TEST(ResizeBicubicCatmullRom, AccuracyOddSizes)
+TEST(FusedPreprocessRgb, AccuracyOddSizes)
 {
     for (auto const pattern : kResizeFillPatterns)
     {
-        TestResizeBicubicCatmullRom(331, 477, 123, 209, pattern);
+        TestFusedResizeRgb(331, 477, 123, 209, pattern);
     }
 }
 
-TEST(ResizeBicubicCatmullRom, AccuracyTinyEdge)
+TEST(FusedPreprocessRgb, AccuracyTinyEdge)
 {
     for (auto const pattern : kResizeFillPatterns)
     {
-        TestResizeBicubicCatmullRom(1, 512, 1, 256, pattern);
-        TestResizeBicubicCatmullRom(512, 1, 256, 1, pattern);
+        TestFusedResizeRgb(1, 512, 1, 256, pattern);
+        TestFusedResizeRgb(512, 1, 256, 1, pattern);
     }
 }
 
-TEST(ResizeBicubicCatmullRom, AccuracyLargeFactorDownscale)
+TEST(FusedPreprocessRgb, AccuracyLargeFactorDownscale)
 {
     // >= 4x downscale, the widest anti-alias filter regime.
     for (auto const pattern : kResizeFillPatterns)
     {
-        TestResizeBicubicCatmullRom(2160, 3840, 512, 960, pattern);
+        TestFusedResizeRgb(2160, 3840, 512, 960, pattern);
     }
 }
 
-// Resize each frame directly into its slot of a multi-frame buffer through a non-owning view. The
-// resize kernel is deterministic, so each slot must byte-match an isolated resize and leave others intact.
-TEST(ResizeBicubicCatmullRom, SlotViewIntoLargerBuffer)
+// Past roughly 4.3x the vertical support outgrows the shared memory stage and is consumed in more
+// than one chunk, a path the geometries above stay just short of.
+TEST(FusedPreprocessRgb, AccuracyMultiChunkSupport)
+{
+    for (auto const pattern : kResizeFillPatterns)
+    {
+        TestFusedResizeRgb(512, 512, 96, 96, pattern);
+        TestFusedResizeRgb(2160, 3840, 448, 448, pattern);
+    }
+}
+
+// A source already at the output size must come through unchanged: at scale 1 the Catmull-Rom kernel
+// is interpolating, so every tap but the centre carries zero weight.
+TEST(FusedPreprocessRgb, IdentitySizeReproducesSource)
+{
+    cudaStream_t stream{nullptr};
+    int32_t const height = 271, width = 149, channels = 3;
+
+    std::vector<unsigned char> input(static_cast<size_t>(height) * width * channels);
+    FillResizeInput(input, height, width, channels, ResizeFillPattern::kRANDOM);
+    rt::imageUtils::ImageData image = MakePinnedRgbImage(input, 1, height, width);
+
+    rt::Tensor dst({1, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::imageUtils::resizeAndNormalizeToRgb(image, 0, 1, kUnitMean, kUnitStd, dst, height, width, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<unsigned char> const got = ReadBackAsU8(dst, input.size());
+    for (size_t i = 0; i < input.size(); ++i)
+    {
+        ASSERT_EQ(got[i], input[i]) << "identity-size preprocessing altered byte " << i;
+    }
+    std::cout << "FusedPreprocessRgb IdentitySize: " << height << "x" << width << " reproduced exactly." << std::endl;
+}
+
+// Each source frame must land in its own output slot and leave the others alone.
+TEST(FusedPreprocessRgb, MultiFrameSlotsAreIndependent)
 {
     cudaStream_t stream{nullptr};
     int32_t const inHeight = 480, inWidth = 640, outHeight = 512, outWidth = 960, channels = 3;
-    int32_t const nFrames = 3;
-    int64_t const slotElems = static_cast<int64_t>(outHeight) * outWidth * channels;
-
-    // Stand-in for mImageDevice: nFrames contiguous slots, sentinel-filled so an unwritten region fails.
-    rt::Tensor bigBuffer({nFrames * slotElems}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    CUDA_CHECK(cudaMemset(bigBuffer.rawPointer(), 0xAB, static_cast<size_t>(nFrames * slotElems)));
-
-    // Scratch reused across frames.
-    rt::Tensor rawImageDevice({inHeight, inWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    rt::Tensor resizeTmpDevice({inHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    rt::Tensor refDevice({outHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
+    int32_t const numFrames = 3;
+    size_t const inFrameElems = static_cast<size_t>(inHeight) * inWidth * channels;
+    size_t const outFrameElems = static_cast<size_t>(outHeight) * outWidth * channels;
 
     std::array<ResizeFillPattern, 3> const patterns{
         ResizeFillPattern::kGRADIENT, ResizeFillPattern::kCHECKERBOARD, ResizeFillPattern::kRANDOM};
-    std::vector<std::vector<unsigned char>> refHost(nFrames);
-
-    for (int32_t f = 0; f < nFrames; ++f)
+    std::vector<unsigned char> input(inFrameElems * numFrames);
+    for (int32_t f = 0; f < numFrames; ++f)
     {
-        std::vector<unsigned char> input(static_cast<size_t>(inHeight) * inWidth * channels);
-        FillResizeInput(input, inHeight, inWidth, channels, patterns[f]);
-        CUDA_CHECK(
-            cudaMemcpyAsync(rawImageDevice.rawPointer(), input.data(), input.size(), cudaMemcpyHostToDevice, stream));
-
-        // Resize into a non-owning view of slot f.
-        rt::Tensor slot(static_cast<unsigned char*>(bigBuffer.rawPointer()) + f * slotElems,
-            {outHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-        kernel::resizeImage(
-            rawImageDevice, resizeTmpDevice, slot, outHeight, outWidth, kernel::InterpolationMode::kBICUBIC, stream);
-
-        kernel::resizeImage(rawImageDevice, resizeTmpDevice, refDevice, outHeight, outWidth,
-            kernel::InterpolationMode::kBICUBIC, stream);
-        refHost[f].resize(static_cast<size_t>(slotElems));
-        CUDA_CHECK(
-            cudaMemcpyAsync(refHost[f].data(), refDevice.rawPointer(), slotElems, cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::vector<unsigned char> frame(inFrameElems);
+        FillResizeInput(frame, inHeight, inWidth, channels, patterns[f]);
+        std::memcpy(input.data() + f * inFrameElems, frame.data(), inFrameElems);
     }
+    rt::imageUtils::ImageData video = MakePinnedRgbImage(input, numFrames, inHeight, inWidth);
 
-    // Each slot must still equal its reference: correct content and no cross-slot clobber.
-    std::vector<unsigned char> bigHost(static_cast<size_t>(nFrames * slotElems));
-    CUDA_CHECK(cudaMemcpy(bigHost.data(), bigBuffer.rawPointer(), bigHost.size(), cudaMemcpyDeviceToHost));
-    for (int32_t f = 0; f < nFrames; ++f)
-    {
-        for (int64_t k = 0; k < slotElems; ++k)
-        {
-            ASSERT_EQ(bigHost[f * slotElems + k], refHost[f][k])
-                << "slot " << f << " element " << k << " differs from the isolated resize";
-        }
-    }
-
-    std::cout << "ResizeBicubicCatmullRom SlotView: " << nFrames << " slots of " << outHeight << "x" << outWidth
-              << " written via non-owning views, all byte-identical to isolated resize." << std::endl;
-}
-
-TEST(ResizeBicubicCatmullRom, Benchmark)
-{
-    // 1080p and 4K frames, both resized to 512x960.
-    BenchmarkResizeBicubicCatmullRom(1080, 1920, 512, 960);
-    BenchmarkResizeBicubicCatmullRom(2160, 3840, 512, 960);
-}
-
-// Contract tests for kernel::copyImageToDeviceAndResize: per-frame resize, identity skip, and the
-// per-dimension raw cap. It reshapes the destination to [numFrames, outH, outW, C] and resizes each
-// frame into it, or copies a frame verbatim when the target equals the source size.
-
-// A single-frame call must be byte-identical to a direct kernel::resizeImage and track the CPU golden
-// within the standalone-kernel margins.
-void TestCopyImageToDeviceAndResize(int32_t const inHeight, int32_t const inWidth, int32_t const outHeight,
-    int32_t const outWidth, ResizeFillPattern const pattern, int32_t const channels = 3)
-{
-    cudaStream_t stream{nullptr};
-
-    std::vector<unsigned char> input(static_cast<size_t>(inHeight) * inWidth * channels);
-    FillResizeInput(input, inHeight, inWidth, channels, pattern);
-
-    rt::Tensor inputTensor({1, inHeight, inWidth, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8);
-    std::memcpy(inputTensor.rawPointer(), input.data(), input.size());
-    rt::imageUtils::ImageData inputImage(std::move(inputTensor));
-    rt::Tensor refTensor({1, outHeight, outWidth, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8);
-    rt::imageUtils::ImageData resizedRef(std::move(refTensor));
-    auto const& resizedRefView = rt::imageUtils::resizeImage(
-        inputImage, resizedRef, outWidth, outHeight, rt::imageUtils::InterpolationMode::kBICUBIC);
-
-    // Direct kernel::resizeImage reference.
-    rt::Tensor rawImageDevice({inHeight, inWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    rt::Tensor resizeTmpDevice({inHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    rt::Tensor refDevice({outHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    CUDA_CHECK(
-        cudaMemcpyAsync(rawImageDevice.rawPointer(), input.data(), input.size(), cudaMemcpyHostToDevice, stream));
-    kernel::resizeImage(
-        rawImageDevice, resizeTmpDevice, refDevice, outHeight, outWidth, kernel::InterpolationMode::kBICUBIC, stream);
-    std::vector<unsigned char> refOut(static_cast<size_t>(outHeight) * outWidth * channels);
-    CUDA_CHECK(cudaMemcpyAsync(refOut.data(), refDevice.rawPointer(), refOut.size(), cudaMemcpyDeviceToHost, stream));
-
-    // Helper path: a 4-D destination shaped like a runner's mImageDevice.
-    rt::Tensor helperRawScratch({inHeight, inWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    rt::Tensor helperTmpScratch({inHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    rt::Tensor dstImage({1, outHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    kernel::copyImageToDeviceAndResize(input.data(), /*numFrames=*/1, inHeight, inWidth, channels, helperRawScratch,
-        helperTmpScratch, dstImage, outHeight, outWidth, stream);
-    std::vector<unsigned char> output(static_cast<size_t>(outHeight) * outWidth * channels);
-    CUDA_CHECK(cudaMemcpyAsync(output.data(), dstImage.rawPointer(), output.size(), cudaMemcpyDeviceToHost, stream));
+    rt::Tensor batched({numFrames, outHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::imageUtils::resizeAndNormalizeToRgb(
+        video, 0, numFrames, kUnitMean, kUnitStd, batched, outHeight, outWidth, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // Helper == direct kernel, byte for byte.
-    for (size_t i = 0; i < output.size(); ++i)
+    for (int32_t f = 0; f < numFrames; ++f)
     {
-        ASSERT_EQ(output[i], refOut[i]) << "helper output differs from direct kernel::resizeImage at index " << i;
+        rt::imageUtils::ImageData single = MakePinnedRgbImage(
+            std::vector<unsigned char>(input.begin() + f * inFrameElems, input.begin() + (f + 1) * inFrameElems), 1,
+            inHeight, inWidth);
+        rt::Tensor isolated({1, outHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+        rt::imageUtils::resizeAndNormalizeToRgb(
+            single, 0, 1, kUnitMean, kUnitStd, isolated, outHeight, outWidth, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        std::vector<unsigned char> const slot = ReadBackAsU8(batched, outFrameElems, f * outFrameElems);
+        std::vector<unsigned char> const ref = ReadBackAsU8(isolated, outFrameElems);
+        for (size_t k = 0; k < outFrameElems; ++k)
+        {
+            ASSERT_EQ(slot[k], ref[k]) << "frame " << f << " element " << k << " differs from the isolated call";
+        }
+    }
+    std::cout << "FusedPreprocessRgb MultiFrame: " << numFrames << " frames, each slot identical to an isolated call."
+              << std::endl;
+}
+
+// A frame range that starts past frame 0 must read that frame and write slot 0.
+TEST(FusedPreprocessRgb, FrameRangeSelectsSource)
+{
+    cudaStream_t stream{nullptr};
+    int32_t const height = 64, width = 96, channels = 3, numFrames = 3;
+    size_t const frameElems = static_cast<size_t>(height) * width * channels;
+
+    std::vector<unsigned char> input(frameElems * numFrames);
+    for (int32_t f = 0; f < numFrames; ++f)
+    {
+        std::fill(input.begin() + f * frameElems, input.begin() + (f + 1) * frameElems,
+            static_cast<unsigned char>(40 * (f + 1)));
+    }
+    rt::imageUtils::ImageData video = MakePinnedRgbImage(input, numFrames, height, width);
+
+    rt::Tensor dst({1, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::imageUtils::resizeAndNormalizeToRgb(video, 2, 1, kUnitMean, kUnitStd, dst, height, width, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<unsigned char> const got = ReadBackAsU8(dst, frameElems);
+    for (size_t i = 0; i < frameElems; ++i)
+    {
+        ASSERT_EQ(got[i], 120) << "frame selection read the wrong source frame at byte " << i;
     }
 
-    std::array<int64_t, 256> histogram{};
-    int32_t maxDiff = 0;
-    int64_t signedDiffSum = 0;
-    unsigned char const* ref = resizedRefView.data();
-    for (size_t i = 0; i < output.size(); ++i)
+    // A multi-frame range is one batched launch, so the offset applies to its first frame only.
+    rt::Tensor pair({2, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::imageUtils::resizeAndNormalizeToRgb(video, 1, 2, kUnitMean, kUnitStd, pair, height, width, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    for (int32_t f = 0; f < 2; ++f)
     {
-        int32_t const signedDiff = static_cast<int32_t>(output[i]) - static_cast<int32_t>(ref[i]);
-        int32_t const diff = std::abs(signedDiff);
-        ++histogram[diff];
-        maxDiff = std::max(maxDiff, diff);
-        signedDiffSum += signedDiff;
+        std::vector<unsigned char> const slot = ReadBackAsU8(pair, frameElems, static_cast<size_t>(f) * frameElems);
+        auto const expected = static_cast<unsigned char>(40 * (f + 2));
+        for (size_t i = 0; i < frameElems; ++i)
+        {
+            ASSERT_EQ(slot[i], expected) << "batched range slot " << f << " read the wrong source frame at byte " << i;
+        }
     }
-    double const within1Lsb = static_cast<double>(histogram[0] + histogram[1]) / static_cast<double>(output.size());
-    double const meanSignedDiff = static_cast<double>(signedDiffSum) / static_cast<double>(output.size());
-    EXPECT_GE(within1Lsb, 0.995);
-    EXPECT_LE(maxDiff, 2);
-    if (pattern != ResizeFillPattern::kCHECKERBOARD)
+}
+
+// The folded normalisation is (v / 255 - mean) / std, evaluated as two divisions.
+TEST(FusedPreprocessRgb, NormalisationMatchesTheSeparateStep)
+{
+    cudaStream_t stream{nullptr};
+    int32_t const height = 128, width = 192, channels = 3;
+    std::array<float, 3> const mean{0.485F, 0.456F, 0.406F};
+    std::array<float, 3> const stdDev{0.229F, 0.224F, 0.225F};
+
+    std::vector<unsigned char> input(static_cast<size_t>(height) * width * channels);
+    FillResizeInput(input, height, width, channels, ResizeFillPattern::kRANDOM);
+    rt::imageUtils::ImageData image = MakePinnedRgbImage(input, 1, height, width);
+
+    rt::Tensor dst({1, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::imageUtils::resizeAndNormalizeToRgb(image, 0, 1, mean, stdDev, dst, height, width, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<half> got(input.size());
+    CUDA_CHECK(cudaMemcpy(got.data(), dst.rawPointer(), got.size() * sizeof(half), cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < input.size(); ++i)
     {
-        EXPECT_LE(std::abs(meanSignedDiff), 0.05);
+        half const expected = __float2half((input[i] / 255.0f - mean[i % channels]) / stdDev[i % channels]);
+        ASSERT_TRUE(isclose(got[i], expected, 1e-5, 1e-5)) << "normalisation differs at element " << i;
     }
+    std::cout << "FusedPreprocessRgb Normalisation: " << height << "x" << width << " matches (v/255 - mean)/std."
+              << std::endl;
+}
+
+// Extreme mean/std push the result outside the half range on one side and to a denormal on the other;
+// the cast is the only place that can round them wrongly.
+TEST(FusedPreprocessRgb, Fp16RoundingAtExtremes)
+{
+    cudaStream_t stream{nullptr};
+    int32_t const height = 8, width = 8, channels = 3;
+    std::array<float, 3> const mean{-100.0F, 0.5F, 1.0F};
+    std::array<float, 3> const stdDev{1e-3F, 1.0F, 1e3F};
+
+    std::vector<unsigned char> input(static_cast<size_t>(height) * width * channels);
+    FillResizeInput(input, height, width, channels, ResizeFillPattern::kGRADIENT);
+    rt::imageUtils::ImageData image = MakePinnedRgbImage(input, 1, height, width);
+
+    rt::Tensor dst({1, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::imageUtils::resizeAndNormalizeToRgb(image, 0, 1, mean, stdDev, dst, height, width, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<half> got(input.size());
+    CUDA_CHECK(cudaMemcpy(got.data(), dst.rawPointer(), got.size() * sizeof(half), cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < input.size(); ++i)
+    {
+        half const expected = __float2half((input[i] / 255.0f - mean[i % channels]) / stdDev[i % channels]);
+        ASSERT_EQ(__half2float(got[i]), __half2float(expected)) << "half cast differs at element " << i;
+    }
+}
+
+TEST(FusedPreprocessRgb, RejectsNonPositiveDims)
+{
+    cudaStream_t stream{nullptr};
+    int32_t const height = 32, width = 32, channels = 3;
+    std::vector<unsigned char> input(static_cast<size_t>(height) * width * channels, 7);
+    rt::imageUtils::ImageData image = MakePinnedRgbImage(input, 1, height, width);
+    rt::Tensor dst({1, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    EXPECT_THROW(rt::imageUtils::resizeAndNormalizeToRgb(image, 0, 1, kUnitMean, kUnitStd, dst, 0, width, stream),
+        std::runtime_error);
+    EXPECT_THROW(rt::imageUtils::resizeAndNormalizeToRgb(image, 0, 1, kUnitMean, kUnitStd, dst, height, -4, stream),
+        std::runtime_error);
+}
+
+TEST(FusedPreprocessRgb, RejectsFrameRangeOutsideTheImage)
+{
+    cudaStream_t stream{nullptr};
+    int32_t const height = 32, width = 32, channels = 3, numFrames = 2;
+    std::vector<unsigned char> input(static_cast<size_t>(numFrames) * height * width * channels, 7);
+    rt::imageUtils::ImageData video = MakePinnedRgbImage(input, numFrames, height, width);
+    rt::Tensor dst({numFrames, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    EXPECT_THROW(rt::imageUtils::resizeAndNormalizeToRgb(video, 1, 2, kUnitMean, kUnitStd, dst, height, width, stream),
+        std::runtime_error);
+    EXPECT_THROW(rt::imageUtils::resizeAndNormalizeToRgb(video, -1, 1, kUnitMean, kUnitStd, dst, height, width, stream),
+        std::runtime_error);
+    EXPECT_THROW(rt::imageUtils::resizeAndNormalizeToRgb(video, 0, 0, kUnitMean, kUnitStd, dst, height, width, stream),
+        std::runtime_error);
+}
+
+TEST(FusedPreprocessRgb, RejectsBadDestination)
+{
+    cudaStream_t stream{nullptr};
+    int32_t const height = 32, width = 32, channels = 3;
+    std::vector<unsigned char> input(static_cast<size_t>(height) * width * channels, 7);
+    rt::imageUtils::ImageData image = MakePinnedRgbImage(input, 1, height, width);
+
+    rt::Tensor hostDst({1, height, width, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kHALF);
+    EXPECT_THROW(
+        rt::imageUtils::resizeAndNormalizeToRgb(image, 0, 1, kUnitMean, kUnitStd, hostDst, height, width, stream),
+        std::runtime_error);
+
+    rt::Tensor u8Dst({1, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
+    EXPECT_THROW(
+        rt::imageUtils::resizeAndNormalizeToRgb(image, 0, 1, kUnitMean, kUnitStd, u8Dst, height, width, stream),
+        std::runtime_error);
+
+    rt::Tensor smallDst({1, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    EXPECT_THROW(rt::imageUtils::resizeAndNormalizeToRgb(
+                     image, 0, 1, kUnitMean, kUnitStd, smallDst, height * 2, width * 2, stream),
+        std::runtime_error);
+}
+
+// A zero std component would divide that channel by zero and write inf, so the entry point rejects it.
+TEST(FusedPreprocessRgb, RejectsZeroStd)
+{
+    cudaStream_t stream{nullptr};
+    int32_t const height = 16, width = 16, channels = 3;
+    std::vector<unsigned char> input(static_cast<size_t>(height) * width * channels, 7);
+    rt::imageUtils::ImageData image = MakePinnedRgbImage(input, 1, height, width);
+    rt::Tensor dst({1, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    std::array<float, 3> const zeroStd{1.0F, 0.0F, 1.0F};
+    EXPECT_THROW(rt::imageUtils::resizeAndNormalizeToRgb(image, 0, 1, kUnitMean, zeroStd, dst, height, width, stream),
+        std::runtime_error);
+}
+
+// A pitch below the plane's valid row width reads the wrong rows while staying inside the allocation,
+// so it is refused at the entry point.
+TEST(FusedPreprocessRgb, RejectsPitchBelowRowWidth)
+{
+    cudaStream_t stream{nullptr};
+    int32_t const height = 16, width = 16, channels = 3;
+    std::vector<unsigned char> input(static_cast<size_t>(height) * width * channels, 7);
+    rt::imageUtils::ImageData image = MakePinnedRgbImage(input, 1, height, width);
+    image.layout.pitchBytes[0] = width * channels - 1;
+    rt::Tensor dst({1, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    EXPECT_THROW(rt::imageUtils::resizeAndNormalizeToRgb(image, 0, 1, kUnitMean, kUnitStd, dst, height, width, stream),
+        std::runtime_error);
+}
+
+// A block-linear frame is sampled through texture objects, so a buffer-backed one carries its pixels
+// in a place the format says nothing about and cannot be read at all.
+TEST(FusedPreprocessRgb, RejectsBlockLinearWithoutTexturePlanes)
+{
+    cudaStream_t stream{nullptr};
+    int32_t const height = 16, width = 16, channels = 3;
+    std::vector<unsigned char> input(static_cast<size_t>(height) * width * channels, 7);
+    rt::imageUtils::ImageData image = MakePinnedRgbImage(input, 1, height, width);
+    image.layout.format = rt::imageUtils::ImageFormat::kNV12BL;
+    rt::Tensor dst({1, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    EXPECT_THROW(rt::imageUtils::resizeAndNormalizeToRgb(image, 0, 1, kUnitMean, kUnitStd, dst, height, width, stream),
+        std::runtime_error);
+}
+
+// `layout` and the extents are public members of an open aggregate, so a frame range that fitted when
+// the image was wrapped can be widened afterwards; the entry point re-derives the reach rather than
+// trust the wrap.
+TEST(FusedPreprocessRgb, RejectsALayoutReachingPastTheBuffer)
+{
+    cudaStream_t stream{nullptr};
+    int32_t const height = 32, width = 32, channels = 3;
+    std::vector<unsigned char> input(static_cast<size_t>(height) * width * channels, 7);
+    rt::imageUtils::ImageData image = MakePinnedRgbImage(input, 1, height, width);
+    rt::Tensor dst({1, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    image.height = height * 2;
+    EXPECT_THROW(rt::imageUtils::resizeAndNormalizeToRgb(image, 0, 1, kUnitMean, kUnitStd, dst, height, width, stream),
+        std::runtime_error);
+}
+
+// The caller may release its source frames from the catch, so the stream has to be idle by the time
+// the exception arrives. The first call leaves a 4K resize in flight; without the drain the stream is
+// still busy when the second one throws.
+TEST(FusedPreprocessRgb, StreamIsDrainedBeforeAnExceptionLeaves)
+{
+    cudaStream_t stream{nullptr};
+    CUDA_CHECK(cudaStreamCreate(&stream));
+
+    int32_t const height = 2160, width = 3840, channels = 3;
+    std::vector<unsigned char> input(static_cast<size_t>(height) * width * channels, 7);
+    rt::imageUtils::ImageData image = MakePinnedRgbImage(input, 1, height, width);
+    rt::Tensor dst({1, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    rt::imageUtils::resizeAndNormalizeToRgb(image, 0, 1, kUnitMean, kUnitStd, dst, height, width, stream);
+    EXPECT_THROW(rt::imageUtils::resizeAndNormalizeToRgb(image, 0, 1, kUnitMean, kUnitStd, dst, 0, width, stream),
+        std::runtime_error);
+    EXPECT_EQ(cudaStreamQuery(stream), cudaSuccess);
+
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
+TEST(FusedPreprocessRgb, Benchmark)
+{
+    // 1080p and 4K frames, both resized to 512x960.
+    BenchmarkFusedResizeRgb(1080, 1920, 512, 960);
+    BenchmarkFusedResizeRgb(2160, 3840, 512, 960);
+    // Video at the frame counts the ViT runners feed a token profile. The batch saves one launch per
+    // frame, so the share it saves grows as the frame shrinks.
+    BenchmarkFusedResizeRgbVideo(720, 1280, 512, 960, 32);
+    BenchmarkFusedResizeRgbVideo(448, 448, 224, 224, 32);
 }
 
 namespace
 {
-struct ResizeGeometry
+
+//! Same cubic the kernel applies, evaluated in double so the reference carries no float rounding of
+//! its own.
+double CatmullRomWeightRef(double x)
 {
-    int32_t inHeight, inWidth, outHeight, outWidth;
+    x = std::abs(x);
+    if (x < 1.0)
+    {
+        return 1.5 * x * x * x - 2.5 * x * x + 1.0;
+    }
+    if (x < 2.0)
+    {
+        return -0.5 * x * x * x + 2.5 * x * x - 4.0 * x + 2.0;
+    }
+    return 0.0;
+}
+
+//! Anti-aliased Catmull-Rom over one interleaved plane, quantised half-up at the end. `shiftX` is the
+//! horizontal sampling phase in source samples.
+std::vector<unsigned char> ResizePlaneRef(unsigned char const* src, int64_t const srcH, int64_t const srcW,
+    int64_t const srcPitch, int64_t const channels, int64_t const outH, int64_t const outW, double const shiftX)
+{
+    double const sx = static_cast<double>(srcW) / static_cast<double>(outW);
+    double const sy = static_cast<double>(srcH) / static_cast<double>(outH);
+    double const fsx = sx > 1.0 ? sx : 1.0;
+    double const fsy = sy > 1.0 ? sy : 1.0;
+
+    std::vector<unsigned char> out(static_cast<size_t>(outH * outW * channels));
+    for (int64_t oy = 0; oy < outH; ++oy)
+    {
+        double const cy = (oy + 0.5) * sy;
+        int64_t const y0 = static_cast<int64_t>(std::ceil(cy - 2.0 * fsy - 0.5));
+        int64_t const y1 = static_cast<int64_t>(std::floor(cy + 2.0 * fsy - 0.5));
+        for (int64_t ox = 0; ox < outW; ++ox)
+        {
+            double const cx = (ox + 0.5) * sx + shiftX;
+            int64_t const x0 = static_cast<int64_t>(std::ceil(cx - 2.0 * fsx - 0.5));
+            int64_t const x1 = static_cast<int64_t>(std::floor(cx + 2.0 * fsx - 0.5));
+            for (int64_t c = 0; c < channels; ++c)
+            {
+                double acc = 0.0;
+                double wsum = 0.0;
+                for (int64_t iy = y0; iy <= y1; ++iy)
+                {
+                    double const wy = CatmullRomWeightRef((iy + 0.5 - cy) / fsy);
+                    int64_t const sy0 = iy < 0 ? 0 : (iy >= srcH ? srcH - 1 : iy);
+                    for (int64_t ix = x0; ix <= x1; ++ix)
+                    {
+                        double const wx = CatmullRomWeightRef((ix + 0.5 - cx) / fsx);
+                        int64_t const sx0 = ix < 0 ? 0 : (ix >= srcW ? srcW - 1 : ix);
+                        acc += wy * wx * static_cast<double>(src[sy0 * srcPitch + sx0 * channels + c]);
+                        wsum += wy * wx;
+                    }
+                }
+                double v = wsum > 0.0 ? acc / wsum : 0.0;
+                v = v < 0.0 ? 0.0 : (v > 255.0 ? 255.0 : v);
+                out[static_cast<size_t>((oy * outW + ox) * channels + c)] = static_cast<unsigned char>(v + 0.5);
+            }
+        }
+    }
+    return out;
+}
+
+struct YuvCoeffsRef
+{
+    double yScale, yOffset, crToR, cbToG, crToG, cbToB;
 };
 
-// Geometries covered by the ResizeBicubicCatmullRom accuracy suite.
-constexpr std::array<ResizeGeometry, 9> kResizeGeometries{{
-    {320, 480, 640, 960},
-    {1024, 1024, 512, 512},
-    {747, 1000, 608, 832},
-    {512, 1536, 768, 768},
-    {294, 1790, 160, 960},
-    {331, 477, 123, 209},
-    {1, 512, 1, 256},
-    {512, 1, 256, 1},
-    {2160, 3840, 512, 960},
-}};
+YuvCoeffsRef MakeCoeffsRef(rt::imageUtils::ColorStandard const standard, rt::imageUtils::ColorRange const range)
+{
+    double kr = 0.0, kb = 0.0;
+    switch (standard)
+    {
+    case rt::imageUtils::ColorStandard::kBt601:
+        kr = 0.299;
+        kb = 0.114;
+        break;
+    case rt::imageUtils::ColorStandard::kBt709:
+        kr = 0.2126;
+        kb = 0.0722;
+        break;
+    default:
+        kr = 0.2627;
+        kb = 0.0593;
+        break;
+    }
+    bool const limited = range == rt::imageUtils::ColorRange::kLimited;
+    double const kg = 1.0 - kr - kb;
+    double const s = limited ? 224.0 : 255.0;
+    return YuvCoeffsRef{limited ? 255.0 / 219.0 : 1.0, limited ? 16.0 : 0.0, 255.0 * 2.0 * (1.0 - kr) / s,
+        -255.0 * 2.0 * kb * (1.0 - kb) / (kg * s), -255.0 * 2.0 * kr * (1.0 - kr) / (kg * s),
+        255.0 * 2.0 * (1.0 - kb) / s};
+}
+
+//! Resize in the NV12 domain and then convert, which is the order the fused kernel applies. Chroma is
+//! resized onto the output chroma grid ((out + 1) / 2) and read back at (x / 2, y / 2), so a 2x2 luma
+//! block shares one chroma sample on both sides of the resize.
+std::vector<unsigned char> Nv12ChainRef(std::vector<unsigned char> const& y, std::vector<unsigned char> const& uv,
+    int64_t const srcH, int64_t const srcW, int64_t const outH, int64_t const outW, YuvCoeffsRef const& coeffs)
+{
+    int64_t const srcChromaH = (srcH + 1) / 2;
+    int64_t const srcChromaW = (srcW + 1) / 2;
+    int64_t const outChromaH = (outH + 1) / 2;
+    int64_t const outChromaW = (outW + 1) / 2;
+
+    std::vector<unsigned char> const yOut = ResizePlaneRef(y.data(), srcH, srcW, srcW, 1, outH, outW, 0.0);
+    std::vector<unsigned char> const uvOut
+        = ResizePlaneRef(uv.data(), srcChromaH, srcChromaW, srcChromaW * 2, 2, outChromaH, outChromaW, 0.25);
+
+    std::vector<unsigned char> rgb(static_cast<size_t>(outH * outW * 3));
+    for (int64_t oy = 0; oy < outH; ++oy)
+    {
+        for (int64_t ox = 0; ox < outW; ++ox)
+        {
+            size_t const uvIdx = static_cast<size_t>((oy / 2) * outChromaW + (ox / 2)) * 2;
+            double const luma = coeffs.yScale * (static_cast<double>(yOut[oy * outW + ox]) - coeffs.yOffset);
+            double const cb = static_cast<double>(uvOut[uvIdx]) - 128.0;
+            double const cr = static_cast<double>(uvOut[uvIdx + 1]) - 128.0;
+            double const channel[3]{
+                luma + coeffs.crToR * cr, luma + coeffs.cbToG * cb + coeffs.crToG * cr, luma + coeffs.cbToB * cb};
+            for (int64_t c = 0; c < 3; ++c)
+            {
+                double const v = channel[c] < 0.0 ? 0.0 : (channel[c] > 255.0 ? 255.0 : channel[c]);
+                rgb[static_cast<size_t>((oy * outW + ox) * 3 + c)] = static_cast<unsigned char>(v + 0.5);
+            }
+        }
+    }
+    return rgb;
+}
+
+//! Wrap two pitch-linear planes as a pinned NV12 frame. The pitches may exceed the valid row width, so
+//! the padding is what a decoder or ISP would leave behind.
+rt::imageUtils::ImageData MakePinnedNv12Image(std::vector<unsigned char> const& y, std::vector<unsigned char> const& uv,
+    int64_t const height, int64_t const width, int64_t const yPitch, int64_t const uvPitch,
+    rt::imageUtils::ColorStandard const standard, rt::imageUtils::ColorRange const range, int64_t const frames = 1)
+{
+    int64_t const chromaRows = (height + 1) / 2;
+    int64_t const chromaRowBytes = 2 * ((width + 1) / 2);
+    int64_t const yBytes = yPitch * height;
+    int64_t const uvBytes = uvPitch * chromaRows;
+    int64_t const frameBytes = yBytes + uvBytes;
+
+    auto buffer = std::make_shared<rt::Tensor>(
+        rt::Tensor({frames * frameBytes}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8));
+    auto* const base = static_cast<unsigned char*>(buffer->rawPointer());
+    std::memset(base, 0, static_cast<size_t>(frames * frameBytes));
+    for (int64_t f = 0; f < frames; ++f)
+    {
+        unsigned char* const frame = base + f * frameBytes;
+        for (int64_t r = 0; r < height; ++r)
+        {
+            std::memcpy(frame + r * yPitch, y.data() + (f * height + r) * width, static_cast<size_t>(width));
+        }
+        for (int64_t r = 0; r < chromaRows; ++r)
+        {
+            std::memcpy(frame + yBytes + r * uvPitch, uv.data() + (f * chromaRows + r) * chromaRowBytes,
+                static_cast<size_t>(chromaRowBytes));
+        }
+    }
+
+    rt::imageUtils::ImageLayout layout{};
+    layout.format = rt::imageUtils::ImageFormat::kNV12PL;
+    layout.colorStandard = standard;
+    layout.colorRange = range;
+    layout.planeOffsetBytes = {0, yBytes};
+    layout.pitchBytes = {yPitch, uvPitch};
+    layout.frameStrideBytes = {frameBytes, frameBytes};
+    return rt::imageUtils::wrapImageBuffer(buffer, layout, width, height, frames);
+}
+
+//! Flat luma with chroma alternating per 2x2 block. Sampling chroma on the luma grid instead of the
+//! chroma grid shifts this pattern by half a chroma sample, which a natural image hides inside one or
+//! two code units and this does not.
+void FillChromaCheckerboard(
+    std::vector<unsigned char>& y, std::vector<unsigned char>& uv, int64_t const height, int64_t const width)
+{
+    std::fill(y.begin(), y.end(), static_cast<unsigned char>(128));
+    int64_t const chromaH = (height + 1) / 2;
+    int64_t const chromaW = (width + 1) / 2;
+    for (int64_t r = 0; r < chromaH; ++r)
+    {
+        for (int64_t c = 0; c < chromaW; ++c)
+        {
+            bool const even = ((r + c) % 2) == 0;
+            uv[static_cast<size_t>(r * chromaW + c) * 2] = even ? 16 : 240;
+            uv[static_cast<size_t>(r * chromaW + c) * 2 + 1] = even ? 240 : 16;
+        }
+    }
+}
+
 } // namespace
 
-TEST(CopyImageToDeviceAndResize, Accuracy)
+// NV12 pitch-linear preprocessing vs a double-precision resize-then-convert reference. Only the
+// arithmetic width and the summation order differ, so the bounds are the resize family's.
+void TestFusedNv12(int64_t const inHeight, int64_t const inWidth, int64_t const outHeight, int64_t const outWidth,
+    bool const chromaCheckerboard, rt::imageUtils::ColorStandard const standard, rt::imageUtils::ColorRange const range,
+    int64_t const yPadBytes = 0, int64_t const uvPadBytes = 0, std::array<float, 3> const& imageMean = kUnitMean,
+    std::array<float, 3> const& imageStd = kUnitStd)
 {
-    for (auto const& g : kResizeGeometries)
+    cudaStream_t stream{nullptr};
+    int64_t const chromaRowBytes = 2 * ((inWidth + 1) / 2);
+
+    std::vector<unsigned char> y(static_cast<size_t>(inHeight * inWidth));
+    std::vector<unsigned char> uv(static_cast<size_t>(((inHeight + 1) / 2) * chromaRowBytes));
+    if (chromaCheckerboard)
     {
-        for (auto const pattern : kResizeFillPatterns)
+        FillChromaCheckerboard(y, uv, inHeight, inWidth);
+    }
+    else
+    {
+        uniformIntInitialization<unsigned char>(y, 0, 255);
+        uniformIntInitialization<unsigned char>(uv, 0, 255);
+    }
+
+    rt::imageUtils::ImageData image = MakePinnedNv12Image(
+        y, uv, inHeight, inWidth, inWidth + yPadBytes, chromaRowBytes + uvPadBytes, standard, range);
+
+    rt::Tensor dst({1, outHeight, outWidth, 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::imageUtils::resizeAndNormalizeToRgb(image, 0, 1, imageMean, imageStd, dst, outHeight, outWidth, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<unsigned char> const ref
+        = Nv12ChainRef(y, uv, inHeight, inWidth, outHeight, outWidth, MakeCoeffsRef(standard, range));
+    DiffStats const s = CompareU8(ReadBackAsU8(dst, ref.size(), 0, imageMean, imageStd), ref.data());
+
+    // The chain quantises the resized Y and CbCr planes to code units before converting, so a
+    // one-unit disagreement in a plane reaches the output multiplied by the matrix: up to 1.17
+    // for luma and 2.15 for chroma across the standards this accepts.
+    EXPECT_GE(s.within1Lsb, 0.995);
+    EXPECT_LE(s.maxDiff, 4);
+
+    std::cout << "FusedPreprocessNv12 Accuracy: in=" << inHeight << "x" << inWidth << ", out=" << outHeight << "x"
+              << outWidth << (chromaCheckerboard ? ", chroma checkerboard" : ", random")
+              << (yPadBytes || uvPadBytes ? ", padded" : "") << " -- ";
+    PrintDiffStats("stats", s);
+}
+
+// The sampling position of chroma. Reading the chroma plane at (x, y) rather than (x / 2, y / 2)
+// compiles, runs and shifts the colours; on this pattern that shift is a full block.
+TEST(FusedPreprocessNv12, ChromaPhaseOnTheChromaGrid)
+{
+    TestFusedNv12(256, 256, 128, 128, /*chromaCheckerboard=*/true, rt::imageUtils::ColorStandard::kBt709,
+        rt::imageUtils::ColorRange::kLimited);
+    TestFusedNv12(256, 256, 256, 256, /*chromaCheckerboard=*/true, rt::imageUtils::ColorStandard::kBt709,
+        rt::imageUtils::ColorRange::kLimited);
+    TestFusedNv12(128, 128, 320, 320, /*chromaCheckerboard=*/true, rt::imageUtils::ColorStandard::kBt709,
+        rt::imageUtils::ColorRange::kLimited);
+}
+
+// The size of that phase. Left-sited chroma sits a quarter of a chroma sample left of the block centroid
+// and the kernel samples a quarter to the right to compensate; the case above takes that quarter from the
+// same constant the kernel uses, so it holds whatever the kernel does. A linear ramp does not: Catmull-Rom
+// reproduces a linear source exactly, so the resampled chroma is the ramp read at the sampling position,
+// which drops kCbStep * kSitingPhase code units when the compensation goes and twice that when it flips.
+TEST(FusedPreprocessNv12, ChromaSitingPhaseIsAQuarterSample)
+{
+    constexpr int64_t kExtent{32};
+    constexpr double kCbBase{96.0};
+    constexpr double kCbStep{6.0};
+    constexpr double kSitingPhase{0.25};
+    constexpr auto kStandard = rt::imageUtils::ColorStandard::kBt709;
+    constexpr auto kRange = rt::imageUtils::ColorRange::kFull;
+
+    int64_t const chromaExtent = kExtent / 2;
+    std::vector<unsigned char> y(static_cast<size_t>(kExtent * kExtent), 128);
+    std::vector<unsigned char> uv(static_cast<size_t>(chromaExtent * chromaExtent * 2), 128);
+    for (int64_t r = 0; r < chromaExtent; ++r)
+    {
+        for (int64_t c = 0; c < chromaExtent; ++c)
         {
-            TestCopyImageToDeviceAndResize(g.inHeight, g.inWidth, g.outHeight, g.outWidth, pattern);
+            uv[static_cast<size_t>((r * chromaExtent + c) * 2)]
+                = static_cast<unsigned char>(kCbBase + kCbStep * static_cast<double>(c));
+        }
+    }
+
+    rt::imageUtils::ImageData image
+        = MakePinnedNv12Image(y, uv, kExtent, kExtent, kExtent, chromaExtent * 2, kStandard, kRange);
+    rt::Tensor dst({1, kExtent, kExtent, 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    cudaStream_t stream{nullptr};
+    rt::imageUtils::resizeAndNormalizeToRgb(image, 0, 1, kUnitMean, kUnitStd, dst, kExtent, kExtent, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<unsigned char> const out = ReadBackAsU8(dst, static_cast<size_t>(kExtent * kExtent * 3));
+
+    YuvCoeffsRef const coeffs = MakeCoeffsRef(kStandard, kRange);
+    double const luma = coeffs.yScale * (128.0 - coeffs.yOffset);
+    int64_t const row = kExtent / 2;
+    // Cr is neutral, so blue carries the ramp alone. The two chroma columns at each edge take clamped
+    // taps, where a Catmull-Rom gather stops reproducing a line.
+    for (int64_t c = 2; c + 2 < chromaExtent; ++c)
+    {
+        double const cb = kCbBase + kCbStep * (static_cast<double>(c) + kSitingPhase);
+        double const blue = luma + coeffs.cbToB * (cb - 128.0);
+        EXPECT_NEAR(out[static_cast<size_t>((row * kExtent + 2 * c) * 3 + 2)], blue, 1.5) << "chroma column " << c;
+    }
+}
+
+TEST(FusedPreprocessNv12, AccuracyAcrossGeometries)
+{
+    TestFusedNv12(
+        480, 640, 224, 224, false, rt::imageUtils::ColorStandard::kBt709, rt::imageUtils::ColorRange::kLimited);
+    TestFusedNv12(
+        1080, 1920, 448, 448, false, rt::imageUtils::ColorStandard::kBt709, rt::imageUtils::ColorRange::kLimited);
+    TestFusedNv12(224, 224, 448, 448, false, rt::imageUtils::ColorStandard::kBt601, rt::imageUtils::ColorRange::kFull);
+}
+
+// Odd extents make (out + 1) / 2 differ from out / 2 on both axes, and put the last chroma column and
+// row half outside the luma grid.
+TEST(FusedPreprocessNv12, OddExtents)
+{
+    TestFusedNv12(
+        747, 1000, 331, 209, false, rt::imageUtils::ColorStandard::kBt709, rt::imageUtils::ColorRange::kLimited);
+    TestFusedNv12(101, 99, 51, 49, true, rt::imageUtils::ColorStandard::kBt709, rt::imageUtils::ColorRange::kLimited);
+}
+
+// The two planes are padded independently. Addressing chroma with the luma pitch reads the wrong rows
+// while staying inside the allocation.
+TEST(FusedPreprocessNv12, IndependentPlanePitches)
+{
+    TestFusedNv12(240, 320, 224, 224, false, rt::imageUtils::ColorStandard::kBt709,
+        rt::imageUtils::ColorRange::kLimited, /*yPadBytes=*/64, /*uvPadBytes=*/32);
+    TestFusedNv12(240, 320, 224, 224, true, rt::imageUtils::ColorStandard::kBt709, rt::imageUtils::ColorRange::kLimited,
+        /*yPadBytes=*/0, /*uvPadBytes=*/96);
+}
+
+// An NV12 frame stride spans both planes, so the batch dimension cannot reach frame f and a video
+// takes one launch per frame. Each slot must still match that frame preprocessed on its own.
+TEST(FusedPreprocessNv12, MultiFrameSlotsAreIndependent)
+{
+    cudaStream_t stream{nullptr};
+    int64_t const inHeight = 120, inWidth = 160, outHeight = 64, outWidth = 96, numFrames = 3;
+    int64_t const chromaRows = (inHeight + 1) / 2;
+    int64_t const chromaRowBytes = 2 * ((inWidth + 1) / 2);
+    size_t const yElems = static_cast<size_t>(inHeight * inWidth);
+    size_t const uvElems = static_cast<size_t>(chromaRows * chromaRowBytes);
+    size_t const outFrameElems = static_cast<size_t>(outHeight * outWidth * 3);
+    auto const standard = rt::imageUtils::ColorStandard::kBt709;
+    auto const range = rt::imageUtils::ColorRange::kLimited;
+
+    std::vector<unsigned char> y(yElems * numFrames);
+    std::vector<unsigned char> uv(uvElems * numFrames);
+    uniformIntInitialization<unsigned char>(y, 0, 255);
+    uniformIntInitialization<unsigned char>(uv, 0, 255);
+
+    rt::imageUtils::ImageData video
+        = MakePinnedNv12Image(y, uv, inHeight, inWidth, inWidth, chromaRowBytes, standard, range, numFrames);
+    rt::Tensor batched({numFrames, outHeight, outWidth, 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::imageUtils::resizeAndNormalizeToRgb(
+        video, 0, numFrames, kUnitMean, kUnitStd, batched, outHeight, outWidth, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    for (int64_t f = 0; f < numFrames; ++f)
+    {
+        size_t const yAt = static_cast<size_t>(f) * yElems;
+        size_t const uvAt = static_cast<size_t>(f) * uvElems;
+        rt::imageUtils::ImageData single
+            = MakePinnedNv12Image(std::vector<unsigned char>(y.begin() + yAt, y.begin() + yAt + yElems),
+                std::vector<unsigned char>(uv.begin() + uvAt, uv.begin() + uvAt + uvElems), inHeight, inWidth, inWidth,
+                chromaRowBytes, standard, range);
+        rt::Tensor isolated({1, outHeight, outWidth, 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+        rt::imageUtils::resizeAndNormalizeToRgb(
+            single, 0, 1, kUnitMean, kUnitStd, isolated, outHeight, outWidth, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        std::vector<unsigned char> const slot
+            = ReadBackAsU8(batched, outFrameElems, static_cast<size_t>(f) * outFrameElems);
+        std::vector<unsigned char> const ref = ReadBackAsU8(isolated, outFrameElems);
+        for (size_t k = 0; k < outFrameElems; ++k)
+        {
+            ASSERT_EQ(slot[k], ref[k]) << "frame " << f << " element " << k << " differs from the isolated call";
+        }
+    }
+    std::cout << "FusedPreprocessNv12 MultiFrame: " << numFrames << " frames, each slot identical to an isolated call."
+              << std::endl;
+}
+
+TEST(FusedPreprocessNv12, EveryColourStandardAndRange)
+{
+    for (auto const standard : {rt::imageUtils::ColorStandard::kBt601, rt::imageUtils::ColorStandard::kBt709,
+             rt::imageUtils::ColorStandard::kBt2020})
+    {
+        for (auto const range : {rt::imageUtils::ColorRange::kLimited, rt::imageUtils::ColorRange::kFull})
+        {
+            TestFusedNv12(128, 160, 64, 80, false, standard, range);
         }
     }
 }
 
-// Identity resize: when the target equals the source the helper copies the raw image verbatim.
-TEST(CopyImageToDeviceAndResize, IdentitySkip)
+// A YUV source with no colour metadata decodes to a plausible picture in the wrong colours, so an
+// unset standard or range is refused rather than defaulted.
+TEST(FusedPreprocessNv12, RejectsUnspecifiedColourMetadata)
 {
     cudaStream_t stream{nullptr};
-    int32_t const height = 273, width = 409, channels = 3; // odd dims, high-frequency content
-    std::vector<unsigned char> input(static_cast<size_t>(height) * width * channels);
-    FillResizeInput(input, height, width, channels, ResizeFillPattern::kCHECKERBOARD);
+    int64_t const height = 64, width = 64;
+    std::vector<unsigned char> y(static_cast<size_t>(height * width), 128);
+    std::vector<unsigned char> uv(static_cast<size_t>(((height + 1) / 2) * 2 * ((width + 1) / 2)), 128);
 
-    rt::Tensor rawScratch({height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    rt::Tensor tmpScratch({height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    rt::Tensor dstImage({1, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    // Sentinel-fill the destination so a skipped copy would be caught.
-    CUDA_CHECK(cudaMemset(dstImage.rawPointer(), 0x5A, input.size()));
+    rt::imageUtils::ImageData image = MakePinnedNv12Image(y, uv, height, width, width, 2 * ((width + 1) / 2),
+        rt::imageUtils::ColorStandard::kBt709, rt::imageUtils::ColorRange::kLimited);
+    image.layout.colorStandard = rt::imageUtils::ColorStandard::kUnspecified;
 
-    kernel::copyImageToDeviceAndResize(input.data(), /*numFrames=*/1, height, width, channels, rawScratch, tmpScratch,
-        dstImage, height, width, stream);
-
-    std::vector<unsigned char> output(input.size());
-    CUDA_CHECK(cudaMemcpyAsync(output.data(), dstImage.rawPointer(), output.size(), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    for (size_t i = 0; i < output.size(); ++i)
-    {
-        ASSERT_EQ(output[i], input[i]) << "identity resize altered pixel " << i;
-    }
-    std::cout << "CopyImageToDeviceAndResize IdentitySkip: " << height << "x" << width << " copied verbatim."
-              << std::endl;
+    rt::Tensor dst({1, height, width, 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    EXPECT_THROW(rt::imageUtils::resizeAndNormalizeToRgb(image, 0, 1, kUnitMean, kUnitStd, dst, height, width, stream),
+        std::runtime_error);
 }
 
-// Raw-side cap: each raw dimension must be <= kGpuResizeMaxRawDim. The check is per-dimension, not on the
-// pixel product, so a tall/thin image that fits the pixel budget but whose long side exceeds the cap is rejected.
-TEST(CopyImageToDeviceAndResize, PerDimensionCap)
+// A frame stride below one frame of its plane overlaps successive frames, so the wrap refuses it.
+TEST(FusedPreprocessNv12, RejectsFrameStrideBelowOneFrame)
+{
+    int64_t const height = 32, width = 32, frames = 2;
+    int64_t const chromaRows = (height + 1) / 2;
+    int64_t const chromaRowBytes = 2 * ((width + 1) / 2);
+    int64_t const yBytes = width * height;
+    int64_t const frameBytes = yBytes + chromaRowBytes * chromaRows;
+
+    auto buffer = std::make_shared<rt::Tensor>(
+        rt::Tensor({frames * frameBytes}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8));
+    rt::imageUtils::ImageLayout layout{};
+    layout.format = rt::imageUtils::ImageFormat::kNV12PL;
+    layout.colorStandard = rt::imageUtils::ColorStandard::kBt709;
+    layout.colorRange = rt::imageUtils::ColorRange::kLimited;
+    layout.planeOffsetBytes = {0, yBytes};
+    layout.pitchBytes = {width, chromaRowBytes};
+    layout.frameStrideBytes = {yBytes - 1, frameBytes};
+
+    EXPECT_THROW(rt::imageUtils::wrapImageBuffer(buffer, layout, width, height, frames), std::runtime_error);
+}
+
+// The kernel narrows both plane pitches to int. A chroma plane one row tall reaches no further than
+// its valid row width whatever its pitch, so the buffer-capacity check cannot bound it and the
+// 32-bit guard is the only thing that does.
+TEST(FusedPreprocessNv12, RejectsChromaPitchBeyond32Bits)
 {
     cudaStream_t stream{nullptr};
-    int32_t const channels = 3, outHeight = 64, outWidth = 64;
+    int64_t const height = 2, width = 32;
+    std::vector<unsigned char> y(static_cast<size_t>(height * width), 128);
+    std::vector<unsigned char> uv(static_cast<size_t>(((height + 1) / 2) * 2 * ((width + 1) / 2)), 128);
 
-    // Small scratch and destination: the per-dimension cap fires before any of these are touched.
-    rt::Tensor rawScratch({64, 64, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    rt::Tensor tmpScratch({64, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    rt::Tensor dstImage({1, outHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
+    rt::imageUtils::ImageData image = MakePinnedNv12Image(y, uv, height, width, width, 2 * ((width + 1) / 2),
+        rt::imageUtils::ColorStandard::kBt709, rt::imageUtils::ColorRange::kLimited);
+    image.layout.pitchBytes[1] = static_cast<int64_t>(std::numeric_limits<int>::max()) + 1;
 
-    // Tall/thin: rawHeight exceeds the cap while the product stays far under kGpuResizeMaxRawDim^2.
+    rt::Tensor dst({1, height, width, 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    EXPECT_THROW(rt::imageUtils::resizeAndNormalizeToRgb(image, 0, 1, kUnitMean, kUnitStd, dst, height, width, stream),
+        std::runtime_error);
+}
+
+// Pageable host memory is not addressable from a kernel; wrapping it has to fail at the wrap rather
+// than at some later synchronisation point.
+TEST(FusedPreprocessNv12, RejectsPageableHostBuffer)
+{
+    int64_t const height = 32, width = 32;
+    int64_t const chromaRowBytes = 2 * ((width + 1) / 2);
+    int64_t const yBytes = width * height;
+    int64_t const uvBytes = chromaRowBytes * ((height + 1) / 2);
+
+    std::vector<unsigned char> pageable(static_cast<size_t>(yBytes + uvBytes), 128);
+    auto buffer = std::make_shared<rt::Tensor>(rt::Tensor(
+        pageable.data(), {yBytes + uvBytes}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8, "pageableNv12"));
+
+    rt::imageUtils::ImageLayout layout{};
+    layout.format = rt::imageUtils::ImageFormat::kNV12PL;
+    layout.colorStandard = rt::imageUtils::ColorStandard::kBt709;
+    layout.colorRange = rt::imageUtils::ColorRange::kLimited;
+    layout.planeOffsetBytes = {0, yBytes};
+    layout.pitchBytes = {width, chromaRowBytes};
+    layout.frameStrideBytes = {yBytes + uvBytes, yBytes + uvBytes};
+
+    EXPECT_THROW(rt::imageUtils::wrapImageBuffer(buffer, layout, width, height, 1), std::runtime_error);
+}
+
+// A page-locked host source and a device-resident copy of the same bytes must produce the same result:
+// the zero-copy path differs only in where the kernel reads from.
+TEST(FusedPreprocessNv12, MappedHostMatchesDeviceResident)
+{
+    cudaStream_t stream{nullptr};
+    int64_t const height = 240, width = 320, outHeight = 224, outWidth = 224;
+    int64_t const chromaRowBytes = 2 * ((width + 1) / 2);
+    int64_t const yBytes = width * height;
+    int64_t const uvBytes = chromaRowBytes * ((height + 1) / 2);
+
+    std::vector<unsigned char> y(static_cast<size_t>(yBytes));
+    std::vector<unsigned char> uv(static_cast<size_t>(uvBytes));
+    uniformIntInitialization<unsigned char>(y, 0, 255);
+    uniformIntInitialization<unsigned char>(uv, 0, 255);
+
+    rt::imageUtils::ImageData hostImage = MakePinnedNv12Image(y, uv, height, width, width, chromaRowBytes,
+        rt::imageUtils::ColorStandard::kBt709, rt::imageUtils::ColorRange::kLimited);
+
+    auto deviceBuffer = std::make_shared<rt::Tensor>(
+        rt::Tensor({yBytes + uvBytes}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8));
+    CUDA_CHECK(cudaMemcpy(deviceBuffer->rawPointer(), hostImage.buffer->rawPointer(),
+        static_cast<size_t>(yBytes + uvBytes), cudaMemcpyHostToDevice));
+    rt::imageUtils::ImageData deviceImage
+        = rt::imageUtils::wrapImageBuffer(deviceBuffer, hostImage.layout, width, height, 1);
+
+    rt::Tensor hostDst({1, outHeight, outWidth, 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor deviceDst({1, outHeight, outWidth, 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::imageUtils::resizeAndNormalizeToRgb(hostImage, 0, 1, kUnitMean, kUnitStd, hostDst, outHeight, outWidth, stream);
+    rt::imageUtils::resizeAndNormalizeToRgb(
+        deviceImage, 0, 1, kUnitMean, kUnitStd, deviceDst, outHeight, outWidth, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    size_t const elems = static_cast<size_t>(outHeight * outWidth * 3);
+    std::vector<unsigned char> const fromHost = ReadBackAsU8(hostDst, elems);
+    std::vector<unsigned char> const fromDevice = ReadBackAsU8(deviceDst, elems);
+    for (size_t i = 0; i < elems; ++i)
     {
-        int64_t const tallH = kernel::kGpuResizeMaxRawDim + 1, tallW = 32;
-        std::vector<unsigned char> tall(static_cast<size_t>(tallH) * tallW * channels, 0);
-        EXPECT_THROW(kernel::copyImageToDeviceAndResize(tall.data(), /*numFrames=*/1, tallH, tallW, channels,
-                         rawScratch, tmpScratch, dstImage, outHeight, outWidth, stream),
-            std::runtime_error);
+        ASSERT_EQ(fromHost[i], fromDevice[i]) << "mapped host and device-resident results differ at " << i;
     }
-    // Wide/thin: rawWidth exceeds the cap, product equally under budget.
-    {
-        int64_t const wideH = 32, wideW = kernel::kGpuResizeMaxRawDim + 1;
-        std::vector<unsigned char> wide(static_cast<size_t>(wideH) * wideW * channels, 0);
-        EXPECT_THROW(kernel::copyImageToDeviceAndResize(wide.data(), /*numFrames=*/1, wideH, wideW, channels,
-                         rawScratch, tmpScratch, dstImage, outHeight, outWidth, stream),
-            std::runtime_error);
-    }
+    std::cout << "FusedPreprocessNv12 ZeroCopy: mapped host result identical to device-resident." << std::endl;
+}
 
-    // Boundary: a raw height exactly at the cap is accepted.
+namespace
+{
+
+//! A CUDA array and the texture object over it, released together and in that order.
+struct TexturePlane
+{
+    cudaArray_t array{nullptr};
+    cudaTextureObject_t texture{};
+
+    TexturePlane() = default;
+    TexturePlane(TexturePlane const&) = delete;
+    TexturePlane& operator=(TexturePlane const&) = delete;
+
+    ~TexturePlane()
     {
-        int64_t const capH = kernel::kGpuResizeMaxRawDim, capW = 8, capOutH = 256, capOutW = 8;
-        std::vector<unsigned char> atCap(static_cast<size_t>(capH) * capW * channels, 0);
-        rt::Tensor capRaw({capH, capW, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-        rt::Tensor capTmp({capH, capOutW, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-        rt::Tensor capDst({1, capOutH, capOutW, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-        EXPECT_NO_THROW(kernel::copyImageToDeviceAndResize(
-            atCap.data(), /*numFrames=*/1, capH, capW, channels, capRaw, capTmp, capDst, capOutH, capOutW, stream));
+        if (texture != 0)
+        {
+            (void) cudaDestroyTextureObject(texture);
+        }
+        if (array != nullptr)
+        {
+            (void) cudaFreeArray(array);
+        }
+    }
+};
+
+//! Sampler state a caller can get wrong, so the tests can vary one field at a time.
+struct SamplerState
+{
+    cudaTextureFilterMode filterMode{cudaFilterModePoint};
+    cudaTextureReadMode readMode{cudaReadModeElementType};
+    int normalizedCoords{0};
+    int sRGB{0};
+    cudaTextureAddressMode addressMode{cudaAddressModeClamp};
+};
+
+//! Upload one plane into a CUDA array and view it through a texture object. There is no NvSci here,
+//! so the array is allocated rather than imported: what this reaches is the sampling path and the
+//! descriptor checks, not the Tegra block order that only a real imported surface carries.
+//! `chromaBits` is 0 for luma and 8 for the interleaved CbCr plane, which fixes the texel width.
+cudaError_t MakeTexturePlane(TexturePlane& plane, unsigned char const* const src, int64_t const width,
+    int64_t const height, int32_t const chromaBits, SamplerState const& sampler = {})
+{
+    int64_t const rowBytes = width * (chromaBits == 0 ? 1 : 2);
+    cudaChannelFormatDesc const channel = cudaCreateChannelDesc(8, chromaBits, 0, 0, cudaChannelFormatKindUnsigned);
+    CUDA_CHECK(cudaMallocArray(&plane.array, &channel, static_cast<size_t>(width), static_cast<size_t>(height)));
+    CUDA_CHECK(cudaMemcpy2DToArray(plane.array, 0, 0, src, static_cast<size_t>(rowBytes), static_cast<size_t>(rowBytes),
+        static_cast<size_t>(height), cudaMemcpyHostToDevice));
+
+    cudaResourceDesc resource{};
+    resource.resType = cudaResourceTypeArray;
+    resource.res.array.array = plane.array;
+
+    cudaTextureDesc description{};
+    description.addressMode[0] = sampler.addressMode;
+    description.addressMode[1] = sampler.addressMode;
+    description.filterMode = sampler.filterMode;
+    description.readMode = sampler.readMode;
+    description.normalizedCoords = sampler.normalizedCoords;
+    description.sRGB = sampler.sRGB;
+
+    cudaError_t const status = cudaCreateTextureObject(&plane.texture, &resource, &description, nullptr);
+    if (status != cudaSuccess)
+    {
+        (void) cudaGetLastError();
+    }
+    return status;
+}
+
+//! The raw half output, for comparisons that have to be exact rather than close.
+std::vector<uint16_t> ReadBackRawHalf(rt::Tensor const& dst, size_t const elems)
+{
+    std::vector<uint16_t> raw(elems);
+    CUDA_CHECK(cudaMemcpy(raw.data(), dst.rawPointer(), elems * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    return raw;
+}
+
+//! The same pixels wrapped both ways, so a test can hold the two paths against each other. The
+//! pitch-linear copy keeps its planes tightly packed, since padding has no counterpart in an array.
+struct Nv12PathPair
+{
+    std::vector<unsigned char> y;
+    std::vector<unsigned char> uv;
+    TexturePlane luma;
+    TexturePlane chroma;
+
+    Nv12PathPair(int64_t const height, int64_t const width, bool const chromaCheckerboard)
+    {
+        int64_t const chromaW = (width + 1) / 2;
+        int64_t const chromaH = (height + 1) / 2;
+        y.resize(static_cast<size_t>(height * width));
+        uv.resize(static_cast<size_t>(chromaH * chromaW * 2));
+        if (chromaCheckerboard)
+        {
+            FillChromaCheckerboard(y, uv, height, width);
+        }
+        else
+        {
+            uniformIntInitialization<unsigned char>(y, 0, 255);
+            uniformIntInitialization<unsigned char>(uv, 0, 255);
+        }
+    }
+};
+
+} // namespace
+
+// Block-linear against the same double-precision chain the pitch-linear tests use, and against the
+// pitch-linear result itself. The two paths differ only in how a tap reaches a sample, so almost
+// every element matches bit for bit; the exceptions are the long accumulations of a heavy downscale,
+// where the two template instantiations contract their weighted sums differently. That divergence is
+// a few elements in a million and stays well inside the bound the chain itself carries.
+void TestNv12BlockLinearMatchesPitchLinear(int64_t const inHeight, int64_t const inWidth, int64_t const outHeight,
+    int64_t const outWidth, bool const chromaCheckerboard = false,
+    rt::imageUtils::ColorStandard const standard = rt::imageUtils::ColorStandard::kBt709,
+    rt::imageUtils::ColorRange const range = rt::imageUtils::ColorRange::kLimited,
+    std::array<float, 3> const& imageMean = kUnitMean, std::array<float, 3> const& imageStd = kUnitStd)
+{
+    cudaStream_t stream{nullptr};
+    int64_t const chromaW = (inWidth + 1) / 2;
+    int64_t const chromaH = (inHeight + 1) / 2;
+
+    Nv12PathPair frame(inHeight, inWidth, chromaCheckerboard);
+    CUDA_CHECK(MakeTexturePlane(frame.luma, frame.y.data(), inWidth, inHeight, 0));
+    CUDA_CHECK(MakeTexturePlane(frame.chroma, frame.uv.data(), chromaW, chromaH, 8));
+
+    rt::imageUtils::ImageData const pitchLinear
+        = MakePinnedNv12Image(frame.y, frame.uv, inHeight, inWidth, inWidth, 2 * chromaW, standard, range);
+    rt::imageUtils::ImageData const blockLinear = rt::imageUtils::wrapImageTexture(
+        frame.luma.texture, frame.chroma.texture, standard, range, inWidth, inHeight);
+
+    rt::Tensor plDst({1, outHeight, outWidth, 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor blDst({1, outHeight, outWidth, 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::imageUtils::resizeAndNormalizeToRgb(pitchLinear, 0, 1, imageMean, imageStd, plDst, outHeight, outWidth, stream);
+    rt::imageUtils::resizeAndNormalizeToRgb(blockLinear, 0, 1, imageMean, imageStd, blDst, outHeight, outWidth, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    size_t const elems = static_cast<size_t>(outHeight * outWidth * 3);
+
+    // The same bound the pitch-linear accuracy family carries: the chain quantises each plane to code
+    // units before converting, so a one-unit disagreement reaches the output through the matrix.
+    std::vector<unsigned char> const reference
+        = Nv12ChainRef(frame.y, frame.uv, inHeight, inWidth, outHeight, outWidth, MakeCoeffsRef(standard, range));
+    DiffStats const againstReference
+        = CompareU8(ReadBackAsU8(blDst, reference.size(), 0, imageMean, imageStd), reference.data());
+    EXPECT_GE(againstReference.within1Lsb, 0.995);
+    EXPECT_LE(againstReference.maxDiff, 4);
+
+    std::vector<uint16_t> const fromPitchLinear = ReadBackRawHalf(plDst, elems);
+    std::vector<uint16_t> const fromBlockLinear = ReadBackRawHalf(blDst, elems);
+    size_t identical = 0;
+    double worstCodeUnits = 0.0;
+    for (size_t i = 0; i < elems; ++i)
+    {
+        if (fromPitchLinear[i] == fromBlockLinear[i])
+        {
+            ++identical;
+            continue;
+        }
+        half pl{};
+        half bl{};
+        std::memcpy(&pl, &fromPitchLinear[i], sizeof(half));
+        std::memcpy(&bl, &fromBlockLinear[i], sizeof(half));
+        // Normalised units scale back to code units by the channel's std.
+        double const inCodeUnits
+            = std::abs(__half2float(pl) - __half2float(bl)) * static_cast<double>(imageStd[i % 3]) * 255.0;
+        worstCodeUnits = std::max(worstCodeUnits, inCodeUnits);
+    }
+    // Both entries instantiate the same chain, so these guard a wrong block order rather than express a
+    // numeric tolerance: every case measured so far is bit-identical, and the residual bound is the
+    // pitch-linear family's own.
+    double const identicalShare = static_cast<double>(identical) / static_cast<double>(elems);
+    EXPECT_GE(identicalShare, 0.9999);
+    EXPECT_LE(worstCodeUnits, 4.0);
+
+    std::cout << "FusedPreprocessNv12Bl Equivalence: in=" << inHeight << "x" << inWidth << ", out=" << outHeight << "x"
+              << outWidth << (chromaCheckerboard ? ", chroma checkerboard" : ", random") << " -- " << identical << "/"
+              << elems << " bit-identical to pitch-linear, worst " << worstCodeUnits << " code units; ";
+    PrintDiffStats("vs reference", againstReference);
+}
+
+// The smallest case that runs the kNV12BL kernel instance end to end, at identity size.
+TEST(FusedPreprocessNv12Bl, AcceptsBlockLinear)
+{
+    TestNv12BlockLinearMatchesPitchLinear(64, 64, 64, 64);
+}
+
+TEST(FusedPreprocessNv12Bl, MatchesPitchLinearAcrossGeometries)
+{
+    TestNv12BlockLinearMatchesPitchLinear(480, 640, 224, 224);
+    TestNv12BlockLinearMatchesPitchLinear(
+        224, 224, 448, 448, false, rt::imageUtils::ColorStandard::kBt601, rt::imageUtils::ColorRange::kFull);
+    // 4K down to the ViT input size, the shape the vision runners actually see.
+    TestNv12BlockLinearMatchesPitchLinear(2160, 3840, 448, 448);
+}
+
+// Odd extents are where the contract's (w + 1) / 2 parts company with w / 2: the chroma array is a
+// column and a row wider than halving would give.
+TEST(FusedPreprocessNv12Bl, OddExtents)
+{
+    TestNv12BlockLinearMatchesPitchLinear(747, 1000, 331, 209);
+    TestNv12BlockLinearMatchesPitchLinear(101, 99, 51, 49, true);
+}
+
+// The address mode is the one sampler field the contract leaves free, because the kernel clamps its
+// tap coordinates before it fetches. Varying it must not move a single output element.
+TEST(FusedPreprocessNv12Bl, AddressModeDoesNotReachTheResult)
+{
+    cudaStream_t stream{nullptr};
+    int64_t const height = 96, width = 128, outHeight = 64, outWidth = 64;
+    int64_t const chromaW = (width + 1) / 2, chromaH = (height + 1) / 2;
+    size_t const elems = static_cast<size_t>(outHeight * outWidth * 3);
+
+    Nv12PathPair frame(height, width, /*chromaCheckerboard=*/true);
+    std::vector<uint16_t> reference;
+    for (cudaTextureAddressMode const mode : {cudaAddressModeClamp, cudaAddressModeBorder, cudaAddressModeWrap})
+    {
+        SamplerState sampler{};
+        sampler.addressMode = mode;
+        TexturePlane luma;
+        TexturePlane chroma;
+        // Wrap and mirror need normalised coordinates, so the driver may refuse them here; a mode
+        // that cannot be built is a mode the kernel can never see.
+        if (MakeTexturePlane(luma, frame.y.data(), width, height, 0, sampler) != cudaSuccess)
+        {
+            continue;
+        }
+        CUDA_CHECK(MakeTexturePlane(chroma, frame.uv.data(), chromaW, chromaH, 8, sampler));
+
+        rt::imageUtils::ImageData const image = rt::imageUtils::wrapImageTexture(luma.texture, chroma.texture,
+            rt::imageUtils::ColorStandard::kBt709, rt::imageUtils::ColorRange::kLimited, width, height);
+        rt::Tensor dst({1, outHeight, outWidth, 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+        rt::imageUtils::resizeAndNormalizeToRgb(image, 0, 1, kUnitMean, kUnitStd, dst, outHeight, outWidth, stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
-    }
-    // Boundary: a raw width exactly at the cap is accepted.
-    {
-        int64_t const capH = 8, capW = kernel::kGpuResizeMaxRawDim, capOutH = 8, capOutW = 256;
-        std::vector<unsigned char> atCap(static_cast<size_t>(capH) * capW * channels, 0);
-        rt::Tensor capRaw({capH, capW, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-        rt::Tensor capTmp({capH, capOutW, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-        rt::Tensor capDst({1, capOutH, capOutW, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-        EXPECT_NO_THROW(kernel::copyImageToDeviceAndResize(
-            atCap.data(), /*numFrames=*/1, capH, capW, channels, capRaw, capTmp, capDst, capOutH, capOutW, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        std::vector<uint16_t> const got = ReadBackRawHalf(dst, elems);
+        if (reference.empty())
+        {
+            reference = got;
+            continue;
+        }
+        ASSERT_EQ(reference, got) << "address mode " << static_cast<int>(mode) << " changed the result";
     }
 }
 
-// 3-D/4-D handoff: the helper writes through a 3-D view into a 4-D mImageDevice-shaped destination that
-// the normalize step then reads in place — must run without a shape error and yield correct values.
-TEST(CopyImageToDeviceAndResize, FourDimDestinationFeedsNormalize)
+// Every sampler field the contract pins, given a wrong value. None of them fails at read time: each
+// returns a plausible sample from the wrong place, so the wrap is the only chance to catch them.
+TEST(FusedPreprocessNv12Bl, RejectsWrongSamplerState)
 {
-    cudaStream_t stream{nullptr};
-    int32_t const inHeight = 480, inWidth = 640, outHeight = 224, outWidth = 224, channels = 3;
+    int64_t const height = 32, width = 32;
+    int64_t const chromaW = (width + 1) / 2, chromaH = (height + 1) / 2;
+    Nv12PathPair frame(height, width, /*chromaCheckerboard=*/true);
 
-    std::vector<unsigned char> input(static_cast<size_t>(inHeight) * inWidth * channels);
-    FillResizeInput(input, inHeight, inWidth, channels, ResizeFillPattern::kGRADIENT);
+    // Linear filtering of an integer format needs a normalised read, so the two travel together.
+    SamplerState filtered{};
+    filtered.filterMode = cudaFilterModeLinear;
+    filtered.readMode = cudaReadModeNormalizedFloat;
+    SamplerState normalizedRead{};
+    normalizedRead.readMode = cudaReadModeNormalizedFloat;
+    SamplerState normalizedCoords{};
+    normalizedCoords.normalizedCoords = 1;
+    SamplerState srgb{};
+    srgb.sRGB = 1;
 
-    rt::Tensor rawScratch({inHeight, inWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    rt::Tensor tmpScratch({inHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    rt::Tensor imageDevice({1, outHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    kernel::copyImageToDeviceAndResize(input.data(), /*numFrames=*/1, inHeight, inWidth, channels, rawScratch,
-        tmpScratch, imageDevice, outHeight, outWidth, stream);
-
-    // Normalize reads the 4-D destination in place.
-    std::vector<float> mean{0.5f, 0.5f, 0.5f};
-    std::vector<float> stdv{0.5f, 0.5f, 0.5f};
-    rt::Tensor meanDevice({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    rt::Tensor stdDevice({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    rt::Tensor normalizedDevice({1, outHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    CUDA_CHECK(cudaMemcpyAsync(
-        meanDevice.rawPointer(), mean.data(), mean.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(
-        stdDevice.rawPointer(), stdv.data(), stdv.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
-    ASSERT_NO_THROW(kernel::normalizeImage(imageDevice, meanDevice, stdDevice, normalizedDevice, stream));
-
-    std::vector<unsigned char> resized(static_cast<size_t>(outHeight) * outWidth * channels);
-    std::vector<half> normalized(resized.size());
-    CUDA_CHECK(
-        cudaMemcpyAsync(resized.data(), imageDevice.rawPointer(), resized.size(), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(normalized.data(), normalizedDevice.rawPointer(), normalized.size() * sizeof(half),
-        cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    for (size_t i = 0; i < resized.size(); ++i)
+    for (SamplerState const& wrong : {filtered, normalizedRead, normalizedCoords, srgb})
     {
-        float const expected = (static_cast<float>(resized[i]) / 255.0f - mean[i % channels]) / stdv[i % channels];
-        ASSERT_TRUE(isclose(normalized[i], __float2half(expected), 1e-3f, 1e-3f))
-            << "normalize of resized pixel " << i << " mismatched";
-    }
-    std::cout
-        << "CopyImageToDeviceAndResize FourDimDestinationFeedsNormalize: resize+normalize through the 4-D buffer OK."
-        << std::endl;
-}
-
-// A same-size resize takes the identity fast path, which bypasses the per-side cap: a pre-resized
-// (doResize=false) image whose side exceeds kGpuResizeMaxRawDim still copies through cleanly.
-TEST(CopyImageToDeviceAndResize, IdentitySkipAboveCap)
-{
-    cudaStream_t stream{nullptr};
-    int64_t const height = kernel::kGpuResizeMaxRawDim + 1, width = 8, channels = 3; // one side over the cap
-    std::vector<unsigned char> input(static_cast<size_t>(height) * width * channels);
-    FillResizeInput(input, static_cast<int32_t>(height), static_cast<int32_t>(width), static_cast<int32_t>(channels),
-        ResizeFillPattern::kRANDOM);
-
-    rt::Tensor rawScratch({64, 64, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    rt::Tensor tmpScratch({64, 64, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    rt::Tensor dstImage({1, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-
-    EXPECT_NO_THROW(kernel::copyImageToDeviceAndResize(input.data(), /*numFrames=*/1, height, width, channels,
-        rawScratch, tmpScratch, dstImage, height, width, stream));
-
-    std::vector<unsigned char> output(input.size());
-    CUDA_CHECK(cudaMemcpyAsync(output.data(), dstImage.rawPointer(), output.size(), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    for (size_t i = 0; i < output.size(); ++i)
-    {
-        ASSERT_EQ(output[i], input[i]) << "identity copy above the cap altered pixel " << i;
-    }
-    std::cout << "CopyImageToDeviceAndResize IdentitySkipAboveCap: " << height << "x" << width
-              << " (over cap) copied verbatim via the identity path." << std::endl;
-}
-
-// Defensive contract: an undersized scratch or a wrong-typed/located destination throws std::runtime_error.
-TEST(CopyImageToDeviceAndResize, RejectsBadScratchAndDst)
-{
-    cudaStream_t stream{nullptr};
-    int64_t const inHeight = 512, inWidth = 512, outHeight = 256, outWidth = 256, channels = 3;
-    std::vector<unsigned char> input(static_cast<size_t>(inHeight) * inWidth * channels, 0);
-    rt::Tensor dstImage({1, outHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-
-    // Undersized raw scratch: reshape to {inHeight,inWidth,C} exceeds its capacity.
-    {
-        rt::Tensor smallRaw({16, 16, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-        rt::Tensor tmp({inHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-        EXPECT_THROW(kernel::copyImageToDeviceAndResize(input.data(), /*numFrames=*/1, inHeight, inWidth, channels,
-                         smallRaw, tmp, dstImage, outHeight, outWidth, stream),
-            std::runtime_error);
-    }
-    // Undersized horizontal-pass scratch: reshape to {inHeight,outWidth,C} exceeds its capacity.
-    {
-        rt::Tensor rawScratch({inHeight, inWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-        rt::Tensor smallTmp({16, 16, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-        EXPECT_THROW(kernel::copyImageToDeviceAndResize(input.data(), /*numFrames=*/1, inHeight, inWidth, channels,
-                         rawScratch, smallTmp, dstImage, outHeight, outWidth, stream),
-            std::runtime_error);
-    }
-    {
-        rt::Tensor rawScratch({inHeight, inWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-        rt::Tensor tmp({inHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-        rt::Tensor hostDst({1, outHeight, outWidth, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8);
-        EXPECT_THROW(kernel::copyImageToDeviceAndResize(input.data(), /*numFrames=*/1, inHeight, inWidth, channels,
-                         rawScratch, tmp, hostDst, outHeight, outWidth, stream),
-            std::runtime_error);
-    }
-    {
-        rt::Tensor rawScratch({inHeight, inWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-        rt::Tensor tmp({inHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-        rt::Tensor halfDst({1, outHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-        EXPECT_THROW(kernel::copyImageToDeviceAndResize(input.data(), /*numFrames=*/1, inHeight, inWidth, channels,
-                         rawScratch, tmp, halfDst, outHeight, outWidth, stream),
+        TexturePlane luma;
+        TexturePlane chroma;
+        if (MakeTexturePlane(luma, frame.y.data(), width, height, 0, wrong) != cudaSuccess)
+        {
+            // The driver refuses to build this combination at all, so it can never reach the wrap.
+            continue;
+        }
+        CUDA_CHECK(MakeTexturePlane(chroma, frame.uv.data(), chromaW, chromaH, 8, wrong));
+        EXPECT_THROW(rt::imageUtils::wrapImageTexture(luma.texture, chroma.texture,
+                         rt::imageUtils::ColorStandard::kBt709, rt::imageUtils::ColorRange::kLimited, width, height),
             std::runtime_error);
     }
 }
 
-// Zero and negative raw or output dimensions are rejected before any reshape or device copy.
-TEST(CopyImageToDeviceAndResize, RejectsNonPositiveDims)
+// The plane geometry the caller states and the arrays it hands over have to agree, or the kernel
+// samples outside the frame it was told about.
+TEST(FusedPreprocessNv12Bl, RejectsPlaneGeometryMismatch)
 {
-    cudaStream_t stream{nullptr};
-    int64_t const inHeight = 512, inWidth = 512, outHeight = 256, outWidth = 256, channels = 3;
-    std::vector<unsigned char> input(static_cast<size_t>(inHeight) * inWidth * channels, 0);
-    rt::Tensor rawScratch({inHeight, inWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    rt::Tensor tmp({inHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    rt::Tensor dstImage({1, outHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
+    int64_t const height = 48, width = 64;
+    int64_t const chromaW = (width + 1) / 2, chromaH = (height + 1) / 2;
+    Nv12PathPair frame(height, width, /*chromaCheckerboard=*/false);
 
-    auto launch = [&](int64_t rawH, int64_t rawW, int64_t outH, int64_t outW) {
-        kernel::copyImageToDeviceAndResize(
-            input.data(), /*numFrames=*/1, rawH, rawW, channels, rawScratch, tmp, dstImage, outH, outW, stream);
+    TexturePlane luma;
+    TexturePlane chroma;
+    CUDA_CHECK(MakeTexturePlane(luma, frame.y.data(), width, height, 0));
+    CUDA_CHECK(MakeTexturePlane(chroma, frame.uv.data(), chromaW, chromaH, 8));
+
+    auto const wrap = [&](int64_t const w, int64_t const h) {
+        return rt::imageUtils::wrapImageTexture(luma.texture, chroma.texture, rt::imageUtils::ColorStandard::kBt709,
+            rt::imageUtils::ColorRange::kLimited, w, h);
     };
+    EXPECT_THROW(wrap(width + 2, height), std::runtime_error);
+    EXPECT_THROW(wrap(width, height + 2), std::runtime_error);
+    EXPECT_THROW(wrap(0, height), std::runtime_error);
 
-    EXPECT_THROW(launch(0, inWidth, outHeight, outWidth), std::runtime_error);
-    EXPECT_THROW(launch(inHeight, 0, outHeight, outWidth), std::runtime_error);
-    EXPECT_THROW(launch(inHeight, inWidth, 0, outWidth), std::runtime_error);
-    EXPECT_THROW(launch(inHeight, inWidth, outHeight, 0), std::runtime_error);
-    EXPECT_THROW(launch(-inHeight, inWidth, outHeight, outWidth), std::runtime_error);
-    EXPECT_THROW(launch(inHeight, inWidth, -outHeight, outWidth), std::runtime_error);
+    // The planes swapped: each is the wrong extent and the wrong texel width for its role.
+    EXPECT_THROW(rt::imageUtils::wrapImageTexture(chroma.texture, luma.texture, rt::imageUtils::ColorStandard::kBt709,
+                     rt::imageUtils::ColorRange::kLimited, width, height),
+        std::runtime_error);
 }
 
-// Multi-frame (video) resize: numFrames > 1 reshapes the destination to [T, outH, outW, C] and resizes
-// each frame independently. Frame t of the batched call must be byte-identical to a standalone
-// single-frame resize of that frame, and an identity target must copy every frame verbatim.
-TEST(CopyImageToDeviceAndResize, MultiFrameAccuracy)
+// A single-channel chroma plane samples Cb where the kernel expects the pair, and a two-channel luma
+// plane doubles its texel width; both read inside the array and neither reports an error.
+TEST(FusedPreprocessNv12Bl, RejectsWrongChannelDescription)
 {
-    cudaStream_t stream{nullptr};
-    int32_t const numFrames = 3, inHeight = 480, inWidth = 640, outHeight = 224, outWidth = 224, channels = 3;
-    int64_t const inFrameBytes = static_cast<int64_t>(inHeight) * inWidth * channels;
-    int64_t const outFrameBytes = static_cast<int64_t>(outHeight) * outWidth * channels;
+    int64_t const height = 48, width = 64;
+    int64_t const chromaW = (width + 1) / 2, chromaH = (height + 1) / 2;
+    Nv12PathPair frame(height, width, /*chromaCheckerboard=*/false);
 
-    // Distinct content per frame so a frame mix-up would show.
-    std::array<ResizeFillPattern, 3> const patterns{
-        ResizeFillPattern::kGRADIENT, ResizeFillPattern::kRANDOM, ResizeFillPattern::kCHECKERBOARD};
-    std::vector<unsigned char> input(static_cast<size_t>(numFrames) * inFrameBytes);
-    for (int32_t t = 0; t < numFrames; ++t)
+    // A two-channel luma plane is twice as wide in bytes, so it needs its own source to read from.
+    std::vector<unsigned char> const wideSource(static_cast<size_t>(height * width * 2), 128);
+
+    TexturePlane luma;
+    TexturePlane wideLuma;
+    TexturePlane chroma;
+    TexturePlane narrowChroma;
+    CUDA_CHECK(MakeTexturePlane(luma, frame.y.data(), width, height, 0));
+    CUDA_CHECK(MakeTexturePlane(wideLuma, wideSource.data(), width, height, 8));
+    CUDA_CHECK(MakeTexturePlane(chroma, frame.uv.data(), chromaW, chromaH, 8));
+    CUDA_CHECK(MakeTexturePlane(narrowChroma, frame.uv.data(), chromaW, chromaH, 0));
+
+    EXPECT_THROW(rt::imageUtils::wrapImageTexture(wideLuma.texture, chroma.texture,
+                     rt::imageUtils::ColorStandard::kBt709, rt::imageUtils::ColorRange::kLimited, width, height),
+        std::runtime_error);
+    EXPECT_THROW(rt::imageUtils::wrapImageTexture(luma.texture, narrowChroma.texture,
+                     rt::imageUtils::ColorStandard::kBt709, rt::imageUtils::ColorRange::kLimited, width, height),
+        std::runtime_error);
+}
+
+// Colour metadata has no default that is right: kUnspecified is the value-initialised state, and
+// guessing a standard silently shifts every colour in the frame.
+TEST(FusedPreprocessNv12Bl, RejectsUnspecifiedColourMetadata)
+{
+    int64_t const height = 32, width = 32;
+    int64_t const chromaW = (width + 1) / 2, chromaH = (height + 1) / 2;
+    Nv12PathPair frame(height, width, /*chromaCheckerboard=*/false);
+
+    TexturePlane luma;
+    TexturePlane chroma;
+    CUDA_CHECK(MakeTexturePlane(luma, frame.y.data(), width, height, 0));
+    CUDA_CHECK(MakeTexturePlane(chroma, frame.uv.data(), chromaW, chromaH, 8));
+
+    EXPECT_THROW(rt::imageUtils::wrapImageTexture(luma.texture, chroma.texture,
+                     rt::imageUtils::ColorStandard::kUnspecified, rt::imageUtils::ColorRange::kLimited, width, height),
+        std::runtime_error);
+    EXPECT_THROW(rt::imageUtils::wrapImageTexture(luma.texture, chroma.texture, rt::imageUtils::ColorStandard::kBt709,
+                     rt::imageUtils::ColorRange::kUnspecified, width, height),
+        std::runtime_error);
+}
+
+// A value-initialised texture object is zero, which is what a caller that forgot to create one, or
+// destroyed it early, hands over.
+TEST(FusedPreprocessNv12Bl, RejectsUnsetTexturePlane)
+{
+    int64_t const height = 32, width = 32;
+    int64_t const chromaW = (width + 1) / 2, chromaH = (height + 1) / 2;
+    Nv12PathPair frame(height, width, /*chromaCheckerboard=*/false);
+
+    TexturePlane luma;
+    TexturePlane chroma;
+    CUDA_CHECK(MakeTexturePlane(luma, frame.y.data(), width, height, 0));
+    CUDA_CHECK(MakeTexturePlane(chroma, frame.uv.data(), chromaW, chromaH, 8));
+
+    EXPECT_THROW(rt::imageUtils::wrapImageTexture(cudaTextureObject_t{}, chroma.texture,
+                     rt::imageUtils::ColorStandard::kBt709, rt::imageUtils::ColorRange::kLimited, width, height),
+        std::runtime_error);
+    EXPECT_THROW(rt::imageUtils::wrapImageTexture(luma.texture, cudaTextureObject_t{},
+                     rt::imageUtils::ColorStandard::kBt709, rt::imageUtils::ColorRange::kLimited, width, height),
+        std::runtime_error);
+}
+
+// A block-linear wrap addresses no buffer at all, so the byte counts that describe one report zero
+// rather than the pitched figure the layout's zeroed pitches would otherwise produce.
+TEST(FusedPreprocessNv12Bl, AddressesNoBytes)
+{
+    int64_t const height = 32, width = 32;
+    int64_t const chromaW = (width + 1) / 2, chromaH = (height + 1) / 2;
+    Nv12PathPair frame(height, width, /*chromaCheckerboard=*/false);
+
+    TexturePlane luma;
+    TexturePlane chroma;
+    CUDA_CHECK(MakeTexturePlane(luma, frame.y.data(), width, height, 0));
+    CUDA_CHECK(MakeTexturePlane(chroma, frame.uv.data(), chromaW, chromaH, 8));
+
+    rt::imageUtils::ImageData const image = rt::imageUtils::wrapImageTexture(luma.texture, chroma.texture,
+        rt::imageUtils::ColorStandard::kBt709, rt::imageUtils::ColorRange::kLimited, width, height);
+    EXPECT_EQ(image.buffer, nullptr);
+    EXPECT_EQ(image.data(), nullptr);
+    EXPECT_EQ(image.frameBytes(), 0);
+    EXPECT_EQ(image.addressedBytes(), 0);
+    EXPECT_EQ(image.frames, 1);
+    EXPECT_EQ(image.channels, 3);
+}
+
+// ---------------------------------------------------------------------------
+// The six ViT families' own resize targets and normalisation constants
+// ---------------------------------------------------------------------------
+namespace
+{
+
+// Qwen2/2.5-VL: patchSize 14, mergeSize 2, builder defaults minImageTokens 4, maxImageTokens 512.
+std::tuple<int64_t, int64_t> QwenTarget(int64_t const height, int64_t const width)
+{
+    return rt::imageUtils::qwenSmartResize(height, width, 14, 2, 4, 512);
+}
+
+// Gemma-4: maxImageTokens 256, poolingKernelSize 4, patchSize 14.
+std::tuple<int64_t, int64_t> Gemma4Target(int64_t const height, int64_t const width)
+{
+    return rt::imageUtils::gemma4ResizeTarget(height, width, 256, 4, 14);
+}
+
+// Gemma-4 Unified: maxPatchesPerImage 256, modelPatchSize 48, positionEmbeddingSize 64.
+std::tuple<int64_t, int64_t> Gemma4UnifiedTarget(int64_t const height, int64_t const width)
+{
+    return rt::imageUtils::gemma4UnifiedResizeTarget(height, width, 256, 48, 64);
+}
+
+// InternVL and Phi-4-MM tile at 448; the token budget is the one the engines are built with.
+std::tuple<int64_t, int64_t> BlockGrid448Target(int64_t const height, int64_t const width)
+{
+    return rt::imageUtils::computeBestBlockGridForResize(height, width, 256, 4096, 448, 448);
+}
+
+// Nemotron-Omni tiles at its force_image_size of 512.
+std::tuple<int64_t, int64_t> BlockGrid512Target(int64_t const height, int64_t const width)
+{
+    return rt::imageUtils::computeBestBlockGridForResize(height, width, 256, 4096, 512, 512);
+}
+
+//! One family's preprocessing configuration: the resize target its runner computes for a source, and
+//! the normalisation constants it applies. The target calls the shared resize-target function rather
+//! than pinning numbers, so a change there reaches these cases instead of leaving them testing a
+//! geometry the runners no longer ask for.
+struct VitFamily
+{
+    char const* name;
+    std::tuple<int64_t, int64_t> (*target)(int64_t height, int64_t width);
+    std::array<float, 3> imageMean;
+    std::array<float, 3> imageStd;
+};
+
+//! Both Gemma-4 runners rescale to [0, 1] without normalising; the other four carry per-channel
+//! constants their engine config supplies.
+constexpr std::array<VitFamily, 6> kVitFamilies{{
+    {"Qwen", QwenTarget, {0.5F, 0.5F, 0.5F}, {0.5F, 0.5F, 0.5F}},
+    {"Gemma-4", Gemma4Target, {0.0F, 0.0F, 0.0F}, {1.0F, 1.0F, 1.0F}},
+    {"Gemma-4 Unified", Gemma4UnifiedTarget, {0.0F, 0.0F, 0.0F}, {1.0F, 1.0F, 1.0F}},
+    {"InternVL", BlockGrid448Target, {0.485F, 0.456F, 0.406F}, {0.229F, 0.224F, 0.225F}},
+    {"Phi-4-MM", BlockGrid448Target, {0.5F, 0.5F, 0.5F}, {0.5F, 0.5F, 0.5F}},
+    {"Nemotron-Omni", BlockGrid512Target, {0.481F, 0.458F, 0.408F}, {0.269F, 0.261F, 0.276F}},
+}};
+
+//! Source geometries the families are driven with: three frames the datasets actually carry (one of
+//! odd height, one a 6:1 strip), plus an upscale and the 4K downscale that reaches the multi-chunk
+//! path on RGB8.
+struct SourceGeometry
+{
+    int64_t height;
+    int64_t width;
+};
+
+constexpr std::array<SourceGeometry, 4> kVitSourceGeometries{{
+    {747, 1000},
+    {294, 1790},
+    {64, 64},
+    {2160, 3840},
+}};
+
+} // namespace
+
+TEST(FusedPreprocessVitGeometry, Rgb8AcrossFamilies)
+{
+    for (auto const& family : kVitFamilies)
     {
-        std::vector<unsigned char> frame(static_cast<size_t>(inFrameBytes));
-        FillResizeInput(frame, inHeight, inWidth, channels, patterns[t]);
-        std::memcpy(input.data() + t * inFrameBytes, frame.data(), frame.size());
-    }
-
-    rt::Tensor rawScratch({inHeight, inWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    rt::Tensor tmpScratch({inHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    rt::Tensor dstImage({numFrames, outHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    kernel::copyImageToDeviceAndResize(input.data(), numFrames, inHeight, inWidth, channels, rawScratch, tmpScratch,
-        dstImage, outHeight, outWidth, stream);
-    std::vector<unsigned char> batched(static_cast<size_t>(numFrames) * outFrameBytes);
-    CUDA_CHECK(cudaMemcpyAsync(batched.data(), dstImage.rawPointer(), batched.size(), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    // Golden: a standalone single-frame resize of each frame; the batched output must match byte for byte.
-    for (int32_t t = 0; t < numFrames; ++t)
-    {
-        rt::Tensor singleDst({1, outHeight, outWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-        kernel::copyImageToDeviceAndResize(input.data() + t * inFrameBytes, /*numFrames=*/1, inHeight, inWidth,
-            channels, rawScratch, tmpScratch, singleDst, outHeight, outWidth, stream);
-        std::vector<unsigned char> single(static_cast<size_t>(outFrameBytes));
-        CUDA_CHECK(
-            cudaMemcpyAsync(single.data(), singleDst.rawPointer(), single.size(), cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        for (int64_t i = 0; i < outFrameBytes; ++i)
+        for (auto const& source : kVitSourceGeometries)
         {
-            ASSERT_EQ(batched[t * outFrameBytes + i], single[i])
-                << "multi-frame resize frame " << t << " differs from single-frame at " << i;
+            auto const [outHeight, outWidth] = family.target(source.height, source.width);
+            std::cout << family.name << ": " << source.height << "x" << source.width << " -> " << outHeight << "x"
+                      << outWidth << std::endl;
+            TestFusedResizeRgb(static_cast<int32_t>(source.height), static_cast<int32_t>(source.width),
+                static_cast<int32_t>(outHeight), static_cast<int32_t>(outWidth), ResizeFillPattern::kRANDOM,
+                family.imageMean, family.imageStd);
         }
     }
+}
 
-    // Identity multi-frame: out == in copies each frame verbatim.
-    rt::Tensor idRaw({inHeight, inWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    rt::Tensor idTmp({inHeight, inWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    rt::Tensor idDst({numFrames, inHeight, inWidth, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    kernel::copyImageToDeviceAndResize(
-        input.data(), numFrames, inHeight, inWidth, channels, idRaw, idTmp, idDst, inHeight, inWidth, stream);
-    std::vector<unsigned char> identity(input.size());
-    CUDA_CHECK(cudaMemcpyAsync(identity.data(), idDst.rawPointer(), identity.size(), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    for (size_t i = 0; i < input.size(); ++i)
+TEST(FusedPreprocessVitGeometry, Nv12PitchLinearAcrossFamilies)
+{
+    for (auto const& family : kVitFamilies)
     {
-        ASSERT_EQ(identity[i], input[i]) << "multi-frame identity copy altered byte " << i;
+        for (auto const& source : kVitSourceGeometries)
+        {
+            auto const [outHeight, outWidth] = family.target(source.height, source.width);
+            TestFusedNv12(source.height, source.width, outHeight, outWidth, /*chromaCheckerboard=*/false,
+                rt::imageUtils::ColorStandard::kBt709, rt::imageUtils::ColorRange::kLimited, 0, 0, family.imageMean,
+                family.imageStd);
+        }
     }
-    std::cout << "CopyImageToDeviceAndResize MultiFrameAccuracy: " << numFrames << " frames resized + identity OK."
+}
+
+TEST(FusedPreprocessVitGeometry, Nv12BlockLinearAcrossFamilies)
+{
+    for (auto const& family : kVitFamilies)
+    {
+        for (auto const& source : kVitSourceGeometries)
+        {
+            auto const [outHeight, outWidth] = family.target(source.height, source.width);
+            TestNv12BlockLinearMatchesPitchLinear(source.height, source.width, outHeight, outWidth,
+                /*chromaCheckerboard=*/false, rt::imageUtils::ColorStandard::kBt709,
+                rt::imageUtils::ColorRange::kLimited, family.imageMean, family.imageStd);
+        }
+    }
+}
+
+// Normalising is an affine step on a value the kernel has already quantised to a code unit, so the
+// code units a family's constants produce are the ones unit constants produce over the same geometry.
+// A constant that reached the resample, or that landed on the wrong channel, would break this.
+TEST(FusedPreprocessVitGeometry, NormalisationDoesNotReachTheResample)
+{
+    cudaStream_t stream{nullptr};
+    int64_t const inHeight = 747, inWidth = 1000;
+
+    std::vector<unsigned char> input(static_cast<size_t>(inHeight * inWidth * 3));
+    FillResizeInput(
+        input, static_cast<int32_t>(inHeight), static_cast<int32_t>(inWidth), 3, ResizeFillPattern::kRANDOM);
+    rt::imageUtils::ImageData image = MakePinnedRgbImage(input, 1, inHeight, inWidth);
+
+    for (auto const& family : kVitFamilies)
+    {
+        auto const [outHeight, outWidth] = family.target(inHeight, inWidth);
+        size_t const elems = static_cast<size_t>(outHeight * outWidth * 3);
+
+        rt::Tensor normalised({1, outHeight, outWidth, 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+        rt::Tensor unit({1, outHeight, outWidth, 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+        rt::imageUtils::resizeAndNormalizeToRgb(
+            image, 0, 1, family.imageMean, family.imageStd, normalised, outHeight, outWidth, stream);
+        rt::imageUtils::resizeAndNormalizeToRgb(image, 0, 1, kUnitMean, kUnitStd, unit, outHeight, outWidth, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        std::vector<unsigned char> const got = ReadBackAsU8(normalised, elems, 0, family.imageMean, family.imageStd);
+        std::vector<unsigned char> const ref = ReadBackAsU8(unit, elems);
+        for (size_t i = 0; i < elems; ++i)
+        {
+            ASSERT_EQ(got[i], ref[i]) << family.name << " element " << i << " differs from the unit-normalised run";
+        }
+        std::cout << "FusedPreprocessVitGeometry Normalisation: " << family.name << " " << outHeight << "x" << outWidth
+                  << " recovered every code unit." << std::endl;
+    }
+}
+
+// Past roughly 13.3x vertically the luma support outgrows the shared memory stage and is consumed in
+// more than one chunk; the chroma plane reaches its own threshold past 23x. No resize target a runner
+// computes is that steep, so the geometries the other NV12 cases carry stay on the single-chunk path.
+TEST(FusedPreprocessNv12, MultiChunkSupport)
+{
+    TestFusedNv12(
+        6400, 448, 448, 448, false, rt::imageUtils::ColorStandard::kBt709, rt::imageUtils::ColorRange::kLimited);
+    TestFusedNv12(
+        12000, 448, 448, 448, false, rt::imageUtils::ColorStandard::kBt709, rt::imageUtils::ColorRange::kLimited);
+}
+
+TEST(FusedPreprocessNv12Bl, MultiChunkSupport)
+{
+    TestNv12BlockLinearMatchesPitchLinear(6400, 448, 448, 448);
+    TestNv12BlockLinearMatchesPitchLinear(12000, 448, 448, 448);
+}
+
+// InternVL, Phi-4-MM and Nemotron-Omni preprocess one source twice: once onto the tile grid and once
+// onto a single-tile thumbnail. The second call must not depend on the first having run.
+TEST(FusedPreprocessNv12, SecondCallOnTheSameFrameIsIndependent)
+{
+    cudaStream_t stream{nullptr};
+    int64_t const inHeight = 747, inWidth = 1000;
+    int64_t const mainHeight = 896, mainWidth = 448, thumbHeight = 448, thumbWidth = 448;
+    int64_t const chromaRowBytes = 2 * ((inWidth + 1) / 2);
+    auto const standard = rt::imageUtils::ColorStandard::kBt709;
+    auto const range = rt::imageUtils::ColorRange::kLimited;
+
+    std::vector<unsigned char> y(static_cast<size_t>(inHeight * inWidth));
+    std::vector<unsigned char> uv(static_cast<size_t>(((inHeight + 1) / 2) * chromaRowBytes));
+    uniformIntInitialization<unsigned char>(y, 0, 255);
+    uniformIntInitialization<unsigned char>(uv, 0, 255);
+    rt::imageUtils::ImageData image
+        = MakePinnedNv12Image(y, uv, inHeight, inWidth, inWidth, chromaRowBytes, standard, range);
+
+    rt::Tensor mainGrid({1, mainHeight, mainWidth, 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor thumb({1, thumbHeight, thumbWidth, 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor thumbAlone({1, thumbHeight, thumbWidth, 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::imageUtils::resizeAndNormalizeToRgb(image, 0, 1, kUnitMean, kUnitStd, mainGrid, mainHeight, mainWidth, stream);
+    rt::imageUtils::resizeAndNormalizeToRgb(image, 0, 1, kUnitMean, kUnitStd, thumb, thumbHeight, thumbWidth, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    rt::imageUtils::ImageData fresh
+        = MakePinnedNv12Image(y, uv, inHeight, inWidth, inWidth, chromaRowBytes, standard, range);
+    rt::imageUtils::resizeAndNormalizeToRgb(
+        fresh, 0, 1, kUnitMean, kUnitStd, thumbAlone, thumbHeight, thumbWidth, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    size_t const elems = static_cast<size_t>(thumbHeight * thumbWidth * 3);
+    std::vector<unsigned char> const after = ReadBackAsU8(thumb, elems);
+    std::vector<unsigned char> const alone = ReadBackAsU8(thumbAlone, elems);
+    for (size_t i = 0; i < elems; ++i)
+    {
+        ASSERT_EQ(after[i], alone[i]) << "thumbnail element " << i << " depends on the preceding main-grid call";
+    }
+    std::cout << "FusedPreprocessNv12 SecondCall: thumbnail identical whether or not the main grid ran first."
               << std::endl;
+}
+
+// A block-linear wrap carries one frame, so a video is one texture pair and one launch per frame into
+// the same destination. Re-running an earlier frame has to reproduce its own result rather than keep
+// any part of the frame that ran in between.
+TEST(FusedPreprocessNv12Bl, SuccessiveFramesDoNotBleed)
+{
+    cudaStream_t stream{nullptr};
+    int64_t const inHeight = 120, inWidth = 160, outHeight = 64, outWidth = 96;
+    int64_t const chromaW = (inWidth + 1) / 2, chromaH = (inHeight + 1) / 2;
+    size_t const elems = static_cast<size_t>(outHeight * outWidth * 3);
+
+    Nv12PathPair first(inHeight, inWidth, /*chromaCheckerboard=*/false);
+    Nv12PathPair second(inHeight, inWidth, /*chromaCheckerboard=*/true);
+    CUDA_CHECK(MakeTexturePlane(first.luma, first.y.data(), inWidth, inHeight, 0));
+    CUDA_CHECK(MakeTexturePlane(first.chroma, first.uv.data(), chromaW, chromaH, 8));
+    CUDA_CHECK(MakeTexturePlane(second.luma, second.y.data(), inWidth, inHeight, 0));
+    CUDA_CHECK(MakeTexturePlane(second.chroma, second.uv.data(), chromaW, chromaH, 8));
+
+    rt::imageUtils::ImageData const frameA = rt::imageUtils::wrapImageTexture(first.luma.texture, first.chroma.texture,
+        rt::imageUtils::ColorStandard::kBt709, rt::imageUtils::ColorRange::kLimited, inWidth, inHeight);
+    rt::imageUtils::ImageData const frameB
+        = rt::imageUtils::wrapImageTexture(second.luma.texture, second.chroma.texture,
+            rt::imageUtils::ColorStandard::kBt709, rt::imageUtils::ColorRange::kLimited, inWidth, inHeight);
+
+    rt::Tensor dst({1, outHeight, outWidth, 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::imageUtils::resizeAndNormalizeToRgb(frameA, 0, 1, kUnitMean, kUnitStd, dst, outHeight, outWidth, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<unsigned char> const firstPass = ReadBackAsU8(dst, elems);
+
+    rt::imageUtils::resizeAndNormalizeToRgb(frameB, 0, 1, kUnitMean, kUnitStd, dst, outHeight, outWidth, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<unsigned char> const between = ReadBackAsU8(dst, elems);
+
+    rt::imageUtils::resizeAndNormalizeToRgb(frameA, 0, 1, kUnitMean, kUnitStd, dst, outHeight, outWidth, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<unsigned char> const thirdPass = ReadBackAsU8(dst, elems);
+
+    size_t differing = 0;
+    for (size_t i = 0; i < elems; ++i)
+    {
+        ASSERT_EQ(firstPass[i], thirdPass[i]) << "element " << i << " kept part of the frame that ran in between";
+        differing += firstPass[i] != between[i] ? 1 : 0;
+    }
+    EXPECT_GT(differing, 0U) << "the two frames produced the same output, so the check proves nothing";
+    std::cout << "FusedPreprocessNv12Bl SuccessiveFrames: " << differing << "/" << elems
+              << " elements differ between the frames, and frame A reproduced exactly." << std::endl;
 }
 
 // ---------------------------------------------------------------------------
