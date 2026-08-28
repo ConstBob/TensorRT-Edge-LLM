@@ -628,19 +628,37 @@ def _find_token_id(model_dir: str, token_str: str) -> "Optional[int]":
 
 
 def _load_all_weights(model_dir: str) -> dict:
-    """Load all safetensors shards in *model_dir* into a flat dict."""
+    """Load all safetensors (or PyTorch ``.bin``) shards in *model_dir* into a
+    flat dict."""
     import glob
 
     from safetensors.torch import load_file
 
     shards = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
-    if not shards:
-        logger.error("No safetensors files found in %s", model_dir)
+    if shards:
+        weights: dict = {}
+        for shard in shards:
+            logger.info("  Loading shard: %s", os.path.basename(shard))
+            weights.update(load_file(shard, device="cpu"))
+        return weights
+
+    # Fallback: PyTorch pickle checkpoints. Some officially supported AWQ VLMs
+    # (e.g. InternVL3-*-AWQ) ship only ``pytorch_model*.bin`` and no safetensors.
+    # Mirror the ``.bin`` support the core weight loader already
+    # has (checkpoint/loader.py _build_shard_map).
+    import torch
+
+    bin_shards = sorted(glob.glob(os.path.join(model_dir, "pytorch_model*.bin"))) \
+        or sorted(glob.glob(os.path.join(model_dir, "*.bin")))
+    if not bin_shards:
+        logger.error("No safetensors or .bin weight files found in %s",
+                     model_dir)
         sys.exit(1)
-    weights: dict = {}
-    for shard in shards:
-        logger.info("  Loading shard: %s", os.path.basename(shard))
-        weights.update(load_file(shard, device="cpu"))
+    weights = {}
+    for shard in bin_shards:
+        logger.info("  Loading .bin shard: %s", os.path.basename(shard))
+        weights.update(torch.load(shard, map_location="cpu",
+                                  weights_only=True))
     return weights
 
 
