@@ -317,6 +317,24 @@ def _int4_groupwise_gemm_v2_translation(
 
 
 # ---------------------------------------------------------------------------
+# QKV packing op
+# ---------------------------------------------------------------------------
+
+
+@script()
+def _qkv_concat_translation(
+    q: onnxscript.FLOAT16,
+    k: onnxscript.FLOAT16,
+    v: onnxscript.FLOAT16,
+) -> onnxscript.FLOAT16:
+    return _trt_edgellm.QkvConcatPlugin(
+        q,
+        k,
+        v,
+    )
+
+
+# ---------------------------------------------------------------------------
 # INT8 SmoothQuant ops
 # ---------------------------------------------------------------------------
 
@@ -1338,6 +1356,8 @@ def build_custom_translation_table() -> dict:
         _int4_groupwise_gemm_translation,
         torch.ops.trt.int4_groupwise_gemm_v2.default:
         _int4_groupwise_gemm_v2_translation,
+        torch.ops.trt.qkv_concat.default:
+        _qkv_concat_translation,
         torch.ops.trt.nvfp4_a16_gemm.default:
         _nvfp4_a16_gemm_translation,
         torch.ops.trt.int8_sq_act_qdq.default:
