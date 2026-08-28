@@ -49,6 +49,12 @@ enum class SpecDecodeMode : int32_t
     kDSpark,
 };
 
+enum class DFlashVersion : int32_t
+{
+    kV1 = 1,
+    kV2 = 2,
+};
+
 //! Runtime storage policy for engines carrying bounded-SWA capability metadata.
 enum class SwaKVCacheMode : int32_t
 {
@@ -192,6 +198,15 @@ struct LLMEngineConfig
 
     //! Mask token ID used to seed cached draft input blocks for DFlash/JetSpec/DSpark.
     int32_t specDraftMaskTokenId{0};
+
+    //! Versioned DFlash engine/runtime ABI. Missing metadata defaults to V1.
+    DFlashVersion dflashVersion{DFlashVersion::kV1};
+    int32_t specSelectorTopK{0};
+    int32_t specSelectorRank{0};
+    std::string dflash2SelectorFile;
+    int32_t specConvKernelSize{0};
+    int32_t specConvGroupSize{0};
+    bool specSupportsProbabilistic{false};
 
     //! Whether cached draft proposal self-attention is causal. JetSpec uses causal rows.
     bool specDraftCausalHead{false};

@@ -1153,19 +1153,6 @@ __global__ void dsparkProbabilisticAcceptKernel(float const* __restrict__ target
     acceptLength[batchIdx] = acceptedDraft + 1;
 }
 
-__device__ float dsparkSparseProbabilityForToken(
-    float const* probs, int32_t const* indices, int32_t topK, int32_t token)
-{
-    for (int32_t k = 0; k < topK; ++k)
-    {
-        if (indices[k] == token)
-        {
-            return probs[k];
-        }
-    }
-    return 0.0F;
-}
-
 __device__ int32_t dsparkSampleFromSparseProbs(float const* probs, int32_t const* indices, int32_t topK, float uniform)
 {
     float const target = dsparkClampUniform(uniform);
@@ -1183,43 +1170,6 @@ __device__ int32_t dsparkSampleFromSparseProbs(float const* probs, int32_t const
         if (target < cumulative)
         {
             return indices[k];
-        }
-    }
-    return fallback;
-}
-
-__device__ int32_t dsparkSampleFromSparseResidual(float const* targetProbs, int32_t const* targetIndices,
-    int32_t targetTopK, float const* draftProbs, int32_t const* draftIndices, int32_t draftTopK, float uniform)
-{
-    float residualSum = 0.0F;
-    for (int32_t k = 0; k < targetTopK; ++k)
-    {
-        int32_t const token = targetIndices[k];
-        float const draftProb = dsparkSparseProbabilityForToken(draftProbs, draftIndices, draftTopK, token);
-        residualSum += fmaxf(targetProbs[k] - draftProb, 0.0F);
-    }
-    if (residualSum <= 1e-20F)
-    {
-        return dsparkSampleFromSparseProbs(targetProbs, targetIndices, targetTopK, uniform);
-    }
-
-    float const target = dsparkClampUniform(uniform) * residualSum;
-    float cumulative = 0.0F;
-    int32_t fallback = targetTopK > 0 ? targetIndices[0] : 0;
-    for (int32_t k = 0; k < targetTopK; ++k)
-    {
-        int32_t const token = targetIndices[k];
-        float const draftProb = dsparkSparseProbabilityForToken(draftProbs, draftIndices, draftTopK, token);
-        float const residual = fmaxf(targetProbs[k] - draftProb, 0.0F);
-        if (residual <= 0.0F)
-        {
-            continue;
-        }
-        fallback = token;
-        cumulative += residual;
-        if (target < cumulative)
-        {
-            return token;
         }
     }
     return fallback;
@@ -1326,71 +1276,6 @@ __global__ void dsparkSampleTopKRowsAndStoreKernel(float const* __restrict__ top
         float const uniform = proposalUniforms[batchIdx * proposalLen + step];
         draftTokenIds[batchIdx * proposalLen + step] = dsparkSampleFromSparseProbs(outProbs, outIndices, topK, uniform);
     }
-}
-
-__global__ void dsparkSparseTopKAcceptKernel(float const* __restrict__ targetTopKProbabilities, // [B, VFY, Kt]
-    int32_t const* __restrict__ targetTopKIndices,                                              // [B, VFY, Kt]
-    float const* __restrict__ draftTopKProbabilities,                                           // [B, draftStride, Kd]
-    int32_t const* __restrict__ draftTopKIndices,                                               // [B, draftStride, Kd]
-    int32_t const* __restrict__ draftTokenIds,                                                  // [B, draftStride]
-    int32_t const* __restrict__ proposalLengths,                                                // [B]
-    float const* __restrict__ acceptUniforms, // [B, 2*draftStride + 1]
-    int32_t* __restrict__ acceptedTokenIds,   // [B, VFY]
-    int32_t* __restrict__ acceptLength,       // [B]
-    int32_t draftStride, int32_t verifyProposalLen, int32_t targetTopK, int32_t draftTopK)
-{
-    int32_t const batchIdx = blockIdx.x;
-    if (threadIdx.x != 0)
-    {
-        return;
-    }
-
-    int32_t const verifyLen = verifyProposalLen + 1;
-    int32_t const uniformStride = 2 * draftStride + 1;
-    int32_t* batchAccepted = acceptedTokenIds + batchIdx * verifyLen;
-    for (int32_t pos = 0; pos < verifyLen; ++pos)
-    {
-        batchAccepted[pos] = 0;
-    }
-
-    int32_t const rowProposalLen = max(1, min(verifyProposalLen, proposalLengths[batchIdx]));
-    int32_t acceptedDraft = 0;
-    for (int32_t step = 0; step < rowProposalLen; ++step)
-    {
-        int32_t const draftToken = draftTokenIds[batchIdx * draftStride + step];
-        float const* targetRow
-            = targetTopKProbabilities + (static_cast<int64_t>(batchIdx) * verifyLen + step) * targetTopK;
-        int32_t const* targetIndexRow
-            = targetTopKIndices + (static_cast<int64_t>(batchIdx) * verifyLen + step) * targetTopK;
-        float const* draftRow
-            = draftTopKProbabilities + (static_cast<int64_t>(batchIdx) * draftStride + step) * draftTopK;
-        int32_t const* draftIndexRow
-            = draftTopKIndices + (static_cast<int64_t>(batchIdx) * draftStride + step) * draftTopK;
-        float const targetProb = dsparkSparseProbabilityForToken(targetRow, targetIndexRow, targetTopK, draftToken);
-        float const draftProb = dsparkSparseProbabilityForToken(draftRow, draftIndexRow, draftTopK, draftToken);
-        float const acceptProb = draftProb <= 1e-20F ? 1.0F : fminf(1.0F, targetProb / draftProb);
-        float const acceptUniform = acceptUniforms[batchIdx * uniformStride + step];
-        if (acceptUniform <= acceptProb)
-        {
-            batchAccepted[acceptedDraft] = draftToken;
-            ++acceptedDraft;
-            continue;
-        }
-
-        float const residualUniform = acceptUniforms[batchIdx * uniformStride + draftStride + step];
-        batchAccepted[acceptedDraft] = dsparkSampleFromSparseResidual(
-            targetRow, targetIndexRow, targetTopK, draftRow, draftIndexRow, draftTopK, residualUniform);
-        acceptLength[batchIdx] = acceptedDraft + 1;
-        return;
-    }
-
-    float const* bonusRow
-        = targetTopKProbabilities + (static_cast<int64_t>(batchIdx) * verifyLen + rowProposalLen) * targetTopK;
-    int32_t const* bonusIndexRow
-        = targetTopKIndices + (static_cast<int64_t>(batchIdx) * verifyLen + rowProposalLen) * targetTopK;
-    float const bonusUniform = acceptUniforms[batchIdx * uniformStride + 2 * draftStride];
-    batchAccepted[acceptedDraft] = dsparkSampleFromSparseProbs(bonusRow, bonusIndexRow, targetTopK, bonusUniform);
-    acceptLength[batchIdx] = acceptedDraft + 1;
 }
 
 } // anonymous namespace
@@ -1725,24 +1610,6 @@ void dsparkSampleTopKRowsAndStore(rt::Tensor const& topKValues, rt::Tensor const
         static_cast<float const*>(proposalUniforms.rawPointer()), static_cast<int32_t*>(draftTokenIds.rawPointer()),
         static_cast<float*>(draftTopKProbabilities.rawPointer()), static_cast<int32_t*>(draftTopKIndices.rawPointer()),
         step, proposalLen, topK, temperature);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void dsparkSparseTopKAccept(rt::Tensor const& targetTopKProbabilities, rt::Tensor const& targetTopKIndices,
-    rt::Tensor const& draftTopKProbabilities, rt::Tensor const& draftTopKIndices, rt::Tensor const& draftTokenIds,
-    rt::Tensor const& proposalLengths, rt::Tensor const& acceptUniforms, rt::Tensor& acceptedTokenIds,
-    rt::Tensor& acceptLength, int32_t batchSize, int32_t draftStride, int32_t verifyProposalLen, int32_t targetTopK,
-    int32_t draftTopK, cudaStream_t stream)
-{
-    dsparkSparseTopKAcceptKernel<<<batchSize, 1, 0, stream>>>(
-        static_cast<float const*>(targetTopKProbabilities.rawPointer()),
-        static_cast<int32_t const*>(targetTopKIndices.rawPointer()),
-        static_cast<float const*>(draftTopKProbabilities.rawPointer()),
-        static_cast<int32_t const*>(draftTopKIndices.rawPointer()),
-        static_cast<int32_t const*>(draftTokenIds.rawPointer()),
-        static_cast<int32_t const*>(proposalLengths.rawPointer()),
-        static_cast<float const*>(acceptUniforms.rawPointer()), static_cast<int32_t*>(acceptedTokenIds.rawPointer()),
-        static_cast<int32_t*>(acceptLength.rawPointer()), draftStride, verifyProposalLen, targetTopK, draftTopK);
     CUDA_CHECK(cudaGetLastError());
 }
 

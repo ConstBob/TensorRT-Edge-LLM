@@ -676,6 +676,7 @@ TEST(RegistryBuilderTest, SpecDraftRegistriesKVPageTableRowsTrackActiveBatch)
     SpecDecodeConfig specConfig{};
     specConfig.baseOutputHiddenDim = 4096;
     specConfig.draftHiddenSize = 4096;
+    specConfig.dflashBlockSize = 8;
     bundle.specConfig = specConfig;
 
     auto checkPageTable = [&](TensorRegistry const& reg, char const* registryName) {
@@ -709,6 +710,10 @@ TEST(RegistryBuilderTest, SpecDraftRegistriesKVPageTableRowsTrackActiveBatch)
     checkPageTable(buildRegistryForSpecDecodeDraft(bundle), "EAGLE/MTP");
 
     draft.specDecodeType = SpecDecodeMode::kDFlash;
+    draft.dflashVersion = DFlashVersion::kV2;
+    draft.specDraftBlockSize = 8;
+    draft.specSelectorTopK = 16;
+    draft.specSelectorRank = 256;
     bundle.base.specDecodeType = draft.specDecodeType;
     bundle.draft = draft;
     checkPageTable(buildRegistryForDFlashDraft(bundle), "DFlash/JetSpec");
@@ -722,6 +727,55 @@ TEST(RegistryBuilderTest, SpecDraftRegistriesKVPageTableRowsTrackActiveBatch)
     bundle.base.specDecodeType = draft.specDecodeType;
     bundle.draft = draft;
     checkPageTable(buildRegistryForDSparkDraft(bundle), "DSpark");
+}
+
+TEST(RegistryBuilderTest, DFlash2RegistryExposesRuntimeSelectorIntermediates)
+{
+    LLMEngineConfig draft = makeBasicLLMConfig();
+    draft.specDecodeType = SpecDecodeMode::kDFlash;
+    draft.dflashVersion = DFlashVersion::kV2;
+    draft.specDraftBlockSize = 8;
+    draft.specSelectorTopK = 16;
+    draft.specSelectorRank = 256;
+
+    DeploymentConfig bundle;
+    bundle.base = makeBasicLLMConfig();
+    bundle.base.specDecodeType = SpecDecodeMode::kDFlash;
+    bundle.base.dflashVersion = DFlashVersion::kV2;
+    bundle.draft = draft;
+    SpecDecodeConfig specConfig{};
+    specConfig.baseOutputHiddenDim = draft.hiddenSize;
+    specConfig.draftHiddenSize = draft.hiddenSize;
+    specConfig.dflashBlockSize = 16;
+    bundle.specConfig = specConfig;
+
+    auto const specs = buildRegistryForDFlashDraft(bundle).allExpandedSpecs();
+    auto findSpec = [&](char const* name) {
+        return std::find_if(specs.begin(), specs.end(), [name](TensorSpec const& spec) { return spec.name == name; });
+    };
+    EXPECT_EQ(findSpec("spec_proposal_uniforms"), specs.end());
+    EXPECT_EQ(findSpec("spec_proposal_token_ids"), specs.end());
+
+    auto const supportIds = findSpec(trt_edgellm::binding_names::kSpecProposalSupportIds);
+    ASSERT_NE(supportIds, specs.end());
+    ASSERT_EQ(supportIds->shape.size(), 3U);
+    EXPECT_EQ(supportIds->shape[1].value, 15);
+    EXPECT_EQ(supportIds->shape[2].value, 16);
+
+    auto const unaryValues = findSpec(trt_edgellm::binding_names::kSpecProposalUnaryValues);
+    ASSERT_NE(unaryValues, specs.end());
+    ASSERT_EQ(unaryValues->shape.size(), supportIds->shape.size());
+    for (size_t i = 0; i < supportIds->shape.size(); ++i)
+    {
+        EXPECT_EQ(unaryValues->shape[i].symbol, supportIds->shape[i].symbol);
+        EXPECT_EQ(unaryValues->shape[i].value, supportIds->shape[i].value);
+    }
+
+    auto const projectedHidden = findSpec(trt_edgellm::binding_names::kSpecProposalProjectedHidden);
+    ASSERT_NE(projectedHidden, specs.end());
+    ASSERT_EQ(projectedHidden->shape.size(), 3U);
+    EXPECT_EQ(projectedHidden->shape[1].value, 15);
+    EXPECT_EQ(projectedHidden->shape[2].value, 256);
 }
 
 // =====================================================================

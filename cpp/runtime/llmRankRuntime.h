@@ -328,6 +328,7 @@ private:
     rt::Tensor mSamplingWorkspace;
     rt::Tensor mSamplingIndices;
     rt::Tensor mSamplingScores;
+    rt::Tensor mSamplingUniforms;
     rt::Tensor mBaseVocabMappingTable; // Vocab mapping table for base model reduced vocab (empty if not used)
 
     // [3] Batch eviction support tensors.
@@ -339,6 +340,7 @@ private:
     rt::Tensor mHostPackedTokenIds;      //!< Host pinned memory for packed token IDs
     rt::Tensor mHostSelectedTokenIds;    //!< Host pinned memory for selected token IDs from sampling
     rt::Tensor mHostOutputSpaceIds;      //!< Host pinned copy of the sampled indices taken before reduced-vocab remap
+    rt::Tensor mHostSamplingUniforms;    //!< Host pinned request-stable uniforms for prefill sampling
     rt::Tensor mHostReuseKVCacheLengths; //!< Host pinned memory for reuse KV cache lengths
 
     // [5] Multimodal support tensors for audio/image token indexing

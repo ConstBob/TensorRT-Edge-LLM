@@ -66,7 +66,7 @@ def configure_base(config,
     config.dflash_block_size = int(
         dflash.get("block_size", draft.get("block_size", 16)))
     config.dflash_mask_token_id = int(dflash.get("mask_token_id", 248070))
-    config.dflash_tree_base = bool(build_args and build_args.tree_base)
+    config.dflash_tree_base = True
 
 
 def configure_draft(config, *, paired_target=None, **kwargs) -> None:

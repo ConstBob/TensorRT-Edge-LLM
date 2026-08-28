@@ -205,15 +205,6 @@ void dsparkSampleTopKRowsAndStore(rt::Tensor const& topKValues, rt::Tensor const
     cudaStream_t stream);
 
 /*!
- * @brief DSpark probabilistic verifier over sparse top-k target/draft supports.
- */
-void dsparkSparseTopKAccept(rt::Tensor const& targetTopKProbabilities, rt::Tensor const& targetTopKIndices,
-    rt::Tensor const& draftTopKProbabilities, rt::Tensor const& draftTopKIndices, rt::Tensor const& draftTokenIds,
-    rt::Tensor const& proposalLengths, rt::Tensor const& acceptUniforms, rt::Tensor& acceptedTokenIds,
-    rt::Tensor& acceptLength, int32_t batchSize, int32_t draftStride, int32_t verifyProposalLen, int32_t targetTopK,
-    int32_t draftTopK, cudaStream_t stream);
-
-/*!
  * @brief DSpark probabilistic verifier with residual sampling.
  *
  * targetProbabilities is [B, proposalLen + 1, vocabSize]. draftProbabilities is

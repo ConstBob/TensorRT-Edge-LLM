@@ -232,6 +232,21 @@ DFlash uses its paired draft checkpoint and model-owned DFlash cache contract:
   --plugin-path /path/to/build/libNvInfer_edgellm_plugin.so
 ```
 
+DFlash V2 checkpoints use the same user-visible DFlash mode. Their
+checkpoint-owned fixed linear selector contract rejects `--tree-base`:
+
+```bash
+.venv/bin/tensorrt-edgellm-build \
+  --model-dir /path/to/qwen3.8-target \
+  --draft-model-dir /path/to/qwen3.8-dflash2-draft \
+  --spec-type dflash \
+  --engine-dir /path/to/engines \
+  --plugin-path /path/to/build/libNvInfer_edgellm_plugin.so
+```
+
+The checkpoint architecture selects V2; its dynamic-convolution and
+candidate-selector plugin contracts are built and validated together.
+
 dSpark uses a paired Qwen3 target and draft checkpoint:
 
 ```bash

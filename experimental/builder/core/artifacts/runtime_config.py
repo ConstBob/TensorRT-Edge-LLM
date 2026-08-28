@@ -18,6 +18,8 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any, Dict
 
+from tensorrt_edgellm.dflash import DFlashVersion
+
 from ...ops.functional.attention import KV_PAGE_SIZE
 from .. import contracts
 from ..config import LAYER_ATTN, LAYER_GDN, LAYER_MAMBA, DeviceConfig
@@ -259,12 +261,28 @@ def build_runtime_config(cfg: DeviceConfig, args) -> Dict[str, Any]:
             })
 
     if args.spec_type == "dflash":
-        out["dflash_config"] = {
-            "target_layer_ids": cfg.dflash_target_layer_ids
-            or [1, 8, 15, 22, 29],
-            "block_size": cfg.dflash_block_size,
-            "mask_token_id": cfg.dflash_mask_token_id,
+        dflash = {
+            "version":
+            int(args.dflash_version),
+            "target_layer_ids":
+            cfg.dflash_target_layer_ids or [1, 8, 15, 22, 29],
+            "block_size":
+            cfg.dflash_block_size,
+            "mask_token_id":
+            cfg.dflash_mask_token_id,
+            "supports_probabilistic_sampling":
+            args.dflash_version == DFlashVersion.V2,
         }
+        if args.dflash_version == DFlashVersion.V2:
+            dflash.update({
+                "is_causal": cfg.dflash2_is_causal,
+                "conv_kernel_size": cfg.dflash2_conv_kernel_size,
+                "conv_group_size": cfg.dflash2_conv_group_size,
+                "selector_rank": cfg.dflash2_selector_rank,
+                "selector_top_k": cfg.dflash2_selector_top_k,
+                "selector_file": "dflash2_selector.safetensors",
+            })
+        out["dflash_config"] = dflash
         out["dflash_tree_base"] = cfg.dflash_tree_base
     if args.spec_type == "mtp":
         out["mtp_tree_base"] = cfg.mtp_tree_base

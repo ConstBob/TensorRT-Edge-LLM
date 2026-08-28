@@ -139,6 +139,12 @@ inline constexpr char const* kDFlashTargetHiddenConcat = "dflash_target_hidden_c
  */
 inline constexpr char const* kDFlashDeltaLengths = "dflash_delta_lengths";
 
+//! DFlash2 draft-engine outputs consumed by the runtime candidate selector.
+inline constexpr char const* kSpecProposalSupportIds = "spec_proposal_support_ids";
+inline constexpr char const* kSpecProposalUnaryValues = "spec_proposal_unary_values";
+inline constexpr char const* kSpecProposalProjectedHidden = "spec_proposal_projected_hidden";
+inline constexpr char const* kDFlash2SelectorFileName = "dflash2_selector.safetensors";
+
 /*!
  * @brief DSpark draft model output: final proposal hidden states.
  *

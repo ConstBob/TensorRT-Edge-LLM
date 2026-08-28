@@ -1328,6 +1328,29 @@ def _dflash_target_kv_cache_update_translation(
     return present_kv
 
 
+@script()
+def _dflash2_grouped_dynamic_conv_translation(
+    hidden_states: OnnxUnion[onnxscript.FLOAT16, onnxscript.BFLOAT16],
+    delta: OnnxUnion[onnxscript.FLOAT16, onnxscript.BFLOAT16],
+    base_kernel: OnnxUnion[onnxscript.FLOAT16, onnxscript.BFLOAT16],
+    residual: onnxscript.FLOAT = None,
+    block_size: int = 8,
+    kernel_size: int = 2,
+    group_size: int = 16,
+    fuse_residual: int = 0,
+) -> OnnxUnion[onnxscript.FLOAT16, onnxscript.BFLOAT16, onnxscript.FLOAT]:
+    return _trt_edgellm.DFlash2GroupedDynamicConvPlugin(
+        hidden_states,
+        delta,
+        base_kernel,
+        residual,
+        block_size=block_size,
+        kernel_size=kernel_size,
+        group_size=group_size,
+        fuse_residual=fuse_residual,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Gemma4 Audio Attention Plugin
 # ---------------------------------------------------------------------------
@@ -1439,6 +1462,8 @@ def build_custom_translation_table() -> dict:
         _fp16_moe_plugin_sigmoid_translation,
         torch.ops.trt_edgellm.dflash_target_kv_cache_update.default:
         _dflash_target_kv_cache_update_translation,
+        torch.ops.trt_edgellm.dflash2_grouped_dynamic_conv.default:
+        _dflash2_grouped_dynamic_conv_translation,
         # TRT native attention ops (used by Alpamayo)
         torch.ops.trt.rope_onnx.default:
         _rope_onnx_translation,

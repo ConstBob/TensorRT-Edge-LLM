@@ -230,6 +230,82 @@ TEST_F(LLMEngineConfigTest, ParseEagleBaseConditioningMetadata)
     EXPECT_EQ(config.specTargetLayerIds, std::vector<int32_t>({0, 5, 11}));
 }
 
+TEST_F(LLMEngineConfigTest, ParseDFlash2BaseContract)
+{
+    Json json = makeMinimalConfig();
+    json["spec_decode_type"] = "dflash";
+    json["engine_role"] = "base";
+    json["dflash_config"] = {
+        {"version", 2},
+        {"target_layer_ids", {1, 3, 5, 7, 11}},
+        {"block_size", 8},
+        {"mask_token_id", 248070},
+        {"is_causal", false},
+        {"conv_kernel_size", 2},
+        {"conv_group_size", 16},
+        {"selector_rank", 256},
+        {"selector_top_k", 16},
+        {"selector_file", "custom_selector.safetensors"},
+        {"supports_probabilistic_sampling", true},
+    };
+    json["builder_config"]["spec_base"] = true;
+    json["builder_config"]["max_verify_tree_size"] = 8;
+    auto const path = writeJsonToTempFile(json);
+
+    auto const cfg = parseEngineConfig(path);
+    EXPECT_EQ(cfg.specDecodeType, SpecDecodeMode::kDFlash);
+    EXPECT_EQ(cfg.dflashVersion, DFlashVersion::kV2);
+    EXPECT_TRUE(isCachedBlockDraftMode(cfg.specDecodeType));
+    EXPECT_EQ(cfg.specDraftBlockSize, 8);
+    EXPECT_EQ(cfg.specDraftMaskTokenId, 248070);
+    EXPECT_FALSE(cfg.specDraftCausalHead);
+    EXPECT_EQ(cfg.specSelectorTopK, 16);
+    EXPECT_EQ(cfg.specSelectorRank, 256);
+    EXPECT_EQ(cfg.dflash2SelectorFile, "custom_selector.safetensors");
+    EXPECT_EQ(cfg.specConvKernelSize, 2);
+    EXPECT_EQ(cfg.specConvGroupSize, 16);
+    EXPECT_TRUE(cfg.specSupportsProbabilistic);
+    EXPECT_EQ(cfg.specTargetLayerIds, std::vector<int32_t>({1, 3, 5, 7, 11}));
+}
+
+TEST_F(LLMEngineConfigTest, DFlash2RejectsInvalidTargetLayerContract)
+{
+    auto makeConfig = [] {
+        Json json = makeMinimalConfig();
+        json["spec_decode_type"] = "dflash";
+        json["engine_role"] = "base";
+        json["dflash_config"] = {{"version", 2}, {"target_layer_ids", {1, 3, 5, 7, 11}}, {"block_size", 8},
+            {"mask_token_id", 248070}, {"is_causal", false}, {"conv_kernel_size", 2}, {"conv_group_size", 16},
+            {"selector_rank", 256}, {"selector_top_k", 16}, {"supports_probabilistic_sampling", true}};
+        json["builder_config"]["spec_base"] = true;
+        json["builder_config"]["max_verify_tree_size"] = 8;
+        return json;
+    };
+
+    Json wrongCount = makeConfig();
+    wrongCount["dflash_config"]["target_layer_ids"] = {1, 3, 5, 7};
+    EXPECT_THROW(parseEngineConfig(writeJsonToTempFile(wrongCount)), std::runtime_error);
+
+    Json duplicate = makeConfig();
+    duplicate["dflash_config"]["target_layer_ids"] = {1, 3, 5, 5, 11};
+    EXPECT_THROW(parseEngineConfig(writeJsonToTempFile(duplicate)), std::runtime_error);
+}
+
+TEST_F(LLMEngineConfigTest, LegacyDFlashMissingVersionDefaultsToV1)
+{
+    Json json = makeMinimalConfig();
+    json["spec_decode_type"] = "dflash";
+    json["engine_role"] = "base";
+    json["dflash_config"] = {{"target_layer_ids", {1, 3, 5, 7, 11}}, {"block_size", 16}, {"mask_token_id", 248070}};
+    json["builder_config"]["spec_base"] = true;
+    json["builder_config"]["max_verify_tree_size"] = 8;
+    auto const path = writeJsonToTempFile(json);
+
+    auto const cfg = parseEngineConfig(path);
+    EXPECT_EQ(cfg.dflashVersion, DFlashVersion::kV1);
+    EXPECT_FALSE(cfg.specSupportsProbabilistic);
+}
+
 TEST_F(LLMEngineConfigTest, MissingKVPoolPagesThrows)
 {
     Json json = makeMinimalConfig();

@@ -598,9 +598,9 @@ PipelineIO PipelineIO::createForSpecDecode(
     io.skipSoftmaxScale = Tensor({1}, DeviceType::kGPU, nvinfer1::DataType::kINT8, "PipelineIO::skipSoftmaxScale");
     CUDA_CHECK(cudaMemsetAsync(io.skipSoftmaxScale.rawPointer(), 0, io.skipSoftmaxScale.getMemoryCapacity(), stream));
 
-    bool const useSpecTree
-        = (isCachedBlockDraftMode(bundle.specDecodeMode()) || bundle.specDecodeMode() == SpecDecodeMode::kMTP)
-        && bundle.specConfig->draftingTopK > 1;
+    SpecDecodeMode const mode = bundle.specDecodeMode();
+    bool const useSpecTree = mode == SpecDecodeMode::kDFlash
+        || ((isCachedBlockDraftMode(mode) || mode == SpecDecodeMode::kMTP) && bundle.specConfig->draftingTopK > 1);
     if (useSpecTree)
     {
         io.specTreeParentIds = Tensor({maxRuntimeBatchSize, effectiveMaxDraftProposalSize}, DeviceType::kGPU,

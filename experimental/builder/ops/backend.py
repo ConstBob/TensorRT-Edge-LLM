@@ -59,6 +59,7 @@ _OPERATION_CREATORS = {
     "fused_nvfp4_gemm_all_reduce": "FusedNvfp4GemmAllReducePlugin",
     "attention": "AttentionPlugin",
     "dflash_target_cache_update": "DFlashTargetKVCacheUpdate",
+    "dflash2_grouped_dynamic_conv": "DFlash2GroupedDynamicConvPlugin",
     "gemma4_attention": "Gemma4AudioAttentionPlugin",
     "fp16_moe": "Fp16MoePlugin",
     "int4_groupwise_gemm": "Int4GroupwiseGemmPlugin",

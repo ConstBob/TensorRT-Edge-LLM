@@ -43,7 +43,8 @@ from transformers import (AutoModel, AutoModelForCausalLM,
 
 from .datasets import (AudioDataset, ImageDataset, TextDataset, dataset_name,
                        resolve_dataset)
-from .quantization_configs import _VISUAL_PREFIXES, build_quant_config
+from .quantization_configs import (_VISUAL_PREFIXES, append_quant_cfg_entries,
+                                   build_quant_config)
 from .qwen3_asr_loader import (asr_calibration_dataloader, is_qwen3_asr_model,
                                load_qwen3_asr_joint_for_calibration,
                                postprocess_qwen3_asr_checkpoint)
@@ -1010,18 +1011,20 @@ def quantize_and_export(
         # exclude any 64-misaligned Linear from int4 -- it stays fp16 and exports
         # as a plain GEMM.
         if quantization == "int4_awq":
+            int4_excludes = []
             for name, module in model.named_modules():
                 if isinstance(
                         module,
                         torch.nn.Linear) and (module.out_features % 64 != 0
                                               or module.in_features % 64 != 0):
-                    quant_cfg["quant_cfg"].append({
+                    int4_excludes.append({
                         "quantizer_name": f"*{name}.weight_quantizer",
                         "enable": False,
                     })
                     print(
                         f"[int4] skipping {name}: weight [{module.out_features}, "
                         f"{module.in_features}] not 64-aligned (kept fp16)")
+            append_quant_cfg_entries(quant_cfg, int4_excludes)
         if kv_cache_quantization is not None and _is_phi4mm_model(model_dir):
             _pre_register_phi4mm_attention_for_kv_quant(model)
         if cp_quantization is not None and is_qwen3_next_omni(model):

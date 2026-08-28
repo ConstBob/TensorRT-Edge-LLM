@@ -45,8 +45,8 @@ struct DecoderRegistryInit
 };
 
 //! Return whether an available speculative decoder should yield to the default decoder for this request.
-bool shouldSelectDefaultDecoder(
-    DecodingStrategyKind speculativeDecoderKind, LLMGenerationRequest const& request) noexcept;
+bool shouldSelectDefaultDecoder(DecodingStrategyKind speculativeDecoderKind,
+    DecodingStrategyCapabilities const& speculativeCapabilities, LLMGenerationRequest const& request) noexcept;
 
 class DecoderRegistry final
 {

@@ -29,6 +29,7 @@
 #include "kernels/speculative/dsparkKernels.h"
 #include "kernels/speculative/eagleAcceptKernels.h"
 #include "kernels/speculative/eagleUtilKernels.h"
+#include "kernels/speculative/speculativeSampling.h"
 #include "profiling/metrics.h"
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
@@ -983,6 +984,10 @@ bool DSparkDecoder::runBaseVerification(DecodingInferenceContext& context)
                 samplingTopK, mRuntime.sampling.workspace, context.stream);
             kernel::dsparkNormalizeTopKRows(mTargetTopKValues, mTargetTopKProbabilities, targetRows, samplingTopK,
                 context.temperature, context.stream);
+            check::check(
+                mTargetTopKProbabilities.reshape({activeBatchSize, verifyLen, samplingTopK}), "Tensor reshape failed");
+            check::check(
+                mTargetTopKIndices.reshape({activeBatchSize, verifyLen, samplingTopK}), "Tensor reshape failed");
         }
         else
         {
@@ -1002,9 +1007,9 @@ bool DSparkDecoder::runBaseVerification(DecodingInferenceContext& context)
             mAcceptUniforms, activeBatchSize * acceptUniformStride, kDSparkSamplingSeed, randomOffset, context.stream);
         if (sparseTopK)
         {
-            kernel::dsparkSparseTopKAccept(mTargetTopKProbabilities, mTargetTopKIndices, mDraftTopKProbabilities,
+            kernel::speculativeSparseAccept(mTargetTopKProbabilities, mTargetTopKIndices, mDraftTopKProbabilities,
                 mDraftTopKIndices, mDraftTokenIds, mProposalLengths, mAcceptUniforms, mAcceptedTokenIds, mAcceptLength,
-                activeBatchSize, mProposalLen, mCurrentProposalLen, samplingTopK, samplingTopK, context.stream);
+                nullptr, context.stream);
         }
         else
         {

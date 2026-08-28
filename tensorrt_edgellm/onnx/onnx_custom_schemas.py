@@ -1912,6 +1912,58 @@ _dflash_target_kv_cache_update_schema = OpSchema(
     ],
 )
 
+_dflash2_grouped_dynamic_conv_schema = OpSchema(
+    name="DFlash2GroupedDynamicConvPlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc="DFlash2 dynamic grouped depthwise convolution.",
+    inputs=[
+        OpSchema.FormalParameter(name="hidden_states",
+                                 description="Activation",
+                                 type_str="T"),
+        OpSchema.FormalParameter(name="delta",
+                                 description="Dynamic coefficients",
+                                 type_str="T"),
+        OpSchema.FormalParameter(name="base_kernel",
+                                 description="Base kernel",
+                                 type_str="T"),
+        OpSchema.FormalParameter(
+            name="residual",
+            description="Optional FP32 fused residual",
+            type_str="tensor(float)",
+            param_option=OpSchema.FormalParameterOption.Optional),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(name="output",
+                                 description="Convolved output",
+                                 type_str="T_OUT")
+    ],
+    type_constraints=[
+        ("T", ["tensor(float16)", "tensor(bfloat16)"], "Activation type."),
+        ("T_OUT", ["tensor(float16)", "tensor(bfloat16)",
+                   "tensor(float)"], "Output type."),
+    ],
+    attributes=[
+        OpSchema.Attribute(name="block_size",
+                           type=OpSchema.AttrType.INT,
+                           description="Fixed proposal block size.",
+                           required=True),
+        OpSchema.Attribute(name="kernel_size",
+                           type=OpSchema.AttrType.INT,
+                           description="Dynamic convolution width.",
+                           required=True),
+        OpSchema.Attribute(name="group_size",
+                           type=OpSchema.AttrType.INT,
+                           description="Channels per coefficient group.",
+                           required=True),
+        OpSchema.Attribute(
+            name="fuse_residual",
+            type=OpSchema.AttrType.INT,
+            description="Whether the FP32 residual input is present.",
+            required=True),
+    ],
+)
+
 # ---------------------------------------------------------------------------
 # Gemma4 Audio Attention Plugin
 # ---------------------------------------------------------------------------
@@ -2030,6 +2082,7 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _all_reduce_plugin_schema,
     _fused_nvfp4_gemm_allreduce_plugin_schema,
     _dflash_target_kv_cache_update_schema,
+    _dflash2_grouped_dynamic_conv_schema,
     _gemma4_audio_attention_plugin_schema,
 )
 

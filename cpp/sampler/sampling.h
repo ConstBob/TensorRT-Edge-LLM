@@ -120,10 +120,18 @@ bool shouldUseNonGreedySampling(float temperature, int64_t topK, float topP) noe
  * \param[in] stream CUDA stream to execute the kernel
  * \param[in] philoxSeed Random seed for sampling (default: 42)
  * \param[in] philoxOffset Random offset for sampling (default: 0)
+ * \param[in] rowUniforms Optional GPU FP32 tensor [batch-size]. When supplied,
+ *                         each row uses this request-derived uniform instead of
+ *                         deriving randomness from its transient batch index.
  * \throws std::runtime_error If CUDA operations fail
  */
 void topKtopPSamplingFromLogits(rt::Tensor const& logits, rt::Tensor& selectedIndices, SamplingParams const& params,
-    rt::Tensor& workspace, cudaStream_t stream, uint64_t philoxSeed = 42, uint64_t philoxOffset = 0);
+    rt::Tensor& workspace, cudaStream_t stream, uint64_t philoxSeed = 42, uint64_t philoxOffset = 0,
+    rt::Tensor const* rowUniforms = nullptr);
+
+//! Construct the exact top-p distribution in the original vocabulary order.
+void topPProbabilitiesFromLogits(rt::Tensor const& logits, rt::Tensor& probabilities, float temperature, float topP,
+    rt::Tensor& workspace, cudaStream_t stream);
 
 /*!
  * \brief Apply sparse per-batch logit biases in place before sampling.
@@ -252,6 +260,9 @@ void selectArgmaxAndComputeEntropy(
  * \throws std::runtime_error if topK and topP are both not set
  */
 size_t getTopKtopPSamplingWorkspaceSize(int32_t batchSize, int32_t vocabSize, SamplingParams const& params);
+
+//! Return the workspace required by topPProbabilitiesFromLogits().
+size_t getTopPProbabilitiesWorkspaceSize(int32_t rows, int32_t vocabSize);
 
 /*!
  * \brief Get workspace size required for selectAllTopK operation (FP32 only).

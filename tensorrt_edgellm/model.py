@@ -28,15 +28,18 @@ import logging
 import os
 from typing import Callable, Dict, Type
 
+import torch
 import torch.nn as nn
 
 from .checkpoint.checkpoint_utils import load_checkpoint_config_dicts
 from .checkpoint.loader import load_weights
 from .config import (QUANT_FP16, QUANT_INT4_AWQ, QUANT_INT4_AWQ_MODELOPT,
                      QUANT_INT4_GPTQ, QUANT_MXFP8, QUANT_NVFP4, ModelConfig,
-                     _is_gemma4_assistant_model_type, make_dflash_draft_config,
+                     _is_gemma4_assistant_model_type,
+                     make_dflash2_draft_config, make_dflash_draft_config,
                      make_dspark_draft_config, make_jetspec_draft_config,
                      make_mtp_draft_config, module_quant_type)
+from .dflash import DFlashVersion, resolve_dflash_contract
 
 __all__ = [
     "AutoModel", "load_model_config", "register_attention_scale_default",
@@ -47,6 +50,27 @@ __all__ = [
 AttentionScaleDefault = Callable[[int], float]
 _MODEL_REGISTRY: Dict[str, Type[nn.Module]] = {}
 _ATTENTION_SCALE_DEFAULT_REGISTRY: Dict[str, AttentionScaleDefault] = {}
+
+
+def _instantiate_model(model_class: Type[nn.Module],
+                       config: ModelConfig,
+                       device: str,
+                       low_cpu_mem_usage: bool = False) -> nn.Module:
+    if low_cpu_mem_usage:
+        if device != "cpu":
+            raise ValueError("low_cpu_mem_usage requires device='cpu'")
+        with torch.device("meta"):
+            return model_class(config)
+
+    model = model_class(config)
+    model.to(device)
+    return model
+
+
+def _materialize_checkpoint_defaults(model: nn.Module, device: str) -> None:
+    materialize = getattr(model, "materialize_checkpoint_defaults", None)
+    if callable(materialize):
+        materialize(device)
 
 
 def standard_attention_scale(head_dim: int) -> float:
@@ -162,7 +186,8 @@ class AutoModel:
                         gemma4_kv_sharing_map: "list[dict] | None" = None,
                         gemma4_target_kv_cache_quant: "str | None" = None,
                         num_decoder_layers: "int | None" = None,
-                        extra_configs: "dict | None" = None) -> nn.Module:
+                        extra_configs: "dict | None" = None,
+                        low_cpu_mem_usage: bool = False) -> nn.Module:
         """Construct and load a model from *model_dir*.
 
         Reads ``config.json`` via :class:`~config.ModelConfig`, looks up the
@@ -235,6 +260,9 @@ class AutoModel:
                             path (e.g. Qwen3); rejected for eagle/mtp/dflash/jetspec/dspark
                             and registered non-default variants. The checkpoint's
                             extra-layer weights are simply skipped by the loader.
+            low_cpu_mem_usage:
+                            Initialize model tensors on the meta device and
+                            materialize them from the checkpoint during load.
 
         Returns:
             Loaded ``nn.Module`` in eval mode.
@@ -273,36 +301,58 @@ class AutoModel:
             config.mtp_base = True
         if dflash_base:
             config.dflash_base = True
+            config.dflash_tree_base = True
         if dflash_tree_base:
             config.dflash_base = True
             config.dflash_tree_base = True
         elif config.dflash_tree_base:
             config.dflash_base = True
+        dflash_version = DFlashVersion.V1
         if config.dflash_base:
-            # Read target_layer_ids from DFlash draft checkpoint if provided
-            if not config.dflash_target_layer_ids and dflash_draft_dir:
-                import json
-                draft_cfg_path = os.path.join(dflash_draft_dir, "config.json")
-                if os.path.isfile(draft_cfg_path):
-                    with open(draft_cfg_path) as f:
-                        draft_cfg = json.load(f)
-                    dflash_cfg = draft_cfg.get("dflash_config", {}) or {}
-                    config.dflash_target_layer_ids = dflash_cfg.get(
-                        "target_layer_ids",
-                        draft_cfg.get("target_layer_ids", [1, 8, 15, 22, 29]))
-                    config.dflash_block_size = int(
-                        dflash_cfg.get("block_size",
-                                       draft_cfg.get("block_size", 16)))
-                    default_mask_token_id = (4 if str(
-                        draft_cfg.get("model_type", "")).startswith("gemma4")
-                                             else 248070)
-                    config.dflash_mask_token_id = int(
-                        dflash_cfg.get(
-                            "mask_token_id",
-                            draft_cfg.get("mask_token_id",
-                                          default_mask_token_id)))
+            if dflash_draft_dir:
+                draft_root, draft_llm = load_checkpoint_config_dicts(
+                    dflash_draft_dir)
+                contract = resolve_dflash_contract(draft_root, draft_llm)
+                dflash_version = contract.version
+                config.dflash_version = contract.version
+                config.dflash_target_layer_ids = list(
+                    contract.target_layer_ids)
+                config.dflash_block_size = contract.block_size
+                config.dflash_mask_token_id = contract.mask_token_id
+                if contract.version == DFlashVersion.V2:
+                    draft_config = make_dflash2_draft_config(
+                        dflash_draft_dir,
+                        _default_attention_scale_for_model_dir(
+                            dflash_draft_dir))
+                    if (config.hidden_size != draft_config.hidden_size
+                            or config.vocab_size != draft_config.vocab_size):
+                        raise ValueError(
+                            "DFlash V2 base/draft hidden and vocabulary sizes must match."
+                        )
+                    invalid = [
+                        index for index in contract.target_layer_ids
+                        if index < 0 or index >= config.num_hidden_layers
+                    ]
+                    if invalid:
+                        raise ValueError(
+                            f"DFlash V2 target-layer IDs outside base model: {invalid}"
+                        )
+                    config.dflash2_target_layer_ids = list(
+                        contract.target_layer_ids)
+                    config.dflash2_block_size = contract.block_size
+                    config.dflash2_mask_token_id = contract.mask_token_id
+                    config.dflash2_is_causal = contract.is_causal
+                    config.dflash2_conv_kernel_size = contract.conv_kernel_size
+                    config.dflash2_conv_group_size = contract.conv_group_size
+                    config.dflash2_selector_rank = contract.selector_rank
+                    config.dflash2_selector_top_k = contract.selector_top_k
             if not config.dflash_target_layer_ids:
                 config.dflash_target_layer_ids = [1, 8, 15, 22, 29]
+        elif dflash_draft and dflash_draft_dir:
+            draft_root, draft_llm = load_checkpoint_config_dicts(
+                dflash_draft_dir)
+            dflash_version = resolve_dflash_contract(draft_root,
+                                                     draft_llm).version
         if jetspec_base:
             config.jetspec_base = True
         if jetspec_tree_base:
@@ -395,6 +445,7 @@ class AutoModel:
                                          mtp_draft=mtp_draft,
                                          dflash_base=config.dflash_base,
                                          dflash_draft=dflash_draft,
+                                         dflash_version=dflash_version,
                                          jetspec_base=config.jetspec_base,
                                          jetspec_draft=jetspec_draft,
                                          dspark_base=config.dspark_base,
@@ -472,6 +523,25 @@ class AutoModel:
             if not draft_has_lm_head:
                 config = _inherit_dflash_lm_head_quant(config, base_config)
             model_class = DFlashDraftModel
+            model_dir = dflash_draft_dir
+            if key_remap is None:
+                key_remap = _dflash_key_remap
+        elif variant == "dflash2_draft":
+            if dflash_draft_dir is None:
+                raise ValueError(
+                    "DFlash V2 draft requires dflash_draft_dir to be set.")
+            from .models.dflash2 import DFlash2DraftModel
+            base_config = config
+            base_model_dir = model_dir
+            base_tie_word_embeddings = base_config.tie_word_embeddings
+            draft_has_lm_head = _checkpoint_has_dflash_lm_head(
+                dflash_draft_dir)
+            config = make_dflash2_draft_config(
+                dflash_draft_dir,
+                _default_attention_scale_for_model_dir(dflash_draft_dir))
+            if not draft_has_lm_head:
+                config = _inherit_dflash_lm_head_quant(config, base_config)
+            model_class = DFlash2DraftModel
             model_dir = dflash_draft_dir
             if key_remap is None:
                 key_remap = _dflash_key_remap
@@ -591,8 +661,10 @@ class AutoModel:
                 "num_decoder_layers: truncated to first %d decoder layers",
                 num_decoder_layers)
 
-        model = model_class(config)
-        model.to(device)
+        model = _instantiate_model(model_class,
+                                   config,
+                                   device,
+                                   low_cpu_mem_usage=low_cpu_mem_usage)
 
         pre_repack_hook = None
         apply_reduced_vocab_after_load = False
@@ -613,7 +685,7 @@ class AutoModel:
             else:
                 apply_reduced_vocab_after_load = True
 
-        if variant in ("dflash_draft",
+        if variant in ("dflash_draft", "dflash2_draft",
                        "jetspec_draft") and not draft_has_lm_head:
             next_pre_repack_hook = pre_repack_hook
 
@@ -635,10 +707,21 @@ class AutoModel:
                      key_prefix=key_prefix,
                      pre_repack_hook=pre_repack_hook,
                      mapping=config.mapping)
+        if low_cpu_mem_usage:
+            _materialize_checkpoint_defaults(model, device)
+            meta_tensors = [
+                name for name, tensor in (*model.named_parameters(),
+                                          *model.named_buffers())
+                if tensor.device.type == "meta"
+            ]
+            if meta_tensors:
+                raise RuntimeError(
+                    "Checkpoint did not materialize model tensors: " +
+                    ", ".join(meta_tensors[:10]))
         refresh_router_bias = getattr(model, "refresh_fp32_router_bias", None)
         if callable(refresh_router_bias):
             refresh_router_bias()
-        if variant in ("dflash_draft", "jetspec_draft"):
+        if variant in ("dflash_draft", "dflash2_draft", "jetspec_draft"):
             if draft_has_lm_head:
                 logging.getLogger(__name__).info(
                     "%s lm_head source: draft checkpoint buffers",
@@ -690,11 +773,6 @@ def _inherit_dflash_lm_head_quant(draft_config: ModelConfig,
     draft_quant = draft_config.quant
     base_quant = base_config.quant
     use_base_group_size = lm_head_quant in _GROUP_SIZE_LM_HEAD_QUANTS
-    if (use_base_group_size and draft_quant.quant_type != QUANT_FP16
-            and draft_quant.group_size != base_quant.group_size):
-        raise ValueError(
-            "DFlash draft cannot share %s base lm_head with a different "
-            "draft quantization group size." % lm_head_quant)
 
     layer_overrides = dict(draft_quant.layer_overrides)
     layer_overrides["lm_head"] = lm_head_quant
@@ -724,6 +802,7 @@ def _resolve_model_variant(config: ModelConfig,
                            mtp_draft: bool,
                            dflash_base: bool = False,
                            dflash_draft: bool = False,
+                           dflash_version: DFlashVersion = DFlashVersion.V1,
                            jetspec_base: bool = False,
                            jetspec_draft: bool = False,
                            dspark_base: bool = False,
@@ -739,7 +818,7 @@ def _resolve_model_variant(config: ModelConfig,
         raise ValueError("mtp_base and mtp_draft cannot both be enabled.")
     if dflash_base and dflash_draft:
         raise ValueError(
-            "dflash_base and dflash_draft cannot both be enabled.")
+            "DFlash base and draft variants cannot both be enabled.")
     if jetspec_base and jetspec_draft:
         raise ValueError(
             "jetspec_base and jetspec_draft cannot both be enabled.")
@@ -799,6 +878,8 @@ def _resolve_model_variant(config: ModelConfig,
         return "eagle3_draft"
     if gemma4_mtp_draft:
         return "gemma4_mtp_draft"
+    if dflash_draft and dflash_version == DFlashVersion.V2:
+        return "dflash2_draft"
     if dflash_draft:
         return "dflash_draft"
     if dflash_base:

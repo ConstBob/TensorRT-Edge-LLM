@@ -122,10 +122,13 @@ struct DecodingInferenceContext
     std::string loraWeightsName{""};       //!< LoRA adapter name used by this request
     cudaStream_t stream{};                 //!< CUDA stream
 
-    float temperature{1.0f}; //!< Temperature for sampling
-    float topP{1.0f};        //!< Top-P sampling parameter
-    int64_t topK{0};         //!< Top-K sampling parameter
-    int32_t numLogprobs{0};  //!< Number of top log-probs to collect per generated token
+    float temperature{1.0f};              //!< Temperature for sampling
+    float topP{1.0f};                     //!< Top-P sampling parameter
+    int64_t topK{0};                      //!< Top-K sampling parameter
+    std::vector<uint64_t> samplingSeeds;  //!< Stable seed for each active logical request
+    bool useRequestStableSampling{false}; //!< Use request-position-derived uniforms for target sampling
+    SpecProposalSampling proposalSampling{SpecProposalSampling::kAuto};
+    int32_t numLogprobs{0}; //!< Number of top log-probs to collect per generated token
     //! Per-batch flat logprobs accumulator.  slot.data is pre-allocated
     //! [(maxGenerateLength + draftingStep) * numLogprobs] in spec-decode mode (vanilla: maxGenerateLength)
     //! to accommodate the up-to-(draftingStep+1) tokens accepted per verify step.

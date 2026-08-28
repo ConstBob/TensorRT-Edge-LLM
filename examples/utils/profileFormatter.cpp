@@ -235,7 +235,6 @@ float getSpecDecodeAverageAcceptLength(metrics::SpecDecodeGenerationMetrics cons
     {
         return 0.0f;
     }
-
     return static_cast<float>(specDecodeGenerationMetrics.totalGeneratedTokens)
         / static_cast<float>(specDecodeGenerationMetrics.totalIterations);
 }

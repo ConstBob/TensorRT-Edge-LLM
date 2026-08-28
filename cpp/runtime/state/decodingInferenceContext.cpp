@@ -42,6 +42,7 @@ void DecodingInferenceContext::initialize(int32_t batchSize, int32_t maxGenLengt
     rawBatchedInputIds.reserve(batchSize);
     tokenIds.resize(batchSize);
     currentGenerateLengths.resize(batchSize, 0);
+    samplingSeeds.resize(batchSize, kDefaultSamplingSeed);
     effectivePrefillLengths.resize(batchSize, 0);
     finishedStates.resize(batchSize, 0);
     thinkingDone.clear();

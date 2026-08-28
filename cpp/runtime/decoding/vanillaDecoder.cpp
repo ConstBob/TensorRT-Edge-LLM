@@ -28,6 +28,7 @@
 #include "runtime/decoding/decoderUtils.h"
 #include "runtime/decoding/guidedDecoder.h"
 #include "runtime/decoding/logitBias.h"
+#include "runtime/decoding/requestStableRng.h"
 #include "sampler/sampling.h"
 
 #include <optional>
@@ -128,10 +129,30 @@ bool VanillaDecoder::decodeStep(DecodingInferenceContext& context)
     check::check(mRuntime.sampling.indices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
     if (shouldUseNonGreedySampling(context.temperature, context.topK, context.topP))
     {
+        constexpr uint64_t kSAMPLING_SEED = 42U;
+        constexpr uint64_t kSAMPLING_OFFSET = 0U;
+        constexpr uint64_t kRANDOM_LANE = 0U;
         SamplingParams params(activeBatchSize, mRuntime.deployment.base.outputVocabSize, context.temperature,
             static_cast<int32_t>(context.topK), context.topP);
+        rt::Tensor const* rowUniforms{nullptr};
+        if (context.useRequestStableSampling)
+        {
+            check::check(mRuntime.sampling.hostUniforms.reshape({activeBatchSize}), "Tensor reshape failed");
+            check::check(mRuntime.sampling.uniforms.reshape({activeBatchSize}), "Tensor reshape failed");
+            for (int32_t batch = 0; batch < activeBatchSize; ++batch)
+            {
+                uint64_t const position = requestStableNextAbsolutePosition(
+                    context.rawBatchedInputIds[batch].size(), context.currentGenerateLengths[batch]);
+                mRuntime.sampling.hostUniforms.dataPointer<float>()[batch] = requestStableUniform(
+                    context.samplingSeeds[batch], position, SpecRandomPurpose::kTarget, kRANDOM_LANE);
+            }
+            CUDA_CHECK(
+                cudaMemcpyAsync(mRuntime.sampling.uniforms.rawPointer(), mRuntime.sampling.hostUniforms.rawPointer(),
+                    activeBatchSize * sizeof(float), cudaMemcpyHostToDevice, context.stream));
+            rowUniforms = &mRuntime.sampling.uniforms;
+        }
         topKtopPSamplingFromLogits(mRuntime.base.pipelineIO.outputLogits, mRuntime.sampling.indices, params,
-            mRuntime.sampling.workspace, context.stream);
+            mRuntime.sampling.workspace, context.stream, kSAMPLING_SEED, kSAMPLING_OFFSET, rowUniforms);
     }
     else
     {

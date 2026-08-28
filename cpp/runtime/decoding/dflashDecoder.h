@@ -45,7 +45,7 @@ public:
 
     char const* name() const noexcept override
     {
-        return userModeName();
+        return mVersion == DFlashVersion::kV2 ? "dflash" : userModeName();
     }
 
     bool isSpeculative() const noexcept override
@@ -55,7 +55,9 @@ public:
 
     DecodingStrategyCapabilities capabilities() const noexcept override
     {
-        return {/*.ownsBaseVerificationCudaGraphs=*/true};
+        return {/*.ownsBaseVerificationCudaGraphs=*/true,
+            /*.supportsLosslessSampling=*/mVersion == DFlashVersion::kV2,
+            /*.maxSamplingSupport=*/mVersion == DFlashVersion::kV2 ? dflash_utils::kDFlash2MaxSamplingSupport : 0};
     }
 
     DecodingKvHeadroom requiredKvHeadroom() const override;
@@ -79,14 +81,23 @@ public:
         Tensor& deviceBatchMapping, cudaStream_t stream) override;
 
 private:
+    bool isV2() const noexcept
+    {
+        return mVersion == DFlashVersion::kV2;
+    }
+    void initializeDFlash2(
+        std::filesystem::path const& engineDir, ExternalWeightManager draftWeights, cudaStream_t stream);
     bool runDraftForward(DecodingInferenceContext& context);
     bool prepareBlockDraftVerifyInputs(DecodingInferenceContext& context);
+    bool prepareV2Proposal(DecodingInferenceContext& context);
     bool captureDraftCudaGraphs(cudaStream_t stream);
     bool buildTreeVerifyInputs(DecodingInferenceContext& context);
     bool runBaseVerification(DecodingInferenceContext& context);
+    bool runV2Acceptance(DecodingInferenceContext& context, int32_t verifySize, int32_t maxAcceptLength);
     bool executeBaseVerification(DecodingInferenceContext& context, int32_t verifySize);
     void reshapeBaseVerificationForCapture(int32_t batchSize, int32_t verifySize, bool includeTreeMetadata);
     void prepareLinearBaseVerificationMetadata(int32_t batchSize, int32_t verifySize, cudaStream_t stream);
+    void prepareLinearTreeBaseVerificationMetadata(int32_t batchSize, int32_t verifySize, cudaStream_t stream);
     void copyVerifyTokenIdsToBaseInput(int32_t batchSize, int32_t verifySize, cudaStream_t stream);
     void runBaseVerificationEmbeddingLookup(
         int32_t batchSize, int32_t verifySize, cudaStream_t stream, bool reshapeGemmaPleOutputs);
@@ -97,9 +108,10 @@ private:
     void bindTargetHiddenDelta(
         int32_t activeBatchSize, int64_t maxDeltaLen, int64_t sourceSeqLen, bool allowLargeDelta, cudaStream_t stream);
     bool checkCudaLastError(char const* stage) const;
-    bool useDDTree() const noexcept
+    bool useTreeVerification() const noexcept
     {
-        return mBlockDraft.treePolicy == dflash_utils::BlockDraftTreePolicy::kDDTree;
+        return mBlockDraft.userMode == SpecDecodeMode::kDFlash
+            || mBlockDraft.treePolicy == dflash_utils::BlockDraftTreePolicy::kDDTree;
     }
     bool causalProposalMask() const noexcept
     {
@@ -112,8 +124,8 @@ private:
 
     DecodingRuntimeContext& mRuntime;
     HybridCacheManager& mDraftCacheManager;
+    DFlashVersion mVersion;
     dflash_utils::CachedBlockDraftRuntimeConfig mBlockDraft;
-
     std::unique_ptr<EngineExecutor> mDraftExecutor;
     TensorMap mDraftTensorMap;
     ExternalWeightManager mDraftExternalWeightManager;
@@ -147,6 +159,30 @@ private:
     Tensor mAcceptLength;         //!< [B] INT32
     Tensor mHostAcceptLengths;    //!< [B] INT32 (CPU)
     Tensor mHostAcceptedTokenIds; //!< [B, maxAcceptBufferSize] INT32 (CPU)
+
+    Tensor mProposalSupportIds;             //!< [B, proposalLen, selectorTopK] INT32
+    Tensor mProposalSupportProbs;           //!< [B, proposalLen, selectorTopK] FP32
+    Tensor mProposalUnaryValues;            //!< [B, proposalLen, selectorTopK] FP32
+    Tensor mProposalProjectedHidden;        //!< [B, proposalLen, selectorRank] FP16
+    Tensor mSelectorPredecessorCodebook;    //!< [vocabSize, selectorRank] FP16
+    Tensor mSelectorSuccessorCodebook;      //!< [vocabSize, selectorRank] FP16
+    Tensor mTargetTopKValues;               //!< [B * verifySize, maxTargetTopK] FP32
+    Tensor mTargetTopKIds;                  //!< [B * verifySize, maxTargetTopK] INT32
+    Tensor mTargetTopKProbs;                //!< [B * verifySize, maxTargetTopK] FP32
+    Tensor mTargetProbabilities;            //!< [B * verifySize, vocabSize] FP32
+    Tensor mProposalLengths;                //!< [B] INT32
+    Tensor mProposalUniforms;               //!< [B, proposalLen] FP32
+    Tensor mAcceptUniforms;                 //!< [B, 2 * proposalLen + 1] FP32
+    Tensor mSamplingTemperatures;           //!< [B] FP32
+    Tensor mProposalGreedyMask;             //!< [B] INT32
+    Tensor mRemainingGenerationLengths;     //!< [B] INT32
+    Tensor mHostRemainingGenerationLengths; //!< [B] INT32 pinned CPU
+    Tensor mRequestSeeds;                   //!< [B] UINT64
+    Tensor mNextAbsolutePositions;          //!< [B] UINT64
+    Tensor mHostRequestSeeds;               //!< [B] INT64 pinned CPU
+    Tensor mHostNextPositions;              //!< [B] INT64 pinned CPU
+    Tensor mHostTemperatures;               //!< [B] FP32 pinned CPU
+    Tensor mHostGreedyMask;                 //!< [B] INT32 pinned CPU
 
     SpecCommonStateTracker mCommonStateTracker;
     Tensor mBuildWorkspace; //!< DDTree build workspace bytes
