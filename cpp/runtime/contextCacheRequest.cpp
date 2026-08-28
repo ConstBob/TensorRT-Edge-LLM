@@ -40,10 +40,18 @@ namespace rt
 namespace
 {
 
-ContextCacheLookupPolicy contextCacheLookupPolicy(LLMGenerationRequest const& request, bool outputThinkerEmbeddings)
+ContextCacheLookupPolicy contextCacheLookupPolicy(
+    LLMGenerationRequest const& request, bool outputThinkerEmbeddings, std::vector<int32_t> const& mediaTokenIds)
 {
+    // A media position keys on the pixels, read on the host; keying one whose pixels are unreadable on the
+    // media token alone would reuse whatever the last image cached, that token being every image's placeholder.
+    bool const mediaUnreadable = !mediaTokenIds.empty()
+        && std::any_of(request.requests.begin(), request.requests.end(), [](auto const& sequence) {
+               return std::any_of(sequence.imageBuffers.begin(), sequence.imageBuffers.end(),
+                   [](imageUtils::ImageData const& image) { return image.data() == nullptr; });
+           });
     bool const requiresBypass = request.contextCacheLookupPolicy == ContextCacheLookupPolicy::kBypass
-        || request.generateAudio || outputThinkerEmbeddings;
+        || request.generateAudio || outputThinkerEmbeddings || mediaUnreadable;
     return requiresBypass ? ContextCacheLookupPolicy::kBypass : ContextCacheLookupPolicy::kUseCache;
 }
 
@@ -65,8 +73,8 @@ std::vector<Hash128> buildPerPositionMediaHash(std::vector<int32_t> const& token
     imageHashes.reserve(imageBuffers.size());
     for (auto const& image : imageBuffers)
     {
-        size_t const totalBytes = static_cast<size_t>(image.bytesPerFrame()) * static_cast<size_t>(image.frames);
-        std::string_view const bytes(reinterpret_cast<char const*>(image.data()), totalBytes);
+        std::string_view const bytes(
+            reinterpret_cast<char const*>(image.data()), static_cast<size_t>(image.addressedBytes()));
         imageHashes.push_back(hashOpaqueIdentity(bytes));
     }
 
@@ -195,12 +203,16 @@ std::optional<ContextCacheRequest> ContextCacheRequest::begin(ContextCacheCoordi
 {
     static std::vector<imageUtils::ImageData> const kEmptyImageBuffers;
     static std::vector<audioUtils::AudioData> const kEmptyAudioBuffers;
+    static std::vector<int32_t> const kEmptyMediaTokenIds;
 
     ContextCacheBatchAdmission admission;
     admission.speculativeRequest = speculativeRequest;
-    admission.lookupPolicy = contextCacheLookupPolicy(request, context.outputThinkerEmbeddings);
+    admission.lookupPolicy = contextCacheLookupPolicy(request, context.outputThinkerEmbeddings, mediaTokenIds);
     admission.commitPolicy = request.contextCacheCommitPolicy;
     admission.replayTailLength = request.contextCacheReplayTailLength;
+
+    // Bypass neither looks up nor publishes, so the media hashes it would key on are not built.
+    bool const usesCache = admission.lookupPolicy == ContextCacheLookupPolicy::kUseCache;
     admission.sequences.reserve(context.rawBatchedInputIds.size());
     for (size_t seqIdx = 0; seqIdx < context.rawBatchedInputIds.size(); ++seqIdx)
     {
@@ -208,8 +220,8 @@ std::optional<ContextCacheRequest> ContextCacheRequest::begin(ContextCacheCoordi
             = (seqIdx < request.requests.size()) ? request.requests[seqIdx].imageBuffers : kEmptyImageBuffers;
         std::vector<audioUtils::AudioData> const& audio
             = (seqIdx < request.requests.size()) ? request.requests[seqIdx].audioBuffers : kEmptyAudioBuffers;
-        admission.sequences.push_back(makeContextCacheSequenceAdmission(
-            context.rawBatchedInputIds[seqIdx], context.loraWeightsName, mediaTokenIds, images, audio));
+        admission.sequences.push_back(makeContextCacheSequenceAdmission(context.rawBatchedInputIds[seqIdx],
+            context.loraWeightsName, usesCache ? mediaTokenIds : kEmptyMediaTokenIds, images, audio));
     }
 
     ContextCacheCoordinator::BeginRequestResult admitted

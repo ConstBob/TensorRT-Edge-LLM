@@ -270,32 +270,14 @@ bool QwenViTRunner::allocateBuffer(cudaStream_t stream)
         return false;
     }
 
-    // Copy image mean and std to device to be used in normalizeImage
-    auto nbBytes = mConfig.imageMean.size() * sizeof(float);
-    auto channels = math::cast<int64_t>(mConfig.imageMean.size());
-    mImageMean = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "QwenViTRunner::mImageMean");
-    mImageStd = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "QwenViTRunner::mImageStd");
-    CUDA_CHECK(
-        cudaMemcpyAsync(mImageMean.rawPointer(), mConfig.imageMean.data(), nbBytes, cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(
-        cudaMemcpyAsync(mImageStd.rawPointer(), mConfig.imageStd.data(), nbBytes, cudaMemcpyHostToDevice, stream));
+    ELLM_CHECK(mConfig.imageMean.size() == 3 && mConfig.imageStd.size() == 3,
+        "QwenViTRunner: image mean and std shall each have three components.");
+    mImageMean = {mConfig.imageMean[0], mConfig.imageMean[1], mConfig.imageMean[2]};
+    mImageStd = {mConfig.imageStd[0], mConfig.imageStd[1], mConfig.imageStd[2]};
 
-    // Pre-allocate temporary image buffers for preprocessing
     int64_t const maxImagePixels = mVitInput.getShape().volume();
-    mImageDevice
-        = rt::Tensor({maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "QwenViTRunner::mImageDevice");
     mNormalizedImageDevice = rt::Tensor(
         {maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "QwenViTRunner::mNormalizedImageDevice");
-
-    // GPU image-resize scratch, sized for the actual dimensions per request.
-    int64_t const kMaxRawPixels = kernel::kGpuResizeMaxRawDim * kernel::kGpuResizeMaxRawDim;
-    // Horizontal-pass scratch holds [rawH, outW, C] floats. smart resize preserves aspect ratio, so
-    // rawH * outW <= sqrt(frameBudget * rawH * rawW) <= sqrt(frameBudget * kMaxRawPixels).
-    int64_t const frameBudget = mConfig.maxHW * mConfig.patchSize * mConfig.patchSize;
-    int64_t const kMaxResizeTmpElems = static_cast<int64_t>(std::sqrt(static_cast<double>(frameBudget) * kMaxRawPixels)
-                                           * kernel::kGpuResizeScratchMargin)
-        * channels;
-    kernel::allocateResizeScratch(channels, kMaxResizeTmpElems, mRawImageDevice, mResizeTmpDevice);
 
     // Pre-allocate tensors for MRoPE position IDs
     auto const mropePosType = usesFractionalMRopePositions() ? nvinfer1::DataType::kFLOAT : nvinfer1::DataType::kINT64;
@@ -355,20 +337,18 @@ void QwenViTRunner::formatPatch(
     int64_t const nSourceFrames = image.frames;
     int64_t const tPadded = totalGridT * mConfig.temporalPatchSize;
 
-    check::check(mImageDevice.reshape({tPadded, height, width, channels}), "Tensor reshape failed");
     check::check(mNormalizedImageDevice.reshape({tPadded, height, width, channels}), "Tensor reshape failed");
 
-    // imagePreprocess resized the source frames into the leading slots; replicate the last one into the
-    // temporal-padding slots (device-to-device).
-    int64_t const resizedFrameBytes = height * width * channels;
-    auto* const base = static_cast<unsigned char*>(mImageDevice.rawPointer());
+    // imagePreprocess preprocessed the source frames into the leading slots; replicate the last one into
+    // the temporal-padding slots (device-to-device).
+    int64_t const resizedFrameBytes = height * width * channels * static_cast<int64_t>(sizeof(half));
+    auto* const base = static_cast<unsigned char*>(mNormalizedImageDevice.rawPointer());
     for (int64_t i = nSourceFrames; i < tPadded; ++i)
     {
         CUDA_CHECK(cudaMemcpyAsync(base + i * resizedFrameBytes, base + (nSourceFrames - 1) * resizedFrameBytes,
             resizedFrameBytes, cudaMemcpyDeviceToDevice, stream));
     }
 
-    kernel::normalizeImage(mImageDevice, mImageMean, mImageStd, mNormalizedImageDevice, stream);
     kernel::transposeToPatchQwenViT(mNormalizedImageDevice, mVitInput, prevPatchBase * mConfig.inputDim,
         mConfig.temporalPatchSize, mConfig.patchSize, mConfig.mergeSize, stream);
 }
@@ -451,17 +431,16 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, std
             {
                 auto [resizedHeight, resizedWidth]
                     = getResizedImageSize(image.frames, image.isVideo, image.height, image.width);
-                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
-                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, resizedHeight, resizedWidth,
-                    stream);
+                rt::imageUtils::resizeAndNormalizeToRgb(image, 0, image.frames, mImageMean, mImageStd,
+                    mNormalizedImageDevice, resizedHeight, resizedWidth, stream);
                 formatPatch(image.resizedMeta(resizedHeight, resizedWidth), spans, totalSeqLength, stream);
             }
             else
             {
                 LOG_DEBUG("Skipping resize for pre-resized image/video %ldx%ld (frames=%ld)", image.height, image.width,
                     image.frames);
-                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
-                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, image.height, image.width, stream);
+                rt::imageUtils::resizeAndNormalizeToRgb(image, 0, image.frames, mImageMean, mImageStd,
+                    mNormalizedImageDevice, image.height, image.width, stream);
                 formatPatch(image, spans, totalSeqLength, stream);
             }
             ++imageCount;
@@ -780,8 +759,8 @@ bool QwenViTRunner::preprocess(rt::LLMGenerationRequest const& request,
         {
             LOG_ERROR("Failed: %s", e.what());
         }
-        // Drain async H2D copies that may still read the request's image buffers, so the caller can
-        // safely release them after the failure -- including when the error propagates.
+        // Preprocessing reads the request's image buffers in place, so drain the stream before the
+        // caller may release them after the failure -- including when the error propagates.
         cudaStreamSynchronize(stream);
         if (actionable)
         {

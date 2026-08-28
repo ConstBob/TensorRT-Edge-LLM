@@ -428,7 +428,7 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                         else if (msgContent.type == "image")
                         {
                             msgContent.content = contentItemJson["image"].get<std::string>();
-                            auto image = rt::imageUtils::loadImageFromFile(msgContent.content);
+                            auto image = rt::imageUtils::loadRgbImageFromFile(msgContent.content);
                             if (image.buffer != nullptr)
                             {
                                 image.doResize = contentItemJson.value("do_resize", true);
@@ -448,7 +448,7 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                             }
                             double const fps = contentItemJson.value("fps", 1.0);
                             msgContent.content = "video[" + std::to_string(framePaths.size()) + " frames]";
-                            auto video = rt::imageUtils::loadVideoFromFrames(framePaths, fps);
+                            auto video = rt::imageUtils::loadRgbVideoFromFrames(framePaths, fps);
                             if (video.buffer != nullptr)
                             {
                                 video.doResize = contentItemJson.value("do_resize", true);

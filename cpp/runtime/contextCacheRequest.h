@@ -41,6 +41,8 @@ public:
     //! A disengaged result means admission failed.
     //! @param mediaTokenIds Placeholder token IDs for media modalities (e.g. image, audio).
     //!        Positions matching any of these IDs are content-hashed for cache differentiation.
+    //! @throws std::runtime_error if a media position has to be hashed and its pixels are not readable
+    //!         on the host.
     static std::optional<ContextCacheRequest> begin(ContextCacheCoordinator& coordinator,
         LLMGenerationRequest const& request, DecodingInferenceContext const& context, bool speculativeRequest,
         DecodingKvHeadroom const& headroom, std::vector<int32_t> const& mediaTokenIds = {});
