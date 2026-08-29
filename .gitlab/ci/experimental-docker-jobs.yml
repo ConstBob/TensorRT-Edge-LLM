@@ -20,9 +20,15 @@ l0_experimental_docker_jedha:
   script:
     - echo "Pipeline start time:$(date)"
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
-    - bash .gitlab/ci/scripts/experimental_docker_board.sh run
+    - >-
+      sh .gitlab/ci/scripts/ci_run.sh "$CI_JOB_PHASE_TIMEOUT_SECONDS"
+      "Run experimental Docker workflow" --
+      bash .gitlab/ci/scripts/experimental_docker_board.sh run
   after_script:
-    - bash .gitlab/ci/scripts/experimental_docker_board.sh cleanup || true
+    - >-
+      sh .gitlab/ci/scripts/ci_run.sh "$CI_JOB_PHASE_TIMEOUT_SECONDS"
+      "Clean experimental Docker workflow" --
+      bash .gitlab/ci/scripts/experimental_docker_board.sh cleanup || true
     - echo "Pipeline end time:$(date)"
     - !reference [.cleanup_engine_storage, after_script]
     - !reference [.record_runner_usage, after_script]

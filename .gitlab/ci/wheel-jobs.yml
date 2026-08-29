@@ -3,6 +3,8 @@
 
 .wheel_rules:
   rules:
+    - if: $CI_TELEMETRY_CLEANUP == "1"
+      when: never
     - if: $CI_COMMIT_BRANCH =~ /^release/
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       changes: &wheel_changes
@@ -41,7 +43,7 @@ wheel_packaging_precheck:
   script:
     - sh .gitlab/ci/scripts/wheel_ci.sh ci-precheck
   artifacts:
-    paths: [artifacts/provenance/source.json]
+    paths: [artifacts/provenance/source.json, .ci-telemetry-artifact/]
     expire_in: 30 days
 
 wheel_python_base:
@@ -67,7 +69,7 @@ wheel_python_base:
   script:
     - sh .gitlab/ci/scripts/wheel_ci.sh ci-build-base
   artifacts:
-    paths: [artifacts/base/]
+    paths: [artifacts/base/, .ci-telemetry-artifact/]
     expire_in: 14 days
 
 .wheel_payload_template:
@@ -89,7 +91,7 @@ wheel_python_base:
     - sh .gitlab/ci/scripts/wheel_ci.sh ci-build-payload
   timeout: 2h
   artifacts:
-    paths: [artifacts/payloads/]
+    paths: [artifacts/payloads/, .ci-telemetry-artifact/]
     expire_in: 14 days
 
 .wheel_assemble_template:
@@ -102,7 +104,7 @@ wheel_python_base:
     - sh .gitlab/ci/scripts/wheel_ci.sh ci-assemble
   timeout: 2h
   artifacts:
-    paths: [dist/]
+    paths: [dist/, .ci-telemetry-artifact/]
     expire_in: 30 days
 
 .wheel_integration_template:
@@ -118,7 +120,7 @@ wheel_python_base:
   interruptible: true
   artifacts:
     when: always
-    paths: [artifacts/integration/]
+    paths: [artifacts/integration/, .ci-telemetry-artifact/]
     expire_in: 30 days
 
 wheel_integration_gate:
@@ -139,5 +141,5 @@ wheel_integration_gate:
   script:
     - sh .gitlab/ci/scripts/wheel_ci.sh ci-integration-gate
   artifacts:
-    paths: [artifacts/integration/gate.json]
+    paths: [artifacts/integration/gate.json, .ci-telemetry-artifact/]
     expire_in: 90 days

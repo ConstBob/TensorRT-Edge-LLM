@@ -2,6 +2,8 @@ variables:
   TRT_BRANCH: "main"
   EDGE_LLM_CACHE_DIR: "/scratch.edge_llm_cache"
   RUNNER_USAGE_DIR: "$EDGE_LLM_CACHE_DIR/runner_usage"
+  CI_TELEMETRY_ENABLED: "1"
+  CI_TELEMETRY_DIR: "$CI_PROJECT_DIR/.ci-telemetry"
   TORCH_DIR: "/scratch.trt_llm_data/llm-models"
   HF_CHECKPOINT_DOWNLOAD_DIR: "$EDGE_LLM_CACHE_DIR/checkpoints/huggingface"
   HF_HOME: "$HF_CHECKPOINT_DOWNLOAD_DIR/.cache"
@@ -33,12 +35,19 @@ variables:
   SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar" # Defines the location of the analysis task cache
   GIT_DEPTH: "0" # Tells git to fetch all the branches of the project, required by the analysis task
   CI_PIP_INSTALL_TIMEOUT_SECONDS: "1200"
+  # Zero records long-running phases without imposing a telemetry timeout.
+  CI_JOB_PHASE_TIMEOUT_SECONDS: "0"
   CI_DOWNLOAD_TIMEOUT_SECONDS: "300"
   CI_GIT_TIMEOUT_SECONDS: "300"
   EDGE_LLM_PIPELINE_NAME: ""
 
 default:
   interruptible: true
+  artifacts:
+    when: always
+    expire_in: 14 days
+    paths:
+      - .ci-telemetry-artifact/
   after_script:
     - !reference [.cleanup_engine_storage, after_script]
     - !reference [.record_runner_usage, after_script]
@@ -55,6 +64,10 @@ workflow:
     - if: $L1 == "true"
       variables:
         EDGE_LLM_PIPELINE_NAME: "L1"
+    # Run the protected telemetry retention schedule without the ordinary pipeline.
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $CI_TELEMETRY_CLEANUP == "1"
+      variables:
+        EDGE_LLM_PIPELINE_NAME: "CI Telemetry Cleanup"
     # Run scheduled L0 stability pipelines only when explicitly selected.
     - if: $CI_PIPELINE_SOURCE == "schedule" && $L0_STABILITY == "true"
       variables:
@@ -96,6 +109,7 @@ include:
   - local: '.gitlab/ci/.github-pr-jobs.yml'
   - local: '.gitlab/ci/local-board-jobs.yml'
   - local: '.gitlab/ci/experimental-docker-jobs.yml'
+  - local: '.gitlab/ci/telemetry-jobs.yml'
 
 # `precheck` is a hard gate. Later `needs` chains must remain rooted in a job
 # that waits for this stage to complete successfully.
@@ -108,3 +122,4 @@ stages:
 - l1_test
 - sonar
 - publish
+- report

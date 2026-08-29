@@ -27,6 +27,7 @@ def _write_runner_record(tmp_path, pipeline_environment):
     environment = {
         "PATH": os.environ["PATH"],
         "RUNNER_USAGE_DIR": str(tmp_path),
+        "CI_PROJECT_DIR": str(tmp_path / "project"),
         "CI_PROJECT_PATH": "TensorRT/tensorrt-edge-llm/tensorrt-edge-llm",
         "CI_PROJECT_PATH_SLUG": "tensorrt-edge-llm",
         "CI_PIPELINE_ID": "123",
@@ -53,9 +54,9 @@ def _write_runner_record(tmp_path, pipeline_environment):
     )
     assert result.returncode == 0, result.stderr
 
-    records = list(tmp_path.rglob("*.json"))
-    assert len(records) == 1
-    return json.loads(records[0].read_text())
+    record_path = tmp_path / "tensorrt-edge-llm" / "123" / "456.json"
+    assert record_path.is_file()
+    return json.loads(record_path.read_text(encoding="utf-8"))
 
 
 def test_record_attributes_usage_to_job_and_runner(tmp_path):

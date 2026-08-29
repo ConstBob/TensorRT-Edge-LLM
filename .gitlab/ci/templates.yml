@@ -12,6 +12,7 @@
       - git config --global url."https://gitlab-master.nvidia.com/ftp/GitHubSync/NVTX-mirror.git".insteadOf "https://github.com/NVIDIA/NVTX.git"
       - git config --global url."https://gitlab-master.nvidia.com/ftp/GitHubSync/xgrammar.git".insteadOf "https://github.com/mlc-ai/xgrammar.git"
       - git config --global url."https://gitlab-master.nvidia.com/ftp/GitHubSync/dlpack.git".insteadOf "https://github.com/dmlc/dlpack.git"
+      - git config --global url."https://gitlab-master.nvidia.com/ftp/GitHubSync/cpptrace.git".insteadOf "https://github.com/jeremy-rifkin/cpptrace.git"
   variables:
     GIT_SUBMODULE_STRATEGY: recursive
 
@@ -132,6 +133,7 @@
     expire_in: 14 days
     paths:
       - .ci-reports/
+      - .ci-telemetry-artifact/
     reports:
       junit: .ci-reports/*.xml
 
@@ -229,7 +231,9 @@
     - echo "Installing package dependencies"
     - cd $LLM_SDK_DIR
     - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install Python build tooling" -- pip3 install build
-    - python3 -m build --wheel --outdir dist .
+    - >-
+      bash .gitlab/ci/scripts/ci_run.sh "$CI_JOB_PHASE_TIMEOUT_SECONDS"
+      "Build Edge LLM wheel" -- python3 -m build --wheel --outdir dist .
     - export EDGE_LLM_WHEEL=$(python3 -c 'import glob; print(glob.glob("dist/*.whl")[0])')
     - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install Edge LLM tool dependencies" -- pip3 install "${EDGE_LLM_WHEEL}[tools]"
     - python3 -c 'import torchvision; print(f"torchvision {torchvision.__version__}")'
@@ -247,7 +251,9 @@
       fi
     - echo "Running checkpoint export tests with pytest. Time:$(date)"
     - |
-      python3 -m pytest tests \
+      bash .gitlab/ci/scripts/ci_run.sh \
+        "$CI_JOB_PHASE_TIMEOUT_SECONDS" "Run checkpoint export tests" -- \
+        python3 -m pytest tests \
         --priority="$PRIORITY" \
         -v \
         --color=yes \
@@ -299,7 +305,12 @@
     - echo "Setting up test environment"
     - if [ -n "$BASELINE_CSV" ]; then mkdir -p "$(dirname "$BASELINE_CSV")"; fi
     - echo "Running pipeline tests with pytest. Time:$(date)"
-    - python3 -m pytest tests/ --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml="$CI_PROJECT_DIR/.ci-reports/test_report_$PRIORITY.xml"
+    - >-
+      bash .gitlab/ci/scripts/ci_run.sh "$CI_JOB_PHASE_TIMEOUT_SECONDS"
+      "Run pipeline tests" -- python3 -m pytest tests/ --priority=$PRIORITY
+      -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html
+      --self-contained-html
+      --junitxml="$CI_PROJECT_DIR/.ci-reports/test_report_$PRIORITY.xml"
     - echo "HTML report saved to $TEST_LOG_DIR; JUnit report saved to $CI_PROJECT_DIR/.ci-reports"
     - ls -la $TEST_LOG_DIR
     - echo "Pipeline end time:$(date)"
@@ -315,6 +326,7 @@
     paths:
       - ci-artifacts/nemo-eval/nemo_eval.log
       - ci-artifacts/nemo-eval/edgellm_server.log
+      - .ci-telemetry-artifact/
   script:
     - echo "Pipeline start time:$(date)"
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
@@ -414,7 +426,12 @@
     - python3 -c "import tensorrt, torch; assert torch.cuda.is_available(), 'CUDA not available'"
     - echo "Running unit tests with pytest. Time:$(date)"
     # Test selection is driven by the tests/test_lists/$PRIORITY.yml list.
-    - python3 -m pytest tests/ --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml="$CI_PROJECT_DIR/.ci-reports/test_report_$PRIORITY.xml"
+    - >-
+      bash .gitlab/ci/scripts/ci_run.sh "$CI_JOB_PHASE_TIMEOUT_SECONDS"
+      "Run unit tests" -- python3 -m pytest tests/ --priority=$PRIORITY -v
+      --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html
+      --self-contained-html
+      --junitxml="$CI_PROJECT_DIR/.ci-reports/test_report_$PRIORITY.xml"
     - echo "HTML report saved to $TEST_LOG_DIR; JUnit report saved to $CI_PROJECT_DIR/.ci-reports"
     - ls -la $TEST_LOG_DIR
     - echo "Pipeline end time:$(date)"
@@ -473,7 +490,14 @@
     - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install accuracy dependencies" -- pip3 install -r examples/accuracy/requirements.txt
     - if [ -n "$BASELINE_CSV" ]; then mkdir -p "$(dirname "$BASELINE_CSV")"; fi
     - echo "Setup complete. Running pipeline tests on device with pytest. Time:$(date)"
-    - python3 -m pytest tests/ --priority=$PRIORITY --execution-mode=remote --remote-host=$BOARD_IP --remote-user=$BOARD_USER --remote-password="$BOARD_PASSWORD_NVKS" --remote-workspace=$REMOTE_WORKSPACE -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml="$CI_PROJECT_DIR/.ci-reports/test_report_$PRIORITY.xml"
+    - >-
+      bash .gitlab/ci/scripts/ci_run.sh "$CI_JOB_PHASE_TIMEOUT_SECONDS"
+      "Run remote pipeline tests" -- python3 -m pytest tests/
+      --priority=$PRIORITY --execution-mode=remote --remote-host=$BOARD_IP
+      --remote-user=$BOARD_USER --remote-password="$BOARD_PASSWORD_NVKS"
+      --remote-workspace=$REMOTE_WORKSPACE -v --color=yes
+      --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html
+      --junitxml="$CI_PROJECT_DIR/.ci-reports/test_report_$PRIORITY.xml"
     - echo "HTML report saved to $TEST_LOG_DIR; JUnit report saved to $CI_PROJECT_DIR/.ci-reports"
     - ls -la $TEST_LOG_DIR
     - deactivate
@@ -518,7 +542,7 @@
     - |
       sshpass -p "$BOARD_PASSWORD_NVKS" \
         ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP \
-        "REMOTE_WORKSPACE='$REMOTE_WORKSPACE' TRT_PACKAGE_DIR='$TRT_PACKAGE_DIR' PRIORITY='$PRIORITY' JUNIT_PREFIX='$CI_JOB_NAME_SLUG' CI_PIP_INSTALL_TIMEOUT_SECONDS='$CI_PIP_INSTALL_TIMEOUT_SECONDS' bash -s" \
+        "REMOTE_WORKSPACE='$REMOTE_WORKSPACE' TRT_PACKAGE_DIR='$TRT_PACKAGE_DIR' PRIORITY='$PRIORITY' JUNIT_PREFIX='$CI_JOB_NAME_SLUG' CI_JOB_ID='$CI_JOB_ID' CI_TELEMETRY_ENABLED='${CI_TELEMETRY_ENABLED:-1}' CI_TELEMETRY_DIR='$REMOTE_WORKSPACE/.ci-telemetry' CI_PIP_INSTALL_TIMEOUT_SECONDS='$CI_PIP_INSTALL_TIMEOUT_SECONDS' CI_JOB_PHASE_TIMEOUT_SECONDS='$CI_JOB_PHASE_TIMEOUT_SECONDS' bash -s" \
         < .gitlab/ci/scripts/device_unit_tests.sh
   after_script:
     - if [ -f "$L0_STORAGE_ENV_FILE" ]; then . "$L0_STORAGE_ENV_FILE"; fi
@@ -530,6 +554,11 @@
   extends:
     - .ci_internal_submodules
   artifacts:
+    when: always
+    expire_in: 14 days
+    paths:
+      - ci-artifacts/lib-size/
+      - .ci-telemetry-artifact/
     reports:
       metrics: ci-artifacts/lib-size/lib_size_metrics.txt
   script:
@@ -543,14 +572,19 @@
     - mkdir -p build
     - cd build
     - echo "Running CMake configuration"
-    - cmake .. 
-        -DTRT_PACKAGE_DIR=$TRT_PACKAGE_DIR 
-        -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake 
-        -DEMBEDDED_TARGET=$EMBEDDED_TARGET
-        -DCUDA_CTK_VERSION=$CUDA_VERSION
-        -DENABLE_CUTE_DSL=${ENABLE_CUTE_DSL:-fmha}
+    - |
+      bash "$CI_PROJECT_DIR/.gitlab/ci/scripts/ci_run.sh" \
+        "$CI_JOB_PHASE_TIMEOUT_SECONDS" "Configure cross build" -- \
+        cmake .. \
+          -DTRT_PACKAGE_DIR=$TRT_PACKAGE_DIR \
+          -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
+          -DEMBEDDED_TARGET=$EMBEDDED_TARGET \
+          -DCUDA_CTK_VERSION=$CUDA_VERSION \
+          -DENABLE_CUTE_DSL=${ENABLE_CUTE_DSL:-fmha}
     - echo "Building the project"
-    - make -j$(nproc)
+    - >-
+      bash "$CI_PROJECT_DIR/.gitlab/ci/scripts/ci_run.sh"
+      "$CI_JOB_PHASE_TIMEOUT_SECONDS" "Build cross target" -- make -j$(nproc)
     - echo "Cross-build completed successfully"
     - echo "Reporting library size"
     - python3 ../scripts/report_library_size.py

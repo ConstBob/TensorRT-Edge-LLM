@@ -28,6 +28,7 @@ set -euo pipefail
 cd "$REMOTE_WORKSPACE"
 ci_run="$REMOTE_WORKSPACE/.gitlab/ci/scripts/ci_run.sh"
 pip_timeout_seconds="${CI_PIP_INSTALL_TIMEOUT_SECONDS:-1200}"
+job_phase_timeout_seconds="${CI_JOB_PHASE_TIMEOUT_SECONDS:-0}"
 
 echo "Setting up python environment on $(hostname)"
 python3 -m venv ut_venv
@@ -64,7 +65,8 @@ python3 -c "import tensorrt, torch; assert torch.cuda.is_available(), 'CUDA not 
 
 echo "Running unit tests with pytest. Time:$(date)"
 # Test selection is driven by the tests/test_lists/$PRIORITY.yml list.
-python3 -m pytest tests/ --priority="$PRIORITY" -v --color=yes \
+bash "$ci_run" "$job_phase_timeout_seconds" "Run device unit tests" -- \
+    python3 -m pytest tests/ --priority="$PRIORITY" -v --color=yes \
     --html="logs/test_report_$PRIORITY.html" --self-contained-html \
     --junit-prefix="$JUNIT_PREFIX" \
     --junitxml="logs/test_report_$PRIORITY.xml"

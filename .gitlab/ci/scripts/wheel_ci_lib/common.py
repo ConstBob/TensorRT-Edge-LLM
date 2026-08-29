@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import pathlib
 import platform
@@ -25,6 +26,7 @@ import subprocess
 import sys
 import time
 import typing
+import uuid
 
 from wheellib import config
 
@@ -58,19 +60,72 @@ _TOOLCHAIN_REQUIREMENTS = {
 }
 
 
+def _record_phase(name: str, status: str, exit_code: int, started_epoch: float,
+                  finished_epoch: float) -> None:
+    job_id = os.environ.get("CI_JOB_ID", "")
+    if os.environ.get("CI_TELEMETRY_ENABLED", "1") == "0" or not job_id:
+        return
+    project_dir = pathlib.Path(os.environ.get("CI_PROJECT_DIR", os.getcwd()))
+    telemetry_root = pathlib.Path(
+        os.environ.get("CI_TELEMETRY_DIR", str(project_dir / ".ci-telemetry")))
+    record_dir = telemetry_root / "phases" / job_id
+    sanitized_name = "".join(character if " " <= character <= "~" else " "
+                             for character in name)
+    payload = {
+        "schema_version":
+        1,
+        "label":
+        sanitized_name,
+        "status":
+        status,
+        "exit_code":
+        exit_code,
+        "started_at":
+        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started_epoch)),
+        "started_epoch":
+        started_epoch,
+        "finished_at":
+        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(finished_epoch)),
+        "finished_epoch":
+        finished_epoch,
+        "elapsed_seconds":
+        max(0.0, finished_epoch - started_epoch),
+    }
+    temporary: typing.Optional[pathlib.Path] = None
+    try:
+        record_dir.mkdir(parents=True, exist_ok=True)
+        record = record_dir / f"phase-wheel-{uuid.uuid4().hex}.json"
+        temporary = record.with_name(f".{record.name}.tmp.{os.getpid()}")
+        temporary.write_text(json.dumps(payload, sort_keys=True) + "\n",
+                             encoding="utf-8")
+        os.replace(temporary, record)
+    except OSError as error:
+        print(f"[wheel-ci] telemetry warning: {error}",
+              file=sys.stderr,
+              flush=True)
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 @contextlib.contextmanager
 def phase(name: str) -> typing.Iterator[None]:
     """Print an unbuffered duration for one CI phase."""
     started = time.monotonic()
+    started_epoch = time.time()
     print(f"[wheel-ci] START {name}", flush=True)
     try:
         yield
     except Exception:
         elapsed = time.monotonic() - started
         print(f"[wheel-ci] FAIL {name} ({elapsed:.1f}s)", flush=True)
+        _record_phase(name, "failure", 1, started_epoch, time.time())
         raise
     elapsed = time.monotonic() - started
     print(f"[wheel-ci] DONE {name} ({elapsed:.1f}s)", flush=True)
+    _record_phase(name, "success", 0, started_epoch, time.time())
 
 
 def install_toolchain(profile: str, python: str = sys.executable) -> None:
