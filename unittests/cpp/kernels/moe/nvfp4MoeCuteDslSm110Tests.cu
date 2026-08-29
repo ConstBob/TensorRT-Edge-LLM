@@ -702,8 +702,8 @@ TEST(CuteDslNvfp4MoeSm110Test, canImplementSupportedSms)
 {
     for (int32_t const sm : {100, 101, 110})
     {
-        // Both supported expert counts {128, 256} must pass on every supported SM.
-        for (int32_t const e : {128, 256})
+        // Supported expert counts {128, 256, 512} must pass on every supported SM.
+        for (int32_t const e : {128, 256, 512})
         {
             EXPECT_TRUE(CuteDslNvfp4MoeSm110Runner::canImplement(
                 /*hiddenSize=*/1024, /*moeInterSize=*/768, e, kTopK, sm, kActSwiGLU, kIoDtypeFp16, kBackendAuto))
@@ -716,13 +716,23 @@ TEST(CuteDslNvfp4MoeSm110Test, canImplementSupportedSms)
                 << "sm=" << sm << " e=" << e;
         }
         // Expert counts outside the supported set are rejected (the cubin is
-        // runtime-polymorphic, but the product contract is exactly {128, 256}).
-        for (int32_t const e : {64, 192, 512})
+        // runtime-polymorphic, but the product contract is exactly {128, 256, 512}).
+        for (int32_t const e : {64, 192, 1024})
         {
             EXPECT_FALSE(CuteDslNvfp4MoeSm110Runner::canImplement(
                 /*hiddenSize=*/1024, /*moeInterSize=*/768, e, kTopK, sm, kActSwiGLU, kIoDtypeFp16, kBackendAuto))
                 << "sm=" << sm << " e=" << e;
         }
+        // top_k is accepted up to kMaxTopK (32, covers Nemotron-3-Super's top_k=22)
+        // and rejected beyond it.
+        EXPECT_TRUE(CuteDslNvfp4MoeSm110Runner::canImplement(
+            /*hiddenSize=*/1024, /*moeInterSize=*/768, kNumExperts, /*topK=*/32, sm, kActReLU2, kIoDtypeFp16,
+            kBackendAuto))
+            << "sm=" << sm;
+        EXPECT_FALSE(CuteDslNvfp4MoeSm110Runner::canImplement(
+            /*hiddenSize=*/1024, /*moeInterSize=*/768, kNumExperts, /*topK=*/33, sm, kActReLU2, kIoDtypeFp16,
+            kBackendAuto))
+            << "sm=" << sm;
     }
 
     EXPECT_FALSE(CuteDslNvfp4MoeSm110Runner::canImplement(
