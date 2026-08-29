@@ -336,6 +336,22 @@ def _tag_subset_wheel(wheel: Path, python_abi: str, selected: Set[str],
     return tagged
 
 
+def _runtime_entries(payloads: Iterable[Dict[str, Any]],
+                     rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Expand a shared multi-SM payload into exact runtime identities."""
+    by_id = {str(row["variant_id"]): row for row in rows}
+    entries = []
+    for payload in payloads:
+        variant_id = str(payload["variant_id"])
+        row = by_id[variant_id]
+        for gpu_sm in CONTRACT.matrix_variant_gpu_sms(row):
+            entry = {key: payload.get(key) for key in sorted(_RUNTIME_FIELDS)}
+            entry["gpu_sm"] = gpu_sm
+            entries.append(entry)
+    return sorted(entries,
+                  key=lambda value: (value["variant_id"], value["gpu_sm"]))
+
+
 def main(argv=None) -> None:
     """Verify selected payloads, inject them, retag them, and pack one wheel."""
     args = _arguments(argv)
@@ -410,11 +426,7 @@ def main(argv=None) -> None:
         for payload in sorted(payloads, key=lambda value: value["variant_id"]):
             _copy_payload(stages[payload["variant_id"]], root,
                           payload["variant_id"])
-        runtime_entries = [{
-            key: payload.get(key)
-            for key in sorted(_RUNTIME_FIELDS)
-        } for payload in sorted(payloads,
-                                key=lambda value: value["variant_id"])]
+        runtime_entries = _runtime_entries(payloads, rows)
         for entry in runtime_entries:
             prefix = f"_native/payloads/{entry['variant_id']}/"
             if entry["plugin"] != prefix + "lib/libNvInfer_edgellm_plugin.so":

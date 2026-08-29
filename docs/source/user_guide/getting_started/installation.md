@@ -396,6 +396,50 @@ cmake .. \
     -DENABLE_CUTE_DSL=ALL
 ```
 
+**IGX Thor with an RTX SM120 GPU**
+
+An IGX Thor system with both the integrated Thor GPU and an attached RTX
+Blackwell GPU can use one plugin/runtime build. Generate one AArch64 CuTe DSL
+artifact containing every supported SM110 and SM120 kernel, then compile the
+CUDA sources for both architectures in one CMake build:
+
+```bash
+python kernelSrcs/build_cutedsl.py \
+    --kernels ALL \
+    --gpu_arch sm_110,sm_120 \
+    --arch aarch64 \
+    --cuda-version 13 \
+    --clean
+
+cmake -S . -B build-igx-thor \
+    -DTRT_PACKAGE_DIR=/usr \
+    -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
+    -DEMBEDDED_TARGET=igx-thor \
+    -DCUDA_CTK_VERSION=13.0 \
+    -DENABLE_CUTE_DSL=ALL
+
+cmake --build build-igx-thor --parallel
+```
+
+`EMBEDDED_TARGET=igx-thor` compiles the CUDA sources for `110a` and `120`,
+requires CUDA 13 or newer, and selects the combined `sm_110_sm_120` CuTe DSL
+artifact. On a native IGX host, set
+`CUDA_DEVICE_ORDER=PCI_BUS_ID`, then use
+`CUDA_VISIBLE_DEVICES=0` for Thor or `CUDA_VISIBLE_DEVICES=1` for RTX. Confirm
+the selection before building or running an engine:
+
+```bash
+python3 -c 'import torch; print(torch.cuda.get_device_name(0))'
+```
+
+In an NVIDIA container use `NVIDIA_VISIBLE_DEVICES=0` or
+`NVIDIA_VISIBLE_DEVICES=1`. The selected physical GPU appears as CUDA device 0
+inside the container, so do not copy the physical ordinal into
+`CUDA_VISIBLE_DEVICES` there. GPU selection is fixed for the life of an
+inference process. To switch GPUs, stop the process, update the selector, use
+the engine built for the selected SM, and restart. TensorRT engines remain
+architecture specific even though the plugin binary is shared.
+
 **DGX Spark (GB10)**
 
 Run this directly on the DGX Spark system. Use `gb10` as the embedded target
@@ -455,12 +499,12 @@ cmake .. \
 |:-------|:------------|:--------|
 | `TRT_PACKAGE_DIR` | Path to TensorRT installation. Auto-detected; manual hint to disambiguate multiple versions. | N/A |
 | `CMAKE_TOOLCHAIN_FILE` | **Required for Edge devices**: Use `cmake/aarch64_linux_toolchain.cmake` for Edge device builds. **Not needed for GPU builds** | N/A |
-| `EMBEDDED_TARGET` | **Required for Edge devices**: `jetson-thor` (Jetson Thor), `auto-thor` (DRIVE Thor / DriveOS), `gb10` (DGX Spark), or `jetson-orin` (Jetson Orin). **Not needed for GPU builds** | N/A |
+| `EMBEDDED_TARGET` | **Required for Edge devices**: `jetson-thor` (Jetson Thor), `igx-thor` (IGX Thor plus RTX SM120), `auto-thor` (DRIVE Thor / DriveOS), `gb10` (DGX Spark), or `jetson-orin` (Jetson Orin). **Not needed for GPU builds** | N/A |
 | `CUDA_CTK_VERSION` | CUDA Toolkit version. Use the platform command above to select `13.3`, `13.2`, or `13.0`. Do not pass `-DCUDA_VERSION`; CMake reserves that name for CUDA headers and rejects it. | target default |
 | `BUILD_UNIT_TESTS` | Build unit tests | OFF |
 | `ENABLE_COVERAGE` | Enable gcov code coverage instrumentation (see [Code Coverage](../../developer_guide/testing/code-coverage.md)) | OFF |
 | `ENABLE_CUTE_DSL` | Select generated CuTe DSL kernels: `fmha`, `ALL`, or a group list such as `gdn`, `gemm`, or `ssd`. Any selection also links `fmha`, which the attention plugins require. Use `ALL` for customer builds. | fmha |
-| `CUTE_DSL_ARTIFACT_TAG` | Artifact tag under `cpp/kernels/cuteDSLArtifact/<arch>/`, for example `sm_87`, `sm_110`, or `sm_121`. Edge targets infer it from `EMBEDDED_TARGET`; pass it explicitly for x86 prebuilt artifacts or when multiple local tags exist for one CPU architecture. | auto |
+| `CUTE_DSL_ARTIFACT_TAG` | Artifact tag under `cpp/kernels/cuteDSLArtifact/<arch>/`, for example `sm_87`, `sm_110`, `sm_110_sm_120`, or `sm_121`. Edge targets infer it from `EMBEDDED_TARGET`; pass it explicitly for x86 prebuilt artifacts or when multiple local tags exist for one CPU architecture. | auto |
 
 **CuTe DSL Kernel Artifacts**
 
@@ -549,7 +593,7 @@ Solution: Specify TensorRT package directory. This directory should contain `lib
 cmake .. \
     -DTRT_PACKAGE_DIR=/usr/local/TensorRT-10.x.x \
     -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
-    -DEMBEDDED_TARGET=<jetson-thor|auto-thor|gb10|jetson-orin> \
+    -DEMBEDDED_TARGET=<jetson-thor|igx-thor|auto-thor|gb10|jetson-orin> \
     -DCUDA_CTK_VERSION=<target CUDA version> \
     -DENABLE_CUTE_DSL=ALL
 ```

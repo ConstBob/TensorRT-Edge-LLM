@@ -90,6 +90,10 @@ TensorRT runtime, and visible GPU SM to one row in `packaging/variants.toml`.
 On a heterogeneous host, select a GPU by the stable UUID reported by
 `nvidia-smi --query-gpu=uuid,name,compute_cap --format=csv,noheader`.
 
+On IGX Thor, the `igx-thor-cu13-sm110-sm120` row is one native payload with
+SM110 and SM120 device images. Select either physical GPU before `--local`;
+both selections resolve to the same build row and resulting payload.
+
 ## Build for selected GPUs
 
 Repeat `--variant` to combine compatible SM payloads built with the same
@@ -110,6 +114,20 @@ diagnostic on another target rather than loading an incompatible binary.
 For an aarch64 cross build, also pass `--toolchain-file`, `--target-sysroot`,
 and `--target-python-include-dir`. Selected variants must share one build
 context; build incompatible platform or TensorRT variants separately.
+
+The IGX Thor dual-GPU payload is already represented by one variant, so do not
+repeat `--variant` for its two SMs:
+
+```bash
+python packaging/wheel_cli.py build-wheel \
+    --variant igx-thor-cu13-sm110-sm120 \
+    --trt-package-dir /usr \
+    --output-dir dist/igx-thor
+```
+
+This produces one normal AArch64 platform wheel. Its runtime manifest contains
+exact SM110 and SM120 identities that reference the same extension and plugin,
+so the CuTe DSL archive and native targets are compiled and packaged once.
 
 ## Build a complete architecture wheel
 

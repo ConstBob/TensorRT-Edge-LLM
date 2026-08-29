@@ -28,9 +28,10 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Tuple
 
-from .config import (REPO_ROOT, cuda_driver_stub, load_matrix, package_version,
-                     require_clean_source, require_variant, run_checked,
-                     sha256, source_revision, source_snapshot, write_json)
+from .config import (CONTRACT, REPO_ROOT, cuda_driver_stub, load_matrix,
+                     package_version, require_clean_source, require_variant,
+                     run_checked, sha256, source_revision, source_snapshot,
+                     write_json)
 
 
 def _positive_int(value: str) -> int:
@@ -222,9 +223,11 @@ def _pybind11_cmake_dir() -> Path:
 
 
 def _cuda_architecture(row: Mapping[str, Any]) -> str:
-    sm = int(row["gpu_sm"])
-    suffix = "a" if sm in {100, 101, 110, 121} else ""
-    return f"{sm}{suffix}"
+    architectures = []
+    for sm in CONTRACT.matrix_variant_gpu_sms(row):
+        suffix = "a" if sm in {100, 101, 110, 121} else ""
+        architectures.append(f"{sm}{suffix}")
+    return ";".join(architectures)
 
 
 def _cmake_configure_command(args: argparse.Namespace, repo_root: Path,

@@ -24,7 +24,7 @@ wheel_payload_aarch64:
       - BUILD_GROUP: "jetson-orin-jp72-cu13-sm87-plus-1"
         BUILD_RUNNER_TAG: "cpu-general-k8s"
         BUILD_IMAGE: "$WHEEL_IMAGE_JETPACK72"
-      - BUILD_GROUP: "jetson-thor-jp70-cu13-sm110"
+      - BUILD_GROUP: "jetson-thor-jp70-cu13-sm110-plus-1"
         BUILD_RUNNER_TAG: "cpu-general-k8s"
         BUILD_IMAGE: "$WHEEL_IMAGE_JETPACK70"
       - BUILD_GROUP: "jetson-thor-jp71-cu13-sm110"

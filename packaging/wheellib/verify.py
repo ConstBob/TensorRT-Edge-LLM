@@ -95,6 +95,17 @@ def _stage_path(stage: Path, relative: str) -> Path:
 
 
 def _audit_tool(name: str) -> str:
+    if name == "cuobjdump":
+        toolkit_roots = [
+            Path(value)
+            for variable in ("CUDAToolkit_ROOT", "CUDA_HOME", "CUDA_PATH")
+            if (value := os.environ.get(variable))
+        ]
+        toolkit_roots.append(Path("/usr/local/cuda"))
+        for root in toolkit_roots:
+            toolkit_tool = root / "bin" / name
+            if (toolkit_tool.is_file() and os.access(toolkit_tool, os.X_OK)):
+                return os.fspath(toolkit_tool)
     executable = shutil.which(name)
     if executable is not None:
         return executable
@@ -144,19 +155,24 @@ def _audit_elf(path: Path, cpu_arch: str, allowed: Set[str]) -> Set[str]:
 
 def _audit_device_images(path: Path, gpu_sm: int) -> None:
     executable = _audit_tool("cuobjdump")
-    result = subprocess.run(
-        [executable, "--dump-elf", os.fspath(path)],
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT)
+    # Inspect one architecture at a time so a later malformed entry cannot
+    # prevent cuobjdump from reaching SM120 in a mixed SM110/SM120 fatbin.
+    # The base filter (for example sm_120) also selects an a-qualified cubin.
+    result = subprocess.run([
+        executable, "--dump-elf", "--gpu-architecture", f"sm_{gpu_sm}",
+        os.fspath(path)
+    ],
+                            check=False,
+                            text=True,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT)
     pattern = rf"arch\s*=\s*sm[_-]?{gpu_sm}(?:a)?(?:\D|$)"
     if re.search(pattern, result.stdout, re.IGNORECASE):
         return
     if result.returncode != 0:
         raise RuntimeError(
-            f"Audit command failed (cuobjdump --dump-elf {path}):\n"
-            f"{result.stdout}")
+            f"Audit command failed (cuobjdump --dump-elf --gpu-architecture "
+            f"sm_{gpu_sm} {path}):\n{result.stdout}")
     raise RuntimeError(f"{path} contains no listed SM{gpu_sm} device image.")
 
 
@@ -388,8 +404,14 @@ def _audit_cutedsl_evidence(metadata: Mapping[str, Any],
             or not isinstance(symbols, list) or not symbols):
         raise RuntimeError("CuTe evidence has an incomplete inventory.")
     member_text = "\n".join(str(value) for value in members)
+    # Multi-SM artifacts qualify every generated object with its target SM to
+    # keep archive members and exported symbols unique.  Compare metadata's
+    # canonical variant names against a canonicalized inventory as well.  The
+    # marker can precede a generated suffix, for example
+    # gdn_decode_mtp__arch110_cache.o -> gdn_decode_mtp_cache.o.
+    canonical_member_text = re.sub(r"__arch\d+(?=[_.]|$)", "", member_text)
     missing_variants = sorted(variant for variant in variants
-                              if variant not in member_text)
+                              if variant not in canonical_member_text)
     missing_symbols = sorted(set(symbols) - linked - defined)
     unresolved_generated = sorted(set(symbols) & unresolved)
     if missing_variants or missing_symbols or unresolved_generated:
@@ -527,8 +549,9 @@ def verify(stage: Path,
     _audit_binary_dependencies(payload, extension, plugin, row, allowlist_path,
                                dependency_roots, require_dependency_resolution)
     if require_device_images:
-        _audit_device_images(extension, int(payload["gpu_sm"]))
-        _audit_device_images(plugin, int(payload["gpu_sm"]))
+        for gpu_sm in CONTRACT.matrix_variant_gpu_sms(row):
+            _audit_device_images(extension, gpu_sm)
+            _audit_device_images(plugin, gpu_sm)
     _audit_payload_size(package_stage, size_budget_path,
                         str(payload["cpu_arch"]))
     return payload

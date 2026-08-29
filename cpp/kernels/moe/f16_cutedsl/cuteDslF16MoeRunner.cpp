@@ -52,10 +52,12 @@ namespace
 
 constexpr int32_t kACT_SWIGLU{2};
 constexpr int32_t kACT_RELU2{4};
-#if !defined(CUTE_DSL_F16_MOE_ARTIFACT_SM)
+#if !defined(CUTE_DSL_F16_MOE_ARTIFACT_SM) && !defined(CUTE_DSL_F16_MOE_MULTI_ARCH_ENABLED)
 #error "CUTE_DSL_F16_MOE_ARTIFACT_SM must identify the linked target artifact"
 #endif
+#if defined(CUTE_DSL_F16_MOE_ARTIFACT_SM)
 constexpr int32_t kARTIFACT_SM{CUTE_DSL_F16_MOE_ARTIFACT_SM};
+#endif
 constexpr size_t kDEVICE_ALIGNMENT{256};
 constexpr int32_t kMAX_PERSISTENT_BLOCKS{256};
 constexpr int32_t kTENSORMAPS_PER_BLOCK{3};
@@ -216,7 +218,11 @@ bool CuteDslF16MoeRunner::canImplement(int32_t hiddenSize, int32_t moeInterSize,
 #if defined(CUTE_DSL_F16_MOE_BLACKWELL_GEFORCE_ENABLED)
     architectureAvailable = architectureAvailable || isBlackwellGeforceSm(smVersion);
 #endif
-    return architectureAvailable && smVersion == kARTIFACT_SM && isSupportedNumExperts(numExperts) && topK > 0
+    bool artifactAvailable{true};
+#if defined(CUTE_DSL_F16_MOE_ARTIFACT_SM)
+    artifactAvailable = smVersion == kARTIFACT_SM;
+#endif
+    return architectureAvailable && artifactAvailable && isSupportedNumExperts(numExperts) && topK > 0
         && topK <= kMaxTopK && hiddenSize > 0 && hiddenSize % kHiddenSizeAlignment == 0 && moeInterSize > 0
         && moeInterSize % kInterSizeAlignment == 0 && fc1N <= std::numeric_limits<int32_t>::max()
         && fc1N % kFc1NAlignment == 0 && (activationType == kACT_SWIGLU || activationType == kACT_RELU2);
@@ -247,11 +253,13 @@ CuteDslF16MoeRunner::Variant CuteDslF16MoeRunner::selectVariant(int32_t smVersio
 
 bool CuteDslF16MoeRunner::ensureKernelModules(int32_t smVersion, cudaStream_t stream) noexcept
 {
+#if defined(CUTE_DSL_F16_MOE_ARTIFACT_SM)
     if (smVersion != kARTIFACT_SM)
     {
         LOG_ERROR("CuteDslF16MoeRunner: linked SM%d artifact cannot execute on SM%d", kARTIFACT_SM, smVersion);
         return false;
     }
+#endif
     switch (selectVariant(smVersion))
     {
     case Variant::kAmpere:
