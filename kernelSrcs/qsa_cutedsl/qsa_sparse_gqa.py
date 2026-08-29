@@ -79,6 +79,15 @@ Variant axes baked at compile time: ``head_dim`` and the
 QSA_DEFAULT_M_BLOCK = 16
 QSA_DEFAULT_N_BLOCK = 16
 QSA_DEFAULT_THREADS = 32
+# Software-pipeline depth: number of (sK, sV) smem stages kept resident.  The
+# single warp is gather-latency bound (No-Eligible ~66%); a DEPTH-stage
+# cp.async pipeline issues DEPTH-1 chunks' gathers ahead so the warp always has
+# outstanding memory ops to overlap with compute.  DEPTH costs DEPTH*(sK+sV)
+# smem; occupancy is not the binding resource here.  DEPTH=2 (prefetch one
+# chunk of BOTH K and V ahead) measured fastest on Thor/SM110: DEPTH>=3 pushes
+# smem past ~48KB, stealing the L1 cache the scattered gather relies on
+# (97% L2 hit) and dropping occupancy, which outweighs the extra prefetch.
+QSA_DEFAULT_PIPE_DEPTH = 2
 
 
 class QSASparseGQAPrefill:
@@ -89,18 +98,23 @@ class QSASparseGQAPrefill:
         m_block_size: int = QSA_DEFAULT_M_BLOCK,
         n_block_size: int = QSA_DEFAULT_N_BLOCK,
         num_threads: int = QSA_DEFAULT_THREADS,
+        pipe_depth: int = QSA_DEFAULT_PIPE_DEPTH,
     ):
         """Initialize the QSA sparse-GQA prefill kernel.
 
         ``head_dim`` must be a multiple of 8 (16-byte alignment of the
         contiguous mode).  ``m_block_size`` bounds the GQA group size
         (``H_q / H_kv <= m_block_size``); the production shape is 12 -> 16.
+        ``pipe_depth`` is the number of gathered (K, V) chunk stages kept in
+        smem for the cp.async software pipeline (>= 2 to overlap gather with
+        compute; DEPTH-1 chunks are prefetched ahead).
         """
         self._head_dim = head_dim
         self._m_block_size = m_block_size
         self._n_block_size = n_block_size
         self._head_dim_padded = (head_dim + 31) // 32 * 32
         self._num_threads = num_threads
+        self._pipe_depth = pipe_depth
         # cp.async row gather: one warp-wave per K/V row, 128-bit per lane.
         self._async_load_cache_mode = cpasync.LoadCacheMode.GLOBAL
 
@@ -110,7 +124,8 @@ class QSASparseGQAPrefill:
 
     @staticmethod
     def can_implement(
-        dtype, head_dim, m_block_size, n_block_size, num_threads
+        dtype, head_dim, m_block_size, n_block_size, num_threads,
+        pipe_depth=QSA_DEFAULT_PIPE_DEPTH,
     ) -> bool:
         """Check whether the (dtype, tile, threads) combo is implementable.
 
@@ -135,11 +150,14 @@ class QSASparseGQAPrefill:
         # 16-bit row, so the CTA width is pinned to the head dim.
         if head_dim != num_threads * 8:
             return False
+        if pipe_depth < 2:
+            return False
 
         head_dim_padded = (head_dim + 31) // 32 * 32
+        # sQ (1 copy) + pipe_depth stages of (sK + sV).
         smem_usage = (
             m_block_size * head_dim_padded
-            + n_block_size * head_dim_padded * 2
+            + pipe_depth * n_block_size * head_dim_padded * 2
         ) * 2
         smem_capacity = utils.get_smem_capacity_in_bytes("sm_80")
         if smem_usage > smem_capacity:
@@ -211,10 +229,13 @@ class QSASparseGQAPrefill:
             (self._m_block_size, self._head_dim_padded),
             (0, 1),
         )
+        # Multi-stage K/V smem: append a pipe_depth stage mode (stride =
+        # per-stage cosize) to the swizzled (n_block, head_dim) atom, exactly
+        # like the gemm-ampere num_stages layout.
         sKV_layout = cute.tile_to_shape(
             sQ_layout_atom,
-            (self._n_block_size, self._head_dim_padded),
-            (0, 1),
+            (self._n_block_size, self._head_dim_padded, self._pipe_depth),
+            (0, 1, 2),
         )
         sV_layout = sKV_layout
         sO_layout = sQ_layout
@@ -230,11 +251,13 @@ class QSASparseGQAPrefill:
             sV: cute.struct.Align[
                 cute.struct.MemRange[self._dtype, cute.cosize(sV_layout)], 1024
             ]
-            # Ping-pong staging of the current / next chunk's token indices:
-            # written during the K gather, read by the V gather and the
-            # sparse score mask.
+            # Per-stage staging of each chunk's token indices: written by the
+            # gather, read by the sparse score mask.
             sIdx: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Int32, 2 * self._n_block_size], 16
+                cute.struct.MemRange[
+                    cutlass.Int32, self._pipe_depth * self._n_block_size
+                ],
+                16,
             ]
 
         # ///////////////////////////////////////////////////////////////////
@@ -378,32 +401,37 @@ class QSASparseGQAPrefill:
         sK = storage.sK.get_tensor(sKV_layout)
         sV = storage.sV.get_tensor(sV_layout)
         sIdx = storage.sIdx.get_tensor(
-            cute.make_layout((2, self._n_block_size), stride=(self._n_block_size, 1))
-        )
-
-        # Transposed view of V for BMM2.
-        sVt = cute.composition(
-            sV,
             cute.make_layout(
-                (self._head_dim_padded, self._n_block_size),
+                (self._pipe_depth, self._n_block_size),
                 stride=(self._n_block_size, 1),
-            ),
+            )
         )
 
         gmem_thr_copy_row = gmem_tiled_copy_row.get_slice(tidx)
         gmem_thr_copy_row_O = gmem_tiled_copy_row_O.get_slice(tidx)
-        # Row-tiled destination partitions: mode 1 walks the tile rows.
+        # Row-tiled destination partitions: mode 1 walks the tile rows, mode 3
+        # walks the pipeline stage.
         tQsQ = gmem_thr_copy_row.partition_D(sQ)
         tKsK = gmem_thr_copy_row.partition_D(sK)
         tVsV = gmem_thr_copy_row.partition_D(sV)
 
         # ///////////////////////////////////////////////////////////////////
-        # MMA partitions and accumulators.
+        # MMA partitions and accumulators.  Stage-0 slices only fix the
+        # (stage-independent) fragment shapes; the actual stage is selected
+        # per chunk inside compute_one_chunk.
         # ///////////////////////////////////////////////////////////////////
         thr_mma = tiled_mma.get_slice(tidx)
+        sK0 = sK[None, None, 0]
+        sVt0 = cute.composition(
+            sV[None, None, 0],
+            cute.make_layout(
+                (self._head_dim_padded, self._n_block_size),
+                stride=(self._n_block_size, 1),
+            ),
+        )
         tSrQ = thr_mma.make_fragment_A(thr_mma.partition_A(sQ))
-        tSrK = thr_mma.make_fragment_B(thr_mma.partition_B(sK))
-        tOrVt = thr_mma.make_fragment_B(thr_mma.partition_B(sVt))
+        tSrK = thr_mma.make_fragment_B(thr_mma.partition_B(sK0))
+        tOrVt = thr_mma.make_fragment_B(thr_mma.partition_B(sVt0))
         acc_shape_O = thr_mma.partition_shape_C(
             (self._m_block_size, self._head_dim_padded)
         )
@@ -432,22 +460,54 @@ class QSASparseGQAPrefill:
 
         tSsQ = smem_thr_copy_Q.partition_S(sQ)
         tSrQ_copy_view = smem_thr_copy_Q.retile(tSrQ)
-        tSsK = smem_thr_copy_K.partition_S(sK)
         tSrK_copy_view = smem_thr_copy_K.retile(tSrK)
-        tOsVt = smem_thr_copy_V.partition_S(sVt)
         tOrVt_copy_view = smem_thr_copy_V.retile(tOrVt)
 
         # ///////////////////////////////////////////////////////////////////
-        # Prologue: Q rows (row < group only; head-padding rows are
-        # zero-filled and never read from gmem — for the last token of the
-        # last batch they would fall outside the allocation) + gathered K
-        # chunk 0.
-        #
-        # Padding tokens (n_chunks == 0) must issue NO cp.async at all: the
-        # chunk loop — the only place that waits on the async groups — never
-        # runs for them, and an in-flight Q load could otherwise land in sQ
-        # after the epilogue has overwritten it as sO (the padding rows must
-        # store exact zeros). Their sQ contents are never read.
+        # Online-softmax state.
+        # ///////////////////////////////////////////////////////////////////
+        row_max = cute.make_rmem_tensor(
+            (acc_O.shape[0][0] * acc_O.shape[1]), cutlass.Float32
+        )
+        row_sum = cute.make_rmem_tensor(
+            (acc_O.shape[0][0] * acc_O.shape[1]), cutlass.Float32
+        )
+        row_max.fill(-cutlass.Float32.inf)
+        row_sum.fill(0.0)
+
+        mma_params = SimpleNamespace(
+            thr_mma=thr_mma,
+            tiled_mma=tiled_mma,
+            tSrQ=tSrQ,
+            tSrK=tSrK,
+            tOrVt=tOrVt,
+            acc_O=acc_O,
+        )
+        smem_copy_params = SimpleNamespace(
+            smem_tiled_copy_Q=smem_tiled_copy_Q,
+            smem_tiled_copy_K=smem_tiled_copy_K,
+            smem_tiled_copy_V=smem_tiled_copy_V,
+            smem_thr_copy_K=smem_thr_copy_K,
+            smem_thr_copy_V=smem_thr_copy_V,
+            sK=sK,
+            sV=sV,
+            tSsQ=tSsQ,
+            tSrQ_copy_view=tSrQ_copy_view,
+            tSrK_copy_view=tSrK_copy_view,
+            tOrVt_copy_view=tOrVt_copy_view,
+        )
+        softmax_params = SimpleNamespace(
+            row_max=row_max,
+            row_sum=row_sum,
+            softmax_scale_log2=softmax_scale_log2,
+        )
+
+        # ///////////////////////////////////////////////////////////////////
+        # Prologue: Q rows (row < group only; head-padding rows zero-filled and
+        # never read from gmem) + gather the first ``pipe_depth`` K/V chunk
+        # stages.  Padding tokens (n_chunks == 0) issue NO cp.async at all —
+        # the mainloop (the only waiter) never runs for them, so an in-flight Q
+        # load could otherwise clobber sQ after the epilogue reuses it as sO.
         # ///////////////////////////////////////////////////////////////////
         if n_chunks > 0:
             for row in cutlass.range_constexpr(self._m_block_size):
@@ -462,100 +522,37 @@ class QSASparseGQAPrefill:
                     )
                 else:
                     tQsQ[None, row, 0].fill(0)
-            self._gather_chunk(
-                mK,
-                mIdx,
-                sIdx,
-                tKsK,
-                gmem_tiled_copy_row,
-                gmem_thr_copy_row,
-                batch,
-                token,
-                kv_row_base,
-                kv_seq_stride,
-                cutlass.Int32(0),
-                topk,
-                load_indices=True,
-            )
-        cute.arch.cp_async_commit_group()
+        for s in cutlass.range_constexpr(self._pipe_depth):
+            if s < n_chunks:
+                self._gather_stage(
+                    mK, mV, mIdx, sIdx, tKsK, tVsV,
+                    gmem_tiled_copy_row, gmem_thr_copy_row,
+                    batch, token, kv_row_base, kv_seq_stride,
+                    cutlass.Int32(s), cutlass.Int32(s), topk,
+                )
+            cute.arch.cp_async_commit_group()
 
         # ///////////////////////////////////////////////////////////////////
-        # Online-softmax state.
+        # Software-pipelined mainloop: wait for chunk i (keeping pipe_depth-1
+        # gathers in flight), compute it, then refill its stage with chunk
+        # i+pipe_depth.  Stage of chunk i+pipe_depth == stage of chunk i.
         # ///////////////////////////////////////////////////////////////////
-        row_max = cute.make_rmem_tensor(
-            (acc_O.shape[0][0] * acc_O.shape[1]), cutlass.Float32
-        )
-        row_sum = cute.make_rmem_tensor(
-            (acc_O.shape[0][0] * acc_O.shape[1]), cutlass.Float32
-        )
-        row_max.fill(-cutlass.Float32.inf)
-        row_sum.fill(0.0)
-
-        basic_params = SimpleNamespace(
-            batch=batch,
-            token=token,
-            kv_row_base=kv_row_base,
-            kv_seq_stride=kv_seq_stride,
-            topk=topk,
-            n_chunks=n_chunks,
-        )
-        mma_params = SimpleNamespace(
-            thr_mma=thr_mma,
-            tiled_mma=tiled_mma,
-            tSrQ=tSrQ,
-            tSrK=tSrK,
-            tOrVt=tOrVt,
-            acc_O=acc_O,
-        )
-        gmem_copy_params = SimpleNamespace(
-            gmem_tiled_copy_row=gmem_tiled_copy_row,
-            gmem_thr_copy_row=gmem_thr_copy_row,
-            tKsK=tKsK,
-            tVsV=tVsV,
-            mK=mK,
-            mV=mV,
-            mIdx=mIdx,
-            sIdx=sIdx,
-        )
-        smem_copy_params = SimpleNamespace(
-            smem_tiled_copy_Q=smem_tiled_copy_Q,
-            smem_tiled_copy_K=smem_tiled_copy_K,
-            smem_tiled_copy_V=smem_tiled_copy_V,
-            tSsQ=tSsQ,
-            tSrQ_copy_view=tSrQ_copy_view,
-            tSsK=tSsK,
-            tSrK_copy_view=tSrK_copy_view,
-            tOsVt=tOsVt,
-            tOrVt_copy_view=tOrVt_copy_view,
-        )
-        softmax_params = SimpleNamespace(
-            row_max=row_max,
-            row_sum=row_sum,
-            softmax_scale_log2=softmax_scale_log2,
-        )
-
-        # Chunk 0 peeled for the is_first constexpr split, exactly like the
-        # FMHA-v2 mask-step peeling.
-        if n_chunks > 0:
+        for i in range(n_chunks):
+            stage = i % self._pipe_depth
+            cute.arch.cp_async_wait_group(self._pipe_depth - 1)
+            self.cta_sync_barrier.arrive_and_wait()
             self.compute_one_chunk(
-                basic_params,
-                mma_params,
-                gmem_copy_params,
-                smem_copy_params,
-                softmax_params,
-                cutlass.Int32(0),
-                is_first_chunk=True,
+                mma_params, smem_copy_params, softmax_params, sIdx, stage,
             )
-        for chunk in range(1, n_chunks, 1):
-            self.compute_one_chunk(
-                basic_params,
-                mma_params,
-                gmem_copy_params,
-                smem_copy_params,
-                softmax_params,
-                chunk,
-                is_first_chunk=False,
-            )
+            next_chunk = i + self._pipe_depth
+            if next_chunk < n_chunks:
+                self._gather_stage(
+                    mK, mV, mIdx, sIdx, tKsK, tVsV,
+                    gmem_tiled_copy_row, gmem_thr_copy_row,
+                    batch, token, kv_row_base, kv_seq_stride,
+                    next_chunk, stage, topk,
+                )
+            cute.arch.cp_async_commit_group()
 
         # ///////////////////////////////////////////////////////////////////
         # Epilogue: normalize, rmem -> smem (aliased over sQ) -> gmem for
@@ -622,12 +619,14 @@ class QSASparseGQAPrefill:
         )
 
     @cute.jit
-    def _gather_chunk(
+    def _gather_stage(
         self,
-        mKV: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
         mIdx: cute.Tensor,
         sIdx: cute.Tensor,
-        dst,
+        dstK,
+        dstV,
         gmem_tiled_copy_row: cute.TiledCopy,
         gmem_thr_copy_row,
         batch: cutlass.Int32,
@@ -635,88 +634,79 @@ class QSASparseGQAPrefill:
         kv_row_base: cutlass.Int32,
         kv_seq_stride: cutlass.Int32,
         chunk: cutlass.Int32,
+        stage: cutlass.Int32,
         topk: cutlass.Int32,
-        load_indices: cutlass.Constexpr,
     ):
-        """Gather one ``n_block_size``-row K or V chunk by token index.
+        """Gather one ``n_block_size``-row chunk's K AND V into pipeline
+        ``stage`` and stage its token indices into ``sIdx[stage]``.
 
         One warp-wave per row: the whole warp cp.async-copies one 256-element
-        row (32 lanes x 128 bits, fully coalesced within the row).  Invalid
-        (``-1`` or beyond-topk) rows are zero-filled so masked columns stay
-        inert in BMM2 even against NaN-poisoned memory.
-
-        ``load_indices=True`` (K pass) reads ``mIdx`` from gmem and stages
-        the chunk's indices into the ``chunk % 2`` half of the ``sIdx``
-        ping-pong buffer; ``False`` (V pass) replays the staged indices.
+        row (32 lanes x 128 bits, fully coalesced).  Invalid (``-1`` or
+        beyond-topk) rows are zero-filled so masked columns stay inert in BMM2
+        even against NaN-poisoned memory.  K and V share the same index, so a
+        single pass issues both — the whole chunk becomes one cp.async group.
         """
-        buf = chunk % 2
         for w in cutlass.range_constexpr(self._n_block_size):
             pos = chunk * self._n_block_size + w
             idx = cutlass.Int32(-1)
-            if cutlass.const_expr(load_indices):
-                if pos < topk:
-                    idx = mIdx[batch, token, pos]
-                # All lanes store the same value — benign, keeps the wave
-                # uniform without a lane predicate.
-                sIdx[buf, w] = idx
-            else:
-                idx = sIdx[buf, w]
+            if pos < topk:
+                idx = mIdx[batch, token, pos]
+            # All lanes store the same value — benign, keeps the wave uniform.
+            sIdx[stage, w] = idx
             if idx >= 0:
-                gRow = self._gmem_row_view(
-                    mKV, kv_row_base + idx * kv_seq_stride
-                )
-                tRow = gmem_thr_copy_row.partition_S(gRow)
-                tRowAligned = cute.make_tensor(tRow.iterator.align(16), tRow.layout)
+                row_off = kv_row_base + idx * kv_seq_stride
+                gRowK = self._gmem_row_view(mK, row_off)
+                tRowK = gmem_thr_copy_row.partition_S(gRowK)
+                tRowKAligned = cute.make_tensor(tRowK.iterator.align(16), tRowK.layout)
                 cute.copy(
                     gmem_tiled_copy_row,
-                    tRowAligned[None, 0, 0],
-                    dst[None, w, 0],
+                    tRowKAligned[None, 0, 0],
+                    dstK[None, w, 0, stage],
+                )
+                gRowV = self._gmem_row_view(mV, row_off)
+                tRowV = gmem_thr_copy_row.partition_S(gRowV)
+                tRowVAligned = cute.make_tensor(tRowV.iterator.align(16), tRowV.layout)
+                cute.copy(
+                    gmem_tiled_copy_row,
+                    tRowVAligned[None, 0, 0],
+                    dstV[None, w, 0, stage],
                 )
             else:
-                dst[None, w, 0].fill(0)
+                dstK[None, w, 0, stage].fill(0)
+                dstV[None, w, 0, stage].fill(0)
 
     @cute.jit
     def compute_one_chunk(
         self,
-        basic_params: SimpleNamespace,
         mma_params: SimpleNamespace,
-        gmem_copy_params: SimpleNamespace,
         smem_copy_params: SimpleNamespace,
         softmax_params: SimpleNamespace,
-        chunk: cutlass.Int32,
-        is_first_chunk: cutlass.Constexpr,
+        sIdx: cute.Tensor,
+        stage: cutlass.Int32,
     ):
-        """One index chunk: BMM1 (Q @ gathered-K^T) -> sparse mask + online
-        softmax -> BMM2 (P @ gathered-V).  cp.async commit/wait/barrier
-        structure is one-to-one with FMHA-v2's ``compute_one_n_block``.
+        """One index chunk (K/V already gathered into ``stage`` by the
+        pipeline): BMM1 (Q @ gathered-K^T) -> sparse mask + online softmax ->
+        BMM2 (P @ gathered-V).  No gather/wait here — the mainloop owns the
+        cp.async pipeline.
         """
+        # Select this chunk's K/V smem stage and re-derive the ldmatrix source
+        # partitions (cheap: same layout, stage-offset pointer).
+        sK_s = smem_copy_params.sK[None, None, stage]
+        sVt_s = cute.composition(
+            smem_copy_params.sV[None, None, stage],
+            cute.make_layout(
+                (self._head_dim_padded, self._n_block_size),
+                stride=(self._n_block_size, 1),
+            ),
+        )
+        tSsK = smem_copy_params.smem_thr_copy_K.partition_S(sK_s)
+        tOsVt = smem_copy_params.smem_thr_copy_V.partition_S(sVt_s)
+
         acc_shape_S = mma_params.thr_mma.partition_shape_C(
             (self._m_block_size, self._n_block_size)
         )
         acc_S = cute.make_rmem_tensor(acc_shape_S, cutlass.Float32)
         acc_S.fill(0.0)
-
-        # Wait for this chunk's K (and, on chunk 0, the Q rows).
-        cute.arch.cp_async_wait_group(0)
-        self.cta_sync_barrier.arrive_and_wait()
-
-        # V gather of the current chunk replays the staged indices.
-        self._gather_chunk(
-            gmem_copy_params.mV,
-            gmem_copy_params.mIdx,
-            gmem_copy_params.sIdx,
-            gmem_copy_params.tVsV,
-            gmem_copy_params.gmem_tiled_copy_row,
-            gmem_copy_params.gmem_thr_copy_row,
-            basic_params.batch,
-            basic_params.token,
-            basic_params.kv_row_base,
-            basic_params.kv_seq_stride,
-            chunk,
-            basic_params.topk,
-            load_indices=False,
-        )
-        cute.arch.cp_async_commit_group()
 
         # ///////////////////////////////////////////////////////////////////
         # S = Q @ K^T  (BMM1), ldmatrix double-buffered over the k mode.
@@ -728,7 +718,7 @@ class QSASparseGQAPrefill:
         )
         cute.copy(
             smem_copy_params.smem_tiled_copy_K,
-            smem_copy_params.tSsK[None, None, 0],
+            tSsK[None, None, 0],
             smem_copy_params.tSrK_copy_view[None, None, 0],
         )
         for k in cutlass.range_constexpr(cute.size(smem_copy_params.tSsQ.shape[2])):
@@ -740,7 +730,7 @@ class QSASparseGQAPrefill:
             )
             cute.copy(
                 smem_copy_params.smem_tiled_copy_K,
-                smem_copy_params.tSsK[None, None, k_next],
+                tSsK[None, None, k_next],
                 smem_copy_params.tSrK_copy_view[None, None, k_next],
             )
             cute.gemm(
@@ -751,39 +741,15 @@ class QSASparseGQAPrefill:
                 acc_S,
             )
 
-        cute.arch.cp_async_wait_group(0)
-        self.cta_sync_barrier.arrive_and_wait()
-
-        # Prefetch next chunk's K into the other sIdx half while softmax and
-        # BMM2 run.
-        if chunk + 1 < basic_params.n_chunks:
-            self._gather_chunk(
-                gmem_copy_params.mK,
-                gmem_copy_params.mIdx,
-                gmem_copy_params.sIdx,
-                gmem_copy_params.tKsK,
-                gmem_copy_params.gmem_tiled_copy_row,
-                gmem_copy_params.gmem_thr_copy_row,
-                basic_params.batch,
-                basic_params.token,
-                basic_params.kv_row_base,
-                basic_params.kv_seq_stride,
-                chunk + 1,
-                basic_params.topk,
-                load_indices=True,
-            )
-            cute.arch.cp_async_commit_group()
-
         # ///////////////////////////////////////////////////////////////////
         # Sparse mask + online softmax.
         # ///////////////////////////////////////////////////////////////////
         self.softmax_rescale_O(
             mma_params,
             softmax_params,
-            gmem_copy_params.sIdx,
-            chunk,
+            sIdx,
+            stage,
             acc_S,
-            is_first_chunk,
         )
 
         rP = cute.make_fragment_like(acc_S, self._dtype)
@@ -808,14 +774,14 @@ class QSASparseGQAPrefill:
 
         cute.copy(
             smem_copy_params.smem_tiled_copy_V,
-            smem_copy_params.tOsVt[None, None, 0],
+            tOsVt[None, None, 0],
             smem_copy_params.tOrVt_copy_view[None, None, 0],
         )
         for k in cutlass.range_constexpr(cute.size(tOrS.shape[2])):
             k_next = (k + 1) % cute.size(tOrS.shape[2])
             cute.copy(
                 smem_copy_params.smem_tiled_copy_V,
-                smem_copy_params.tOsVt[None, None, k_next],
+                tOsVt[None, None, k_next],
                 smem_copy_params.tOrVt_copy_view[None, None, k_next],
             )
             cute.gemm(
@@ -832,28 +798,29 @@ class QSASparseGQAPrefill:
         mma_params: SimpleNamespace,
         softmax_params: SimpleNamespace,
         sIdx: cute.Tensor,
-        chunk: cutlass.Int32,
+        stage: cutlass.Int32,
         acc_S: cute.Tensor,
-        is_first_chunk: cutlass.Constexpr,
     ):
         """Apply the sparse-index mask and online softmax to ``acc_S``.
 
-        The only mask is index validity: staged ``sIdx`` entries < 0 force
-        the column to -inf for every row.  There is no positional masking —
-        causality is baked into the index list by the indexer.  The scale
-        is applied to the FP32 scores at exp2 time (row_max tracked on raw
-        scores), never pre-folded into the low-precision Q.
+        The only mask is index validity: staged ``sIdx[stage]`` entries < 0
+        force the column to -inf for every row.  There is no positional
+        masking — causality is baked into the index list by the indexer.  The
+        scale is applied to the FP32 scores at exp2 time (row_max tracked on
+        raw scores), never pre-folded into the low-precision Q.
+
+        The general online-softmax rescale path is used for every chunk: on
+        the first chunk ``row_max`` is still ``-inf`` and ``row_sum`` is 0, so
+        the running-max correction ``exp2(-inf) = 0`` correctly leaves the
+        zero-initialised accumulator untouched — no ``is_first`` peel needed.
         """
         acc_S_mn = self._make_acc_tensor_mn_view(acc_S)
         acc_O_mn = self._make_acc_tensor_mn_view(mma_params.acc_O)
-        row_max_prev = None
-        if cutlass.const_expr(not is_first_chunk):
-            row_max_prev = cute.make_fragment_like(
-                softmax_params.row_max, cutlass.Float32
-            )
-            cute.basic_copy(softmax_params.row_max, row_max_prev)
+        row_max_prev = cute.make_fragment_like(
+            softmax_params.row_max, cutlass.Float32
+        )
+        cute.basic_copy(softmax_params.row_max, row_max_prev)
 
-        buf = chunk % 2
         mcS = cute.make_identity_tensor(
             (self._m_block_size, self._n_block_size)
         )
@@ -866,7 +833,7 @@ class QSASparseGQAPrefill:
         )
         for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
             col_idx = tScS_mn[0, c][1]
-            col_valid[c] = sIdx[buf, col_idx] >= 0
+            col_valid[c] = sIdx[stage, col_idx] >= 0
 
         for r in cutlass.range_constexpr(cute.size(softmax_params.row_max)):
             for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
@@ -878,10 +845,8 @@ class QSASparseGQAPrefill:
                 cute.ReductionOp.MAX, -cutlass.Float32.inf, 0
             )
             row_max_cur_row = self._threadquad_reduce_max(row_max_cur_row)
-            row_max_prev_row = None
-            if cutlass.const_expr(not is_first_chunk):
-                row_max_prev_row = row_max_prev[r]
-                row_max_cur_row = cute.arch.fmax(row_max_prev_row, row_max_cur_row)
+            row_max_prev_row = row_max_prev[r]
+            row_max_cur_row = cute.arch.fmax(row_max_prev_row, row_max_cur_row)
             # Keep -inf in the running max until a valid score arrives, but
             # use a finite max for the exponent arithmetic so fully-masked
             # rows stay at exp2(-inf) = 0 instead of NaN.
@@ -897,16 +862,15 @@ class QSASparseGQAPrefill:
             acc_S_row_sum = acc_S_row_exp.reduce(
                 cute.ReductionOp.ADD, cutlass.Float32.zero, 0
             )
-            if cutlass.const_expr(not is_first_chunk):
-                prev_minus_cur_exp = cute.math.exp2(
-                    row_max_prev_row * softmax_params.softmax_scale_log2
-                    - row_max_safe_row * softmax_params.softmax_scale_log2,
-                    fastmath=True,
-                )
-                acc_S_row_sum = (
-                    acc_S_row_sum + softmax_params.row_sum[r] * prev_minus_cur_exp
-                )
-                acc_O_mn[r, None] = acc_O_mn[r, None].load() * prev_minus_cur_exp
+            prev_minus_cur_exp = cute.math.exp2(
+                row_max_prev_row * softmax_params.softmax_scale_log2
+                - row_max_safe_row * softmax_params.softmax_scale_log2,
+                fastmath=True,
+            )
+            acc_S_row_sum = (
+                acc_S_row_sum + softmax_params.row_sum[r] * prev_minus_cur_exp
+            )
+            acc_O_mn[r, None] = acc_O_mn[r, None].load() * prev_minus_cur_exp
             softmax_params.row_max[r] = row_max_cur_row
             softmax_params.row_sum[r] = acc_S_row_sum
             acc_S_mn[r, None] = acc_S_row_exp
@@ -1182,6 +1146,7 @@ def run(
     m_block_size: int = QSA_DEFAULT_M_BLOCK,
     n_block_size: int = QSA_DEFAULT_N_BLOCK,
     num_threads: int = QSA_DEFAULT_THREADS,
+    pipe_depth: int = QSA_DEFAULT_PIPE_DEPTH,
     ragged: bool = False,
     warmup_iterations: int = 3,
     iterations: int = 10,
@@ -1201,11 +1166,12 @@ def run(
     _tag = f"[{file_name}]"
 
     if not QSASparseGQAPrefill.can_implement(
-        dtype, head_dim, m_block_size, n_block_size, num_threads
+        dtype, head_dim, m_block_size, n_block_size, num_threads, pipe_depth
     ):
         raise ValueError(
             f"{_tag} Unsupported config: dtype={dtype}, head_dim={head_dim}, "
-            f"Br={m_block_size}, Bc={n_block_size}, threads={num_threads}"
+            f"Br={m_block_size}, Bc={n_block_size}, threads={num_threads}, "
+            f"pipe_depth={pipe_depth}"
         )
     if num_head % kv_group_size != 0:
         raise ValueError(
@@ -1241,7 +1207,8 @@ def run(
             f"group={kv_group_size}, ragged={ragged}"
         )
         print(f"{_tag}   softmax_scale={softmax_scale}")
-        print(f"{_tag}   Br={m_block_size}, Bc={n_block_size}, threads={num_threads}")
+        print(f"{_tag}   Br={m_block_size}, Bc={n_block_size}, threads={num_threads}, "
+              f"pipe_depth={pipe_depth}")
         cp.random.seed(20260829)
         print(f"{_tag}   CuPy random seed=20260829")
 
@@ -1294,6 +1261,7 @@ def run(
         m_block_size=m_block_size,
         n_block_size=n_block_size,
         num_threads=num_threads,
+        pipe_depth=pipe_depth,
     )
 
     current_stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
@@ -1444,6 +1412,8 @@ def _parse_args(argv=None):
     p.add_argument("--m_block_size", type=int, default=QSA_DEFAULT_M_BLOCK)
     p.add_argument("--n_block_size", type=int, default=QSA_DEFAULT_N_BLOCK)
     p.add_argument("--num_threads", type=int, default=QSA_DEFAULT_THREADS)
+    p.add_argument("--pipe_depth", type=int, default=QSA_DEFAULT_PIPE_DEPTH,
+                   help="cp.async software-pipeline depth (K/V smem stages).")
     p.add_argument("--ragged", action="store_true",
                    help="Use random per-batch context lengths (< seqlen).")
     p.add_argument("--warmup_iterations", type=int, default=3)
@@ -1474,6 +1444,7 @@ def main():
         m_block_size=args.m_block_size,
         n_block_size=args.n_block_size,
         num_threads=args.num_threads,
+        pipe_depth=args.pipe_depth,
         ragged=args.ragged,
         warmup_iterations=args.warmup_iterations,
         iterations=args.iterations,
