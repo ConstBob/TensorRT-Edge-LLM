@@ -186,7 +186,7 @@ __global__ void fillFp32Kernel(float* data, int64_t n, float value)
 
 struct Fp32ValueBatch
 {
-    float values[256];
+    float values[512];
 };
 
 __global__ void writeFp32Kernel(Fp32ValueBatch values, float* output, int32_t count)
@@ -405,7 +405,7 @@ cudaError_t launchFillFp32(void* dFp32, int64_t n, float value, cudaStream_t str
 
 cudaError_t launchWriteFp32(float const* values, int32_t count, void* dFp32, cudaStream_t stream)
 {
-    if (values == nullptr || dFp32 == nullptr || count <= 0 || count > 256)
+    if (values == nullptr || dFp32 == nullptr || count <= 0 || count > 512)
     {
         return cudaErrorInvalidValue;
     }
@@ -414,7 +414,7 @@ cudaError_t launchWriteFp32(float const* values, int32_t count, void* dFp32, cud
     {
         batch.values[index] = values[index];
     }
-    writeFp32Kernel<<<1, 256, 0, stream>>>(batch, static_cast<float*>(dFp32), count);
+    writeFp32Kernel<<<1, 512, 0, stream>>>(batch, static_cast<float*>(dFp32), count);
     return cudaGetLastError();
 }
 
