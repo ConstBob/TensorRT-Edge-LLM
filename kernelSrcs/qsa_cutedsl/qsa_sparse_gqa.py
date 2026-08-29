@@ -152,6 +152,10 @@ class QSASparseGQAPrefill:
             return False
         if pipe_depth < 2:
             return False
+        # The coalesced index fetch holds a whole chunk's indices in one
+        # per-lane register (32 lanes) and distributes them with warp shuffle.
+        if n_block_size > 32:
+            return False
 
         head_dim_padded = (head_dim + 31) // 32 * 32
         # sQ (1 copy) + pipe_depth stages of (sK + sV).
@@ -522,13 +526,25 @@ class QSASparseGQAPrefill:
                     )
                 else:
                     tQsQ[None, row, 0].fill(0)
+        # Index prefetch runs ONE pipeline step ahead of the K/V gather: the
+        # coalesced index load for chunk c is issued a full iteration before
+        # the gather that consumes it, so its gmem round-trip hides under a
+        # chunk of compute instead of sitting on the cp.async address path.
+        idx_reg = cutlass.Int32(-1)
+        if n_chunks > 0:
+            idx_reg = self._load_chunk_indices(
+                mIdx, batch, token, cutlass.Int32(0), topk
+            )
         for s in cutlass.range_constexpr(self._pipe_depth):
             if s < n_chunks:
                 self._gather_stage(
-                    mK, mV, mIdx, sIdx, tKsK, tVsV,
+                    mK, mV, sIdx, tKsK, tVsV,
                     gmem_tiled_copy_row, gmem_thr_copy_row,
-                    batch, token, kv_row_base, kv_seq_stride,
-                    cutlass.Int32(s), cutlass.Int32(s), topk,
+                    kv_row_base, kv_seq_stride,
+                    idx_reg, cutlass.Int32(s),
+                )
+                idx_reg = self._load_chunk_indices(
+                    mIdx, batch, token, cutlass.Int32(s + 1), topk
                 )
             cute.arch.cp_async_commit_group()
 
@@ -547,10 +563,13 @@ class QSASparseGQAPrefill:
             next_chunk = i + self._pipe_depth
             if next_chunk < n_chunks:
                 self._gather_stage(
-                    mK, mV, mIdx, sIdx, tKsK, tVsV,
+                    mK, mV, sIdx, tKsK, tVsV,
                     gmem_tiled_copy_row, gmem_thr_copy_row,
-                    batch, token, kv_row_base, kv_seq_stride,
-                    next_chunk, stage, topk,
+                    kv_row_base, kv_seq_stride,
+                    idx_reg, stage,
+                )
+                idx_reg = self._load_chunk_indices(
+                    mIdx, batch, token, next_chunk + 1, topk
                 )
             cute.arch.cp_async_commit_group()
 
@@ -619,61 +638,117 @@ class QSASparseGQAPrefill:
         )
 
     @cute.jit
+    def _load_chunk_indices(
+        self,
+        mIdx: cute.Tensor,
+        batch: cutlass.Int32,
+        token: cutlass.Int32,
+        chunk: cutlass.Int32,
+        topk: cutlass.Int32,
+    ) -> cutlass.Int32:
+        """ONE coalesced index load for a whole chunk.
+
+        Lane ``l < n_block_size`` loads ``indices[chunk * n_block + l]`` — a
+        single 64B transaction — instead of ``n_block`` warp-uniform 4B scalar
+        loads, each of which exposed a full gmem round-trip on the cp.async
+        address path (long_scoreboard stalls, 12.5% bytes/sector signature).
+        Out-of-range lanes/positions return ``-1`` (masked).  Callers issue
+        this one pipeline step AHEAD of the consuming gather so the load's
+        latency hides under a chunk of compute.
+        """
+        tidx, _, _ = cute.arch.thread_idx()
+        lane = tidx % 32
+        pos_l = chunk * self._n_block_size + lane
+        idx_l = cutlass.Int32(-1)
+        if lane < self._n_block_size and pos_l < topk:
+            idx_l = mIdx[batch, token, pos_l]
+        return idx_l
+
+    @cute.jit
     def _gather_stage(
         self,
         mK: cute.Tensor,
         mV: cute.Tensor,
-        mIdx: cute.Tensor,
         sIdx: cute.Tensor,
         dstK,
         dstV,
         gmem_tiled_copy_row: cute.TiledCopy,
         gmem_thr_copy_row,
-        batch: cutlass.Int32,
-        token: cutlass.Int32,
         kv_row_base: cutlass.Int32,
         kv_seq_stride: cutlass.Int32,
-        chunk: cutlass.Int32,
+        idx_l: cutlass.Int32,
         stage: cutlass.Int32,
-        topk: cutlass.Int32,
     ):
         """Gather one ``n_block_size``-row chunk's K AND V into pipeline
         ``stage`` and stage its token indices into ``sIdx[stage]``.
 
         One warp-wave per row: the whole warp cp.async-copies one 256-element
-        row (32 lanes x 128 bits, fully coalesced).  Invalid (``-1`` or
-        beyond-topk) rows are zero-filled so masked columns stay inert in BMM2
-        even against NaN-poisoned memory.  K and V share the same index, so a
-        single pass issues both — the whole chunk becomes one cp.async group.
+        row (32 lanes x 128 bits, fully coalesced).  Invalid (``-1``) rows are
+        zero-filled so masked columns stay inert in BMM2 even against
+        NaN-poisoned memory.  K and V share the same index, so a single pass
+        issues both — the whole chunk becomes one cp.async group.
+
+        ``idx_l`` is the chunk's per-lane index register prefetched by
+        ``_load_chunk_indices``; the row loop broadcasts row ``w``'s index
+        from lane ``w`` with ``shfl.sync.idx`` — zero memory traffic per row,
+        and the broadcast value keeps the per-row branches warp-uniform.
+
+        The lane-local ``sIdx[stage, lane]`` store replaces the old
+        all-lanes-store-everything pattern; readers (the softmax mask) only
+        run after the mainloop's CTA barrier for this chunk, which publishes
+        the stores.
         """
+        tidx, _, _ = cute.arch.thread_idx()
+        lane = tidx % 32
+        if lane < self._n_block_size:
+            sIdx[stage, lane] = idx_l
         for w in cutlass.range_constexpr(self._n_block_size):
-            pos = chunk * self._n_block_size + w
-            idx = cutlass.Int32(-1)
-            if pos < topk:
-                idx = mIdx[batch, token, pos]
-            # All lanes store the same value — benign, keeps the wave uniform.
-            sIdx[stage, w] = idx
-            if idx >= 0:
-                row_off = kv_row_base + idx * kv_seq_stride
-                gRowK = self._gmem_row_view(mK, row_off)
-                tRowK = gmem_thr_copy_row.partition_S(gRowK)
-                tRowKAligned = cute.make_tensor(tRowK.iterator.align(16), tRowK.layout)
-                cute.copy(
-                    gmem_tiled_copy_row,
-                    tRowKAligned[None, 0, 0],
-                    dstK[None, w, 0, stage],
-                )
-                gRowV = self._gmem_row_view(mV, row_off)
-                tRowV = gmem_thr_copy_row.partition_S(gRowV)
-                tRowVAligned = cute.make_tensor(tRowV.iterator.align(16), tRowV.layout)
-                cute.copy(
-                    gmem_tiled_copy_row,
-                    tRowVAligned[None, 0, 0],
-                    dstV[None, w, 0, stage],
-                )
-            else:
-                dstK[None, w, 0, stage].fill(0)
-                dstV[None, w, 0, stage].fill(0)
+            # Broadcast row w's index from lane w (warp-uniform result).
+            idx = cutlass.Int32(cute.arch.shuffle_sync(idx_l, w))
+            self._gather_row(
+                mK, mV, dstK, dstV, gmem_tiled_copy_row,
+                gmem_thr_copy_row, kv_row_base, kv_seq_stride,
+                idx, w, stage,
+            )
+
+    @cute.jit
+    def _gather_row(
+        self,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        dstK,
+        dstV,
+        gmem_tiled_copy_row: cute.TiledCopy,
+        gmem_thr_copy_row,
+        kv_row_base: cutlass.Int32,
+        kv_seq_stride: cutlass.Int32,
+        idx: cutlass.Int32,
+        w: cutlass.Constexpr,
+        stage: cutlass.Int32,
+    ):
+        """cp.async one token's K and V rows into ``dstK/dstV[w, stage]``;
+        invalid (``idx < 0``) rows are zero-filled."""
+        if idx >= 0:
+            row_off = kv_row_base + idx * kv_seq_stride
+            gRowK = self._gmem_row_view(mK, row_off)
+            tRowK = gmem_thr_copy_row.partition_S(gRowK)
+            tRowKAligned = cute.make_tensor(tRowK.iterator.align(16), tRowK.layout)
+            cute.copy(
+                gmem_tiled_copy_row,
+                tRowKAligned[None, 0, 0],
+                dstK[None, w, 0, stage],
+            )
+            gRowV = self._gmem_row_view(mV, row_off)
+            tRowV = gmem_thr_copy_row.partition_S(gRowV)
+            tRowVAligned = cute.make_tensor(tRowV.iterator.align(16), tRowV.layout)
+            cute.copy(
+                gmem_tiled_copy_row,
+                tRowVAligned[None, 0, 0],
+                dstV[None, w, 0, stage],
+            )
+        else:
+            dstK[None, w, 0, stage].fill(0)
+            dstV[None, w, 0, stage].fill(0)
 
     @cute.jit
     def compute_one_chunk(
