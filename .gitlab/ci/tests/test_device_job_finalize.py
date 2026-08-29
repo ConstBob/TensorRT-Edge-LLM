@@ -40,6 +40,7 @@ def finalizer_environment(monkeypatch, tmp_path):
     monkeypatch.setenv("BOARD_PASSWORD_NVKS", "password")
     monkeypatch.setenv("BOARD_IP", "192.0.2.10")
     monkeypatch.setenv("CI_PROJECT_DIR", str(project_dir))
+    monkeypatch.delenv("CI_JOB_ID", raising=False)
     monkeypatch.setenv("TEST_LOG_DIR", str(test_log_dir))
     monkeypatch.setenv("REMOTE_WORKSPACE",
                        "/home/tester/tensorrt-edge-llm-ut-123")

@@ -353,7 +353,10 @@ quantization_sanity:
     # conftest.from_environment requires these paths; the unit tests do not use them.
     - export ONNX_DIR=$(pwd)/.ci_qc_onnx LLM_MODELS_DIR=$(pwd)/.ci_qc_models EDGELLM_DATA_DIR=$(pwd)/.ci_qc_data
     - mkdir -p "$ONNX_DIR" "$LLM_MODELS_DIR" "$EDGELLM_DATA_DIR"
-    - python3 -m pytest tests/python-unittests/test_quantize.py -v --color=yes
+    - >-
+      bash .gitlab/ci/scripts/ci_run.sh "$CI_JOB_PHASE_TIMEOUT_SECONDS"
+      "Run quantization sanity tests" -- python3 -m pytest
+      tests/python-unittests/test_quantize.py -v --color=yes
   extends: .mr_and_l1_rules
   interruptible: true
 

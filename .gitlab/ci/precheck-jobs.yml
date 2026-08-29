@@ -19,6 +19,8 @@
 
 .precheck_rules:
   rules:
+    - if: $CI_TELEMETRY_CLEANUP == "1"
+      when: never
     - if: $CI_PIPELINE_SOURCE == "schedule" && $L0_STABILITY == "true"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $L1 == "true"
@@ -82,7 +84,11 @@ ci_script_tests:
     - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install CI test dependencies" -- pip3 install -r .gitlab/ci/tests/requirements.txt
     - export LLM_SDK_DIR="$CI_PROJECT_DIR"
     - mkdir -p "$CI_PROJECT_DIR/.ci-reports"
-    - python3 -m pytest .gitlab/ci/tests -v --color=yes --junitxml="$CI_PROJECT_DIR/.ci-reports/ci_script_tests.xml"
+    - >-
+      bash .gitlab/ci/scripts/ci_run.sh "$CI_JOB_PHASE_TIMEOUT_SECONDS"
+      "Run CI script tests" --
+      python3 -m pytest .gitlab/ci/tests -v
+      --color=yes --junitxml="$CI_PROJECT_DIR/.ci-reports/ci_script_tests.xml"
     - deactivate
     - echo "Pipeline end time:$(date)"
   interruptible: true

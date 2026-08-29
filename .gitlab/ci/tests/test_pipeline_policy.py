@@ -246,4 +246,7 @@ def test_ci_script_tests_are_blocking_for_every_supported_pipeline():
 
     assert job["stage"] == "precheck"
     assert not job.get("allow_failure", False)
-    assert {rule["if"] for rule in _rules(job)} == expected_conditions
+    assert {
+        rule["if"]
+        for rule in _rules(job) if rule.get("when", "on_success") != "never"
+    } == expected_conditions

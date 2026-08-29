@@ -36,6 +36,8 @@ SSH_OPTIONS = (
     "-o",
     "ServerAliveCountMax=2",
 )
+MAX_PHASE_RECORD_BYTES = 64 * 1024
+MAX_PHASE_RECORDS = 1000
 
 
 def _parse_args(
@@ -169,6 +171,79 @@ def _collect_reports(target: str, workspace: str, password: str) -> None:
         _publish_junit_reports(staging_path, project_dir)
 
 
+def _collect_phase_records(target: str, workspace: str, password: str) -> None:
+    if os.environ.get("CI_TELEMETRY_ENABLED", "1") == "0":
+        return
+
+    job_id = os.environ.get("CI_JOB_ID", "")
+    if not job_id:
+        return
+    if not job_id.isdigit():
+        print(
+            f"WARNING: Remote telemetry skipped for invalid job ID: {job_id}",
+            file=sys.stderr)
+        return
+
+    project_dir = pathlib.Path(os.environ.get("CI_PROJECT_DIR", os.getcwd()))
+    telemetry_root = pathlib.Path(
+        os.environ.get("CI_TELEMETRY_DIR", str(project_dir / ".ci-telemetry")))
+    destination = telemetry_root / "phases" / job_id
+    with tempfile.TemporaryDirectory(
+            prefix="device-telemetry-") as staging_dir:
+        staging_path = pathlib.Path(staging_dir)
+        fetched = _run([
+            "sshpass",
+            "-e",
+            "rsync",
+            "-a",
+            "--no-owner",
+            "--no-group",
+            "--safe-links",
+            f"--max-size={MAX_PHASE_RECORD_BYTES}",
+            "--timeout=60",
+            "-e",
+            shlex.join(["ssh", *SSH_OPTIONS]),
+            f"{target}:{workspace}/.ci-telemetry/phases/{job_id}/",
+            f"{staging_path}/",
+        ], password, "remote telemetry collection")
+        if not fetched:
+            return
+
+        try:
+            destination.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            print(f"WARNING: Cannot create telemetry directory: {error}",
+                  file=sys.stderr)
+            return
+
+        published = 0
+        sources = sorted(staging_path.glob("phase-*.json"))
+        if len(sources) > MAX_PHASE_RECORDS:
+            print(("WARNING: Remote telemetry record limit exceeded; "
+                   f"publishing first {MAX_PHASE_RECORDS}"),
+                  file=sys.stderr)
+            sources = sources[:MAX_PHASE_RECORDS]
+        for source in sources:
+            if source.is_symlink() or not source.is_file():
+                continue
+            temporary = destination / f".{source.name}.tmp.{os.getpid()}"
+            try:
+                if source.stat().st_size > MAX_PHASE_RECORD_BYTES:
+                    continue
+                shutil.copy2(source, temporary)
+                os.replace(temporary, destination / source.name)
+            except OSError as error:
+                print(f"WARNING: Cannot publish {source.name}: {error}",
+                      file=sys.stderr)
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                continue
+            published += 1
+        print(f"Published {published} remote telemetry phase record(s)")
+
+
 def main(argv: typing.Optional[typing.Sequence[str]] = None) -> int:
     args = _parse_args(argv)
     try:
@@ -185,6 +260,7 @@ def main(argv: typing.Optional[typing.Sequence[str]] = None) -> int:
 
     if args.fetch_reports:
         _collect_reports(target, workspace, password)
+        _collect_phase_records(target, workspace, password)
 
     print(f"Cleaning up remote workspace {workspace}")
     _run([

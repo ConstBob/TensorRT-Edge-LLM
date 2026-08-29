@@ -13,6 +13,11 @@ l0_local_spark_build_and_test:
   variables:
     TRT_PACKAGE_DIR: "/usr"
   artifacts:
+    when: always
+    expire_in: 14 days
+    paths:
+      - ci-artifacts/lib-size/
+      - .ci-telemetry-artifact/
     reports:
       metrics: ci-artifacts/lib-size/lib_size_metrics.txt
   script:
@@ -25,17 +30,23 @@ l0_local_spark_build_and_test:
     - echo "Generating CuteDSL kernel artifacts (venv)"
     - python3 -m venv venv/cutedsl
     - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install CuTeDSL dependencies" -- venv/cutedsl/bin/pip install 'nvidia-cutlass-dsl[cu13]==4.7.0' cupy-cuda13x==13.6.0
-    - venv/cutedsl/bin/python kernelSrcs/build_cutedsl.py --kernels ALL
+    - >-
+      sh .gitlab/ci/scripts/ci_run.sh "$CI_JOB_PHASE_TIMEOUT_SECONDS"
+      "Build local Spark CuTeDSL kernels" --
+      venv/cutedsl/bin/python kernelSrcs/build_cutedsl.py --kernels ALL
     - echo "Building project with unit tests"
     - rm -rf build && mkdir build && cd build
-    - cmake ..
-        -DTRT_PACKAGE_DIR=$TRT_PACKAGE_DIR
-        -DBUILD_UNIT_TESTS=ON
-        -DENABLE_CUTE_DSL=ALL
-        -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake
-        -DEMBEDDED_TARGET=gb10
-        -DCUDA_CTK_VERSION=13.0
-    - make -j$(nproc)
+    - >-
+      sh "$CI_PROJECT_DIR/.gitlab/ci/scripts/ci_run.sh"
+      "$CI_JOB_PHASE_TIMEOUT_SECONDS" "Configure local Spark build" --
+      cmake .. -DTRT_PACKAGE_DIR=$TRT_PACKAGE_DIR -DBUILD_UNIT_TESTS=ON
+      -DENABLE_CUTE_DSL=ALL
+      -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake
+      -DEMBEDDED_TARGET=gb10 -DCUDA_CTK_VERSION=13.0
+    - >-
+      sh "$CI_PROJECT_DIR/.gitlab/ci/scripts/ci_run.sh"
+      "$CI_JOB_PHASE_TIMEOUT_SECONDS" "Build local Spark targets" --
+      make -j$(nproc)
     - echo "Reporting library size"
     - python3 ../scripts/report_library_size.py
         --build-dir .
@@ -48,7 +59,10 @@ l0_local_spark_build_and_test:
     # Serial on purpose: these boards have far less device memory than an x86
     # dev box, and concurrent groups would contend for it. Locally, add
     # --parallel $(nproc).
-    - ctest --output-on-failure
+    - >-
+      sh "$CI_PROJECT_DIR/.gitlab/ci/scripts/ci_run.sh"
+      "$CI_JOB_PHASE_TIMEOUT_SECONDS" "Run local Spark unit tests" --
+      ctest --output-on-failure
     - echo "Pipeline end time:$(date)"
   extends:
     - .ci_internal_submodules

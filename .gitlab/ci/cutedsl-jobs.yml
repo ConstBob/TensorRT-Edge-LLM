@@ -19,6 +19,8 @@
 
 .cutedsl_artifact_rules:
   rules:
+    - if: $CI_TELEMETRY_CLEANUP == "1"
+      when: never
     # Explicit suites need these artifacts even when an MR requests [skip tests].
     - if: $L1 == "true"
     - if: $CI_PIPELINE_SOURCE == "schedule" && $L0_STABILITY == "true"
@@ -65,7 +67,8 @@ build_cutedsl_docker_image:
       printf '{"auths":{"%s":{"auth":"%s"}}}' \
         "$CI_REGISTRY" "$registry_auth" > "$HOME/.docker/config.json"
     - |
-      buildctl-daemonless.sh build \
+      sh "$CI_PROJECT_DIR/.gitlab/ci/scripts/ci_run.sh" 0 \
+        "Build and publish CuTeDSL image" -- buildctl-daemonless.sh build \
         --frontend dockerfile.v0 \
         --local "context=$CI_PROJECT_DIR/kernelSrcs" \
         --local "dockerfile=$CI_PROJECT_DIR/kernelSrcs" \
@@ -97,7 +100,10 @@ build_cutedsl_docker_matrix:
     - echo "Pipeline start time:$(date)"
     - 'echo "Runner node:${NODE_NAME:-$(hostname)}"'
     - nvidia-smi
-    - bash /workspace/kernelSrcs/build_cutedsl_tarballs.sh
+    - >-
+      sh "$CI_PROJECT_DIR/.gitlab/ci/scripts/ci_run.sh" 0
+      "Build CuTeDSL kernel matrix" --
+      bash /workspace/kernelSrcs/build_cutedsl_tarballs.sh
     - compgen -G "$CUTE_DSL_PREBUILT_DIR/cutedsl_*.tar.gz" >/dev/null
     - (cd "$CUTE_DSL_PREBUILT_DIR" && sha256sum -c cutedsl_*.tar.gz.sha256)
     - ls -lh "$CUTE_DSL_PREBUILT_DIR"/cutedsl_*.tar.gz*
@@ -111,3 +117,4 @@ build_cutedsl_docker_matrix:
     paths:
       - kernelSrcs/cuteDSLPrebuilt/*.tar.gz
       - kernelSrcs/cuteDSLPrebuilt/*.tar.gz.sha256
+      - .ci-telemetry-artifact/
