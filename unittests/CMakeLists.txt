@@ -190,7 +190,8 @@ edgellm_add_unit_test(
   cpp/kernels/multiDeviceKernels
   cpp/kernels/nvfp4A16BlackwellGemm
   cpp/kernels/nvfp4A16BlackwellGemv
-  cpp/kernels/dart)
+  cpp/kernels/dart
+  cpp/kernels/qsaIndexer)
 
 edgellm_add_unit_test(NAME unitTestPlugins DIRS cpp/plugins/nvfp4A16GemmPlugin
                       cpp/plugins/allReducePlugin)

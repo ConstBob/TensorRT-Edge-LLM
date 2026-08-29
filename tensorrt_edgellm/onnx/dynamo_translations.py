@@ -141,6 +141,87 @@ def _attention_plugin_translation(
 
 
 # ---------------------------------------------------------------------------
+# QSA attention plugin translation (Qwen Sparse Attention, prefill-only v1)
+# ---------------------------------------------------------------------------
+
+
+@script()
+def _qsa_attention_plugin_translation(
+    qkv: onnxscript.FLOAT16,
+    index_qk: onnxscript.FLOAT16,
+    past_key_value: onnxscript.FLOAT16,
+    context_lengths: onnxscript.INT32,
+    rope_rotary_cos_sin: onnxscript.FLOAT,
+    kvcache_start_index: onnxscript.INT32,
+    kv_page_table: onnxscript.INT32,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    indexer_n_heads: int,
+    indexer_head_dim: int,
+    indexer_budget: int,
+    indexer_compress_ratio: int,
+    attention_scale: float,
+    rms_norm_eps: float,
+    q_norm_gamma: Sequence[float],
+    k_norm_gamma: Sequence[float],
+    indexer_q_norm_gamma: Sequence[float],
+    indexer_k_norm_gamma: Sequence[float],
+) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16]:
+    """QSA plugin: block-compressed indexer + sparse GQA prefill attention.
+
+    Signature order matches ``trt::qsa_attention_plugin`` positionally (the
+    FX graph normalizes every kwarg into a positional arg). All 11 ONNX
+    inputs are required, so the export post-pass never compacts this node.
+
+    Gamma semantics: ``q_norm_gamma`` / ``k_norm_gamma`` arrive PRE-FOLDED as
+    (1 + w); ``indexer_q_norm_gamma`` / ``indexer_k_norm_gamma`` arrive RAW w
+    (the CUDA indexer kernel adds the 1 internally). All four are FP16
+    constant INPUTS (engine weights baked at build time).
+    """
+    q_norm_gamma_fp16 = _op21.Cast(
+        _op21.Constant(value_floats=q_norm_gamma),
+        to=int(onnx.TensorProto.FLOAT16),
+    )
+    k_norm_gamma_fp16 = _op21.Cast(
+        _op21.Constant(value_floats=k_norm_gamma),
+        to=int(onnx.TensorProto.FLOAT16),
+    )
+    indexer_q_norm_gamma_fp16 = _op21.Cast(
+        _op21.Constant(value_floats=indexer_q_norm_gamma),
+        to=int(onnx.TensorProto.FLOAT16),
+    )
+    indexer_k_norm_gamma_fp16 = _op21.Cast(
+        _op21.Constant(value_floats=indexer_k_norm_gamma),
+        to=int(onnx.TensorProto.FLOAT16),
+    )
+    attn_4d, present_kv = _trt_edgellm.QsaAttentionPlugin(
+        qkv,
+        index_qk,
+        past_key_value,
+        context_lengths,
+        rope_rotary_cos_sin,
+        kvcache_start_index,
+        kv_page_table,
+        q_norm_gamma_fp16,
+        k_norm_gamma_fp16,
+        indexer_q_norm_gamma_fp16,
+        indexer_k_norm_gamma_fp16,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        indexer_n_heads=indexer_n_heads,
+        indexer_head_dim=indexer_head_dim,
+        indexer_budget=indexer_budget,
+        indexer_compress_ratio=indexer_compress_ratio,
+        attention_scale=attention_scale,
+        rms_norm_eps=rms_norm_eps,
+        _outputs=2,
+    )
+    return attn_4d, present_kv
+
+
+# ---------------------------------------------------------------------------
 # FP8 ops
 # ---------------------------------------------------------------------------
 
@@ -1413,6 +1494,8 @@ def build_custom_translation_table() -> dict:
     return {
         torch.ops.trt.attention_plugin.default:
         _attention_plugin_translation,
+        torch.ops.trt.qsa_attention_plugin.default:
+        _qsa_attention_plugin_translation,
         torch.ops.trt.fp8_quantize.default:
         _fp8_quantize_translation,
         torch.ops.trt.fp8_dequantize.default:
