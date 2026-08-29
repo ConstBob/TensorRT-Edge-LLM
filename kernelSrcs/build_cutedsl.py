@@ -955,7 +955,7 @@ KERNEL_VARIANTS = [
         script="qsa_cutedsl/qsa_sparse_gqa.py",
         script_args=[
             "--head_dim", "256",
-            "--m_block_size", "16", "--n_block_size", "32", "--num_threads", "32",
+            "--m_block_size", "16", "--n_block_size", "16", "--num_threads", "32",
             "--dtype", "Float16", "--export_only",
         ],
     ),
@@ -966,7 +966,7 @@ KERNEL_VARIANTS = [
         script="qsa_cutedsl/qsa_sparse_gqa.py",
         script_args=[
             "--head_dim", "256",
-            "--m_block_size", "16", "--n_block_size", "32", "--num_threads", "32",
+            "--m_block_size", "16", "--n_block_size", "16", "--num_threads", "32",
             "--dtype", "BFloat16", "--export_only",
         ],
     ),

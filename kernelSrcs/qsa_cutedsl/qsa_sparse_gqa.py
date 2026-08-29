@@ -77,7 +77,7 @@ Variant axes baked at compile time: ``head_dim`` and the
 """
 
 QSA_DEFAULT_M_BLOCK = 16
-QSA_DEFAULT_N_BLOCK = 32
+QSA_DEFAULT_N_BLOCK = 16
 QSA_DEFAULT_THREADS = 32
 
 
