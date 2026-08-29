@@ -217,7 +217,7 @@ def test_download_runtime_libs_wheel_uses_configured_wheelhouse(
 def test_tarball_builder_lists_mixed_cuda_matrix():
     script = _REPO_ROOT / "kernelSrcs" / "build_cutedsl_tarballs.sh"
     matrix = ("x86_64:sm_100:13,x86_64:sm_100:12,"
-              "aarch64:sm_101:12,aarch64:sm_110:13")
+              "aarch64:sm_101:12,aarch64:sm_110+sm_120:13")
     env = os.environ.copy()
     env["CUTE_DSL_MATRIX"] = matrix
 
@@ -231,7 +231,7 @@ def test_tarball_builder_lists_mixed_cuda_matrix():
         "cutedsl_x86_64_sm_100_cuda13.tar.gz",
         "cutedsl_x86_64_sm_100_cuda12.tar.gz",
         "cutedsl_aarch64_sm_101_cuda12.tar.gz",
-        "cutedsl_aarch64_sm_110_cuda13.tar.gz",
+        "cutedsl_aarch64_sm_110_sm_120_cuda13.tar.gz",
     ]
 
 
@@ -253,6 +253,7 @@ def test_tarball_builder_default_matrix_includes_expected_targets(cuda_major):
     assert f"cutedsl_x86_64_sm_80_cuda{cuda_major}.tar.gz" in tarballs
     if cuda_major == "13":
         assert "cutedsl_aarch64_sm_90_cuda13.tar.gz" in tarballs
+        assert "cutedsl_aarch64_sm_110_sm_120_cuda13.tar.gz" in tarballs
 
 
 def test_tarball_builder_docker_matrix_matches_ci_targets():
@@ -274,6 +275,7 @@ def test_tarball_builder_docker_matrix_matches_ci_targets():
         "aarch64:sm_90:13",
         "aarch64:sm_101:12",
         "aarch64:sm_110:13",
+        "aarch64:sm_110+sm_120:13",
         "aarch64:sm_121:12",
         "aarch64:sm_121:13",
     ]
@@ -285,6 +287,64 @@ def test_tarball_builder_docker_matrix_matches_ci_targets():
                           (121, "sm_121a")])
 def test_default_compile_gpu_arch_is_derived_from_target_sm(sm, expected):
     assert build_cutedsl.default_compile_gpu_arch(sm) == expected
+
+
+def test_parse_sms_preserves_order_and_removes_duplicates():
+    assert build_cutedsl._parse_sms("sm_110,120,sm_110") == [110, 120]
+    assert build_cutedsl._multi_sm_artifact_tag([110, 120]) == "sm_110_sm_120"
+
+
+def test_multi_sm_headers_generate_canonical_dispatch(tmp_path):
+    variant = build_cutedsl.KernelVariant(name="example",
+                                          group="fmha",
+                                          supported_sms=[110, 120],
+                                          script="unused")
+    variants_by_sm = {110: [variant], 120: [variant]}
+    staging_dirs = {}
+    for sm in variants_by_sm:
+        marker = build_cutedsl._multi_sm_marker(sm)
+        staging = tmp_path / f"staging-{sm}"
+        staging.mkdir()
+        staging_dirs[(sm, variant.name)] = staging
+        (staging / f"example{marker}.h").write_text(
+            "#pragma once\n"
+            f"void _mlir_example{marker}_cuda_init(void **);\n"
+            f"void _mlir_example{marker}_call(void **args, int32_t num_args);\n"
+        )
+
+    output = tmp_path / "artifact"
+    output.mkdir()
+    dispatch = build_cutedsl._write_multi_sm_headers_and_dispatch(
+        output, variants_by_sm, staging_dirs, [110, 120])
+
+    canonical = (output / "include" / "example.h").read_text()
+    dispatch_text = dispatch.read_text()
+    assert "__arch" not in canonical
+    assert '#include "example.h"' in (output / "include" /
+                                      "cutedsl_all.h").read_text()
+    assert "case 110:" in dispatch_text
+    assert "case 120:" in dispatch_text
+    assert "getProcessDeviceSm()" in dispatch_text
+    assert "static int const sm" in dispatch_text
+    assert "cudaGetDeviceCount" not in dispatch_text
+    assert "_mlir_example__arch110_call(args, numArgs);" in dispatch_text
+    assert "_mlir_example__arch120_call(args, numArgs);" in dispatch_text
+
+
+def test_multi_sm_rejects_duplicate_global_definitions(monkeypatch):
+    completed = subprocess.CompletedProcess(
+        args=[],
+        returncode=0,
+        stdout=("first.o:\n00000000 T unique_a\n00000010 T duplicate\n\n"
+                "second.o:\n00000000 T unique_b\n00000010 T duplicate\n"),
+        stderr="",
+    )
+    monkeypatch.setattr(build_cutedsl.subprocess, "run",
+                        lambda *args, **kwargs: completed)
+
+    with pytest.raises(RuntimeError, match="Duplicate global definitions"):
+        build_cutedsl._check_defined_symbol_collision(
+            [Path("first.o"), Path("second.o")])
 
 
 @pytest.mark.parametrize("sm", _FMHA_V2_SUPPORTED_SMS)

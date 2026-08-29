@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 from . import assemble, base, cutedsl, payload, verify
-from .config import REPO_ROOT, load_matrix
+from .config import CONTRACT, REPO_ROOT, load_matrix
 
 
 def _positive_int(value: str) -> int:
@@ -129,7 +129,7 @@ def _local_variant(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         row for row in rows if row["cpu_arch"] == detected.cpu_arch
         and row["cuda_runtime_soname"] == detected.cuda_runtime_soname
         and row["tensorrt_runtime_soname"] == detected.tensorrt_runtime_soname
-        and int(row["gpu_sm"]) == detected.gpu_sm
+        and detected.gpu_sm in CONTRACT.matrix_variant_gpu_sms(row)
         and _probe_matches(row, detected)
     ]
     if len(matches) != 1:

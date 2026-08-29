@@ -21,8 +21,8 @@ cpp/kernels/cuteDSLArtifact/<arch>/<artifact_tag>/
     ...
 ```
 
-`artifact_tag` is currently `sm_<NN>`, for example `sm_80`, `sm_110`, or
-`sm_121`.
+`artifact_tag` is `sm_<NN>` for one target, or the ordered concatenation for a
+multi-SM artifact, for example `sm_80`, `sm_110`, or `sm_110_sm_120`.
 
 These artifacts are local build inputs for CMake. They are not intended to be
 checked into git by default.
@@ -57,6 +57,10 @@ python kernelSrcs/build_cutedsl.py
 python kernelSrcs/build_cutedsl.py --kernels gdn --gpu_arch sm_87
 python kernelSrcs/build_cutedsl.py --kernels fmha --gpu_arch sm_110 --arch aarch64
 python kernelSrcs/build_cutedsl.py --kernels gemm --gpu_arch sm_121 --arch aarch64
+
+# Build one complete runtime-dispatched artifact for an IGX Thor + RTX system
+python kernelSrcs/build_cutedsl.py --kernels ALL \
+  --gpu_arch sm_110,sm_120 --arch aarch64 --clean
 ```
 
 ## Docker Artifact Builder
@@ -95,6 +99,7 @@ cutedsl_aarch64_sm_87_cuda13.tar.gz
 cutedsl_aarch64_sm_90_cuda13.tar.gz
 cutedsl_aarch64_sm_101_cuda12.tar.gz
 cutedsl_aarch64_sm_110_cuda13.tar.gz
+cutedsl_aarch64_sm_110_sm_120_cuda13.tar.gz
 cutedsl_aarch64_sm_121_cuda12.tar.gz
 cutedsl_aarch64_sm_121_cuda13.tar.gz
 ```
@@ -227,7 +232,7 @@ a clean full-matrix rebuild so stale archive members cannot be retained.
 | Flag | Default | Description |
 |---|---|---|
 | `--kernels GROUPS` | `ALL` | A registered group such as `f16_moe`, `fmha`, `gdn`, `gemm`, `gemm_nvfp4`, `int4_fp16_gemm`, `nvfp4_moe`, `nvfp4_fused_moe`, or `ssd`; a comma-separated list; or `ALL`. `fmha` is the attention family: the FMHA-v2 kernels plus the optimized Blackwell kernels on SM100/SM101/SM110. Variants whose `supported_sms` excludes the target SM are skipped. |
-| `--gpu_arch SM` | auto-detected | Target GPU SM (e.g. `sm_100`); auto-detected via cupy / nvidia-smi when omitted. The CuTe DSL compile architecture is derived automatically, including the required Blackwell `a` suffix. |
+| `--gpu_arch SM[,SM...]` | auto-detected | One target GPU SM (for example `sm_100`), or an ordered comma-separated set for one runtime-dispatched artifact (for example `sm_110,sm_120`). The CuTe DSL compile architectures are derived automatically, including required Blackwell `a` suffixes. Multi-SM generation uses one worker pool and requires `--clean` when replacing an existing artifact. |
 | `--arch ARCH` | auto-detected | Target CPU arch `x86_64` or `aarch64`. If it differs from the build host, kernels are cross-compiled (target host objects). |
 | `--cuda-version VERSION` | host CUDA | Artifact CUDA flavor used to select `cu12` or `cu13` runtime objects. |
 | `--runtime-libs-version VERSION` | CuTe DSL package version | Target-architecture runtime-libs wheel version; use when compiler and runtime-libs package versions differ. |
@@ -281,9 +286,11 @@ cmake .. -DENABLE_CUTE_DSL=gemm -DCUTE_DSL_ARTIFACT_TAG=sm_110
 cmake .. -DENABLE_CUTE_DSL=gemm -DCUTE_DSL_ARTIFACT_TAG=sm_121
 ```
 
-`EMBEDDED_TARGET=gb10`, `auto-thor`, `jetson-thor`, and `jetson-orin` map to a
-default artifact tag when unambiguous. `thor-all` requires an explicit
-`CUTE_DSL_ARTIFACT_TAG`.
+`EMBEDDED_TARGET=gb10`, `auto-thor`, `jetson-thor`, `igx-thor`, and
+`jetson-orin` map to a default artifact tag. `igx-thor` requires CUDA 13 or
+newer and selects `sm_110_sm_120`. Its generated dispatcher selects an
+architecture-qualified kernel entry point from the process's CUDA device and
+caches that selection.
 
 ## Cross-Compiling for AArch64 (Thor) and Runtime Deployment
 

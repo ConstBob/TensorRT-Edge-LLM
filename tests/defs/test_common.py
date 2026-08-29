@@ -83,7 +83,7 @@ def _build_project(env_config: EnvironmentConfig,
     cmake_cmd.append(f'-DCUDA_CTK_VERSION={device_config.cuda_version}')
 
     if device_config.target in [
-            'jetson-orin', 'auto-thor', 'jetson-thor', 'gb10'
+            'jetson-orin', 'auto-thor', 'jetson-thor', 'igx-thor', 'gb10'
     ]:
         cmake_cmd.append(f'-DEMBEDDED_TARGET={device_config.target}')
         cmake_cmd.append(
@@ -91,7 +91,7 @@ def _build_project(env_config: EnvironmentConfig,
 
     # Enable all available CuTe DSL kernels for aarch64 targets.
     if device_config.target in [
-            'jetson-orin', 'auto-thor', 'jetson-thor', 'gb10'
+            'jetson-orin', 'auto-thor', 'jetson-thor', 'igx-thor', 'gb10'
     ]:
         cmake_cmd.append('-DENABLE_CUTE_DSL=ALL')
         test_logger.info("CuTe DSL: using available artifact")

@@ -144,6 +144,10 @@ set_source_files_properties(${PLUGIN_JIT_EMBEDDED_SOURCES_OUTPUT}
 file(GLOB_RECURSE COMMON_CPP_SRCS "common/*.cpp")
 file(GLOB_RECURSE KERNELS_CPP_SRCS "kernels/*.cpp")
 file(GLOB_RECURSE KERNELS_CU_SRCS "kernels/*.cu")
+# CuTe DSL artifacts may contain a generated host dispatcher. It has its own
+# target in CuteDsl.cmake and must not be swept into every kernel archive by the
+# recursive source glob above.
+list(FILTER KERNELS_CPP_SRCS EXCLUDE REGEX "/cuteDSLArtifact/")
 # Exclude MoE Marlin ops/instantiations - compiled only via include from
 # moeMarlin.cu.
 list(

@@ -37,6 +37,7 @@ Usage (run from the repo root):
   python kernelSrcs/build_cutedsl.py --kernels gdn        # single group
   python kernelSrcs/build_cutedsl.py --kernels fmha,gdn   # multiple groups
   python kernelSrcs/build_cutedsl.py --gpu_arch sm_110    # override SM detection
+  python kernelSrcs/build_cutedsl.py --gpu_arch sm_110,sm_120  # one dual-SM artifact
   python kernelSrcs/build_cutedsl.py --gpu_arch sm_110 --arch aarch64  # cross-compile host objects
   python kernelSrcs/build_cutedsl.py --clean --verbose    # clean rebuild
 
@@ -1857,6 +1858,20 @@ def _parse_sm(gpu_arch_str):
     return sm
 
 
+def _parse_sms(gpu_arch_str):
+    """Parse a comma-separated SM list while preserving its order."""
+    sms = []
+    for token in gpu_arch_str.split(","):
+        if not token.strip():
+            raise ValueError(
+                f"Invalid --gpu_arch {gpu_arch_str!r}: empty SM entry."
+            )
+        sm = _parse_sm(token)
+        if sm not in sms:
+            sms.append(sm)
+    return sms
+
+
 def detect_gpu_sm() -> int:
     """Auto-detect the current GPU SM.
 
@@ -2221,7 +2236,9 @@ def check_dependencies(sm=None, selected_groups=None, cuda_ver=None):
 # ---------------------------------------------------------------------------
 
 
-def _compile_command(variant, staging_dir, compile_gpu_arch, host_target, sm):
+def _compile_command(
+    variant, staging_dir, compile_gpu_arch, host_target, sm, export_name=None
+):
     script = _SCRIPT_DIR / variant.script
     if compile_gpu_arch or host_target:
         cmd = [
@@ -2238,25 +2255,33 @@ def _compile_command(variant, staging_dir, compile_gpu_arch, host_target, sm):
     else:
         cmd = [sys.executable, str(script)]
 
-    cmd += ["--output_dir", str(staging_dir),
-            "--file_name", variant.name,
-            "--function_prefix", variant.name]
     cmd += variant.script_args
     if variant.wants_target_sm:
         # The kernel script cannot resolve this itself: CUTE_DSL_ARCH is unset
         # for every target in build_cutedsl_tarballs.sh's matrix, so a device
         # query inside the script would report the build host's GPU.
         cmd += ["--target_sm", str(sm)]
+    export_name = export_name or variant.name
+    # Keep these last: a few registry entries carry historical output-name
+    # overrides in script_args, while a multi-SM artifact must apply its unique
+    # architecture suffix to every emitted object and C symbol.
+    cmd += ["--output_dir", str(staging_dir),
+            "--file_name", export_name,
+            "--function_prefix", export_name]
     return cmd
 
 
-def _compile_one(variant, staging_dir, verbose, sm, compile_gpu_arch, host_target):
+def _compile_one(
+    variant, staging_dir, verbose, sm, compile_gpu_arch, host_target,
+    export_name=None,
+):
     """Invoke a kernel script to AOT-compile one variant into .o + .h.
 
     Returns (name, ok, elapsed_secs, error_msg).
     """
-    cmd = _compile_command(variant, staging_dir, compile_gpu_arch, host_target,
-                           sm)
+    cmd = _compile_command(
+        variant, staging_dir, compile_gpu_arch, host_target, sm, export_name
+    )
 
     t0 = time.monotonic()
     result = subprocess.run(
@@ -2267,8 +2292,9 @@ def _compile_one(variant, staging_dir, verbose, sm, compile_gpu_arch, host_targe
     if result.returncode != 0:
         # Show the head (traceback / first error) rather than the tail, which is typically more diagnostic.
         return variant.name, False, elapsed, (result.stderr or result.stdout or "")[:4000]
-    obj = staging_dir / f"{variant.name}.o"
-    hdr = staging_dir / f"{variant.name}.h"
+    output_stem = export_name or variant.name
+    obj = staging_dir / f"{output_stem}.o"
+    hdr = staging_dir / f"{output_stem}.h"
     if not obj.exists() or not hdr.exists():
         # Some variants (e.g. gdn_decode_mtp --cache_only) produce artifacts with
         # a suffix (e.g. gdn_decode_mtp_cache.o/.h).  Accept any .o + .h pair.
@@ -2301,6 +2327,51 @@ def compile_variants(variants, staging_dirs, jobs, verbose, sm, compile_gpu_arch
     if failures:
         for name, msg in failures:
             print(f"\n  [{name}]\n{msg}")
+        sys.exit(1)
+
+
+def compile_multi_sm_variants(
+    variants_by_sm, staging_dirs, jobs, verbose, compile_gpu_arches, host_target
+):
+    """Compile every selected SM in one shared process pool."""
+    total = sum(len(variants) for variants in variants_by_sm.values())
+    print(
+        f"\nCompiling {total} kernel variant(s) for "
+        f"{len(variants_by_sm)} SM targets (jobs={jobs})..."
+    )
+    failures = []
+    with concurrent.futures.ProcessPoolExecutor(max_workers=jobs) as pool:
+        futures = {}
+        max_variants = max(len(variants) for variants in variants_by_sm.values())
+        for variant_index in range(max_variants):
+            for sm, variants in variants_by_sm.items():
+                if variant_index >= len(variants):
+                    continue
+                variant = variants[variant_index]
+                export_name = _multi_sm_export_name(variant.name, sm)
+                future = pool.submit(
+                    _compile_one,
+                    variant,
+                    staging_dirs[(sm, variant.name)],
+                    verbose,
+                    sm,
+                    compile_gpu_arches[sm],
+                    host_target,
+                    export_name,
+                )
+                futures[future] = (sm, variant)
+
+        for future in concurrent.futures.as_completed(futures):
+            sm, variant = futures[future]
+            _, ok, elapsed, msg = future.result()
+            label = f"SM{sm}/{variant.name}"
+            print(f"  {'✓' if ok else '✗'} {label:<32} ({elapsed:.1f}s)")
+            if not ok:
+                failures.append((label, msg))
+
+    if failures:
+        for label, msg in failures:
+            print(f"\n  [{label}]\n{msg}")
         sys.exit(1)
 
 # ELF e_machine values for validating CuTe DSL runtime static objects.
@@ -2555,14 +2626,391 @@ def _check_obj_name_collision(kernel_objs, runtime_objs):
         )
 
 
+def _check_defined_symbol_collision(object_files):
+    """Reject duplicate externally visible definitions before archiving."""
+    result = subprocess.run(
+        ["nm", "-g", "--defined-only"] + [str(path) for path in object_files],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    owners = {}
+    current_object = None
+    for line in result.stdout.splitlines():
+        if line.endswith(":"):
+            current_object = line[:-1]
+            continue
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        symbol = fields[-1]
+        owners.setdefault(symbol, set()).add(current_object or "<unknown>")
+    duplicates = {
+        symbol: paths for symbol, paths in owners.items() if len(paths) > 1
+    }
+    if duplicates:
+        details = "\n".join(
+            f"  {symbol}: {', '.join(sorted(paths))}"
+            for symbol, paths in sorted(duplicates.items())[:20]
+        )
+        raise RuntimeError(
+            "Duplicate global definitions in multi-SM CuTe DSL objects:\n"
+            f"{details}"
+        )
+
+
+def _multi_sm_artifact_tag(sms):
+    return "_".join(sm_to_artifact_tag(sm) for sm in sms)
+
+
+def _multi_sm_marker(sm):
+    return f"__arch{sm}"
+
+
+def _multi_sm_export_name(variant_name, sm):
+    return f"{variant_name}{_multi_sm_marker(sm)}"
+
+
+_EXTERN_MLIR_PATTERN = re.compile(
+    r"(?m)^void\s+([A-Za-z_][A-Za-z0-9_]*)\s*"
+    r"\(void\s*\*\*\s*(?:args)?\s*"
+    r"(,\s*int32_t\s+num_args)?\s*\)\s*;"
+)
+
+
+def _external_mlir_functions(header_text):
+    functions = []
+    for match in _EXTERN_MLIR_PATTERN.finditer(header_text):
+        name = match.group(1)
+        if name.startswith("_mlir_"):
+            functions.append((name, bool(match.group(2))))
+    return functions
+
+
+def _write_multi_sm_headers_and_dispatch(
+    output_dir, variants_by_sm, staging_dirs, sms
+):
+    """Write canonical headers plus one host-side SM dispatcher.
+
+    Each CuTe DSL object is generated with an architecture-qualified C symbol
+    prefix. The public headers keep their existing ABI; their external MLIR
+    entry points forward to the matching qualified object for the one visible
+    CUDA device.
+    """
+    inc_dir = output_dir / "include"
+    inc_dir.mkdir(exist_ok=True)
+    canonical_headers = {}
+    header_groups = {}
+    symbol_targets = {}
+
+    for sm, variants in variants_by_sm.items():
+        marker = _multi_sm_marker(sm)
+        for variant in variants:
+            staging_dir = staging_dirs[(sm, variant.name)]
+            for header in sorted(staging_dir.glob("*.h")):
+                tagged_name = header.name
+                tagged_text = header.read_text()
+                if marker not in tagged_name or marker not in tagged_text:
+                    raise RuntimeError(
+                        f"{header}: generated multi-SM header is missing marker {marker!r}"
+                    )
+                canonical_name = tagged_name.replace(marker, "")
+                canonical_text = tagged_text.replace(marker, "")
+                previous = canonical_headers.get(canonical_name)
+                if previous is not None and previous != canonical_text:
+                    raise RuntimeError(
+                        f"Generated header ABI differs across SM targets: {canonical_name}"
+                    )
+                canonical_headers[canonical_name] = canonical_text
+                header_groups[canonical_name] = variant.group
+                shutil.copy2(header, inc_dir / tagged_name)
+
+                tagged_functions = _external_mlir_functions(tagged_text)
+                canonical_functions = _external_mlir_functions(canonical_text)
+                if len(tagged_functions) != len(canonical_functions):
+                    raise RuntimeError(
+                        f"Could not normalize external MLIR declarations in {header}"
+                    )
+                for canonical, tagged in zip(canonical_functions, tagged_functions):
+                    canonical_symbol, canonical_has_count = canonical
+                    tagged_symbol, tagged_has_count = tagged
+                    if canonical_has_count != tagged_has_count:
+                        raise RuntimeError(
+                            f"External MLIR signature mismatch in {header}: {canonical_symbol}"
+                        )
+                    targets = symbol_targets.setdefault(
+                        canonical_symbol,
+                        {"has_count": canonical_has_count, "targets": {}},
+                    )
+                    if targets["has_count"] != canonical_has_count:
+                        raise RuntimeError(
+                            f"Conflicting external MLIR signatures for {canonical_symbol}"
+                        )
+                    targets["targets"][sm] = tagged_symbol
+
+    for name, text in canonical_headers.items():
+        (inc_dir / name).write_text(text)
+
+    for group in sorted(set(header_groups.values())):
+        names = sorted(
+            name for name, header_group in header_groups.items()
+            if header_group == group
+        )
+        (inc_dir / f"cutedsl_{group}_all.h").write_text(
+            "#pragma once\n"
+            "// Auto-generated by build_cutedsl.py -- do not edit\n"
+            + "".join(f'#include "{name}"\n' for name in names)
+        )
+
+    umbrella_names = sorted(canonical_headers)
+    (inc_dir / "cutedsl_all.h").write_text(
+        "#pragma once\n"
+        "// Auto-generated by build_cutedsl.py -- do not edit\n"
+        + "".join(f'#include "{name}"\n' for name in umbrella_names)
+    )
+
+    declarations = []
+    definitions = []
+    for canonical_symbol, data in sorted(symbol_targets.items()):
+        has_count = data["has_count"]
+        parameters = "void **args, int32_t numArgs" if has_count else "void **args"
+        arguments = "args, numArgs" if has_count else "args"
+        for tagged_symbol in data["targets"].values():
+            declarations.append(f"void {tagged_symbol}({parameters});")
+
+        body = [f"void {canonical_symbol}({parameters})", "{", "    switch (getProcessDeviceSm())", "    {"]
+        for sm, tagged_symbol in sorted(data["targets"].items()):
+            body.extend(
+                [
+                    f"    case {sm}:",
+                    f"        {tagged_symbol}({arguments});",
+                    "        break;",
+                ]
+            )
+        body.extend(
+            [
+                "    default:",
+                f'        failUnsupportedSm("{canonical_symbol}");',
+                "        break;",
+                "    }",
+                "}",
+            ]
+        )
+        definitions.append("\n".join(body))
+
+    dispatch_source = output_dir / "cutedsl_dispatch.cpp"
+    dispatch_source.write_text(
+        "// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.\n"
+        "// SPDX-License-Identifier: Apache-2.0\n\n"
+        "// Auto-generated by build_cutedsl.py -- do not edit.\n"
+        "#include <cstdint>\n"
+        "#include <cstdlib>\n"
+        "#include <cstdio>\n"
+        "#include <cuda_runtime_api.h>\n\n"
+        "namespace\n"
+        "{\n"
+        "int getProcessDeviceSm()\n"
+        "{\n"
+        "    static int const sm = [] {\n"
+        "        int device{};\n"
+        "        cudaDeviceProp properties{};\n"
+        "        if (cudaGetDevice(&device) != cudaSuccess\n"
+        "            || cudaGetDeviceProperties(&properties, device) != cudaSuccess)\n"
+        "        {\n"
+        "            return -1;\n"
+        "        }\n"
+        "        return properties.major * 10 + properties.minor;\n"
+        "    }();\n"
+        "    return sm;\n"
+        "}\n\n"
+        "[[noreturn]] void failUnsupportedSm(char const* symbol)\n"
+        "{\n"
+        "    std::fprintf(stderr,\n"
+        '        "CuTe DSL multi-SM dispatch failed for %s on the current CUDA device\\n", symbol);\n'
+        "    std::abort();\n"
+        "}\n"
+        "} // namespace\n\n"
+        "extern \"C\"\n"
+        "{\n"
+        + "\n".join(sorted(set(declarations)))
+        + "\n\n"
+        + "\n\n".join(definitions)
+        + "\n} // extern \"C\"\n"
+    )
+    return dispatch_source
+
+
 # ---------------------------------------------------------------------------
 # Main build logic
 # ---------------------------------------------------------------------------
 
+
+def _build_multi_sm(args, sms):
+    host_arch = detect_arch()
+    arch = detect_arch(args.arch)
+    artifact_tag = _multi_sm_artifact_tag(sms)
+    output_dir = Path(args.output_dir) / arch / artifact_tag
+    host_target = default_host_target_for_arch(arch, host_arch)
+    compile_gpu_arches = {sm: default_compile_gpu_arch(sm) for sm in sms}
+    variants_by_sm = {sm: select_variants(sm, args.kernels) for sm in sms}
+    groups_selected = sorted(
+        {variant.group for variants in variants_by_sm.values() for variant in variants}
+    )
+
+    print(f"Build host  : {host_arch}")
+    print(f"Target arch : {arch}")
+    print(f"Build mode  : {'cross' if arch != host_arch else 'native'}")
+    print(f"GPU SMs     : {', '.join(f'SM{sm}' for sm in sms)} (--gpu_arch override)")
+    print(
+        "Compile arch: "
+        + ", ".join(compile_gpu_arches[sm] for sm in sms)
+    )
+    if host_target:
+        print(f"Host target : {host_target}")
+    print(f"Artifact tag: {artifact_tag}")
+    print(f"Output dir  : {output_dir}")
+
+    print("\nChecking dependencies...")
+    (
+        dsl_ver,
+        lib_dir,
+        cuda_ver,
+        host_cuda_ver,
+        cupy_pkg,
+        cupy_ver,
+        dsl_cuda_version,
+    ) = check_dependencies(
+        selected_groups=groups_selected, cuda_ver=args.cuda_version
+    )
+    runtime_libs_version = args.runtime_libs_version or dsl_ver
+
+    print(f"Groups      : {groups_selected}")
+    for sm, variants in variants_by_sm.items():
+        print(f"SM{sm} variants: {[variant.name for variant in variants]}")
+
+    if output_dir.exists() and not args.clean:
+        raise RuntimeError(
+            f"Multi-SM artifact already exists: {output_dir}\n"
+            "Re-run with --clean so its dispatch table and archive remain atomic."
+        )
+    root_staging = Path(tempfile.mkdtemp(prefix="cutedsl_multi_sm_build_"))
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    staged_output_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f".{artifact_tag}.publishing-", dir=output_dir.parent
+        )
+    )
+    try:
+        staging_dirs = {}
+        for sm, variants in variants_by_sm.items():
+            for variant in variants:
+                staging_dir = root_staging / f"sm{sm}" / variant.name
+                staging_dir.mkdir(parents=True)
+                staging_dirs[(sm, variant.name)] = staging_dir
+
+        compile_multi_sm_variants(
+            variants_by_sm,
+            staging_dirs,
+            args.jobs,
+            args.verbose,
+            compile_gpu_arches,
+            host_target,
+        )
+
+        kernel_obj_files = []
+        canonical_variants = set()
+        for sm, variants in variants_by_sm.items():
+            marker = _multi_sm_marker(sm)
+            for variant in variants:
+                objects = sorted(staging_dirs[(sm, variant.name)].glob("*.o"))
+                kernel_obj_files.extend(objects)
+                canonical_variants.update(obj.stem.replace(marker, "") for obj in objects)
+
+        runtime_archive = resolve_static_runtime_archive(
+            arch,
+            host_arch,
+            lib_dir.parent if lib_dir else None,
+            cuda_ver,
+            runtime_libs_version,
+            root_staging,
+        )
+        runtime_obj_dir = root_staging / "runtime_objs"
+        runtime_obj_dir.mkdir()
+        subprocess.run(
+            ["ar", "x", str(runtime_archive)],
+            cwd=str(runtime_obj_dir),
+            check=True,
+        )
+        runtime_objs = sorted(runtime_obj_dir.glob("*.o"))
+        _check_obj_name_collision(kernel_obj_files, runtime_objs)
+        _check_defined_symbol_collision(kernel_obj_files + runtime_objs)
+
+        lib_path = staged_output_dir / f"libcutedsl_{arch}.a"
+        subprocess.run(
+            ["ar", "rcs", str(lib_path)]
+            + [str(obj) for obj in kernel_obj_files]
+            + [str(obj) for obj in runtime_objs],
+            check=True,
+        )
+        dispatch_source = _write_multi_sm_headers_and_dispatch(
+            staged_output_dir, variants_by_sm, staging_dirs, sms
+        )
+        print(f"\n  Created {lib_path.name} ({lib_path.stat().st_size // 1024} KB)")
+        print(f"  Created {dispatch_source.name}")
+        print(
+            f"  Embedded static runtime: {runtime_archive} "
+            f"({runtime_archive.stat().st_size // 1024} KB)"
+        )
+
+        metadata = {
+            "arch": arch,
+            "artifact_tag": artifact_tag,
+            "gpu_arch": artifact_tag,
+            "gpu_archs": [sm_to_artifact_tag(sm) for sm in sms],
+            "compile_gpu_arch": ",".join(
+                compile_gpu_arches[sm] for sm in sms
+            ),
+            "compile_gpu_archs": [compile_gpu_arches[sm] for sm in sms],
+            "wrapper_gpu_arch": ",".join(
+                compile_gpu_arches[sm] for sm in sms
+            ),
+            "host_target": host_target,
+            "cuda_version": cuda_ver,
+            "cuda_package_variant": _cuda_package_variant(cuda_ver),
+            "host_cuda_version": host_cuda_ver,
+            "cutlass_dsl_version": dsl_ver,
+            "cutlass_dsl_cuda_version": dsl_cuda_version,
+            "cupy_package": cupy_pkg,
+            "cupy_version": cupy_ver,
+            "runtime_libs_version": runtime_libs_version,
+            "build_date": datetime.now(timezone.utc).isoformat(),
+            "groups": groups_selected,
+            "variants": sorted(canonical_variants),
+            "runtime_static_archive": _RUNTIME_STATIC_ARCHIVE,
+            "dispatch_source": dispatch_source.name,
+        }
+        (staged_output_dir / "metadata.json").write_text(
+            json.dumps(metadata, indent=2) + "\n"
+        )
+
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
+        staged_output_dir.rename(output_dir)
+    finally:
+        shutil.rmtree(root_staging, ignore_errors=True)
+        shutil.rmtree(staged_output_dir, ignore_errors=True)
+
+    print(f"\nDone. Artifacts written to: {output_dir}")
+
+
 def build(args):
     # Resolve SM: explicit override or auto-detect from the running GPU.
     if args.gpu_arch:
-        sm = _parse_sm(args.gpu_arch)
+        sms = _parse_sms(args.gpu_arch)
+        if len(sms) > 1:
+            _build_multi_sm(args, sms)
+            return
+        sm = sms[0]
         sm_source = "--gpu_arch override"
     else:
         sm = detect_gpu_sm()
@@ -2758,9 +3206,11 @@ def main():
     p.add_argument(
         "--gpu_arch",
         default=None,
-        help="Override target GPU SM (e.g. sm_87, sm_100). "
+        help="Override target GPU SM (e.g. sm_87, sm_100), or provide a "
+             "comma-separated list for one runtime-dispatched artifact "
+             "(e.g. sm_110,sm_120). "
              "Default: auto-detect via cupy / nvidia-smi. "
-             "Used only for variant filtering — never forwarded to kernel scripts.",
+             "Each value selects variants and the corresponding AOT compile architecture.",
     )
     p.add_argument(
         "--kernels",

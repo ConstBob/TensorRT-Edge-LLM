@@ -30,6 +30,7 @@ from . import NativeDetectionError
 _CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75
 _CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76
 _DGX_SPARK_MODEL_MARKERS = ("dgx spark", "gb10")
+_IGX_THOR_MODEL_MARKERS = ("igx thor", )
 
 
 @dataclass(frozen=True)
@@ -97,15 +98,24 @@ def _device_model_probe() -> Optional[Tuple[str, str]]:
         if model:
             return "device-model", model
 
-    # DGX Spark is ACPI/DMI based and does not expose a device-tree model.
+    # Some NVIDIA systems are ACPI/DMI based and expose no device-tree model.
     path = Path("/sys/class/dmi/id/product_name")
     if not path.is_file():
         return None
     model = path.read_text(encoding="utf-8", errors="replace").strip()
     normalized = re.sub(r"[_-]+", " ", model)
     if any(marker in normalized.casefold()
-           for marker in _DGX_SPARK_MODEL_MARKERS):
+           for marker in (*_DGX_SPARK_MODEL_MARKERS,
+                          *_IGX_THOR_MODEL_MARKERS)):
         return "device-model", normalized
+    return None
+
+
+def _igx_thor_probe() -> Optional[Tuple[str, str]]:
+    model = _device_model_probe()
+    if model is not None and any(marker in model[1].casefold()
+                                 for marker in _IGX_THOR_MODEL_MARKERS):
+        return model
     return None
 
 
@@ -116,7 +126,10 @@ def _drive_probe() -> Optional[Tuple[str, str]]:
     if not text:
         model = _device_model_probe()
         if model is not None and any(marker in model[1].casefold()
-                                     for marker in _DGX_SPARK_MODEL_MARKERS):
+                                     for marker in (
+                                         *_DGX_SPARK_MODEL_MARKERS,
+                                         *_IGX_THOR_MODEL_MARKERS,
+                                     )):
             return None
         rootfs = Path("/etc/nvidia/version-ubuntu-rootfs.txt")
         if not rootfs.is_file():
@@ -152,7 +165,8 @@ def _ubuntu_probe(cpu_arch: str) -> Optional[Tuple[str, str]]:
 
 
 def _platform_probe(cpu_arch: str) -> Tuple[str, str]:
-    for probe in (_drive_probe, _l4t_probe, _device_model_probe):
+    for probe in (_drive_probe, _igx_thor_probe, _l4t_probe,
+                  _device_model_probe):
         result = probe()
         if result is not None:
             return result
