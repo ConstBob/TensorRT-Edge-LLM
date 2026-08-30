@@ -33,7 +33,7 @@ Algorithm contract under test (frozen with the C++ plugin, M3):
   (``normalize(x) * gamma`` with gamma PRE-FOLDED as (1+w)) -> partial neox
   RoPE (rotary dim 64 of head size 256, theta=1e7) -> paged KV write
   (roped K, raw V).
-* Indexer (NH=4, D_idx=128, ratio=4, budget=512, width=2051): q Gemma-norm
+* Indexer (NH=4, D_idx=128, ratio=4, block_topk=512 / budget=2048 tokens, width=2051): q Gemma-norm
   with RAW w (kernel computes 1+w internally) + rope@t; compressed keys per
   complete block g: fp32 mean of 4 raw keys (fixed order) -> cast fp16 ->
   Gemma-norm -> rope@4g; scores = sum_h relu(q_h . kbar_g) / sqrt(128) in
@@ -96,11 +96,14 @@ NUM_KV_HEADS = 2
 HEAD_SIZE = 256
 INDEXER_N_HEADS = 4
 INDEXER_HEAD_DIM = 128
-INDEXER_BUDGET = 512
 INDEXER_COMPRESS_RATIO = 4
-# Widest possible index row: budget complete blocks + a (ratio-1)-token tail.
-INDEX_WIDTH = INDEXER_BUDGET * INDEXER_COMPRESS_RATIO + (
-    INDEXER_COMPRESS_RATIO - 1)  # 2051
+# Top blocks selected per query row (kQSA_BLOCK_TOPK).
+INDEXER_BLOCK_TOPK = 512
+# The plugin's indexer_budget attribute counts EXPANDED TOKENS
+# (kQSA_INDEX_BUDGET = block_topk * ratio), not blocks.
+INDEXER_BUDGET = INDEXER_BLOCK_TOPK * INDEXER_COMPRESS_RATIO  # 2048
+# Widest possible index row: the token budget + a (ratio-1)-token tail.
+INDEX_WIDTH = INDEXER_BUDGET + (INDEXER_COMPRESS_RATIO - 1)  # 2051
 ROTARY_DIM = 64  # partial rope: first 64 dims of each head
 ROPE_THETA = 1.0e7
 RMS_NORM_EPS = 1e-6
@@ -200,7 +203,7 @@ class QsaTorchReference:
                  head_size: int = HEAD_SIZE,
                  indexer_n_heads: int = INDEXER_N_HEADS,
                  indexer_head_dim: int = INDEXER_HEAD_DIM,
-                 indexer_budget: int = INDEXER_BUDGET,
+                 indexer_block_topk: int = INDEXER_BLOCK_TOPK,
                  indexer_compress_ratio: int = INDEXER_COMPRESS_RATIO,
                  attention_scale: float = 0.0,
                  rms_norm_eps: float = RMS_NORM_EPS,
@@ -211,9 +214,9 @@ class QsaTorchReference:
         self.d = head_size
         self.nh = indexer_n_heads
         self.di = indexer_head_dim
-        self.budget = indexer_budget
+        self.budget = indexer_block_topk  # blocks per row
         self.ratio = indexer_compress_ratio
-        self.width = indexer_budget * indexer_compress_ratio + (
+        self.width = indexer_block_topk * indexer_compress_ratio + (
             indexer_compress_ratio - 1)
         # attention_scale == 0.0 selects the plugin default 1/sqrt(head_size).
         self.scale = (attention_scale if attention_scale != 0.0 else 1.0 /
@@ -502,7 +505,7 @@ def test_reference_index_list_invariants():
     assert indices.shape == (len(batch_lengths), seq, INDEX_WIDTH)
     assert INDEX_WIDTH == 2051
 
-    ratio, budget = INDEXER_COMPRESS_RATIO, INDEXER_BUDGET
+    ratio, budget = INDEXER_COMPRESS_RATIO, INDEXER_BLOCK_TOPK
     for bi, length in enumerate(batch_lengths):
         # Padding rows are all -1.
         assert (indices[bi, length:] == -1).all(), "padding rows must be -1"
@@ -556,8 +559,8 @@ def test_reference_sparse_regime_differs_from_dense():
     t = length - 1
     valid = indices[0, t][indices[0, t] >= 0]
     n_vis = (t + 1) // INDEXER_COMPRESS_RATIO
-    assert n_vis > INDEXER_BUDGET
-    assert valid.numel() == INDEXER_BUDGET * INDEXER_COMPRESS_RATIO + (
+    assert n_vis > INDEXER_BLOCK_TOPK
+    assert valid.numel() == INDEXER_BLOCK_TOPK * INDEXER_COMPRESS_RATIO + (
         t + 1) % INDEXER_COMPRESS_RATIO
     assert valid.numel() < t + 1  # tokens were dropped
 
