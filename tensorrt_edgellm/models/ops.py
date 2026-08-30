@@ -2076,7 +2076,7 @@ def _(q_raw, k_raw, v, gamma, rel_key, valid, seq_len_carrier, chunk_size,
 
 
 # ---------------------------------------------------------------------------
-# Custom op: trt::qsa_attention_plugin  (Qwen Sparse Attention, prefill v1)
+# Custom op: trt::qsa_attention_plugin  (Qwen Sparse Attention, prefill)
 # ---------------------------------------------------------------------------
 
 

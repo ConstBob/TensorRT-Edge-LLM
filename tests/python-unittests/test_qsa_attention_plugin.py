@@ -111,7 +111,7 @@ QKV_PACKED = (NUM_Q_HEADS + 2 * NUM_KV_HEADS) * HEAD_SIZE  # 7168
 INDEX_QK_PACKED = (INDEXER_N_HEADS + 1) * INDEXER_HEAD_DIM  # 640
 
 # QSA CuTe-DSL sparse kernel variants are registered for these SMs only.
-QSA_SMS = frozenset({110, 120, 121})
+QSA_SMS = frozenset({100, 101, 110})
 
 
 # --------------------------------------------------------------------------- #

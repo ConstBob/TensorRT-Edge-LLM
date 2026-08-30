@@ -45,9 +45,9 @@ constexpr int32_t kQsaMaxGroupSize{16};
 
 bool isQsaSm(int32_t smVersion)
 {
-    // 101 covers Thor after applyThorSMRenumberWAR (and CUDA-12 toolkits that report
-    // Thor as SM101 natively) — same convention as isFMHAV2SM.
-    return smVersion == 101 || smVersion == 110 || smVersion == 120 || smVersion == 121;
+    // 100 is the B100-class target; 101 covers Thor after applyThorSMRenumberWAR (and
+    // CUDA-12 toolkits that report Thor as SM101 natively) — same convention as isFMHAV2SM.
+    return smVersion == 100 || smVersion == 101 || smVersion == 110;
 }
 
 //! Populate a [B, S, H] descriptor over a contiguous [B, S, H, D] buffer. The QSA kernels bake

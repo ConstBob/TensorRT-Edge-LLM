@@ -951,7 +951,7 @@ KERNEL_VARIANTS = [
     KernelVariant(
         name="qsa_sparse_d256",
         group="qsa",
-        supported_sms=[101, 110, 120, 121],
+        supported_sms=[100, 101, 110],
         script="qsa_cutedsl/qsa_sparse_gqa.py",
         script_args=[
             "--head_dim", "256",
@@ -962,7 +962,7 @@ KERNEL_VARIANTS = [
     KernelVariant(
         name="qsa_sparse_d256_bf16",
         group="qsa",
-        supported_sms=[101, 110, 120, 121],
+        supported_sms=[100, 101, 110],
         script="qsa_cutedsl/qsa_sparse_gqa.py",
         script_args=[
             "--head_dim", "256",

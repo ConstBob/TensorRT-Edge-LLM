@@ -52,7 +52,7 @@ constexpr char const* kQSA_ATTENTION_PLUGIN_VERSION{"1"};
 constexpr char const* kQSA_ATTENTION_PLUGIN_NAME{"QsaAttentionPlugin"};
 
 // Input / output index mapping. ALL inputs are required — there are no optional slots, so
-// the positional contract is fixed (see design/in_progress/qsa_attention_plugin.md).
+// the positional contract is fixed.
 constexpr int32_t kIN_QKV_IDX{0};                   //!< [B, S, (Hq + 2*Hkv) * D] FP16 packed QKV
 constexpr int32_t kIN_INDEX_QK_IDX{1};              //!< [B, S, (idxHeads + 1) * idxDim] FP16 indexer projection
 constexpr int32_t kIN_KV_CACHE_IDX{2};              //!< [2, numPages, 128, Hkv, D] FP16 paged pool

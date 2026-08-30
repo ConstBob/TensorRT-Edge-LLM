@@ -41,8 +41,7 @@ namespace plugins
 //!
 //! v1 contract: PREFILL ONLY (kvcache_start_index must have runtime shape [0]); padded
 //! activations; FP16 surface; all 11 inputs required (no optional slots). The attention
-//! output gate (out * sigmoid(gate)) and every projection stay in the graph. See
-//! design/in_progress/qsa_attention_plugin.md for the full contract.
+//! output gate (out * sigmoid(gate)) and every projection stay in the graph.
 class QsaAttentionPlugin : public nvinfer1::IPluginV3,
                            public nvinfer1::IPluginV3OneCore,
                            public nvinfer1::IPluginV3OneBuildV2,
