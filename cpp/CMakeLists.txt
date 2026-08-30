@@ -125,8 +125,8 @@ add_custom_command(
     ${PLUGIN_JIT_EMBEDDED_SOURCES_OUTPUT} --xqa_dir
     ${CMAKE_SOURCE_DIR}/kernelSrcs/xqa --gemv_dir
     ${CMAKE_SOURCE_DIR}/kernelSrcs/nvfp4A16BlackwellGemv --qsa_indexer_dir
-    ${CMAKE_SOURCE_DIR}/kernelSrcs/qsaIndexer --cpp_dir
-    ${CMAKE_SOURCE_DIR}/cpp --cuda_include_dir ${CUDA_RUNTIME_API_INCLUDE_DIR}
+    ${CMAKE_SOURCE_DIR}/kernelSrcs/qsaIndexer --cpp_dir ${CMAKE_SOURCE_DIR}/cpp
+    --cuda_include_dir ${CUDA_RUNTIME_API_INCLUDE_DIR}
   DEPENDS
     ${XQA_SOURCE_FILES}
     ${NVFP4_A16_BLACKWELL_GEMV_JIT_SOURCE_FILES}
