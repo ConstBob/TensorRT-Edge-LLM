@@ -45,8 +45,7 @@ public:
     //!         on the host.
     static std::optional<ContextCacheRequest> begin(ContextCacheCoordinator& coordinator,
         LLMGenerationRequest const& request, DecodingInferenceContext const& context, bool speculativeRequest,
-        DecodingKvHeadroom const& headroom,
-        std::vector<int32_t> const& mediaTokenIds = {},
+        DecodingKvHeadroom const& headroom, std::vector<int32_t> const& mediaTokenIds = {},
         DecodingTokenStateContract tokenStateContract = DecodingTokenStateContract::kCommittedPlusLookahead,
         ContextCacheCommitPolicy commitPolicy = ContextCacheCommitPolicy::kIncludingGeneratedTokens);
 

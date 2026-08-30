@@ -1241,9 +1241,9 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
     std::optional<ManagedKVCacheRequest> managedKVCacheRequest;
     if (mContextCache != nullptr || mBoundedSwaKVPageManager != nullptr)
     {
-        std::optional<ManagedKVCacheRequest> admitted
-            = ManagedKVCacheRequest::begin(mContextCache.get(), mBoundedSwaKVPageManager.get(), request, context,
-                decodingStrategy.isSpeculative(), kvHeadroom, tokenStateContract, contextCacheCommitPolicy, mediaTokenIds);
+        std::optional<ManagedKVCacheRequest> admitted = ManagedKVCacheRequest::begin(mContextCache.get(),
+            mBoundedSwaKVPageManager.get(), request, context, decodingStrategy.isSpeculative(), kvHeadroom,
+            tokenStateContract, contextCacheCommitPolicy, mediaTokenIds);
         if (!admitted.has_value())
         {
             return false;

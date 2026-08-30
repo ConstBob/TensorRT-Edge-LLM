@@ -364,9 +364,9 @@ TEST_F(ContextCacheRequestTests, FullyCommittedContractPublishesOnlyPromptState)
 {
     DecodingInferenceContext context = makeContext({makeTokens(kTOKENS_PER_PAGE)}, mStream);
     LLMGenerationRequest requestConfig{};
-    std::optional<ContextCacheRequest> request = ContextCacheRequest::begin(
-        *mCoordinator, requestConfig, context, /*speculativeRequest=*/false, DecodingKvHeadroom{1, 0}, {},
-        DecodingTokenStateContract::kFullyCommitted, ContextCacheCommitPolicy::kPrefillStateOnly);
+    std::optional<ContextCacheRequest> request = ContextCacheRequest::begin(*mCoordinator, requestConfig, context,
+        /*speculativeRequest=*/false, DecodingKvHeadroom{1, 0}, {}, DecodingTokenStateContract::kFullyCommitted,
+        ContextCacheCommitPolicy::kPrefillStateOnly);
     ASSERT_TRUE(request.has_value());
 
     ASSERT_TRUE(request->preparePrefill());

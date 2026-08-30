@@ -235,9 +235,8 @@ std::optional<ContextCacheRequest> ContextCacheRequest::begin(ContextCacheCoordi
     return ContextCacheRequest{coordinator, std::move(*admitted.admission), tokenStateContract};
 }
 
-ContextCacheRequest::ContextCacheRequest(
-    ContextCacheCoordinator& coordinator, ContextCacheCoordinator::AdmissionResult&& admission,
-    DecodingTokenStateContract tokenStateContract) noexcept
+ContextCacheRequest::ContextCacheRequest(ContextCacheCoordinator& coordinator,
+    ContextCacheCoordinator::AdmissionResult&& admission, DecodingTokenStateContract tokenStateContract) noexcept
     : mCoordinator(coordinator)
     , mRequest(std::move(admission.request))
     , mTokenStateContract(tokenStateContract)
@@ -291,8 +290,8 @@ bool ContextCacheRequest::completePrefill(
             size_t const suffixLength = context.tokenIds[slot].size();
             size_t const fullInputLength = context.rawBatchedInputIds[slot].size();
             ELLM_CHECK(context.currentGenerateLengths[slot] == 0
-                    && suffixLength == static_cast<size_t>(context.effectivePrefillLengths[slot])
-                    && suffixLength > 0 && suffixLength <= fullInputLength,
+                    && suffixLength == static_cast<size_t>(context.effectivePrefillLengths[slot]) && suffixLength > 0
+                    && suffixLength <= fullInputLength,
                 "Fully committed prefill must not append a sampled lookahead token");
             progress.push_back(ContextCacheSequenceAdvance{nullptr, 0, static_cast<int32_t>(fullInputLength)});
         }

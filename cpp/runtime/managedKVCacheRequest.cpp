@@ -54,9 +54,8 @@ std::optional<ManagedKVCacheRequest> ManagedKVCacheRequest::begin(ContextCacheCo
         "Managed KV cache request requires exactly one lifecycle backend");
     if (contextCache != nullptr)
     {
-        std::optional<ContextCacheRequest> admitted
-            = ContextCacheRequest::begin(
-                *contextCache, request, context, speculativeRequest, headroom, mediaTokenIds, tokenStateContract, commitPolicy);
+        std::optional<ContextCacheRequest> admitted = ContextCacheRequest::begin(*contextCache, request, context,
+            speculativeRequest, headroom, mediaTokenIds, tokenStateContract, commitPolicy);
         if (!admitted.has_value())
         {
             return std::nullopt;
