@@ -37,7 +37,7 @@ strides, softmax scale.
 
 | name | dtype | SMs |
 |---|---|---|
-| `qsa_sparse_d256` | fp16 | 100, 101, 110 |
+| `qsa_sparse_d256_fp16` | fp16 | 100, 101, 110 |
 | `qsa_sparse_d256_bf16` | bf16 | 100, 101, 110 |
 
 ## Standalone test / benchmark (needs a GPU)

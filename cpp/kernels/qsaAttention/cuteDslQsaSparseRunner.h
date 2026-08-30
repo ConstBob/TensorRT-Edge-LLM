@@ -98,7 +98,7 @@ private:
     nvinfer1::DataType mDataType{nvinfer1::DataType::kHALF};
 
 #if defined(CUTE_DSL_QSA_ENABLED)
-    static detail::LazyKernelModule<qsa_sparse_d256_Kernel_Module_t> sSparseD256;
+    static detail::LazyKernelModule<qsa_sparse_d256_fp16_Kernel_Module_t> sSparseD256Fp16;
     static detail::LazyKernelModule<qsa_sparse_d256_bf16_Kernel_Module_t> sSparseD256Bf16;
 #endif // defined(CUTE_DSL_QSA_ENABLED)
 };

@@ -26,7 +26,7 @@
 namespace trt_edgellm
 {
 
-detail::LazyKernelModule<qsa_sparse_d256_Kernel_Module_t> CuteDslQsaSparsePrefillRunner::sSparseD256{};
+detail::LazyKernelModule<qsa_sparse_d256_fp16_Kernel_Module_t> CuteDslQsaSparsePrefillRunner::sSparseD256Fp16{};
 detail::LazyKernelModule<qsa_sparse_d256_bf16_Kernel_Module_t> CuteDslQsaSparsePrefillRunner::sSparseD256Bf16{};
 
 namespace
@@ -153,8 +153,8 @@ bool CuteDslQsaSparsePrefillRunner::preflight(cudaStream_t stream)
 {
     if (mDataType == nvinfer1::DataType::kHALF)
     {
-        return detail::ensureModuleLoaded<qsa_sparse_d256_Kernel_Module_Load, qsa_sparse_d256_Kernel_Module_Unload>(
-            sSparseD256, "qsa_sparse_d256", stream);
+        return detail::ensureModuleLoaded<qsa_sparse_d256_fp16_Kernel_Module_Load,
+            qsa_sparse_d256_fp16_Kernel_Module_Unload>(sSparseD256Fp16, "qsa_sparse_d256_fp16", stream);
     }
     if (mDataType == nvinfer1::DataType::kBF16)
     {
@@ -174,8 +174,8 @@ bool CuteDslQsaSparsePrefillRunner::run(QsaSparsePrefillParams const& params)
     int32_t status = -1;
     if (mDataType == nvinfer1::DataType::kHALF)
     {
-        status = callQsaSparsePrefill<cute_dsl_qsa_sparse_d256_wrapper, qsa_sparse_d256_Kernel_Module_Load,
-            qsa_sparse_d256_Kernel_Module_Unload>(sSparseD256, "qsa_sparse_d256", params);
+        status = callQsaSparsePrefill<cute_dsl_qsa_sparse_d256_fp16_wrapper, qsa_sparse_d256_fp16_Kernel_Module_Load,
+            qsa_sparse_d256_fp16_Kernel_Module_Unload>(sSparseD256Fp16, "qsa_sparse_d256_fp16", params);
     }
     else if (mDataType == nvinfer1::DataType::kBF16)
     {

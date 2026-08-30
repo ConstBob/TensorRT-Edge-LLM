@@ -949,7 +949,7 @@ KERNEL_VARIANTS = [
     # top-k token-index list.  B/S/H_q/H_kv/topk stay runtime-dynamic; only
     # head_dim and the (Br, Bc, threads) tuning are baked.
     KernelVariant(
-        name="qsa_sparse_d256",
+        name="qsa_sparse_d256_fp16",
         group="qsa",
         supported_sms=[100, 101, 110],
         script="qsa_cutedsl/qsa_sparse_gqa.py",
