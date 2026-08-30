@@ -610,6 +610,18 @@ int32_t QsaAttentionPlugin::onShapeChange([[maybe_unused]] PluginTensorDesc cons
     [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] PluginTensorDesc const* out,
     [[maybe_unused]] int32_t nbOutputs) noexcept
 {
+    // The indexer kernels are NVRTC-compiled and driver-loaded lazily on first launch. Warm
+    // them up here so a CUDA Graph capture of enqueue never observes those one-time
+    // host-side steps.
+    try
+    {
+        kernel::ensureQsaIndexerKernelsLoaded<half>();
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("QsaAttentionPlugin '%s' failed to JIT the QSA indexer kernels: %s", mLayerName.c_str(), e.what());
+        return -1;
+    }
     return 0;
 }
 

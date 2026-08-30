@@ -41,6 +41,20 @@ constexpr int32_t kQSA_INDEX_WIDTH = 2051;     //!< kQSA_INDEX_BUDGET + up to (k
 //! initializeNormalRopeCosSin (rotaryDim = 64).
 constexpr int32_t kQSA_INDEXER_ROTARY_DIM = 64;
 
+//! \brief Compile (NVRTC) and driver-load the QSA indexer kernels for activation type T.
+//!
+//! The device code lives in kernelSrcs/qsaIndexer/qsaIndexerJitKernels.cu and every launcher
+//! below JIT-compiles and cuModuleLoadData's it lazily on first use, cached process-wide per
+//! (CUDA context, SM version, dtype). Those one-time host-side steps must not happen inside a
+//! CUDA Graph capture, so callers that capture the launchers (or enqueue them from a TRT
+//! plugin whose stream may be captured) must call this warmup first from a non-captured
+//! context, e.g. onShapeChange; after it returns, the launchers only issue cuLaunchKernel.
+//!
+//! \tparam T Activation type: half or __nv_bfloat16.
+//! \throws std::runtime_error on NVRTC or CUDA driver failure
+template <typename T>
+void ensureQsaIndexerKernelsLoaded();
+
 //! \brief K1a: Gemma-style qk-norm + partial neox rope on the index-Q heads.
 //!
 //! Reads the packed indexer projection `indexQk` [batchSize, seqLen, 640] where each row is

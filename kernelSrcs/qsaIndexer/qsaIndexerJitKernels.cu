@@ -15,22 +15,53 @@
  * limitations under the License.
  */
 
-#include "common/checkMacros.h"
-#include "qsaIndexerKernels.h"
+// QSA indexer device kernels, NVRTC dialect. Compiled at runtime by
+// cpp/kernels/qsaIndexer/qsaIndexerJitCompiler.cpp; the host launchers live in
+// cpp/kernels/qsaIndexer/qsaIndexerKernels.cpp. The exact numerics documented in
+// cpp/kernels/qsaIndexer/qsaIndexerKernels.h are pinned by unit tests: keep the
+// device code bit-identical when editing either side.
 
-#include <algorithm>
-#include <cfloat>
-#include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-namespace trt_edgellm
-{
-namespace kernel
-{
+#if !defined(QSA_INDEXER_DATA_TYPE) || !defined(QSA_INDEXER_SOURCE_ABI)
+#error "QSA indexer JIT configuration is incomplete"
+#endif
+
+#if QSA_INDEXER_SOURCE_ABI != 1
+#error "Unsupported QSA indexer source ABI"
+#endif
+
+// NVRTC has no <cstdint>/<cfloat>; spell out the fixed-width types and FLT_MAX.
+using int32_t = int;
+using int64_t = long long;
+using uint32_t = unsigned int;
+static_assert(sizeof(int32_t) == 4, "int32_t must be 4 bytes");
+static_assert(sizeof(int64_t) == 8, "int64_t must be 8 bytes");
+static_assert(sizeof(uint32_t) == 4, "uint32_t must be 4 bytes");
 
 namespace
 {
+
+#if QSA_INDEXER_DATA_TYPE == 0
+using QsaType = half;
+#elif QSA_INDEXER_DATA_TYPE == 1
+using QsaType = __nv_bfloat16;
+#else
+#error "Unsupported QSA indexer data type"
+#endif
+
+//! FLT_MAX; masked logits must compare equal to the host's -FLT_MAX bit for bit.
+constexpr float kFloatMax = 3.402823466e+38F;
+
+//! QSA indexer geometry; must match the kQSA_* constants in
+//! cpp/kernels/qsaIndexer/qsaIndexerKernels.h (the host side keeps its own copy).
+constexpr int32_t kQSA_INDEXER_NUM_HEADS = 4;  //!< Index-Q heads.
+constexpr int32_t kQSA_INDEXER_HEAD_DIM = 128; //!< Index-Q / index-K head dimension.
+constexpr int32_t kQSA_COMPRESS_RATIO = 4;     //!< Raw index-K tokens averaged per compressed block.
+constexpr int32_t kQSA_BLOCK_TOPK = 512;       //!< Blocks selected per query row.
+constexpr int32_t kQSA_INDEX_WIDTH = 2051;     //!< Expanded token indices per query row.
+constexpr int32_t kQSA_INDEXER_ROTARY_DIM = 64;
 
 constexpr int32_t kWarpSize = 32;
 constexpr int32_t kDimsPerLane = kQSA_INDEXER_HEAD_DIM / kWarpSize;                        // 4
@@ -39,11 +70,6 @@ constexpr int32_t kQNormedRowWidth = kQSA_INDEXER_NUM_HEADS * kQSA_INDEXER_HEAD_
 constexpr int32_t kRawKColumnOffset = kQSA_INDEXER_NUM_HEADS * kQSA_INDEXER_HEAD_DIM;      // 512
 constexpr int32_t kHalfRotaryDim = kQSA_INDEXER_ROTARY_DIM / 2;                            // 32
 constexpr uint32_t kFullWarpMask = 0xffffffffU;
-
-constexpr int32_t ceilDiv(int32_t a, int32_t b)
-{
-    return (a + b - 1) / b;
-}
 
 template <typename T>
 __device__ __forceinline__ float toFloat(T const& v);
@@ -103,10 +129,11 @@ __device__ __forceinline__ float applyNeoxRopeFromSmem(float const* headSmem, fl
     return headSmem[d];
 }
 
+} // namespace
+
 //! K1a: see launchQsaIndexQPrep. grid(B*S), block(128); warp h owns q head h, 4 dims/lane.
-template <typename T>
-__global__ void qsaIndexQPrepKernel(T* qNormed, T const* indexQk, float const* cosSin, int32_t const* contextLengths,
-    T const* wQ, float rmsEps, int32_t seqLen)
+extern "C" __global__ void qsa_indexer_q_prep(QsaType* qNormed, QsaType const* indexQk, float const* cosSin,
+    int32_t const* contextLengths, QsaType const* wQ, float rmsEps, int32_t seqLen)
 {
     int32_t const row = static_cast<int32_t>(blockIdx.x); // b * seqLen + t
     int32_t const batchIdx = row / seqLen;
@@ -114,7 +141,7 @@ __global__ void qsaIndexQPrepKernel(T* qNormed, T const* indexQk, float const* c
     int32_t const head = static_cast<int32_t>(threadIdx.x) / kWarpSize;
     int32_t const lane = static_cast<int32_t>(threadIdx.x) % kWarpSize;
 
-    T* out = qNormed + static_cast<int64_t>(row) * kQNormedRowWidth + head * kQSA_INDEXER_HEAD_DIM;
+    QsaType* out = qNormed + static_cast<int64_t>(row) * kQNormedRowWidth + head * kQSA_INDEXER_HEAD_DIM;
 
     if (tokenIdx >= contextLengths[batchIdx])
     {
@@ -122,14 +149,14 @@ __global__ void qsaIndexQPrepKernel(T* qNormed, T const* indexQk, float const* c
 #pragma unroll
         for (int32_t i = 0; i < kDimsPerLane; ++i)
         {
-            out[lane * kDimsPerLane + i] = fromFloat<T>(0.0f);
+            out[lane * kDimsPerLane + i] = fromFloat<QsaType>(0.0f);
         }
         return;
     }
 
     __shared__ float sQ[kQSA_INDEXER_NUM_HEADS][kQSA_INDEXER_HEAD_DIM];
 
-    T const* in = indexQk + static_cast<int64_t>(row) * kIndexQkRowWidth + head * kQSA_INDEXER_HEAD_DIM;
+    QsaType const* in = indexQk + static_cast<int64_t>(row) * kIndexQkRowWidth + head * kQSA_INDEXER_HEAD_DIM;
 
     // FP32 sum-of-squares over the 128 head dims (4 elements per lane + warp reduction).
     float x[kDimsPerLane];
@@ -152,27 +179,26 @@ __global__ void qsaIndexQPrepKernel(T* qNormed, T const* indexQk, float const* c
     }
     __syncwarp();
 
-    // Partial neox rope at position tokenIdx; single cast to T at the very end.
+    // Partial neox rope at position tokenIdx; single cast to QsaType at the very end.
     float const* cosSinRow = cosSin + static_cast<int64_t>(tokenIdx) * kQSA_INDEXER_ROTARY_DIM;
 #pragma unroll
     for (int32_t i = 0; i < kDimsPerLane; ++i)
     {
         int32_t const d = lane * kDimsPerLane + i;
-        out[d] = fromFloat<T>(applyNeoxRopeFromSmem(sQ[head], cosSinRow, d));
+        out[d] = fromFloat<QsaType>(applyNeoxRopeFromSmem(sQ[head], cosSinRow, d));
     }
 }
 
 //! K1b: see launchQsaIndexKCompress. grid(B * numGroups), block(32); one warp per (b, g).
-template <typename T>
-__global__ void qsaIndexKCompressKernel(T* kbar, T const* indexQk, float const* cosSin, int32_t const* contextLengths,
-    T const* wK, float rmsEps, int32_t seqLen, int32_t numBlocks, int32_t numGroups, int32_t blockBegin,
-    int32_t pastLen)
+extern "C" __global__ void qsa_indexer_k_compress(QsaType* kbar, QsaType const* indexQk, float const* cosSin,
+    int32_t const* contextLengths, QsaType const* wK, float rmsEps, int32_t seqLen, int32_t numBlocks,
+    int32_t numGroups, int32_t blockBegin, int32_t pastLen)
 {
     int32_t const batchIdx = static_cast<int32_t>(blockIdx.x) / numGroups;
     int32_t const blockId = blockBegin + static_cast<int32_t>(blockIdx.x) % numGroups;
     int32_t const lane = static_cast<int32_t>(threadIdx.x);
 
-    T* out = kbar + (static_cast<int64_t>(batchIdx) * numBlocks + blockId) * kQSA_INDEXER_HEAD_DIM;
+    QsaType* out = kbar + (static_cast<int64_t>(batchIdx) * numBlocks + blockId) * kQSA_INDEXER_HEAD_DIM;
 
     int32_t const firstToken = blockId * kQSA_COMPRESS_RATIO;
     bool const valid = (firstToken + kQSA_COMPRESS_RATIO - 1 < contextLengths[batchIdx]) && (firstToken >= pastLen);
@@ -182,7 +208,7 @@ __global__ void qsaIndexKCompressKernel(T* kbar, T const* indexQk, float const* 
 #pragma unroll
         for (int32_t i = 0; i < kDimsPerLane; ++i)
         {
-            out[lane * kDimsPerLane + i] = fromFloat<T>(0.0f);
+            out[lane * kDimsPerLane + i] = fromFloat<QsaType>(0.0f);
         }
         return;
     }
@@ -190,7 +216,7 @@ __global__ void qsaIndexKCompressKernel(T* kbar, T const* indexQk, float const* 
     __shared__ float sK[kQSA_INDEXER_HEAD_DIM];
 
     // Raw index-K rows of the 4 block tokens (columns [512, 640) of indexQk).
-    T const* k0 = indexQk + static_cast<int64_t>(batchIdx) * seqLen * kIndexQkRowWidth
+    QsaType const* k0 = indexQk + static_cast<int64_t>(batchIdx) * seqLen * kIndexQkRowWidth
         + static_cast<int64_t>(firstToken - pastLen) * kIndexQkRowWidth + kRawKColumnOffset;
 
     float m[kDimsPerLane];
@@ -199,13 +225,13 @@ __global__ void qsaIndexKCompressKernel(T* kbar, T const* indexQk, float const* 
     for (int32_t i = 0; i < kDimsPerLane; ++i)
     {
         int32_t const d = lane * kDimsPerLane + i;
-        // FP32 mean in FIXED sequential order, then the bit-compatibility-critical cast to T.
+        // FP32 mean in FIXED sequential order, then the bit-compatibility-critical cast to QsaType.
         float acc = toFloat(k0[d]);
         acc = acc + toFloat(k0[kIndexQkRowWidth + d]);
         acc = acc + toFloat(k0[2 * kIndexQkRowWidth + d]);
         acc = acc + toFloat(k0[3 * kIndexQkRowWidth + d]);
         acc = acc * 0.25f;
-        m[i] = toFloat(fromFloat<T>(acc));
+        m[i] = toFloat(fromFloat<QsaType>(acc));
         sumSq = fmaf(m[i], m[i], sumSq);
     }
     sumSq = warpReduceSum(sumSq);
@@ -219,22 +245,21 @@ __global__ void qsaIndexKCompressKernel(T* kbar, T const* indexQk, float const* 
     }
     __syncwarp();
 
-    // Rope at the position of the block's first token; single cast to T at the very end.
+    // Rope at the position of the block's first token; single cast to QsaType at the very end.
     float const* cosSinRow = cosSin + static_cast<int64_t>(firstToken) * kQSA_INDEXER_ROTARY_DIM;
 #pragma unroll
     for (int32_t i = 0; i < kDimsPerLane; ++i)
     {
         int32_t const d = lane * kDimsPerLane + i;
-        out[d] = fromFloat<T>(applyNeoxRopeFromSmem(sK, cosSinRow, d));
+        out[d] = fromFloat<QsaType>(applyNeoxRopeFromSmem(sK, cosSinRow, d));
     }
 }
 
 //! K2: see launchQsaIndexScores. grid(numRows, ceilDiv(numBlocks, 64)), block(256).
 //! The CTA stages the row's 4x128 q in FP32 smem; each of the 8 warps owns 8 consecutive
 //! block-columns of the 64-column tile and evaluates them one at a time.
-template <typename T>
-__global__ void qsaIndexScoresKernel(float* logits, T const* qNormed, T const* kbar, int32_t const* contextLengths,
-    int32_t seqLen, int32_t numBlocks, int32_t rowStart)
+extern "C" __global__ void qsa_indexer_scores(float* logits, QsaType const* qNormed, QsaType const* kbar,
+    int32_t const* contextLengths, int32_t seqLen, int32_t numBlocks, int32_t rowStart)
 {
     constexpr int32_t kColumnsPerCta = 64;
     constexpr int32_t kColumnsPerWarp = 8;
@@ -256,7 +281,7 @@ __global__ void qsaIndexScoresKernel(float* logits, T const* qNormed, T const* k
     __shared__ float sQ[kQNormedRowWidth];
     if (!isPadding)
     {
-        T const* q = qNormed + static_cast<int64_t>(row) * kQNormedRowWidth;
+        QsaType const* q = qNormed + static_cast<int64_t>(row) * kQNormedRowWidth;
         for (int32_t i = static_cast<int32_t>(threadIdx.x); i < kQNormedRowWidth; i += static_cast<int32_t>(blockDim.x))
         {
             sQ[i] = toFloat(q[i]);
@@ -272,10 +297,10 @@ __global__ void qsaIndexScoresKernel(float* logits, T const* qNormed, T const* k
             break;
         }
 
-        float score = -FLT_MAX;
+        float score = -kFloatMax;
         if (blockId < numVisible)
         {
-            T const* kb = kbar + (static_cast<int64_t>(batchIdx) * numBlocks + blockId) * kQSA_INDEXER_HEAD_DIM;
+            QsaType const* kb = kbar + (static_cast<int64_t>(batchIdx) * numBlocks + blockId) * kQSA_INDEXER_HEAD_DIM;
             float partial[kQSA_INDEXER_NUM_HEADS] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
             for (int32_t i = 0; i < kDimsPerLane; ++i)
@@ -308,7 +333,7 @@ __global__ void qsaIndexScoresKernel(float* logits, T const* qNormed, T const* k
 }
 
 //! ids[r * numBlocks + c] = c for the segmented sort values.
-__global__ void qsaIndexIdsFillKernel(int32_t* ids, int64_t numItems, int32_t numBlocks)
+extern "C" __global__ void qsa_indexer_ids_fill(int32_t* ids, int64_t numItems, int32_t numBlocks)
 {
     int64_t const stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
     for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < numItems; i += stride)
@@ -318,7 +343,7 @@ __global__ void qsaIndexIdsFillKernel(int32_t* ids, int64_t numItems, int32_t nu
 }
 
 //! K4: see launchQsaIndexExpand. grid(numRows), block(256), threads stride the 2051 outputs.
-__global__ void qsaIndexExpandKernel(int32_t* outIdx, int32_t const* sortedIds, int32_t const* contextLengths,
+extern "C" __global__ void qsa_indexer_expand(int32_t* outIdx, int32_t const* sortedIds, int32_t const* contextLengths,
     int32_t seqLen, int32_t numBlocks, int32_t rowStart)
 {
     int32_t const chunkRow = static_cast<int32_t>(blockIdx.x);
@@ -360,106 +385,3 @@ __global__ void qsaIndexExpandKernel(int32_t* outIdx, int32_t const* sortedIds, 
         out[j] = value;
     }
 }
-
-} // namespace
-
-template <typename T>
-void launchQsaIndexQPrep(T* qNormed, T const* indexQk, float const* cosSin, int32_t const* contextLengths, T const* wQ,
-    float rmsEps, int32_t batchSize, int32_t seqLen, cudaStream_t stream)
-{
-    ELLM_CHECK(
-        qNormed != nullptr && indexQk != nullptr && cosSin != nullptr && contextLengths != nullptr && wQ != nullptr,
-        "launchQsaIndexQPrep: null pointer argument");
-    ELLM_CHECK(batchSize > 0 && seqLen > 0, "launchQsaIndexQPrep: batchSize and seqLen must be positive");
-
-    dim3 const grid(static_cast<uint32_t>(batchSize) * static_cast<uint32_t>(seqLen));
-    dim3 const block(kQSA_INDEXER_NUM_HEADS * kWarpSize);
-    qsaIndexQPrepKernel<T><<<grid, block, 0, stream>>>(qNormed, indexQk, cosSin, contextLengths, wQ, rmsEps, seqLen);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-template <typename T>
-void launchQsaIndexKCompress(T* kbar, T const* indexQk, float const* cosSin, int32_t const* contextLengths, T const* wK,
-    float rmsEps, int32_t batchSize, int32_t seqLen, int32_t numBlocks, int32_t blockBegin, int32_t blockEnd,
-    int32_t pastLen, cudaStream_t stream)
-{
-    ELLM_CHECK(kbar != nullptr && indexQk != nullptr && cosSin != nullptr && contextLengths != nullptr && wK != nullptr,
-        "launchQsaIndexKCompress: null pointer argument");
-    ELLM_CHECK(batchSize > 0 && seqLen > 0, "launchQsaIndexKCompress: batchSize and seqLen must be positive");
-    ELLM_CHECK(0 <= blockBegin && blockBegin < blockEnd && blockEnd <= numBlocks,
-        "launchQsaIndexKCompress: require 0 <= blockBegin < blockEnd <= numBlocks");
-    ELLM_CHECK(pastLen >= 0, "launchQsaIndexKCompress: pastLen must be non-negative");
-
-    int32_t const numGroups = blockEnd - blockBegin;
-    dim3 const grid(static_cast<uint32_t>(batchSize) * static_cast<uint32_t>(numGroups));
-    dim3 const block(kWarpSize);
-    qsaIndexKCompressKernel<T><<<grid, block, 0, stream>>>(
-        kbar, indexQk, cosSin, contextLengths, wK, rmsEps, seqLen, numBlocks, numGroups, blockBegin, pastLen);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-template <typename T>
-void launchQsaIndexScores(float* logits, T const* qNormed, T const* kbar, int32_t const* contextLengths,
-    int32_t batchSize, int32_t seqLen, int32_t numBlocks, int32_t rowStart, int32_t numRows, cudaStream_t stream)
-{
-    ELLM_CHECK(logits != nullptr && qNormed != nullptr && kbar != nullptr && contextLengths != nullptr,
-        "launchQsaIndexScores: null pointer argument");
-    ELLM_CHECK(batchSize > 0 && seqLen > 0 && numBlocks > 0, "launchQsaIndexScores: invalid problem dimensions");
-    ELLM_CHECK(rowStart >= 0 && numRows > 0
-            && static_cast<int64_t>(rowStart) + numRows <= static_cast<int64_t>(batchSize) * seqLen,
-        "launchQsaIndexScores: row chunk out of range");
-
-    constexpr int32_t kColumnsPerCta = 64;
-    dim3 const grid(static_cast<uint32_t>(numRows), static_cast<uint32_t>(ceilDiv(numBlocks, kColumnsPerCta)));
-    dim3 const block(256);
-    qsaIndexScoresKernel<T>
-        <<<grid, block, 0, stream>>>(logits, qNormed, kbar, contextLengths, seqLen, numBlocks, rowStart);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void launchQsaIndexIdsFill(int32_t* ids, int32_t numRows, int32_t numBlocks, cudaStream_t stream)
-{
-    ELLM_CHECK(ids != nullptr, "launchQsaIndexIdsFill: null pointer argument");
-    ELLM_CHECK(numRows > 0 && numBlocks > 0, "launchQsaIndexIdsFill: invalid dimensions");
-
-    int64_t const numItems = static_cast<int64_t>(numRows) * numBlocks;
-    constexpr int32_t kBlockSize = 256;
-    int64_t const numBlocksLaunch = std::min<int64_t>((numItems + kBlockSize - 1) / kBlockSize, 65535);
-    qsaIndexIdsFillKernel<<<static_cast<uint32_t>(numBlocksLaunch), kBlockSize, 0, stream>>>(ids, numItems, numBlocks);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void launchQsaIndexExpand(int32_t* outIdx, int32_t const* sortedIds, int32_t const* contextLengths, int32_t batchSize,
-    int32_t seqLen, int32_t numBlocks, int32_t rowStart, int32_t numRows, cudaStream_t stream)
-{
-    ELLM_CHECK(outIdx != nullptr && sortedIds != nullptr && contextLengths != nullptr,
-        "launchQsaIndexExpand: null pointer argument");
-    ELLM_CHECK(batchSize > 0 && seqLen > 0 && numBlocks > 0, "launchQsaIndexExpand: invalid problem dimensions");
-    ELLM_CHECK(rowStart >= 0 && numRows > 0
-            && static_cast<int64_t>(rowStart) + numRows <= static_cast<int64_t>(batchSize) * seqLen,
-        "launchQsaIndexExpand: row chunk out of range");
-
-    dim3 const grid(static_cast<uint32_t>(numRows));
-    dim3 const block(256);
-    qsaIndexExpandKernel<<<grid, block, 0, stream>>>(outIdx, sortedIds, contextLengths, seqLen, numBlocks, rowStart);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-// Explicit instantiations for the supported activation types.
-template void launchQsaIndexQPrep<half>(
-    half*, half const*, float const*, int32_t const*, half const*, float, int32_t, int32_t, cudaStream_t);
-template void launchQsaIndexQPrep<__nv_bfloat16>(__nv_bfloat16*, __nv_bfloat16 const*, float const*, int32_t const*,
-    __nv_bfloat16 const*, float, int32_t, int32_t, cudaStream_t);
-
-template void launchQsaIndexKCompress<half>(half*, half const*, float const*, int32_t const*, half const*, float,
-    int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, cudaStream_t);
-template void launchQsaIndexKCompress<__nv_bfloat16>(__nv_bfloat16*, __nv_bfloat16 const*, float const*, int32_t const*,
-    __nv_bfloat16 const*, float, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, cudaStream_t);
-
-template void launchQsaIndexScores<half>(
-    float*, half const*, half const*, int32_t const*, int32_t, int32_t, int32_t, int32_t, int32_t, cudaStream_t);
-template void launchQsaIndexScores<__nv_bfloat16>(float*, __nv_bfloat16 const*, __nv_bfloat16 const*, int32_t const*,
-    int32_t, int32_t, int32_t, int32_t, int32_t, cudaStream_t);
-
-} // namespace kernel
-} // namespace trt_edgellm
