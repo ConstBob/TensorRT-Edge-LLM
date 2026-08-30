@@ -27,7 +27,7 @@ infrastructure and conventions.
 | `QsaAttentionPlugin`
 | link:../concepts/components/attention/[Attention]
 | Qwen Sparse Attention (QSA) prefill: fused RoPE/qk-norm/KV write, weight-free block indexer with top-512 selection, and sparse GQA over the selected tokens.
-| Qwen3.8-Flash-Next sparse-attention decoder layers (prefill v1).
+| Qwen3.8-Flash-Next sparse-attention decoder layers (prefill).
 
 | `ViTAttentionPlugin`
 | link:../concepts/components/attention/[Attention], link:../concepts/components/vision/[Vision]
