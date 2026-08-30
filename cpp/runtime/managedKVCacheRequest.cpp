@@ -56,7 +56,7 @@ std::optional<ManagedKVCacheRequest> ManagedKVCacheRequest::begin(ContextCacheCo
     {
         std::optional<ContextCacheRequest> admitted
             = ContextCacheRequest::begin(
-                *contextCache, request, context, speculativeRequest, headroom, tokenStateContract, commitPolicy, mediaTokenIds);
+                *contextCache, request, context, speculativeRequest, headroom, mediaTokenIds, tokenStateContract, commitPolicy);
         if (!admitted.has_value())
         {
             return std::nullopt;

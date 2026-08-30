@@ -360,6 +360,35 @@ TEST_F(ContextCacheRequestTests, AdmissionUsesValidatedCoordinatorContract)
     ASSERT_TRUE(vanilla->finish());
 }
 
+TEST_F(ContextCacheRequestTests, FullyCommittedContractPublishesOnlyPromptState)
+{
+    DecodingInferenceContext context = makeContext({makeTokens(kTOKENS_PER_PAGE)}, mStream);
+    LLMGenerationRequest requestConfig{};
+    std::optional<ContextCacheRequest> request = ContextCacheRequest::begin(*mCoordinator, requestConfig, context,
+        /*speculativeRequest=*/false, DecodingKvHeadroom{1, 0}, {},
+        DecodingTokenStateContract::kFullyCommitted, ContextCacheCommitPolicy::kPrefillStateOnly);
+    ASSERT_TRUE(request.has_value());
+
+    ASSERT_TRUE(request->preparePrefill());
+    context.tokenIds[0] = context.rawBatchedInputIds[0];
+    context.effectivePrefillLengths[0] = static_cast<int32_t>(context.tokenIds[0].size());
+    ASSERT_TRUE(request->enqueuePrefillCaptures());
+    ASSERT_EQ(cudaStreamSynchronize(context.stream), cudaSuccess);
+    ASSERT_TRUE(request->completePrefill(context, {}));
+    ContextCacheMetrics const afterPrefill = mCoordinator->metrics();
+    EXPECT_GT(afterPrefill.publicationAttempts, 0U);
+
+    ASSERT_TRUE(request->prepareDecodeStep(context, DecodingKvHeadroom{1, 0}));
+    context.tokenIds[0].push_back(9101);
+    context.tokenIds[0].push_back(9102);
+    context.currentGenerateLengths[0] = 2;
+    context.finishedStates[0] = 1;
+    context.slotStreams[0].terminalReason = FinishReason::kLength;
+    ASSERT_TRUE(request->completeDecodeStep(context, {}));
+    EXPECT_EQ(mCoordinator->metrics().publicationAttempts, afterPrefill.publicationAttempts);
+    ASSERT_TRUE(request->finish());
+}
+
 TEST_F(ContextCacheRequestTests, HostImageKeysThePlaceholderRunOnItsPixels)
 {
     DecodingInferenceContext context = makeContext({makeImageTokens()}, mStream);

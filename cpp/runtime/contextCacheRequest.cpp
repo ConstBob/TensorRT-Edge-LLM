@@ -199,9 +199,8 @@ bool contextCacheOperationSucceeded(ContextCacheCoordinatorStatus status, char c
 
 std::optional<ContextCacheRequest> ContextCacheRequest::begin(ContextCacheCoordinator& coordinator,
     LLMGenerationRequest const& request, DecodingInferenceContext const& context, bool speculativeRequest,
-    DecodingKvHeadroom const& headroom, DecodingTokenStateContract tokenStateContract,
-    ContextCacheCommitPolicy commitPolicy,
-    std::vector<int32_t> const& mediaTokenIds)
+    DecodingKvHeadroom const& headroom, std::vector<int32_t> const& mediaTokenIds,
+    DecodingTokenStateContract tokenStateContract, ContextCacheCommitPolicy commitPolicy)
 {
     static std::vector<imageUtils::ImageData> const kEmptyImageBuffers;
     static std::vector<audioUtils::AudioData> const kEmptyAudioBuffers;
