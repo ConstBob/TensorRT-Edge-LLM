@@ -256,6 +256,14 @@ block 8, block 16 is also supported, and DFlash2 does not support DDTree.
 | [deepseek-ai/dspark_qwen3_4b_block7](https://huggingface.co/deepseek-ai/dspark_qwen3_4b_block7) | [Qwen/Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) |
 | [deepseek-ai/dspark_qwen3_8b_block7](https://huggingface.co/deepseek-ai/dspark_qwen3_8b_block7) | [Qwen/Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) |
 | [deepseek-ai/dspark_gemma4_12b_block7](https://huggingface.co/deepseek-ai/dspark_gemma4_12b_block7) | [google/gemma-4-12B-it](https://huggingface.co/google/gemma-4-12B-it) |
+| [nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark) | [nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4) |
+
+The Nemotron-3.5-Lightning DSpark draft differs from the DeepSpec block7 drafts
+above: it uses a block size of 8, sliding-window attention (1024) with a learned
+per-head attention sink, and causal proposal attention. Because the sliding
+window is baked into the draft engine as the contiguous-query XQA variant, this
+draft supports chain drafting only — `--specDraftTopK > 1` (DDTree) is rejected
+at runtime.
 
 ### JetSpec Draft Models
 

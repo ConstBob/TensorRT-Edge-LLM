@@ -1134,15 +1134,17 @@ def _export_llm(model_dir: str,
             logger.exception("[LLM] ONNX export failed")
             raise SystemExit(1) from exc
 
-        # DFlash: the draft's proposal query embeds the mask token via this base
-        # engine's shared embedding table, so fold the draft's trained mask row
-        # into it (no-op when the row is shared with the base).
-        if dflash_draft_dir and world == 1:
+        # DFlash / DSpark: the draft's proposal query embeds the mask token via
+        # this base engine's shared embedding table, so fold the draft's trained
+        # mask row into it (no-op when the row is shared with the base).
+        cached_draft_dir = dflash_draft_dir or dspark_draft_dir
+        if cached_draft_dir and world == 1:
             from ..checkpoint.checkpoint_utils import _runtime_embedding_scale
             _patch_dflash_mask_embedding(
                 llm_out_dir,
-                dflash_draft_dir,
-                embedding_scale=_runtime_embedding_scale(model))
+                cached_draft_dir,
+                embedding_scale=_runtime_embedding_scale(model),
+                label="DFlash" if dflash_draft_dir else "DSpark")
 
         # Free this rank's model before building the next one
         del model
@@ -1566,8 +1568,11 @@ def _export_jetspec_draft(model_dir: str,
 
 def _patch_dflash_mask_embedding(llm_out_dir: str,
                                  dflash_draft_dir: str,
-                                 embedding_scale: float = 1.0) -> None:
-    """Fold the DFlash draft's trained mask-token embedding into the base sidecar.
+                                 embedding_scale: float = 1.0,
+                                 label: str = "DFlash") -> None:
+    """Fold a cached draft's trained mask-token embedding into the base sidecar.
+
+    Shared by DFlash and DSpark, which use the same cached-draft contract.
 
     The runtime embeds the draft proposal query ``[anchor, mask, ...]`` by
     looking ``mask_token_id`` up in the base engine's shared
@@ -1586,16 +1591,18 @@ def _patch_dflash_mask_embedding(llm_out_dir: str,
 
     emb_path = os.path.join(llm_out_dir, "embedding.safetensors")
     if not os.path.exists(emb_path):
-        logger.warning("[DFlash] %s missing; cannot fold draft mask embedding",
-                       emb_path)
+        logger.warning("[%s] %s missing; cannot fold draft mask embedding",
+                       label, emb_path)
         return
 
     draft_cfg = _load_config(dflash_draft_dir)
-    dcfg = draft_cfg.get("dflash_config", {}) or {}
+    dcfg = (draft_cfg.get("dspark_config") or draft_cfg.get("dflash_config")
+            or {})
     mask_id = dcfg.get("mask_token_id", draft_cfg.get("mask_token_id"))
     if mask_id is None:
-        logger.warning("[DFlash] draft config has no mask_token_id; skipping "
-                       "mask embedding fold")
+        logger.warning(
+            "[%s] draft config has no mask_token_id; skipping "
+            "mask embedding fold", label)
         return
     mask_id = int(mask_id)
 
@@ -1614,14 +1621,15 @@ def _patch_dflash_mask_embedding(llm_out_dir: str,
         if draft_vec is not None:
             break
     if draft_vec is None:
-        logger.info("[DFlash] draft checkpoint has no embed_tokens; mask "
-                    "embedding is shared with the base (no fold needed)")
+        logger.info(
+            "[%s] draft checkpoint has no embed_tokens; mask "
+            "embedding is shared with the base (no fold needed)", label)
         return
 
     with safe_open(emb_path, framework="pt", device="cpu") as f:
         if "embedding_scale" in set(f.keys()):
             raise ValueError(
-                "DFlash mask-embedding fold does not support FP8 "
+                label + " mask-embedding fold does not support FP8 "
                 "embedding.safetensors; re-export the base without "
                 "--fp8-embedding.")
         weight = f.get_tensor("embedding")
@@ -1632,8 +1640,8 @@ def _patch_dflash_mask_embedding(llm_out_dir: str,
                       atol=1e-3,
                       rtol=0.0):
         logger.info(
-            "[DFlash] draft mask embedding (id=%d) matches base; no fold needed",
-            mask_id)
+            "[%s] draft mask embedding (id=%d) matches base; no fold needed",
+            label, mask_id)
         return
 
     weight[mask_id] = patched_row
@@ -1644,8 +1652,8 @@ def _patch_dflash_mask_embedding(llm_out_dir: str,
     save_file({"embedding": weight.contiguous()}, tmp_path)
     os.replace(tmp_path, emb_path)
     logger.info(
-        "[DFlash] Folded draft mask embedding (id=%d) into base "
-        "embedding.safetensors", mask_id)
+        "[%s] Folded draft mask embedding (id=%d) into base "
+        "embedding.safetensors", label, mask_id)
 
 
 _DSPARK_HEAD_TENSOR_KEYS = {
@@ -1655,18 +1663,36 @@ _DSPARK_HEAD_TENSOR_KEYS = {
     "confidence_bias": "confidence_head.proj.bias",
 }
 
+# Per-tensor NVFP4 scale companions. A quantized head weight ships as packed
+# uint8 [out, in//2] plus these; the runtime sidecar contract is dense FP16, so
+# the packed form is decoded here rather than at load time.
+_DSPARK_HEAD_SCALE_KEYS = {
+    "markov_w2": ("markov_head.markov_w2.weight_scale",
+                  "markov_head.markov_w2.weight_scale_2"),
+}
 
-def _load_dspark_head_tensors(draft_dir: str, required_keys: set[str]) -> dict:
+
+def _load_dspark_head_tensors(draft_dir: str,
+                              required_keys: set[str],
+                              group_size: int = 16) -> dict:
     """Load DSpark Markov/confidence sidecar tensors from safetensors shards."""
     import glob
 
+    import torch
     from safetensors import safe_open
+
+    from ..models.ops import nvfp4_dequantize
 
     shards = sorted(glob.glob(os.path.join(draft_dir, "*.safetensors")))
     if not shards:
         raise FileNotFoundError(f"No safetensors files found in {draft_dir}")
 
-    remaining = dict(_DSPARK_HEAD_TENSOR_KEYS)
+    wanted = dict(_DSPARK_HEAD_TENSOR_KEYS)
+    for scale_keys in _DSPARK_HEAD_SCALE_KEYS.values():
+        for idx, ckpt_key in enumerate(scale_keys):
+            wanted[f"__scale{idx}__{ckpt_key}"] = ckpt_key
+
+    remaining = dict(wanted)
     loaded: dict = {}
     source: dict = {}
     for shard in shards:
@@ -1686,6 +1712,46 @@ def _load_dspark_head_tensors(draft_dir: str, required_keys: set[str]) -> dict:
                         "dtype": str(tensor.dtype).replace("torch.", ""),
                     }
                     del remaining[save_name]
+
+    for save_name, (scale_key, scale2_key) in _DSPARK_HEAD_SCALE_KEYS.items():
+        weight = loaded.get(save_name)
+        if weight is None or weight.dtype not in (torch.uint8, torch.int8):
+            continue
+        scale = loaded.pop(f"__scale0__{scale_key}", None)
+        scale2 = loaded.pop(f"__scale1__{scale2_key}", None)
+        if scale is None or scale2 is None:
+            raise KeyError(
+                f"DSpark head tensor '{save_name}' is NVFP4-packed but "
+                f"'{scale_key}' / '{scale2_key}' are missing from the checkpoint."
+            )
+        loaded[save_name] = nvfp4_dequantize(weight, scale, scale2, group_size)
+        source[save_name].update({
+            "nvfp4_dequantized":
+            True,
+            "group_size":
+            group_size,
+            "packed_shape":
+            source[save_name]["shape"],
+            "shape":
+            list(loaded[save_name].shape),
+            "dtype":
+            str(loaded[save_name].dtype).replace("torch.", ""),
+        })
+
+    for key in [k for k in loaded if k.startswith("__scale")]:
+        del loaded[key]
+        source.pop(key, None)
+
+    # Any head tensor still byte-packed has no dequantization rule in
+    # _DSPARK_HEAD_SCALE_KEYS. Writing it to the sidecar would reinterpret packed
+    # nibbles as FP16, so fail loudly instead.
+    still_packed = sorted(name for name, tensor in loaded.items()
+                          if tensor.dtype in (torch.uint8, torch.int8))
+    if still_packed:
+        raise ValueError(
+            f"DSpark head tensor(s) {still_packed} are byte-packed but have no "
+            "entry in _DSPARK_HEAD_SCALE_KEYS; add the weight_scale / "
+            "weight_scale_2 keys for them before exporting this checkpoint.")
 
     missing_required = sorted(required_keys - loaded.keys())
     if missing_required:
@@ -1721,7 +1787,18 @@ def _export_dspark_sidecars(dspark_draft_dir: str, draft_out_dir: str) -> None:
     if enable_confidence:
         required.update({"confidence_weight", "confidence_bias"})
 
-    tensors, source = _load_dspark_head_tensors(dspark_draft_dir, required)
+    quant_cfg = cfg.get("quantization_config", {}) or {}
+    group_size = int(quant_cfg.get("group_size") or 16)
+    # _load_dspark_head_tensors only implements the NVFP4 block-scale layout.
+    # Another algorithm would still present as uint8/int8 and be silently
+    # misinterpreted, so reject it here.
+    quant_algo = str(quant_cfg.get("quant_algo") or "")
+    if quant_algo and "NVFP4" not in quant_algo.upper():
+        raise ValueError(
+            f"DSpark head export supports NVFP4-quantized Markov weights; "
+            f"draft checkpoint declares quant_algo={quant_algo!r}.")
+    tensors, source = _load_dspark_head_tensors(dspark_draft_dir, required,
+                                                group_size)
     out_tensors = _to_fp16(tensors)
     heads_path = os.path.join(draft_out_dir, "dspark_heads.safetensors")
     save_file(out_tensors, heads_path)

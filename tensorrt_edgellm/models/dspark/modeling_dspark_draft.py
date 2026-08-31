@@ -100,6 +100,22 @@ class MLP(nn.Module):
             self.up_proj(hidden_states))
 
 
+def _layer_uses_sliding_attention(config: ModelConfig, layer_idx: int) -> bool:
+    """Whether *layer_idx* runs sliding-window attention.
+
+    Falls back to the config-level window when the checkpoint ships no
+    per-layer labels, so drafts that only set ``sliding_window`` still apply it.
+    """
+    if config.sliding_window_size <= 0:
+        return False
+    labels = config.raw_layer_types or config.attention_layer_types
+    if not labels:
+        return True
+    if layer_idx >= len(labels):
+        return False
+    return labels[layer_idx] == "sliding_attention"
+
+
 # ---------------------------------------------------------------------------
 # DSpark Cached Attention Layer
 # ---------------------------------------------------------------------------
@@ -134,7 +150,11 @@ class DSparkCachedAttention(nn.Module):
             self.num_heads = config.num_attention_heads
             self.num_kv_heads = config.num_key_value_heads
             self.head_dim = config.head_dim
-            self.sliding_window_size = -1
+            # Non-Gemma4 drafts label every layer uniformly, so the config-level
+            # window applies to all of them when layer_types request sliding.
+            self.sliding_window_size = (config.sliding_window_size
+                                        if _layer_uses_sliding_attention(
+                                            config, layer_idx) else -1)
         self.attention_scale = config.attention_scaling
         self.hidden_size = config.hidden_size
 
@@ -165,6 +185,20 @@ class DSparkCachedAttention(nn.Module):
         self.k_norm = norm_cls(self.head_dim, eps=config.rms_norm_eps)
         self.v_norm = (Gemma4ValueRMSNorm(self.head_dim, config.rms_norm_eps)
                        if self.is_gemma4 and config.has_value_norm else None)
+
+        self._attention_sinks_list: list = []
+        if config.attention_sink_bias:
+            self.register_buffer("attention_sink_bias",
+                                 torch.zeros(self.num_heads,
+                                             dtype=torch.float32),
+                                 persistent=True)
+
+    def _capture_attention_sink_list(self) -> None:
+        """Mirror the loaded sink buffer into a plain Python list."""
+        sink = getattr(self, "attention_sink_bias", None)
+        if sink is not None:
+            self._attention_sinks_list = sink.detach().to(
+                torch.float32).cpu().flatten().tolist()
 
     def forward(
             self,
@@ -230,6 +264,14 @@ class DSparkCachedAttention(nn.Module):
                                     self.num_kv_heads * self.head_dim)
 
         # --- AttentionPlugin: proposal attention over full context ---
+        sink_kwargs = {}
+        if self.sliding_window_size > 0:
+            # The DSpark proposal block is a linear chain at consecutive
+            # positions, which is what the contiguous-query SWA variant assumes.
+            sink_kwargs["enable_contiguous_query_swa"] = 1
+        if self._attention_sinks_list:
+            sink_kwargs["attention_sinks"] = self._attention_sinks_list
+            sink_kwargs["enable_attention_sink"] = 1
         attn_4d, present_kv = attention_plugin(
             torch.cat([q, k_self, v_self], dim=-1),
             updated_kv,
@@ -249,7 +291,8 @@ class DSparkCachedAttention(nn.Module):
             skip_softmax_scale_factor=0.0,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
-            qkv_scales=[1.0, 1.0, 1.0])
+            qkv_scales=[1.0, 1.0, 1.0],
+            **sink_kwargs)
 
         # attn_4d: [B, BS, Hq, D] -> [B, BS, Hq*D]
         attn_output = attn_4d.reshape(batch_size, proposal_seq_len,
@@ -403,7 +446,10 @@ class DSparkDraftModel(nn.Module):
                               hidden_size,
                               bias=False,
                               module_name="fc")
-        if not isinstance(self.fc, FP16Linear):
+        self.fc_native_precision = getattr(config,
+                                           "dspark_fc_native_precision", False)
+        if not self.fc_native_precision and not isinstance(
+                self.fc, FP16Linear):
             raise ValueError(
                 "DSpark draft fc projector must remain dense FP16 for the "
                 "full-FP32 target-hidden projection. Exclude module 'fc' "
@@ -443,13 +489,16 @@ class DSparkDraftModel(nn.Module):
             (logits [B, BS, V], hidden_states [B, BS, H], present_key_values list)
         """
         # Project multi-layer hidden states: [B, L, Nl*H] -> [B, L, H]
-        # Qwen3-8B target_hidden can spike above abs=2e4 for some first-token
-        # channels. The visible pre-RMSNorm FC result must remain FP32; casting
-        # an already-overflowed FP16 FC output back to FP32 is too late.
-        bias = (self.fc.bias.to(torch.float32)
-                if self.fc.bias is not None else None)
-        h_delta_acc = F.linear(target_hidden_concat.to(torch.float32),
-                               self.fc.weight.to(torch.float32), bias)
+        if self.fc_native_precision:
+            h_delta_acc = self.fc(target_hidden_concat.to(torch.float16))
+        else:
+            # Qwen3-8B target_hidden can spike above abs=2e4 for some first-token
+            # channels. The visible pre-RMSNorm FC result must remain FP32; casting
+            # an already-overflowed FP16 FC output back to FP32 is too late.
+            bias = (self.fc.bias.to(torch.float32)
+                    if self.fc.bias is not None else None)
+            h_delta_acc = F.linear(target_hidden_concat.to(torch.float32),
+                                   self.fc.weight.to(torch.float32), bias)
         h_delta = self.hidden_norm(h_delta_acc).to(inputs_embeds.dtype)
 
         # Run through decoder layers

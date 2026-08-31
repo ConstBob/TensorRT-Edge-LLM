@@ -662,12 +662,14 @@ __global__ void dsparkConfidenceKernel(half const* __restrict__ draftHiddenState
     int32_t const* __restrict__ firstPrevTokens,                                   // [B]
     int32_t const* __restrict__ draftTokenIds,                                     // [B, P]
     float* __restrict__ confidenceScores,                                          // [B, P]
-    int32_t proposalLen, int32_t hiddenSize, int32_t markovRank, bool confidenceWithMarkov)
+    int32_t proposalLen, int32_t hiddenSize, int32_t markovRank, bool confidenceWithMarkov, int32_t hiddenStride,
+    int32_t hiddenOffset)
 {
     int32_t const step = blockIdx.x;
     int32_t const batchIdx = blockIdx.y;
     float localSum = 0.0F;
-    half const* hidden = draftHiddenStates + (static_cast<int64_t>(batchIdx) * proposalLen + step) * hiddenSize;
+    half const* hidden
+        = draftHiddenStates + (static_cast<int64_t>(batchIdx) * hiddenStride + step + hiddenOffset) * hiddenSize;
     for (int32_t idx = threadIdx.x; idx < hiddenSize; idx += blockDim.x)
     {
         localSum += __half2float(hidden[idx]) * __half2float(confidenceWeight[idx]);
@@ -781,7 +783,8 @@ __global__ void dsparkBuildMarkovLogitsKernel(float const* __restrict__ backbone
     int32_t const* __restrict__ firstPrevTokens,                                        // [B]
     int32_t const* __restrict__ draftTokenIds,                                          // [B, P]
     float* __restrict__ correctedLogits,                                                // [B, V]
-    int32_t step, int32_t proposalLen, int32_t vocabSize, int32_t markovRank)
+    int32_t step, int32_t proposalLen, int32_t vocabSize, int32_t markovRank, int32_t logitsStride,
+    int32_t logitsOffset)
 {
     int32_t const vocabBlockIdx = blockIdx.x;
     int32_t const batchIdx = blockIdx.y;
@@ -796,7 +799,8 @@ __global__ void dsparkBuildMarkovLogitsKernel(float const* __restrict__ backbone
     int32_t const prevToken
         = (step == 0) ? firstPrevTokens[batchIdx] : draftTokenIds[batchIdx * proposalLen + step - 1];
     half const* prevMarkov = markovW1 + static_cast<int64_t>(prevToken) * markovRank;
-    float const* stepLogits = backboneLogits + (static_cast<int64_t>(batchIdx) * proposalLen + step) * vocabSize;
+    float const* stepLogits
+        = backboneLogits + (static_cast<int64_t>(batchIdx) * logitsStride + step + logitsOffset) * vocabSize;
     half const* vocabMarkov = markovW2 + static_cast<int64_t>(vocabIdx) * markovRank;
 
     float bias = 0.0F;
@@ -844,7 +848,8 @@ __global__ void dsparkMarkovGreedyFusedKernel(float const* __restrict__ backbone
     int32_t const* __restrict__ firstPrevTokens,                                        // [B]
     unsigned long long* __restrict__ greedySlots,                                       // [B, P], zeroed per round
     float* __restrict__ stackedOut,                                                     // depth row base or nullptr
-    int64_t outBatchStride, int32_t step, int32_t proposalLen, int32_t vocabSize, int32_t markovRank)
+    int64_t outBatchStride, int32_t step, int32_t proposalLen, int32_t vocabSize, int32_t markovRank,
+    int32_t logitsStride, int32_t logitsOffset)
 {
     __shared__ half w1Shared[kMarkovFusedMaxRank];
     __shared__ unsigned long long warpBest[kMarkovFusedWarpsPerBlock];
@@ -862,7 +867,8 @@ __global__ void dsparkMarkovGreedyFusedKernel(float const* __restrict__ backbone
     int32_t const warpId = threadIdx.x / 32;
     int32_t const laneId = threadIdx.x % 32;
     int32_t const lanesUsed = markovRank / 8; // one 8-rank vector per lane
-    float const* stepLogits = backboneLogits + (static_cast<int64_t>(batchIdx) * proposalLen + step) * vocabSize;
+    float const* stepLogits
+        = backboneLogits + (static_cast<int64_t>(batchIdx) * logitsStride + step + logitsOffset) * vocabSize;
     int32_t const wordsPerRow = markovRank / 8;
 
     unsigned long long best = 0ULL;
@@ -968,7 +974,7 @@ __global__ void dsparkMarkovGreedyFusedFp8Kernel(float const* __restrict__ backb
     half const* __restrict__ w2RowScales, // [V]
     int32_t const* __restrict__ firstPrevTokens, unsigned long long* __restrict__ greedySlots,
     float* __restrict__ stackedOut, int64_t outBatchStride, int32_t step, int32_t proposalLen, int32_t vocabSize,
-    int32_t markovRank)
+    int32_t markovRank, int32_t logitsStride, int32_t logitsOffset)
 {
     __shared__ half w1Shared[kMarkovFusedMaxRank];
     __shared__ unsigned long long warpBest[kMarkovFusedWarpsPerBlock];
@@ -991,7 +997,8 @@ __global__ void dsparkMarkovGreedyFusedFp8Kernel(float const* __restrict__ backb
     int32_t const groupIdx = laneId / lanesPerToken;
     int32_t const rankBase = laneInGroup * 16;
     int32_t const vecsPerRow = lanesPerToken;
-    float const* stepLogits = backboneLogits + (static_cast<int64_t>(batchIdx) * proposalLen + step) * vocabSize;
+    float const* stepLogits
+        = backboneLogits + (static_cast<int64_t>(batchIdx) * logitsStride + step + logitsOffset) * vocabSize;
 
     int32_t const warpTokens = tokensPerWarpIter * kMarkovFusedTokensPerWarp;
     int32_t const warpTokenBase = blockIdx.x * (kMarkovFusedWarpsPerBlock * warpTokens) + warpId * warpTokens;
@@ -1335,7 +1342,7 @@ void dsparkComputeConfidenceAndProposalLengths(rt::Tensor const& draftHiddenStat
     rt::Tensor const& confidenceWeight, rt::Tensor const& confidenceBias, rt::Tensor const& firstPrevTokens,
     rt::Tensor const& draftTokenIds, rt::Tensor& confidenceScores, rt::Tensor& proposalLengths, int32_t batchSize,
     int32_t proposalLen, int32_t hiddenSize, int32_t markovRank, bool confidenceWithMarkov, float threshold,
-    int32_t minProposalLen, int32_t maxProposalLen, cudaStream_t stream)
+    int32_t minProposalLen, int32_t maxProposalLen, cudaStream_t stream, int32_t hiddenStride, int32_t hiddenOffset)
 {
     dim3 const confidenceGrid(proposalLen, batchSize);
     dsparkConfidenceKernel<<<confidenceGrid, kProbabilityBlockSize, 0, stream>>>(
@@ -1343,7 +1350,8 @@ void dsparkComputeConfidenceAndProposalLengths(rt::Tensor const& draftHiddenStat
         static_cast<half const*>(confidenceWeight.rawPointer()), static_cast<half const*>(confidenceBias.rawPointer()),
         static_cast<int32_t const*>(firstPrevTokens.rawPointer()),
         static_cast<int32_t const*>(draftTokenIds.rawPointer()), static_cast<float*>(confidenceScores.rawPointer()),
-        proposalLen, hiddenSize, markovRank, confidenceWithMarkov);
+        proposalLen, hiddenSize, markovRank, confidenceWithMarkov, hiddenStride > 0 ? hiddenStride : proposalLen,
+        hiddenOffset);
     CUDA_CHECK(cudaGetLastError());
     dsparkThresholdProposalLengthsKernel<<<batchSize, 1, 0, stream>>>(
         static_cast<float const*>(confidenceScores.rawPointer()), static_cast<int32_t*>(proposalLengths.rawPointer()),
@@ -1355,7 +1363,7 @@ void dsparkComputeConfidenceAndSPSProposalLengths(rt::Tensor const& draftHiddenS
     rt::Tensor const& confidenceWeight, rt::Tensor const& confidenceBias, rt::Tensor const& firstPrevTokens,
     rt::Tensor const& draftTokenIds, rt::Tensor& confidenceScores, rt::Tensor& proposalLengths, int32_t batchSize,
     int32_t proposalLen, int32_t hiddenSize, int32_t markovRank, bool confidenceWithMarkov, float survivalFloor,
-    int32_t minProposalLen, int32_t maxProposalLen, cudaStream_t stream)
+    int32_t minProposalLen, int32_t maxProposalLen, cudaStream_t stream, int32_t hiddenStride, int32_t hiddenOffset)
 {
     dim3 const confidenceGrid(proposalLen, batchSize);
     dsparkConfidenceKernel<<<confidenceGrid, kProbabilityBlockSize, 0, stream>>>(
@@ -1363,7 +1371,8 @@ void dsparkComputeConfidenceAndSPSProposalLengths(rt::Tensor const& draftHiddenS
         static_cast<half const*>(confidenceWeight.rawPointer()), static_cast<half const*>(confidenceBias.rawPointer()),
         static_cast<int32_t const*>(firstPrevTokens.rawPointer()),
         static_cast<int32_t const*>(draftTokenIds.rawPointer()), static_cast<float*>(confidenceScores.rawPointer()),
-        proposalLen, hiddenSize, markovRank, confidenceWithMarkov);
+        proposalLen, hiddenSize, markovRank, confidenceWithMarkov, hiddenStride > 0 ? hiddenStride : proposalLen,
+        hiddenOffset);
     CUDA_CHECK(cudaGetLastError());
     dsparkSPSProposalLengthsKernel<<<batchSize, 1, 0, stream>>>(
         static_cast<float const*>(confidenceScores.rawPointer()), static_cast<int32_t*>(proposalLengths.rawPointer()),
@@ -1374,7 +1383,8 @@ void dsparkComputeConfidenceAndSPSProposalLengths(rt::Tensor const& draftHiddenS
 void dsparkComputeConfidenceScores(rt::Tensor const& draftHiddenStates, rt::Tensor const& markovW1,
     rt::Tensor const& confidenceWeight, rt::Tensor const& confidenceBias, rt::Tensor const& firstPrevTokens,
     rt::Tensor const& draftTokenIds, rt::Tensor& confidenceScores, int32_t batchSize, int32_t proposalLen,
-    int32_t hiddenSize, int32_t markovRank, bool confidenceWithMarkov, cudaStream_t stream)
+    int32_t hiddenSize, int32_t markovRank, bool confidenceWithMarkov, cudaStream_t stream, int32_t hiddenStride,
+    int32_t hiddenOffset)
 {
     dim3 const confidenceGrid(proposalLen, batchSize);
     dsparkConfidenceKernel<<<confidenceGrid, kProbabilityBlockSize, 0, stream>>>(
@@ -1382,7 +1392,8 @@ void dsparkComputeConfidenceScores(rt::Tensor const& draftHiddenStates, rt::Tens
         static_cast<half const*>(confidenceWeight.rawPointer()), static_cast<half const*>(confidenceBias.rawPointer()),
         static_cast<int32_t const*>(firstPrevTokens.rawPointer()),
         static_cast<int32_t const*>(draftTokenIds.rawPointer()), static_cast<float*>(confidenceScores.rawPointer()),
-        proposalLen, hiddenSize, markovRank, confidenceWithMarkov);
+        proposalLen, hiddenSize, markovRank, confidenceWithMarkov, hiddenStride > 0 ? hiddenStride : proposalLen,
+        hiddenOffset);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1409,7 +1420,7 @@ void dsparkVanillaMarkovSample(rt::Tensor const& backboneLogits, rt::Tensor cons
     rt::Tensor const& firstPrevTokens, rt::Tensor const& proposalUniforms, rt::Tensor& draftTokenIds,
     rt::Tensor& draftProbabilities, rt::Tensor& correctedLogitsScratch, rt::Tensor& probabilityScratch,
     int32_t batchSize, int32_t proposalLen, int32_t vocabSize, int32_t markovRank, float temperature, int32_t topK,
-    float topP, cudaStream_t stream)
+    float topP, cudaStream_t stream, int32_t logitsStride, int32_t logitsOffset)
 {
     check::check(probabilityScratch.reshape({batchSize, vocabSize}), "Tensor reshape failed");
     int32_t const numVocabBlocks = dsparkMarkovPartialCount(vocabSize);
@@ -1424,7 +1435,8 @@ void dsparkVanillaMarkovSample(rt::Tensor const& backboneLogits, rt::Tensor cons
             static_cast<float const*>(backboneLogits.rawPointer()), static_cast<half const*>(markovW1.rawPointer()),
             static_cast<half const*>(markovW2.rawPointer()), static_cast<int32_t const*>(firstPrevTokens.rawPointer()),
             static_cast<int32_t const*>(draftTokenIds.rawPointer()),
-            static_cast<float*>(correctedLogitsScratch.rawPointer()), step, proposalLen, vocabSize, markovRank);
+            static_cast<float*>(correctedLogitsScratch.rawPointer()), step, proposalLen, vocabSize, markovRank,
+            logitsStride > 0 ? logitsStride : proposalLen, logitsOffset);
         CUDA_CHECK(cudaGetLastError());
 
         dsparkLogitsToProbabilities(
@@ -1446,7 +1458,8 @@ void dsparkVanillaMarkovSample(rt::Tensor const& backboneLogits, rt::Tensor cons
 
 void dsparkBuildMarkovLogits(rt::Tensor const& backboneLogits, rt::Tensor const& markovW1, rt::Tensor const& markovW2,
     rt::Tensor const& firstPrevTokens, rt::Tensor const& draftTokenIds, rt::Tensor& correctedLogitsScratch,
-    int32_t batchSize, int32_t step, int32_t proposalLen, int32_t vocabSize, int32_t markovRank, cudaStream_t stream)
+    int32_t batchSize, int32_t step, int32_t proposalLen, int32_t vocabSize, int32_t markovRank, cudaStream_t stream,
+    int32_t logitsStride, int32_t logitsOffset)
 {
     int32_t const numVocabBlocks = dsparkMarkovPartialCount(vocabSize);
     dim3 const markovGrid(numVocabBlocks, batchSize);
@@ -1454,7 +1467,8 @@ void dsparkBuildMarkovLogits(rt::Tensor const& backboneLogits, rt::Tensor const&
         static_cast<float const*>(backboneLogits.rawPointer()), static_cast<half const*>(markovW1.rawPointer()),
         static_cast<half const*>(markovW2.rawPointer()), static_cast<int32_t const*>(firstPrevTokens.rawPointer()),
         static_cast<int32_t const*>(draftTokenIds.rawPointer()),
-        static_cast<float*>(correctedLogitsScratch.rawPointer()), step, proposalLen, vocabSize, markovRank);
+        static_cast<float*>(correctedLogitsScratch.rawPointer()), step, proposalLen, vocabSize, markovRank,
+        logitsStride > 0 ? logitsStride : proposalLen, logitsOffset);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1466,7 +1480,7 @@ bool dsparkFusedGreedySupported(int32_t markovRank)
 void dsparkMarkovGreedyFusedStep(rt::Tensor const& backboneLogits, rt::Tensor const& markovW1,
     rt::Tensor const& markovW2, rt::Tensor const& firstPrevTokens, rt::Tensor& greedySlots, rt::Tensor* stackedLogits,
     int32_t stackedDepthRow, int32_t batchSize, int32_t step, int32_t proposalLen, int32_t vocabSize,
-    int32_t markovRank, cudaStream_t stream)
+    int32_t markovRank, cudaStream_t stream, int32_t logitsStride, int32_t logitsOffset)
 {
     check::check(dsparkFusedGreedySupported(markovRank), "fused greedy Markov step: unsupported markov rank");
     int32_t const numTokenBlocks = (vocabSize + kMarkovFusedBlockTokens - 1) / kMarkovFusedBlockTokens;
@@ -1487,7 +1501,7 @@ void dsparkMarkovGreedyFusedStep(rt::Tensor const& backboneLogits, rt::Tensor co
         static_cast<float const*>(backboneLogits.rawPointer()), static_cast<half const*>(markovW1.rawPointer()),
         static_cast<half const*>(markovW2.rawPointer()), static_cast<int32_t const*>(firstPrevTokens.rawPointer()),
         static_cast<unsigned long long*>(greedySlots.rawPointer()), stackedOut, outBatchStride, step, proposalLen,
-        vocabSize, markovRank);
+        vocabSize, markovRank, logitsStride > 0 ? logitsStride : proposalLen, logitsOffset);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1510,7 +1524,7 @@ void dsparkQuantizeMarkovW2Fp8(rt::Tensor const& markovW2, rt::Tensor& w2Fp8, rt
 void dsparkMarkovGreedyFusedStepFp8(rt::Tensor const& backboneLogits, rt::Tensor const& markovW1,
     rt::Tensor const& w2Fp8, rt::Tensor const& w2RowScales, rt::Tensor const& firstPrevTokens, rt::Tensor& greedySlots,
     rt::Tensor* stackedLogits, int32_t stackedDepthRow, int32_t batchSize, int32_t step, int32_t proposalLen,
-    int32_t vocabSize, int32_t markovRank, cudaStream_t stream)
+    int32_t vocabSize, int32_t markovRank, cudaStream_t stream, int32_t logitsStride, int32_t logitsOffset)
 {
     // lanesPerToken = markovRank / 16 must be a power of two: the kernel tiles a warp into
     // 32 / lanesPerToken lane groups and uses lanesPerToken-wide shuffle reductions, both of
@@ -1539,7 +1553,7 @@ void dsparkMarkovGreedyFusedStepFp8(rt::Tensor const& backboneLogits, rt::Tensor
         static_cast<uint4 const*>(w2Fp8.rawPointer()), static_cast<half const*>(w2RowScales.rawPointer()),
         static_cast<int32_t const*>(firstPrevTokens.rawPointer()),
         static_cast<unsigned long long*>(greedySlots.rawPointer()), stackedOut, outBatchStride, step, proposalLen,
-        vocabSize, markovRank);
+        vocabSize, markovRank, logitsStride > 0 ? logitsStride : proposalLen, logitsOffset);
     CUDA_CHECK(cudaGetLastError());
 #else
     check::check(false, "EDGELLM_DSPARK_W2_FP8 requires CUDA >= 11.8 (cuda_fp8.h unavailable).");

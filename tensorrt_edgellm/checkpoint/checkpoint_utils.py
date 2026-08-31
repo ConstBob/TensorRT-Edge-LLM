@@ -269,6 +269,29 @@ def load_checkpoint_config_dicts(
         if key not in llm and val is not None:
             llm[key] = val
 
+    # Sliding-window compatibility: HF attention configs (e.g. Qwen3Config) null
+    # out sliding_window unless the legacy use_sliding_window flag is set, but
+    # checkpoints on the newer convention declare per-layer "sliding_attention"
+    # in layer_types and omit that flag. The patch-back above only fills ABSENT
+    # keys, so the nulled window would survive. Treat layer_types as the
+    # authority and recover the raw value; a checkpoint that deliberately
+    # disables its window reports full_attention layers and is untouched.
+    if llm.get("sliding_window") is None:
+        for source in (llm, raw):
+            layer_types = source.get("layer_types")
+            if not isinstance(layer_types, list):
+                continue
+            if "sliding_attention" not in layer_types:
+                continue
+            raw_window = raw.get("sliding_window")
+            if raw_window is None:
+                sub = raw.get("text_config")
+                raw_window = sub.get("sliding_window") if isinstance(
+                    sub, dict) else None
+            if raw_window is not None:
+                llm["sliding_window"] = raw_window
+            break
+
     # VLM / transformers v5 rope compatibility: rope_scaling may be null
     # while rope_parameters carries the real config (transformers v5
     # convention), and either may live only in a nested sub-config
@@ -806,6 +829,9 @@ def build_runtime_llm_config_dict(
             config.dspark_confidence_head_with_markov,
             "markov_head_type": config.dspark_markov_head_type,
             "markov_rank": config.dspark_markov_rank,
+            "causal_head": bool(config.dspark_causal_proposal),
+            "contiguous_query_swa": bool(config.sliding_window_size > 0),
+            "sample_from_anchor": config.dspark_sample_from_anchor,
             "heads_file": "dspark_heads.safetensors",
             "heads_info_file": "dspark_heads_info.json",
         }
@@ -829,6 +855,7 @@ def build_runtime_llm_config_dict(
                 config.dspark_confidence_head_with_markov,
                 "markov_head_type": config.dspark_markov_head_type,
                 "markov_rank": config.dspark_markov_rank,
+                "sample_from_anchor": config.dspark_sample_from_anchor,
             },
         })
 
