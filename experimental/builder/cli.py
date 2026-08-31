@@ -156,7 +156,8 @@ def _speculative_build_plan(args: argparse.Namespace, bundle, components):
             args,
             spec_role=contracts.SpecRole.BASE.value,
             draft_model_dir=(draft_model_dir if args.spec_type
-                             in ("eagle3", "dflash", "dspark") else None),
+                             in ("eagle3", "dflash", "jetspec",
+                                 "dspark") else None),
             target_model_dir=None,
         )
         draft_args = _copy_args(
@@ -273,10 +274,11 @@ def _add_build_args(parser: argparse.ArgumentParser) -> None:
               ", ".join(contracts.component_build_order()) + "."))
     parser.add_argument(
         "--spec-type",
-        choices=("none", "eagle3", "mtp", "dflash", "dspark", "gemma4_mtp"),
+        choices=("none", "eagle3", "mtp", "dflash", "jetspec", "dspark",
+                 "gemma4_mtp"),
         default="none",
         help=("Build both speculative engines in this single invocation. "
-              "EAGLE3, DFlash, dSpark, and Gemma4 MTP also require "
+              "EAGLE3, DFlash, JetSpec, dSpark, and Gemma4 MTP also require "
               "--draft-model-dir."))
     parser.add_argument("--dense",
                         choices=("auto", "nvfp4-qdq", "fp16"),

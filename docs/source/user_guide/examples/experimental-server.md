@@ -85,7 +85,11 @@ invalidate its cached bundle. Python callers can perform cache maintenance with
 
 `--speculative-config` accepts `method`, `model`, and
 `num_speculative_tokens`. The base, draft, and auxiliary model components are
-built and cached as one paired runtime.
+built and cached as one paired runtime. When omitted, the server reads the
+proposal length from the draft checkpoint. For EAGLE3 and MTP,
+`num_speculative_tokens` is the number of sequential draft steps. For DFlash
+and JetSpec it is the proposal block size; for dSpark it is the number of
+proposal tokens, with one additional base-verification token.
 
 EAGLE3 example:
 
@@ -105,6 +109,15 @@ tensorrt-edgellm-serve Qwen/Qwen3.5-4B \
   '{"method":"dflash","model":"z-lab/Qwen3.5-4B-DFlash","num_speculative_tokens":3}'
 ```
 
+JetSpec example:
+
+```bash
+tensorrt-edgellm-serve Qwen/Qwen3-8B \
+  --cache-dir /data/edgellm-cache \
+  --speculative-config \
+  '{"method":"jetspec","model":"JetSpec/jetspec-qwen3-8b","num_speculative_tokens":16}'
+```
+
 dSpark example:
 
 ```bash
@@ -116,7 +129,13 @@ tensorrt-edgellm-serve Qwen/Qwen3-4B \
 
 For a checkpoint containing native MTP layers, select `mtp` without `model`.
 Gemma MTP instead supplies its separate assistant checkpoint as `model`. The
-`disable_spec_decode` request field can disable drafting for one request.
+server defaults MTP, DFlash, JetSpec, and dSpark to their linear contracts.
+Where the method supports branching, setting `--draft-top-k` above 1 selects
+its tree contract and causes the direct builder to compile matching tree-base
+inputs automatically. The
+`disable_spec_decode` request field can disable drafting for one request,
+except with a Gemma MTP verification engine; use a standalone target bundle
+for target-only Gemma inference.
 `logit_bias` remains active on the speculative path; native verification and
 fallback sampling honor it without forcing vanilla decoding.
 
@@ -249,7 +268,7 @@ either `fps` or `nframes`; the server samples the clip, validates the visual
 engine profile before decoding, and rejects frame lists that exceed its raw
 pre-pruning tubelet capacity.
 
-ASR-capable models expose transcription:
+ASR-capable autoregressive models expose transcription:
 
 ```bash
 curl -s http://localhost:8000/v1/audio/transcriptions \
@@ -259,6 +278,8 @@ curl -s http://localhost:8000/v1/audio/transcriptions \
 ```
 
 Uploads are limited to 25 MiB. The response format can be `json` or `text`.
+Nemotron-3.5-ASR is a non-autoregressive RNN-T model with a separate
+experimental server; see [Nemotron-3.5-ASR](../../developer_guide/models/nemotron3_5_asr.md).
 
 ### Omni Audio Output
 

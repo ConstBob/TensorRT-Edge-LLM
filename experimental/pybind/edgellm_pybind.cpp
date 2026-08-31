@@ -37,6 +37,9 @@
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/melSpectrogram.h"
+#ifdef EDGELLM_ENABLE_NEMOTRON_ASR
+#include "runtime/nemotronAsrRuntime.h"
+#endif
 #include "runtime/qwen3OmniTTSRuntime.h"
 #include "runtime/streaming.h"
 
@@ -254,10 +257,11 @@ public:
     PyLLMRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, int32_t draftTopK, int32_t draftStep,
         int32_t verifyTreeSize, std::string const& checkpointDir, std::string const& draftCheckpointDir,
-        ContextCacheConfig const& contextCacheConfig)
+        ContextCacheConfig const& contextCacheConfig, int32_t dflashBlockSize)
     {
         mPluginHandle = loadEdgellmPluginLib();
         SpecDecodeDraftingConfig draftingConfig{draftTopK, draftStep, verifyTreeSize};
+        draftingConfig.dflashBlockSize = dflashBlockSize;
         mRuntime = std::make_unique<LLMInferenceRuntime>(engineDir, multimodalEngineDir, loraWeightsMap, draftingConfig,
             mStream.get(), contextCacheConfig, checkpointDir, draftCheckpointDir);
     }
@@ -447,6 +451,47 @@ private:
     std::unique_ptr<Qwen3OmniTTSRuntime> mTtsRuntime;
     std::unique_ptr<Code2WavRunner> mCode2wavRunner;
 };
+
+#ifdef EDGELLM_ENABLE_NEMOTRON_ASR
+class PyNemotronAsrRuntime
+{
+public:
+    PyNemotronAsrRuntime(std::string const& engineDir, std::string const& tokenizerDir)
+    {
+        mPluginHandle = loadEdgellmPluginLib();
+        std::string const& tokenizer = tokenizerDir.empty() ? engineDir : tokenizerDir;
+        mRuntime = std::make_unique<NemotronAsrRuntime>(engineDir, tokenizer, mStream.get());
+    }
+
+    NemotronAsrRuntime::Result transcribe(std::string const& audioBytes, int32_t promptId)
+    {
+        constexpr int32_t kTargetSampleRate = 16000;
+        audio::AudioPCM pcm;
+        if (!audio::loadAudioBytes(
+                reinterpret_cast<uint8_t const*>(audioBytes.data()), audioBytes.size(), kTargetSampleRate, pcm))
+        {
+            throw std::runtime_error("Audio decode failed (unsupported container or corrupt bytes)");
+        }
+        int32_t const resolvedPromptId = promptId >= 0 ? promptId : mRuntime->defaultPromptId();
+        return mRuntime->transcribe(pcm, resolvedPromptId, mStream.get());
+    }
+
+    int32_t defaultPromptId() const
+    {
+        return mRuntime->defaultPromptId();
+    }
+
+    int64_t maxMelFrames() const
+    {
+        return mRuntime->maxMelFrames();
+    }
+
+private:
+    CudaStreamWrapper mStream;
+    std::unique_ptr<void, DlDeleter> mPluginHandle;
+    std::unique_ptr<NemotronAsrRuntime> mRuntime;
+};
+#endif
 
 imageUtils::ImageData loadImageFromPath(std::string const& path)
 {
@@ -881,11 +926,12 @@ PYBIND11_MODULE(_edgellm_runtime, m)
             py::arg("checkpoint_dir") = "", py::arg("context_cache_config") = ContextCacheConfig{},
             "Construct for vanilla (non-speculative) decoding")
         .def(py::init<std::string const&, std::string const&, std::unordered_map<std::string, std::string> const&,
-                 int32_t, int32_t, int32_t, std::string const&, std::string const&, ContextCacheConfig const&>(),
+                 int32_t, int32_t, int32_t, std::string const&, std::string const&, ContextCacheConfig const&,
+                 int32_t>(),
             py::arg("engine_dir"), py::arg("multimodal_engine_dir"), py::arg("lora_weights_map"),
             py::arg("draft_top_k"), py::arg("draft_step"), py::arg("verify_tree_size"), py::arg("checkpoint_dir") = "",
             py::arg("draft_checkpoint_dir") = "", py::arg("context_cache_config") = ContextCacheConfig{},
-            "Construct for speculative decoding")
+            py::arg("dflash_block_size") = 0, "Construct for speculative decoding")
         .def("handle_request", &PyLLMRuntime::handleRequest, py::arg("request"),
             py::call_guard<py::gil_scoped_release>(), "Process a generation request and return the response")
         .def("load_omni", &PyLLMRuntime::loadOmni, py::arg("talker_engine_dir"), py::arg("code_predictor_engine_dir"),
@@ -924,6 +970,23 @@ PYBIND11_MODULE(_edgellm_runtime, m)
             py::arg("audio_channel"), py::call_guard<py::gil_scoped_release>(),
             "Synthesize speech for text; PCM chunks stream to audio_channel; returns codec frame count")
         .def("get_speaker_names", &PyTTSRuntime::getSpeakerNames);
+
+#ifdef EDGELLM_ENABLE_NEMOTRON_ASR
+    py::class_<NemotronAsrRuntime::Result>(m, "NemotronAsrResult")
+        .def_readonly("tokens", &NemotronAsrRuntime::Result::tokens)
+        .def_readonly("text", &NemotronAsrRuntime::Result::text)
+        .def_readonly("num_mel_frames", &NemotronAsrRuntime::Result::numMelFrames)
+        .def_readonly("num_encoder_frames", &NemotronAsrRuntime::Result::numEncoderFrames)
+        .def_readonly("num_decode_steps", &NemotronAsrRuntime::Result::numDecodeSteps);
+
+    py::class_<PyNemotronAsrRuntime>(m, "NemotronAsrRuntime")
+        .def(py::init<std::string const&, std::string const&>(), py::arg("engine_dir"), py::arg("tokenizer_dir") = "",
+            py::call_guard<py::gil_scoped_release>())
+        .def("transcribe", &PyNemotronAsrRuntime::transcribe, py::arg("audio_bytes"), py::arg("prompt_id") = -1,
+            py::call_guard<py::gil_scoped_release>())
+        .def("default_prompt_id", &PyNemotronAsrRuntime::defaultPromptId)
+        .def_property_readonly("max_mel_frames", &PyNemotronAsrRuntime::maxMelFrames);
+#endif
 
     // ========================================================================
     // Builder: LLM

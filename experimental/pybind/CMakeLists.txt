@@ -116,9 +116,24 @@ find_package(
 find_package(pybind11 CONFIG REQUIRED)
 
 # ── Header include paths (from source tree) ───────────────────────────────
+set(NEMOTRON_ASR_DIR ${EDGELLM_ROOT}/experimental_models/nemotron3_5_asr/cpp)
+set(EDGELLM_NEMOTRON_ASR_RUNTIME)
+if(_PYBIND_STANDALONE)
+  find_library(
+    EDGELLM_NEMOTRON_ASR_RUNTIME
+    NAMES nemotronAsrExperimental
+    HINTS ${EDGELLM_BUILD_DIR}/experimental_models/nemotron3_5_asr/cpp
+    NO_DEFAULT_PATH)
+elseif(TARGET nemotronAsrExperimental)
+  set(EDGELLM_NEMOTRON_ASR_RUNTIME nemotronAsrExperimental)
+endif()
+
 set(EDGELLM_INCLUDE_DIRS
     ${EDGELLM_ROOT}/cpp ${EDGELLM_ROOT}/examples/multimodal
     ${EDGELLM_ROOT}/3rdParty/nlohmannJson/include ${EDGELLM_ROOT}/3rdParty/stb)
+if(EDGELLM_NEMOTRON_ASR_RUNTIME)
+  list(APPEND EDGELLM_INCLUDE_DIRS ${NEMOTRON_ASR_DIR})
+endif()
 
 # ── Build the pybind shared library ───────────────────────────────────────
 # device_link_stub.cu is an empty CUDA file that forces CMake to run the
@@ -153,6 +168,12 @@ endif()
 target_include_directories(_edgellm_runtime PRIVATE ${EDGELLM_INCLUDE_DIRS})
 target_include_directories(_edgellm_runtime SYSTEM PRIVATE ${CUDA_INCLUDE}
                                                            ${TRT_INCLUDE_DIR})
+if(EDGELLM_NEMOTRON_ASR_RUNTIME)
+  target_compile_definitions(_edgellm_runtime
+                             PRIVATE EDGELLM_ENABLE_NEMOTRON_ASR=1)
+  target_link_libraries(_edgellm_runtime
+                        PRIVATE ${EDGELLM_NEMOTRON_ASR_RUNTIME})
+endif()
 
 if(TARGET Python::Module)
   target_link_libraries(_edgellm_runtime PRIVATE Python::Module)
