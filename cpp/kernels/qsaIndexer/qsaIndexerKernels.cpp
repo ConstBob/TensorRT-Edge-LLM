@@ -127,8 +127,26 @@ public:
         key.sm = getSMVersion();
         key.dataType = dataType;
 
-        CUDA_CHECK(cudaFree(nullptr));
+        // Fast path: an already-loaded module must be reachable without any CUDA
+        // runtime call — TRT re-invokes onShapeChange (and thus the warmup) during
+        // CUDA-graph capture, where even cudaFree(nullptr) invalidates the capture.
+        // cuCtxGetCurrent is a pure query and capture-safe.
         CUcontext context{};
+        CUDA_DRIVER_CHECK(cuCtxGetCurrent(&context));
+        if (context != nullptr)
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            auto const existing = mModules.find(RegistryKey{context, key});
+            if (existing != mModules.end())
+            {
+                return existing->second;
+            }
+        }
+
+        // Slow path (first load): establish the context and compile. Illegal during
+        // graph capture by design — callers must warm up (ensureQsaIndexerKernelsLoaded
+        // / a non-captured enqueue) before capturing.
+        CUDA_CHECK(cudaFree(nullptr));
         CUDA_DRIVER_CHECK(cuCtxGetCurrent(&context));
         ELLM_CHECK(context != nullptr, "QSA indexer JIT module load requires a current CUDA context");
 
