@@ -487,11 +487,15 @@ def test_runtime_load_forwards_context_cache_config(monkeypatch, engine_type):
     llm._draft_top_k = 4
     llm._draft_step = 3
     llm._verify_tree_size = 8
+    llm._dflash_block_size = 0
     llm._context_cache_config = ContextCacheConfig(enabled=True,
                                                    max_records=23)
 
     llm._load_runtime()
 
-    native = captured["args"][-1]
+    native = captured["args"][-2 if engine_type ==
+                              EngineType.SPEC_DECODE else -1]
     assert native.enabled
     assert native.max_records == 23
+    if engine_type == EngineType.SPEC_DECODE:
+        assert captured["args"][-1] == 0

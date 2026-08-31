@@ -2285,22 +2285,28 @@ def _export_audio(model_dir: str,
 
 
 def _copy_asr_tokenizer(model_dir: str, out_dir: str) -> None:
-    """Copy the RNN-T tokenizer sidecar into the engine dir.
+    """Copy the RNN-T tokenizer and prompt metadata into the export dir.
 
     ``NemotronAsrRuntime`` detokenizes emitted RNN-T tokens with
     ``tokenizer.json`` (``tokenizer_config.json`` is optional — special-token
     config). Copying them here keeps the exported engine dir self-contained.
     """
     import shutil
-    for name in ("tokenizer.json", "tokenizer_config.json"):
+    required = ("tokenizer.json", "processor_config.json")
+    missing = [
+        name for name in required
+        if not os.path.isfile(os.path.join(model_dir, name))
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "Nemotron-3.5-ASR checkpoint is missing required runtime "
+            f"artifacts: {', '.join(missing)}")
+    for name in ("tokenizer.json", "tokenizer_config.json",
+                 "processor_config.json"):
         src = os.path.join(model_dir, name)
         if os.path.exists(src):
             shutil.copy2(src, os.path.join(out_dir, name))
             logger.info("[Audio] Copied %s", name)
-        elif name == "tokenizer.json":
-            logger.warning(
-                "[Audio] %s not found in checkpoint — the RNN-T runtime "
-                "needs it to detokenize.", name)
 
 
 # ---------------------------------------------------------------------------

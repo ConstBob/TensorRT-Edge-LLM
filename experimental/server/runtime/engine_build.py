@@ -52,6 +52,7 @@ class BuildOptions:
     max_image_tokens_per_image: Optional[int] = None
     tp_size: Optional[int] = None
     plugin_path: str = ""
+    tree_base: bool = False
 
     @property
     def builder_spec_type(self) -> str:
@@ -78,6 +79,8 @@ class BuildOptions:
             argv += ["--draft-model-dir", self.draft_model_dir]
         if self.plugin_path:
             argv += ["--plugin-path", self.plugin_path]
+        if self.tree_base:
+            argv.append("--tree-base")
         for flag, value in (
             ("--max-input-len", self.max_input_len),
             ("--max-kv-cache-capacity", self.max_kv_cache_capacity),

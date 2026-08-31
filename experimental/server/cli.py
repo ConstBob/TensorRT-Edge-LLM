@@ -18,7 +18,7 @@ import logging
 
 from .api.app import run_http_server
 from .config import ServerConfigError, parse_server_config
-from .runtime.engine import LLM
+from .runtime.engine import load_model
 from .runtime.engine_client import EngineClient
 
 
@@ -33,7 +33,7 @@ def main() -> None:
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    llm = LLM(**config.model.llm_kwargs())
+    llm = load_model(**config.model.llm_kwargs())
     client = EngineClient(llm, config.api)
     logging.getLogger("edgellm.server").info(
         "Loaded model=%s max_model_len=%s kv_cache_dtype=%s "

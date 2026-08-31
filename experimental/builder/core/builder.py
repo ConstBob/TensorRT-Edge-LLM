@@ -193,18 +193,21 @@ class BuildArgs:
                 raise ValueError("speculative roles require --spec-type")
         elif self.spec_type != "none":
             raise ValueError("--spec-type requires --spec-role base or draft")
-        if self.tree_base and not (self.resolved_spec_role
-                                   == contracts.SpecRole.BASE
-                                   and self.spec_type in ("mtp", "dflash")):
+        if self.tree_base and not (
+                self.resolved_spec_role == contracts.SpecRole.BASE
+                and self.spec_type in ("mtp", "dflash", "jetspec")):
             raise ValueError(
-                "--tree-base is only valid for an MTP or DFlash base engine")
+                "--tree-base is only valid for an MTP, DFlash, or JetSpec base engine"
+            )
         if self.draft_reduced_vocab_dir and not (
                 self.resolved_spec_role == contracts.SpecRole.DRAFT
-                and self.spec_type == "dflash"):
+                and self.spec_type in ("dflash", "jetspec")):
             raise ValueError(
-                "--draft-reduced-vocab-dir is only valid for a DFlash draft")
+                "--draft-reduced-vocab-dir is only valid for a DFlash or JetSpec draft"
+            )
         paired_base = (self.resolved_spec_role == contracts.SpecRole.BASE
-                       and self.spec_type in ("eagle3", "dflash", "dspark"))
+                       and self.spec_type
+                       in ("eagle3", "dflash", "jetspec", "dspark"))
         if paired_base and not self.draft_model_dir:
             raise ValueError(
                 f"{self.spec_type} base requires --draft-model-dir for pairing"
@@ -221,7 +224,8 @@ class BuildArgs:
                 "--target-model-dir is only valid for a paired draft engine")
         if (self.reduced_vocab_dir
                 and self.resolved_spec_role == contracts.SpecRole.BASE
-                and self.spec_type in ("dflash", "dspark", "gemma4_mtp")):
+                and self.spec_type
+                in ("dflash", "jetspec", "dspark", "gemma4_mtp")):
             raise ValueError(
                 f"{self.spec_type} base engines require the full vocabulary")
         if self.fp8_embedding and self.resolved_spec_role == contracts.SpecRole.DRAFT:
@@ -583,7 +587,7 @@ def _setup_llm_profiles(builder, config, network, cfg: DeviceConfig,
     generation_sequence_max = args.profile_limits.generation_sequence_max(
         args.resolved_spec_role)
     if (args.resolved_spec_role == contracts.SpecRole.DRAFT
-            and args.spec_type in ("dflash", "dspark")):
+            and args.spec_type in ("dflash", "jetspec", "dspark")):
         draft = args.max_draft_tree_size
         set_profile_shapes("inputs_embeds", (1, 1, embed_width),
                            (maxB, draft, embed_width),
@@ -616,8 +620,12 @@ def _setup_llm_profiles(builder, config, network, cfg: DeviceConfig,
     # context_lengths [B]
     set_profile_shapes("context_lengths", (1, ), (maxB, ), (maxB, ))
 
-    # kvcache_start_index [B] -- context min 0 (prefill from empty), gen min 1
-    set_profile_shapes("kvcache_start_index", (0, ), (maxB, ), (maxB, ),
+    # Draft cache updates require one start position per K/V delta batch.
+    block_draft = (args.resolved_spec_role == contracts.SpecRole.DRAFT
+                   and args.spec_type in ("dflash", "jetspec", "dspark"))
+    context_start_min = (1, ) if block_draft else (0, )
+    set_profile_shapes("kvcache_start_index",
+                       context_start_min, (maxB, ), (maxB, ),
                        generation_min=(1, ),
                        generation_opt=(maxB, ),
                        generation_max=(maxB, ))
@@ -683,7 +691,7 @@ def _setup_llm_profiles(builder, config, network, cfg: DeviceConfig,
     set_profile_shapes("attention_pos_id", (1, 1), (maxB, 1),
                        (maxB, tree_size))
     if (args.resolved_spec_role == contracts.SpecRole.DRAFT
-            and args.spec_type in ("dflash", "dspark")):
+            and args.spec_type in ("dflash", "jetspec", "dspark")):
         draft = args.max_draft_tree_size
         set_profile_shapes(
             "attention_mask", (1, 1, 1),
@@ -715,10 +723,11 @@ def _setup_llm_profiles(builder, config, network, cfg: DeviceConfig,
     set_profile_shapes("dflash_delta_lengths", (1, ), (maxB, ), (maxB, ))
     dflash_width = fixed_dim("dflash_target_hidden_concat", -1, H)
     if (args.resolved_spec_role == contracts.SpecRole.DRAFT
-            and args.spec_type in ("dflash", "dspark")):
-        generation_hidden = args.max_draft_tree_size
+            and args.spec_type in ("dflash", "jetspec", "dspark")):
+        generation_hidden = args.max_draft_tree_size + 1
         if args.spec_type == "dspark":
-            generation_hidden = args.max_verify_tree_size
+            generation_hidden = max(generation_hidden,
+                                    args.max_verify_tree_size)
         set_profile_shapes("dflash_target_hidden_concat", (1, 1, dflash_width),
                            (maxB, max(1, maxIn // 2), dflash_width),
                            (maxB, maxIn, dflash_width),

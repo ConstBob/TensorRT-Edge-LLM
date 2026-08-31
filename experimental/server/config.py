@@ -70,10 +70,10 @@ class SpeculativeConfig:
                                     ", ".join(unsupported))
 
         method = raw.get("method")
-        if method not in {"eagle3", "mtp", "dflash", "dspark"}:
+        if method not in {"eagle3", "mtp", "dflash", "jetspec", "dspark"}:
             raise ServerConfigError(
                 "--speculative-config.method must be one of eagle3, mtp, "
-                "dflash, or dspark")
+                "dflash, jetspec, or dspark")
         num_tokens = raw.get("num_speculative_tokens")
         if num_tokens is not None and (isinstance(num_tokens, bool)
                                        or not isinstance(num_tokens, int)
@@ -87,7 +87,8 @@ class SpeculativeConfig:
             raise ServerConfigError(
                 "--speculative-config.model must be a checkpoint path or "
                 "Hugging Face model ID")
-        if method in {"eagle3", "dflash", "dspark"} and not draft_model:
+        if method in {"eagle3", "dflash", "jetspec", "dspark"
+                      } and not draft_model:
             raise ServerConfigError(
                 f"--speculative-config.method {method!r} requires "
                 "speculative-config.model")
@@ -170,9 +171,9 @@ class ModelConfig:
     max_input_len: int = 4096
     max_batch_size: int = 1
     max_kv_cache_capacity: int = 8192
-    draft_top_k: int = 10
-    draft_step: int = 6
-    verify_tree_size: int = 60
+    draft_top_k: Optional[int] = None
+    draft_step: Optional[int] = None
+    verify_tree_size: Optional[int] = None
     speculative_config: Optional[SpeculativeConfig] = None
     context_cache_config: ContextCacheConfig = field(
         default_factory=ContextCacheConfig)
@@ -321,9 +322,9 @@ def create_argument_parser() -> argparse.ArgumentParser:
     model.add_argument("--max-kv-cache-capacity",
                        type=_positive_int,
                        default=8192)
-    model.add_argument("--draft-top-k", type=_positive_int, default=10)
-    model.add_argument("--draft-step", type=_positive_int, default=6)
-    model.add_argument("--verify-tree-size", type=_positive_int, default=60)
+    model.add_argument("--draft-top-k", type=_positive_int)
+    model.add_argument("--draft-step", type=_positive_int)
+    model.add_argument("--verify-tree-size", type=_positive_int)
     model.add_argument("--speculative-config", default="")
     model.add_argument(
         "--enable-context-reuse",
@@ -353,9 +354,10 @@ def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
         raise ServerConfigError("--queue-timeout must be positive")
 
     speculative = SpeculativeConfig.parse(args.speculative_config)
-    draft_step = (speculative.num_speculative_tokens if speculative
-                  and speculative.num_speculative_tokens is not None else
-                  args.draft_step)
+    draft_step = args.draft_step
+    if (speculative and speculative.method in {"eagle3", "mtp"}
+            and speculative.num_speculative_tokens is not None):
+        draft_step = speculative.num_speculative_tokens
     context_cache = ContextCacheConfig(
         enabled=args.enable_context_reuse,
         max_records=args.context_cache_max_records,
