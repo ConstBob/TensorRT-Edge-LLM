@@ -84,6 +84,9 @@ l0_super_thor:
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_pipeline_super_thor
     EDGELLM_NCCL_SO_PATH: "$EDGE_LLM_CACHE_DIR/nccl/tegra-thor/lib/libnccl.so.2.29.2"
+    # test_build_and_run validates this before it runs. The quantized checkpoint
+    # itself still resolves through EDGELLM_DATA_DIR.
+    LLM_MODELS_DIR: "$EDGE_LLM_CACHE_DIR/models"
     L0_JOB_WRITES_ENGINES: "1"
     ENABLE_MULTI_DEVICE: "ON"
     ENABLE_MULTI_DEVICE_MPI: "ON"
