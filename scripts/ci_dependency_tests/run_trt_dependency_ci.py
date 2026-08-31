@@ -499,14 +499,13 @@ def _cute_dsl_cmake_args(architecture: Arch, compute_capability: str,
         CMake arguments selecting the supported CuTeDSL kernel groups and
         matching prebuilt artifact.
     """
+    cmake_args = ["-DENABLE_CUTE_DSL=ALL"]
+    artifact_tag = None
     if architecture is Arch.D7L:
-        return [
-            "-DENABLE_CUTE_DSL=fmha;fmha_v2;ffpa;gdn;gemm;ssd",
-            "-DCUTE_DSL_ARTIFACT_TAG=sm_110",
-        ]
-    cmake_args = ["-DENABLE_CUTE_DSL=ffpa;fmha_v2;gdn;gemm;int4_fp16_gemm;ssd"]
-    if native_x86:
+        artifact_tag = "sm_110"
+    elif native_x86:
         artifact_tag = f"sm_{compute_capability.replace('.', '')}"
+    if artifact_tag is not None:
         cmake_args.append(f"-DCUTE_DSL_ARTIFACT_TAG={artifact_tag}")
     return cmake_args
 
