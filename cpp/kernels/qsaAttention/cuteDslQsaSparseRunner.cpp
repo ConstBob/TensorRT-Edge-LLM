@@ -45,8 +45,6 @@ constexpr int32_t kQsaMaxGroupSize{16};
 
 bool isQsaSm(int32_t smVersion)
 {
-    // 100 is the B100-class target; 101 covers Thor after applyThorSMRenumberWAR (and
-    // CUDA-12 toolkits that report Thor as SM101 natively) — same convention as isFMHAV2SM.
     return smVersion == 100 || smVersion == 101 || smVersion == 110;
 }
 

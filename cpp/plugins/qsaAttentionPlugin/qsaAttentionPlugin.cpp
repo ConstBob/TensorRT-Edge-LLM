@@ -610,9 +610,10 @@ int32_t QsaAttentionPlugin::onShapeChange([[maybe_unused]] PluginTensorDesc cons
     [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] PluginTensorDesc const* out,
     [[maybe_unused]] int32_t nbOutputs) noexcept
 {
-    // The indexer kernels are NVRTC-compiled and driver-loaded lazily on first launch. Warm
-    // them up here so a CUDA Graph capture of enqueue never observes those one-time
-    // host-side steps.
+    // Both kernel families load lazily on first use (the indexer via NVRTC + driver
+    // load, the CuTe-DSL sparse kernel via cudaLibraryLoad in preflight). Warm them up
+    // here so a CUDA Graph capture of enqueue never observes those one-time host-side
+    // steps.
     try
     {
         kernel::ensureQsaIndexerKernelsLoaded<half>();
@@ -620,6 +621,12 @@ int32_t QsaAttentionPlugin::onShapeChange([[maybe_unused]] PluginTensorDesc cons
     catch (std::exception const& e)
     {
         LOG_ERROR("QsaAttentionPlugin '%s' failed to JIT the QSA indexer kernels: %s", mLayerName.c_str(), e.what());
+        return -1;
+    }
+    CuteDslQsaSparsePrefillRunner runner(DataType::kHALF);
+    if (!runner.preflight(nullptr))
+    {
+        LOG_ERROR("QsaAttentionPlugin '%s' failed to load the CuTe DSL sparse kernel module.", mLayerName.c_str());
         return -1;
     }
     return 0;
