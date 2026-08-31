@@ -129,6 +129,15 @@ Complete assembly requires every matrix row for the requested architecture and
 preserves the release-compatible wheel name. Missing, extra, stale, or
 revision-mismatched payloads are rejected.
 
+Final x86_64 wheels use `manylinux_2_35_x86_64`, matching the oldest selected
+Ubuntu 22.04 payload. Final aarch64 wheels use `manylinux_2_39_aarch64`, matching
+the Ubuntu 24.04 platform baseline of the configured Jetson, DRIVE, and DGX
+Spark payloads. The runtime selects one exact platform payload before loading
+native code, so newer mutually exclusive payloads do not raise the x86_64
+installation floor. Payload verification audits ELF architecture, dependencies,
+RPATHs, and target-library resolution before fan-in; release validation rejects
+other platform tags before Artifactory or Kitmaker.
+
 ## Low-level commands
 
 Every stage remains independently reviewable and usable for custom build

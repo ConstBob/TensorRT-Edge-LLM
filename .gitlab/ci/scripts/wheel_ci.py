@@ -21,7 +21,7 @@ import subprocess
 import sys
 import typing
 
-from wheel_ci_lib import build_jobs, integration, matrix
+from wheel_ci_lib import build_jobs, integration, matrix, release
 
 
 def _generate_ci_command(values: typing.Sequence[str]) -> None:
@@ -56,6 +56,14 @@ def main(values: typing.Optional[typing.Sequence[str]] = None) -> int:
         lambda args: _no_arguments(integration.integration_ci, args),
         "ci-integration-gate":
         lambda args: _no_arguments(integration.integration_gate, args),
+        "ci-release-validate":
+        lambda args: _no_arguments(release.ci_validate, args),
+        "ci-release-stage":
+        lambda args: _no_arguments(release.ci_stage, args),
+        "ci-release-rehearse":
+        lambda args: _no_arguments(release.ci_rehearse, args),
+        "ci-release-publish":
+        lambda args: _no_arguments(release.ci_publish, args),
     }
     if not arguments or arguments[0] not in commands:
         available = ", ".join(sorted(commands))

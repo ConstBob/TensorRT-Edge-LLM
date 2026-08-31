@@ -51,6 +51,15 @@ workflow:
     # Skip draft MRs completely
     - if: $CI_MERGE_REQUEST_TITLE =~ /^(\[Draft\]|\(Draft\)|Draft:)/
       when: never
+    # Run the complete non-publishing wheel release path only when a maintainer
+    # explicitly starts it from a protected rehearsal branch.
+    - if: >-
+        $CI_PIPELINE_SOURCE == "web" &&
+        $CI_COMMIT_BRANCH =~ /^rehearsal\// &&
+        $CI_COMMIT_REF_PROTECTED == "true" &&
+        $EDGELLM_WHEEL_RELEASE_REHEARSAL == "true"
+      variables:
+        EDGE_LLM_PIPELINE_NAME: "Wheel release rehearsal"
     # Run explicitly selected L1 pipelines, including existing schedules.
     - if: $L1 == "true"
       variables:
@@ -89,6 +98,7 @@ include:
   - local: '.gitlab/ci/cutedsl-jobs.yml'
   - local: '.gitlab/ci/wheel-jobs.yml'
   - local: '.gitlab/ci/wheel-generated.yml'
+  - local: '.gitlab/ci/wheel-release-jobs.yml'
   - local: '.gitlab/ci/l0-jobs.yml'
   - local: '.gitlab/ci/l1-jobs.yml'
   - local: '.gitlab/ci/sonar-jobs.yml'

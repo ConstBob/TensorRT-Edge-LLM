@@ -1,0 +1,172 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+.wheel_release_vault_identity:
+  variables:
+    VAULT_AUTH_PATH: jwt/nvidia/gitlab-master
+  id_tokens:
+    VAULT_ID_TOKEN:
+      aud: $VAULT_SERVER_URL
+
+.wheel_release_artifactory_secrets:
+  extends: [.wheel_release_vault_identity]
+  secrets:
+    ARTIFACTORY_USERNAME:
+      vault:
+        engine:
+          name: kv-v2
+          path: edge-llm/kv
+        path: release/pypi
+        field: artifactory_username
+      file: false
+      token: $VAULT_ID_TOKEN
+    ARTIFACTORY_TOKEN:
+      vault:
+        engine:
+          name: kv-v2
+          path: edge-llm/kv
+        path: release/pypi
+        field: artifactory_token
+      file: false
+      token: $VAULT_ID_TOKEN
+
+.wheel_release_kitmaker_secret:
+  extends: [.wheel_release_vault_identity]
+  secrets:
+    KITMAKER_API_TOKEN:
+      vault:
+        engine:
+          name: kv-v2
+          path: edge-llm/kv
+        path: release/kitmaker
+        field: api_token
+      file: false
+      token: $VAULT_ID_TOKEN
+
+.protected_release_or_rehearsal_rules:
+  rules:
+    - if: >-
+        $CI_COMMIT_BRANCH =~ /^release\// &&
+        $CI_COMMIT_REF_PROTECTED == "true"
+    - if: >-
+        $CI_PIPELINE_SOURCE == "web" &&
+        $CI_COMMIT_BRANCH =~ /^rehearsal\// &&
+        $CI_COMMIT_REF_PROTECTED == "true" &&
+        $EDGELLM_WHEEL_RELEASE_REHEARSAL == "true"
+    - when: never
+
+wheel_release_vault_smoke:
+  stage: precheck
+  extends:
+    - .wheel_release_artifactory_secrets
+    - .protected_release_or_rehearsal_rules
+  tags: [cpu-k8s]
+  image: python:3.12-bookworm
+  interruptible: true
+  script:
+    - test -n "$ARTIFACTORY_USERNAME"
+    - test -n "$ARTIFACTORY_TOKEN"
+    - echo "Vault Artifactory secrets resolved successfully."
+
+wheel_release_validate:
+  stage: publish
+  extends: [.wheel_rules]
+  tags: [cpu-general-k8s]
+  image: python:3.12-bookworm
+  interruptible: true
+  needs:
+    - job: wheel_assemble_x86
+      artifacts: true
+    - job: wheel_assemble_aarch64
+      artifacts: true
+    - job: wheel_integration_gate
+      artifacts: true
+  script:
+    - sh .gitlab/ci/scripts/wheel_ci.sh ci-release-validate
+  artifacts:
+    paths: [artifacts/release/release-manifest.json]
+    expire_in: 90 days
+
+wheel_release_stage:
+  stage: publish
+  extends:
+    - .wheel_release_artifactory_secrets
+    - .protected_release_or_rehearsal_rules
+  tags: [cpu-general-k8s]
+  image: python:3.12-bookworm
+  interruptible: false
+  needs:
+    - job: wheel_assemble_x86
+      artifacts: true
+    - job: wheel_assemble_aarch64
+      artifacts: true
+    - job: wheel_release_validate
+      artifacts: true
+    - job: wheel_release_vault_smoke
+  before_script:
+    - python -m pip install --disable-pip-version-check -r packaging/wheel-release-requirements.txt
+  script:
+    - sh .gitlab/ci/scripts/wheel_ci.sh ci-release-stage
+  artifacts:
+    when: always
+    paths:
+      - artifacts/release/staged-release-manifest.json
+      - artifacts/release/artifactory-verification.json
+    expire_in: 90 days
+
+wheel_release_rehearse:
+  stage: publish
+  extends: [.wheel_release_kitmaker_secret]
+  tags: [cpu-general-k8s]
+  image: python:3.12-bookworm
+  interruptible: false
+  resource_group: wheel-publication
+  environment:
+    name: wheel-publication-rehearsal
+  rules:
+    - if: >-
+        $CI_COMMIT_BRANCH =~ /^release\// &&
+        $CI_COMMIT_REF_PROTECTED == "true"
+      when: manual
+    - if: >-
+        $CI_PIPELINE_SOURCE == "web" &&
+        $CI_COMMIT_BRANCH =~ /^rehearsal\// &&
+        $CI_COMMIT_REF_PROTECTED == "true" &&
+        $EDGELLM_WHEEL_RELEASE_REHEARSAL == "true"
+      when: on_success
+    - when: never
+  needs:
+    - job: wheel_release_stage
+      artifacts: true
+  script:
+    - sh .gitlab/ci/scripts/wheel_ci.sh ci-release-rehearse
+  artifacts:
+    when: always
+    paths: [artifacts/release/kitmaker-rehearsal-evidence.json]
+    expire_in: 90 days
+
+wheel_release_publish:
+  stage: publish
+  extends: [.wheel_release_kitmaker_secret]
+  tags: [cpu-general-k8s]
+  image: python:3.12-bookworm
+  interruptible: false
+  resource_group: wheel-publication
+  environment:
+    name: wheel-publication
+  rules:
+    - if: >-
+        $CI_COMMIT_BRANCH =~ /^release\// &&
+        $CI_COMMIT_REF_PROTECTED == "true" &&
+        $EDGELLM_RELEASE_AUTH_READY == "true"
+      when: manual
+    - when: never
+  needs:
+    - job: wheel_release_stage
+      artifacts: true
+  script:
+    - sh .gitlab/ci/scripts/wheel_ci.sh ci-release-publish
+  artifacts:
+    when: always
+    paths: [artifacts/release/]
+    expire_in: 90 days
