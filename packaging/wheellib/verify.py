@@ -39,6 +39,15 @@ _REQUIRED = set(CONTRACT.RUNTIME_VARIANT_FIELDS) | {
     "source_provenance_sha256",
     "submodule_revisions",
 }
+_GLIBC_BASELINES = {
+    ("ubuntu", "22.04"): (2, 35),
+    ("ubuntu", "24.04"): (2, 39),
+    ("jetson", "jp70"): (2, 39),
+    ("jetson", "jp71"): (2, 39),
+    ("jetson", "jp72"): (2, 39),
+    ("drive", "7.2"): (2, 39),
+    ("dgx-spark", "current"): (2, 39),
+}
 
 
 def _arguments(argv=None) -> argparse.Namespace:
@@ -151,6 +160,30 @@ def _audit_elf(path: Path, cpu_arch: str, allowed: Set[str]) -> Set[str]:
                 raise RuntimeError(
                     f"{path} contains non-relative RPATH entry {entry!r}.")
     return needed
+
+
+def _audit_glibc_symbols(path: Path, row: Mapping[str, Any]) -> None:
+    """Reject ELF symbols newer than the payload target platform."""
+    platform = (str(row["platform_family"]), str(row["platform_release"]))
+    try:
+        baseline = _GLIBC_BASELINES[platform]
+    except KeyError as error:
+        raise RuntimeError(
+            f"No reviewed GLIBC baseline for platform {platform}.") from error
+    versions = {
+        (int(major), int(minor))
+        for major, minor in re.findall(
+            r"\bGLIBC_(\d+)\.(\d+)\b",
+            _tool_output(["readelf", "--version-info",
+                          os.fspath(path)]),
+        )
+    }
+    required = max(versions, default=(0, 0))
+    if required > baseline:
+        raise RuntimeError(
+            f"{path} requires GLIBC {required[0]}.{required[1]}, newer than "
+            f"{platform[0]} {platform[1]} baseline "
+            f"{baseline[0]}.{baseline[1]}.")
 
 
 def _audit_device_images(path: Path, gpu_sm: int) -> None:
@@ -479,6 +512,8 @@ def _audit_binary_dependencies(payload: Mapping[str, Any], extension: Path,
             f"{sorted(platform_provided - allowed)}.")
     needed = _audit_elf(extension, str(payload["cpu_arch"]), allowed)
     needed.update(_audit_elf(plugin, str(payload["cpu_arch"]), allowed))
+    _audit_glibc_symbols(extension, row)
+    _audit_glibc_symbols(plugin, row)
     required_dsos = {
         payload["cuda_runtime_soname"], payload["tensorrt_runtime_soname"]
     }

@@ -35,6 +35,7 @@ ABI_INTERPRETERS = {
     "cp311": "python3.11",
     "cp312": "python3.12",
 }
+INTEGRATION_GATE_SCHEMA_VERSION = 2
 BUILD_ENVIRONMENT = {
     "TRT_PACKAGE_DIR": "ci_trt_package",
     "WHEEL_TOOLCHAIN_FILE": "ci_toolchain",

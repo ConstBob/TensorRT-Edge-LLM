@@ -375,19 +375,21 @@ def integration_gate() -> None:
         raise RuntimeError("Incomplete integration evidence: "
                            f"missing={sorted(set(expected) - set(found))}, "
                            f"extra={sorted(set(found) - set(expected))}.")
+    qualified_wheels = {}
     for key, value in found.items():
         row = expected[key]
         wheel = common.single_wheel(str(row["cpu_arch"]), key[1])
         _validate_integration_result(key, value, wheel)
+        digest = str(value["wheel_sha256"])
+        previous = qualified_wheels.setdefault(wheel.name, digest)
+        if previous != digest:
+            raise RuntimeError(
+                f"Integration evidence disagrees for {wheel.name}.")
     config.write_json(
         config.REPO_ROOT / "artifacts" / "integration" / "gate.json",
         {
-            "schema_version":
-            1,
-            "qualified_rows":
-            len(found),
-            "wheel_sha256":
-            sorted({value["wheel_sha256"]
-                    for value in found.values()}),
+            "schema_version": common.INTEGRATION_GATE_SCHEMA_VERSION,
+            "qualified_rows": len(found),
+            "qualified_wheels": dict(sorted(qualified_wheels.items())),
         },
     )

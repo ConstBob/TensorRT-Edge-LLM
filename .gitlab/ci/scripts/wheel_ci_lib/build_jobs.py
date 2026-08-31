@@ -211,13 +211,10 @@ def _assemble_wheel(cpu_arch: str, python_abi: str) -> None:
         "--output-dir",
         str(output),
     ])
-    wheel = common.single_wheel(cpu_arch, python_abi)
-    (output / "wheel.sha256").write_text(
-        f"{config.sha256(wheel)}  {wheel.name}\n", encoding="utf-8")
 
 
 def assemble_ci() -> None:
-    """Assemble and checksum one architecture's ABI wheels concurrently."""
+    """Assemble one architecture's ABI wheels concurrently."""
     cpu_arch = config.required_environment("WHEEL_ARCH")
     if cpu_arch not in {"x86_64", "aarch64"}:
         raise RuntimeError(f"Unsupported assembly architecture {cpu_arch!r}.")

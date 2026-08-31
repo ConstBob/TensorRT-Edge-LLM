@@ -50,7 +50,7 @@ directly.
 Install a locally built or downloaded wheel into a clean environment:
 
 ```bash
-export EDGELLM_WHEEL=/absolute/path/to/tensorrt_edgellm-0.10.0-cp312-cp312-linux_x86_64.whl
+export EDGELLM_WHEEL=/absolute/path/to/tensorrt_edgellm-0.10.0-cp312-cp312-manylinux_2_35_x86_64.whl
 python -m pip install "$EDGELLM_WHEEL"
 ```
 

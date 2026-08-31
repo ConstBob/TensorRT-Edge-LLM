@@ -6,6 +6,11 @@
     - if: $CI_TELEMETRY_CLEANUP == "1"
       when: never
     - if: $CI_COMMIT_BRANCH =~ /^release/
+    - if: >-
+        $CI_PIPELINE_SOURCE == "web" &&
+        $CI_COMMIT_BRANCH =~ /^rehearsal\// &&
+        $CI_COMMIT_REF_PROTECTED == "true" &&
+        $EDGELLM_WHEEL_RELEASE_REHEARSAL == "true"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       changes: &wheel_changes
         - .gitmodules
@@ -15,6 +20,8 @@
         - .gitlab/ci/scripts/wheel_ci.py
         - .gitlab/ci/scripts/wheel_ci_lib/**/*
         - .gitlab/ci/scripts/wheel_ci.sh
+        - .gitlab/ci/wheel-release-jobs.yml
+        - .gitlab/ci/tests/test_wheel_release.py
         - packaging/cmake/**/*
         - packaging/docker/**/*
         - packaging/wheellib/**/*
