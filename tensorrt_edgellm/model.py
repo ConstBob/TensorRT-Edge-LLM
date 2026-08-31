@@ -584,9 +584,18 @@ class AutoModel:
                 raise ValueError(
                     "dspark_draft requires dspark_draft_dir to be set.")
             from .models.dspark.modeling_dspark_draft import DSparkDraftModel
+            base_config = config
+            base_model_dir = model_dir
+            base_tie_word_embeddings = base_config.tie_word_embeddings
+            draft_has_lm_head = _checkpoint_has_dflash_lm_head(
+                dspark_draft_dir, _dspark_key_remap)
             config = make_dspark_draft_config(
                 dspark_draft_dir,
                 _default_attention_scale_for_model_dir(dspark_draft_dir))
+            if base_config.model_type == "nemotron_h":
+                config.dspark_fc_native_precision = True
+            if not draft_has_lm_head:
+                config = _inherit_dflash_lm_head_quant(config, base_config)
             model_class = DSparkDraftModel
             model_dir = dspark_draft_dir
             if key_remap is None:
@@ -685,8 +694,8 @@ class AutoModel:
             else:
                 apply_reduced_vocab_after_load = True
 
-        if variant in ("dflash_draft", "dflash2_draft",
-                       "jetspec_draft") and not draft_has_lm_head:
+        if variant in ("dflash_draft", "dflash2_draft", "jetspec_draft",
+                       "dspark_draft") and not draft_has_lm_head:
             next_pre_repack_hook = pre_repack_hook
 
             def _load_pre_repack_dflash_lm_head(loaded_model: nn.Module):
@@ -721,11 +730,14 @@ class AutoModel:
         refresh_router_bias = getattr(model, "refresh_fp32_router_bias", None)
         if callable(refresh_router_bias):
             refresh_router_bias()
-        if variant in ("dflash_draft", "dflash2_draft", "jetspec_draft"):
+        if variant in ("dflash_draft", "dflash2_draft", "jetspec_draft",
+                       "dspark_draft"):
             if draft_has_lm_head:
                 logging.getLogger(__name__).info(
-                    "%s lm_head source: draft checkpoint buffers",
-                    "JetSpec" if variant == "jetspec_draft" else "DFlash")
+                    "%s lm_head source: draft checkpoint buffers", {
+                        "jetspec_draft": "JetSpec",
+                        "dspark_draft": "DSpark",
+                    }.get(variant, "DFlash"))
         if apply_reduced_vocab_after_load:
             from .vocab_reduction.onnx_export import \
                 apply_reduced_vocab_from_dir
@@ -1115,12 +1127,17 @@ def _normalize_dflash_lm_head_tensor_shape(target_name: str, source, target):
         "lm_head=%s" % (target_name, source.shape, target.shape))
 
 
-def _checkpoint_has_dflash_lm_head(model_dir: str) -> bool:
-    """Return whether a DFlash draft checkpoint owns lm_head tensors."""
+def _checkpoint_has_dflash_lm_head(model_dir: str, key_remap=None) -> bool:
+    """Return whether a cached-draft checkpoint owns lm_head tensors.
+
+    ``key_remap`` defaults to the DFlash remap; DSpark passes its own so the
+    check runs against the same key view the loader will use.
+    """
     from .checkpoint.loader import _build_shard_map
 
+    remap = key_remap if key_remap is not None else _dflash_key_remap
     for key in _build_shard_map(model_dir):
-        mapped = _dflash_key_remap(key)
+        mapped = remap(key)
         if mapped is not None and mapped.startswith("lm_head."):
             return True
     return False

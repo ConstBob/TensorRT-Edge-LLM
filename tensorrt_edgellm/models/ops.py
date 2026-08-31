@@ -148,6 +148,14 @@ def attention_plugin(
     # Shape-only runtime policy selector for bounded-capable SWA layers. A
     # length of 1 selects bounded O(W) storage; length 0 selects full storage.
     swa_kv_cache_mode: Optional[torch.Tensor] = None,
+    # Per-Q-head learned attention sink logits, length == num_q_heads, ordered
+    # [num_kv_heads][q_heads_per_kv]. Default None so torch.export strips the
+    # kwarg for models without sinks.
+    attention_sinks: Optional[List[float]] = None,
+    enable_attention_sink: int = 0,
+    # Set only when the speculative query block occupies consecutive positions
+    # (linear proposal chain). Tree-shaped drafts must leave this at 0.
+    enable_contiguous_query_swa: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Unified stub for AttentionPlugin covering all feature combinations.
 
@@ -253,6 +261,9 @@ def _(
     enable_kv_shared=0,
     skip_softmax_scale=None,
     swa_kv_cache_mode=None,
+    attention_sinks=None,
+    enable_attention_sink=0,
+    enable_contiguous_query_swa=0,
 ):
     batch_size, seq_len, _ = qkv.shape
     return (torch.empty(batch_size,

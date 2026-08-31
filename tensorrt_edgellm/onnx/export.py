@@ -61,6 +61,12 @@ from ..external_weights import (externalize_model_weights,
 from ..models.default.modeling_default import CausalLM
 from .dynamo_translations import build_custom_translation_table
 
+#: Name of the FP32 learned-attention-sink constant emitted by the AttentionPlugin
+#: translation rule (``attention_sinks_fp32`` in dynamo_translations.py; ONNX appends
+#: ``_2``, ``_3``... per layer). The XQA kernel reads sinks as ``float const*``
+#: (``mergeAttentionSinks`` in mha.cu), so they must not be downgraded to FP16.
+_ATTENTION_SINK_INIT_PREFIX = "attention_sinks_fp32"
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["export_onnx"]
@@ -247,10 +253,13 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
     _ATTENTION_POS_ID_POSITION = 10
     _SKIP_SCALE_POSITION = 11
     _SWA_KV_CACHE_MODE_POSITION = 12
+    # Sinks are emitted after the SWA mode selector in the translation's full
+    # optional layout, so they occupy the next pre-compaction slot.
+    _ATTENTION_SINKS_POSITION = 13
     model = onnx.load(onnx_path, load_external_data=False)
     changed = 0
     mode_shape_changed = False
-    dropped_gamma_tensors: set = set()
+    dropped_const_tensors: set = set()
     for graph_input in model.graph.input:
         if graph_input.name != "swa_kv_cache_mode":
             continue
@@ -285,6 +294,10 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
             (a.i for a in node.attribute if a.name == "enable_qk_norm"),
             0,
         )
+        attention_sink = next(
+            (a.i for a in node.attribute if a.name == "enable_attention_sink"),
+            0,
+        )
         skip_scale_factor = next(
             (a.f
              for a in node.attribute if a.name == "skip_softmax_scale_factor"),
@@ -299,7 +312,7 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
         if qk_norm:
             new_inputs += [get_input(i) for i in _GAMMA_POSITIONS]
         else:
-            dropped_gamma_tensors.update(
+            dropped_const_tensors.update(
                 get_input(i) for i in _GAMMA_POSITIONS if get_input(i))
         if context_mask_selector:
             new_inputs.append(get_input(_CONTEXT_MASK_SELECTOR_POSITION))
@@ -339,14 +352,25 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
         elif supports_bounded_attr is not None:
             node.attribute.remove(supports_bounded_attr)
             node_changed = True
+
+        # Learned attention-sink constant, emitted after the SWA mode selector;
+        # kept iff the layer enables sinks. Appended before the single commit
+        # below so a node that needs no compaction still keeps its sink.
+        sink_input = get_input(_ATTENTION_SINKS_POSITION)
+        if attention_sink:
+            if sink_input:
+                new_inputs.append(sink_input)
+        elif sink_input:
+            dropped_const_tensors.add(sink_input)
+
         if new_inputs != inputs:
             del node.input[:]
             node.input.extend(new_inputs)
             node_changed = True
         changed += int(node_changed)
 
-    # Prune the gamma Constant/Cast chains that no longer feed any node.
-    if dropped_gamma_tensors:
+    # Prune the gamma / sink Constant/Cast chains that no longer feed any node.
+    if dropped_const_tensors:
         consumed = {i for n in model.graph.node for i in n.input}
         graph_outputs = {o.name for o in model.graph.output}
         pruned = True
@@ -355,10 +379,10 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
             for n in list(model.graph.node):
                 if not n.output:
                     continue
-                if all(o in dropped_gamma_tensors and o not in consumed
+                if all(o in dropped_const_tensors and o not in consumed
                        and o not in graph_outputs for o in n.output):
                     model.graph.node.remove(n)
-                    dropped_gamma_tensors.update(n.input)
+                    dropped_const_tensors.update(n.input)
                     consumed = {
                         i
                         for node_ in model.graph.node
@@ -368,7 +392,7 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
         # The dynamo exporter may lift the gamma Constants to graph
         # initializers instead of Constant nodes — drop those as well.
         for init in list(model.graph.initializer):
-            if init.name in dropped_gamma_tensors and init.name not in consumed:
+            if init.name in dropped_const_tensors and init.name not in consumed:
                 model.graph.initializer.remove(init)
 
     if not changed and not mode_shape_changed:
@@ -592,6 +616,14 @@ def _initializer_dtype_fixup_required(
                     plugin_fp32_init_names.add(node.input[input_idx])
         if node.op_type == "Fp16MoePlugin" and len(node.input) > 4:
             plugin_fp32_init_names.add(node.input[4])
+        if node.op_type == "AttentionPlugin":
+            # Learned attention sinks are read by the XQA kernel as float const* and
+            # must survive the FP32 -> FP16 weight downgrade. Matched by initializer
+            # name rather than input position so the plugin's optional-input list can
+            # grow without silently protecting the wrong tensor.
+            plugin_fp32_init_names.update(
+                name for name in node.input
+                if name.startswith(_ATTENTION_SINK_INIT_PREFIX))
 
     init_map = {init.name: init for init in model.graph.initializer}
     elem_types: dict[str, int] = {}
@@ -799,6 +831,28 @@ def _capture_qk_norm_gammas_for_export(model: "CausalLM") -> None:
                 "would silently drop the fused qk_norm.")
 
 
+def _capture_attention_sinks_for_export(model: "CausalLM") -> None:
+    """Populate learned attention-sink lists on every attention module.
+
+    Same contract as :func:`_capture_qk_norm_gammas_for_export`: raises if a
+    module carries sink weights but nothing was captured, because a dropped
+    sink is a silent change to the softmax denominator rather than a build
+    failure.
+    """
+    for module in model.modules():
+        if not hasattr(module, "_capture_attention_sink_list"):
+            continue
+        module._capture_attention_sink_list()
+        has_sink = getattr(module, "attention_sink_bias", None) is not None
+        captured = bool(getattr(module, "_attention_sinks_list", None))
+        if has_sink and not captured:
+            raise RuntimeError(
+                "attention sink capture failed for "
+                f"{type(module).__name__}: the module has attention_sink_bias "
+                "weights but no sink values were captured — the export would "
+                "silently drop the learned sink.")
+
+
 def _fix_initializer_dtypes(
     onnx_path: str,
     dedup_dql_scales: bool = False,
@@ -888,6 +942,14 @@ def _fix_initializer_dtypes(
             plugin_fp32_init_names.add(node.input[8])
         if node.op_type == "Fp16MoePlugin" and len(node.input) > 4:
             plugin_fp32_init_names.add(node.input[4])
+        if node.op_type == "AttentionPlugin":
+            # Learned attention sinks are read by the XQA kernel as float const* and
+            # must survive the FP32 -> FP16 weight downgrade. Matched by initializer
+            # name rather than input position so the plugin's optional-input list can
+            # grow without silently protecting the wrong tensor.
+            plugin_fp32_init_names.update(
+                name for name in node.input
+                if name.startswith(_ATTENTION_SINK_INIT_PREFIX))
 
     init_map = {init.name: init for init in model.graph.initializer}
     elem_types: dict[str, int] = {}
@@ -1073,6 +1135,7 @@ def _export_model(
 ) -> "list[dict[str, object]]":
     setup_fp8_qkv_scales_for_export(model)
     _capture_qk_norm_gammas_for_export(model)
+    _capture_attention_sinks_for_export(model)
     spec = model.onnx_export_spec()
 
     translation_table = build_custom_translation_table()

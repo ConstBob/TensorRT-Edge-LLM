@@ -79,6 +79,9 @@ def _attention_plugin_translation(
     enable_kv_shared: int = 0,
     skip_softmax_scale: onnxscript.INT8 = None,
     swa_kv_cache_mode: onnxscript.INT8 = None,
+    attention_sinks: Sequence[float] = (),
+    enable_attention_sink: int = 0,
+    enable_contiguous_query_swa: int = 0,
 ) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16]:
     """Unified attention plugin covering vanilla, FP8-KV, tree, and tree+FP8-KV.
 
@@ -98,6 +101,9 @@ def _attention_plugin_translation(
         _op21.Constant(value_floats=k_norm_gamma),
         to=int(onnx.TensorProto.FLOAT16),
     )
+    # Sinks stay FP32: the XQA kernel reads them as `float const*`, unlike the
+    # gammas above. A zero-length constant signals "no sink".
+    attention_sinks_fp32 = _op21.Constant(value_floats=attention_sinks)
     attn_4d, present_kv = _trt_edgellm.AttentionPlugin(
         qkv,
         past_key_value,
@@ -112,6 +118,7 @@ def _attention_plugin_translation(
         attention_pos_id,
         skip_softmax_scale,
         swa_kv_cache_mode,
+        attention_sinks_fp32,
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
@@ -126,6 +133,8 @@ def _attention_plugin_translation(
         rms_norm_eps=rms_norm_eps,
         enable_qk_norm=enable_qk_norm,
         enable_kv_shared=enable_kv_shared,
+        enable_attention_sink=enable_attention_sink,
+        enable_contiguous_query_swa=enable_contiguous_query_swa,
         _outputs=2,
     )
     return attn_4d, present_kv

@@ -90,6 +90,7 @@ bool isFp8KVCacheSupportedSM(int32_t smVersion)
 //   [vision_block_ids]                  when enable_vision_block_attention
 //   [skip_softmax_scale]                when skip-softmax has a calibrated default
 //   [swa_kv_cache_mode]                 when bounded SWA storage is supported
+//   [attention_sinks]                   when enable_attention_sink   (engine-weight constant)
 //
 // The gamma weights are engine weights: FP16 Constant initializers wired to plugin inputs,
 // baked into the engine at build time (device-resident, no runtime upload). Models without
@@ -112,19 +113,22 @@ constexpr int32_t kNUM_TREE_ATTN_OPTIONAL_INPUTS{2};
 constexpr int32_t kNUM_VISION_BLOCK_OPTIONAL_INPUTS{1};
 constexpr int32_t kNUM_SKIP_SCALE_OPTIONAL_INPUTS{1};
 constexpr int32_t kNUM_SWA_CACHE_MODE_OPTIONAL_INPUTS{1};
+constexpr int32_t kNUM_ATTENTION_SINK_OPTIONAL_INPUTS{1};
 constexpr int32_t kNUM_REQUIRED_OUTPUTS{2};
 constexpr int64_t kFULL_KV_CACHE_MODE_LENGTH{0};
 constexpr int64_t kBOUNDED_SWA_CACHE_MODE_LENGTH{1};
 
 int32_t getExpectedNbInputs(int32_t enableQKNorm, int32_t enableContextMaskSelector, int32_t enableTreeAttention,
-    int32_t enableVisionBlockAttention, float skipSoftmaxScaleFactor, bool supportsBoundedKVCache)
+    int32_t enableVisionBlockAttention, float skipSoftmaxScaleFactor, bool supportsBoundedKVCache,
+    int32_t enableAttentionSink)
 {
     return kNUM_REQUIRED_INPUTS + (enableQKNorm ? kNUM_QK_NORM_OPTIONAL_INPUTS : 0)
         + (enableContextMaskSelector ? kNUM_CONTEXT_MASK_SELECTOR_OPTIONAL_INPUTS : 0)
         + (enableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0)
         + (enableVisionBlockAttention ? kNUM_VISION_BLOCK_OPTIONAL_INPUTS : 0)
         + (skipSoftmaxScaleFactor > 0.F ? kNUM_SKIP_SCALE_OPTIONAL_INPUTS : 0)
-        + (supportsBoundedKVCache ? kNUM_SWA_CACHE_MODE_OPTIONAL_INPUTS : 0);
+        + (supportsBoundedKVCache ? kNUM_SWA_CACHE_MODE_OPTIONAL_INPUTS : 0)
+        + (enableAttentionSink ? kNUM_ATTENTION_SINK_OPTIONAL_INPUTS : 0);
 }
 
 // Dynamic input-index helpers for the optional inputs (positions depend on which optional
@@ -163,6 +167,14 @@ constexpr int32_t swaCacheModeInputIdx(bool enableQKNorm, bool enableContextMask
 {
     return skipSoftmaxScaleInputIdx(enableQKNorm, enableContextMaskSelector, enableTreeAttention, enableVisionBlock)
         + (skipSoftmaxScaleFactor > 0.F ? kNUM_SKIP_SCALE_OPTIONAL_INPUTS : 0);
+}
+
+constexpr int32_t attentionSinkInputIdx(bool enableQKNorm, bool enableContextMaskSelector, bool enableTreeAttention,
+    bool enableVisionBlock, float skipSoftmaxScaleFactor, bool supportsBoundedKVCache)
+{
+    return swaCacheModeInputIdx(
+               enableQKNorm, enableContextMaskSelector, enableTreeAttention, enableVisionBlock, skipSoftmaxScaleFactor)
+        + (supportsBoundedKVCache ? kNUM_SWA_CACHE_MODE_OPTIONAL_INPUTS : 0);
 }
 
 // Support Tree Attention decoding schema up to 128 tokens in the draft tree per batch.
@@ -674,6 +686,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
     , mEnableTreeAttention(parsePluginScalarField<int32_t>("enable_tree_attention", fc).value_or(0))
     , mEnableQKNorm(parsePluginScalarField<int32_t>("enable_qk_norm", fc).value_or(0))
     , mEnableKVShared(parsePluginScalarField<int32_t>("enable_kv_shared", fc).value_or(0))
+    , mEnableContiguousQuerySwa(parsePluginScalarField<int32_t>("enable_contiguous_query_swa", fc).value_or(0))
+    , mEnableAttentionSink(parsePluginScalarField<int32_t>("enable_attention_sink", fc).value_or(0))
     , mEnableFp8KVCache(parsePluginScalarField<int32_t>("enable_fp8_kv_cache", fc).value_or(0))
     , mSlidingWindowSize(parsePluginScalarField<int32_t>("sliding_window_size", fc).value_or(-1))
     , mSupportsBoundedKVCache(parsePluginScalarField<int32_t>("supports_bounded_kv_cache", fc).value_or(0) != 0)
@@ -789,6 +803,10 @@ XQAJitKey AttentionPlugin::getXQAJitKey() const noexcept
     key.tokensPerPage = rt::kTOKENS_PER_PAGE;
     key.slidingWindow = mSlidingWindowSize > 0;
     key.specDecode = static_cast<bool>(mEnableTreeAttention);
+    // Per-query-row window cutoffs. The kernel variant reconstructs each row's
+    // position as firstQueryPosition + queryRow, so it is correct only for a
+    // linear proposal chain; tree-shaped drafts must not opt in.
+    key.contiguousQuerySwa = mEnableContiguousQuerySwa && key.specDecode && key.slidingWindow;
     return key;
 }
 
@@ -826,6 +844,7 @@ void AttentionPlugin::compileXQAJitKernelForBuild()
     // for single-token steps and fallback requests.
     XQAJitKey vanillaKey = key;
     vanillaKey.specDecode = false;
+    vanillaKey.contiguousQuerySwa = false;
     mXqaJitKernels.push_back({vanillaKey, compileAndLoad(vanillaKey)});
 
     // Only tree-attention engines need a second, distinct spec-decode kernel.
@@ -897,6 +916,8 @@ IPluginV3* AttentionPlugin::clone() noexcept
             mSlidingWindowSize, mQkvScales, mAttentionScale);
         p->mEnableQKNorm = mEnableQKNorm;
         p->mEnableKVShared = mEnableKVShared;
+        p->mEnableContiguousQuerySwa = mEnableContiguousQuerySwa;
+        p->mEnableAttentionSink = mEnableAttentionSink;
         p->mRmsNormEps = mRmsNormEps;
         p->mSkipSoftmaxScaleFactor = mSkipSoftmaxScaleFactor;
         p->mXqaJitKernels = mXqaJitKernels;
@@ -1121,8 +1142,9 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    int32_t const expectedNbInputs = getExpectedNbInputs(mEnableQKNorm, mEnableContextMaskSelector,
-        mEnableTreeAttention, mEnableVisionBlockAttention, mSkipSoftmaxScaleFactor, mSupportsBoundedKVCache);
+    int32_t const expectedNbInputs
+        = getExpectedNbInputs(mEnableQKNorm, mEnableContextMaskSelector, mEnableTreeAttention,
+            mEnableVisionBlockAttention, mSkipSoftmaxScaleFactor, mSupportsBoundedKVCache, mEnableAttentionSink);
     bool const checkNumIOs = nbInputs == expectedNbInputs && nbOutputs == kNUM_REQUIRED_OUTPUTS;
     if (inOut == nullptr || !checkNumIOs || pos < 0 || pos >= nbInputs + nbOutputs)
     {
@@ -1228,8 +1250,9 @@ bool AttentionPlugin::supportsFormatCombination(
 int32_t AttentionPlugin::configurePlugin(
     DynamicPluginTensorDesc const* in, int32_t nbInputs, DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept
 {
-    int32_t const expectedNbInputs = getExpectedNbInputs(mEnableQKNorm, mEnableContextMaskSelector,
-        mEnableTreeAttention, mEnableVisionBlockAttention, mSkipSoftmaxScaleFactor, mSupportsBoundedKVCache);
+    int32_t const expectedNbInputs
+        = getExpectedNbInputs(mEnableQKNorm, mEnableContextMaskSelector, mEnableTreeAttention,
+            mEnableVisionBlockAttention, mSkipSoftmaxScaleFactor, mSupportsBoundedKVCache, mEnableAttentionSink);
     if (in == nullptr || out == nullptr || nbInputs != expectedNbInputs || nbOutputs != kNUM_REQUIRED_OUTPUTS)
     {
         LOG_ERROR("AttentionPlugin: expected %d inputs and %d outputs, but got %d inputs and %d outputs.",
@@ -1268,8 +1291,9 @@ int32_t AttentionPlugin::configurePlugin(
 size_t AttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
     DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept
 {
-    int32_t const expectedNbInputs = getExpectedNbInputs(mEnableQKNorm, mEnableContextMaskSelector,
-        mEnableTreeAttention, mEnableVisionBlockAttention, mSkipSoftmaxScaleFactor, mSupportsBoundedKVCache);
+    int32_t const expectedNbInputs
+        = getExpectedNbInputs(mEnableQKNorm, mEnableContextMaskSelector, mEnableTreeAttention,
+            mEnableVisionBlockAttention, mSkipSoftmaxScaleFactor, mSupportsBoundedKVCache, mEnableAttentionSink);
     if (inputs == nullptr || outputs == nullptr || nbInputs != expectedNbInputs || nbOutputs != kNUM_REQUIRED_OUTPUTS)
     {
         LOG_ERROR(
@@ -1352,6 +1376,20 @@ half const* AttentionPlugin::resolveNormGammaInput(
     }
     check::check(inputDesc[inputIdx].dims.d[0] == mHeadSize, "qk_norm gamma length must equal head_size.");
     return static_cast<half const*>(inputs[inputIdx]);
+}
+
+float const* AttentionPlugin::resolveAttentionSinkInput(
+    PluginTensorDesc const* inputDesc, void const* const* inputs, int32_t inputIdx) const
+{
+    if (inputDesc[inputIdx].dims.d[0] <= 0)
+    {
+        return nullptr;
+    }
+    // The XQA kernel indexes sinks as [numKVHeads][qHeadsPerKv]; a per-Q-head
+    // vector in natural GQA order is exactly that layout.
+    check::check(inputDesc[inputIdx].dims.d[0] == mNumQHeads, "attention_sinks length must equal num_q_heads.");
+    check::check(inputDesc[inputIdx].type == DataType::kFLOAT, "attention_sinks must be FP32.");
+    return static_cast<float const*>(inputs[inputIdx]);
 }
 
 int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
@@ -1540,6 +1578,11 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
         return 1;
     }
 
+    check::check(!mEnableAttentionSink
+            || (executionMode != AttentionExecutionMode::kNORMAL_PREFILL
+                && executionMode != AttentionExecutionMode::kCHUNKED_PREFILL),
+        "Learned attention sinks are not yet implemented in the FMHA prefill path.");
+
     auto* alignedWorkspacePtr = static_cast<std::byte*>(workspace);
     if (alignedWorkspacePtr == nullptr
         || reinterpret_cast<uintptr_t>(alignedWorkspacePtr) % static_cast<uintptr_t>(kDEVICE_ALIGNMENT) != 0)
@@ -1550,6 +1593,11 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
 
     // Gamma engine-weight inputs are device-resident at engine load. Models without
     // qk_norm do not wire them ⇒ nullptr ⇒ the kernel takes the RoPE-only path.
+    float const* attentionSinkDevicePtr = mEnableAttentionSink
+        ? resolveAttentionSinkInput(inputDesc, inputs,
+              attentionSinkInputIdx(mEnableQKNorm, mEnableContextMaskSelector, mEnableTreeAttention,
+                  mEnableVisionBlockAttention, mSkipSoftmaxScaleFactor, mSupportsBoundedKVCache))
+        : nullptr;
     half const* qNormGammaDevicePtr
         = mEnableQKNorm ? resolveNormGammaInput(inputDesc, inputs, qNormGammaInputIdx()) : nullptr;
     half const* kNormGammaDevicePtr
@@ -2318,11 +2366,13 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
         params.kvCache.pageList = pageTable;
         params.kvCache.tokensPerPage = static_cast<uint32_t>(rt::kTOKENS_PER_PAGE);
         params.slidingWinSize = mSlidingWindowSize > 0 ? static_cast<uint32_t>(mSlidingWindowSize) : 0U;
+        params.attentionSinks = attentionSinkDevicePtr;
         if (executionMode == AttentionExecutionMode::kTREE_DECODING)
         {
             // Execute tree attention decoding.
             params.treeAttnMask = attentionMaskTensor.dataPointer<int32_t>();
             params.qSeqLen = runtimeSeqLen;
+            params.contiguousQuerySwa = mEnableContiguousQuerySwa && params.slidingWinSize > 0;
             xqaRunner.dispatchSpecDecodeXQAKernel(params, stream);
         }
         else
@@ -2337,8 +2387,9 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
 int32_t AttentionPlugin::onShapeChange(
     PluginTensorDesc const* in, int32_t nbInputs, PluginTensorDesc const* out, int32_t nbOutputs) noexcept
 {
-    int32_t const expectedNbInputs = getExpectedNbInputs(mEnableQKNorm, mEnableContextMaskSelector,
-        mEnableTreeAttention, mEnableVisionBlockAttention, mSkipSoftmaxScaleFactor, mSupportsBoundedKVCache);
+    int32_t const expectedNbInputs
+        = getExpectedNbInputs(mEnableQKNorm, mEnableContextMaskSelector, mEnableTreeAttention,
+            mEnableVisionBlockAttention, mSkipSoftmaxScaleFactor, mSupportsBoundedKVCache, mEnableAttentionSink);
     if (in == nullptr || out == nullptr || nbInputs != expectedNbInputs || nbOutputs != kNUM_REQUIRED_OUTPUTS)
     {
         LOG_ERROR("AttentionPlugin: expected %d inputs and %d outputs, but got %d inputs and %d outputs.",
@@ -2372,6 +2423,9 @@ PluginFieldCollection const* AttentionPlugin::getFieldsToSerialize() noexcept
     mDataToSerialize.emplace_back("enable_tree_attention", &mEnableTreeAttention, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("enable_qk_norm", &mEnableQKNorm, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("enable_kv_shared", &mEnableKVShared, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back(
+        "enable_contiguous_query_swa", &mEnableContiguousQuerySwa, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("enable_attention_sink", &mEnableAttentionSink, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("enable_fp8_kv_cache", &mEnableFp8KVCache, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back(
         "enable_vision_block_attention", &mEnableVisionBlockAttention, PluginFieldType::kINT32, 1);
@@ -2414,6 +2468,8 @@ AttentionPluginCreator::AttentionPluginCreator()
     mPluginAttributes.emplace_back(PluginField("enable_qk_norm", nullptr, PluginFieldType::kINT32, 0));
     // Optional (default 0). Shared-KV layer: packed input is Q only; no KV-cache write.
     mPluginAttributes.emplace_back(PluginField("enable_kv_shared", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(PluginField("enable_attention_sink", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(PluginField("enable_contiguous_query_swa", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("enable_fp8_kv_cache", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("enable_vision_block_attention", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("enable_context_mask_selector", nullptr, PluginFieldType::kINT32, 0));

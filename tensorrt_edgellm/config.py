@@ -651,6 +651,8 @@ class ModelConfig:
     # Gemma4 full/global attention reuses k_proj(hidden_states) as the value
     # projection source when enabled.
     attention_k_eq_v: bool = False
+    # Per-Q-head learned attention sink: extra logit merged into softmax denominator.
+    attention_sink_bias: bool = False
     # DiffusionGemma uses one shared backbone with phase-dependent layer scalars.
     encoder_layer_scalars: List[float] = field(default_factory=list)
     decoder_layer_scalars: List[float] = field(default_factory=list)
@@ -799,9 +801,12 @@ class ModelConfig:
     dspark_block_size: int = 7
     dspark_mask_token_id: int = 151669
     dspark_enable_confidence_head: bool = False
+    dspark_sample_from_anchor: bool = True
     dspark_confidence_head_with_markov: bool = False
     dspark_markov_head_type: str = ""
     dspark_markov_rank: int = 0
+    dspark_fc_native_precision: bool = False
+    dspark_causal_proposal: bool = False
     # ------------------------------------------ sparse MoE config (Qwen3-style)
     # num_experts=0 means dense (no MoE) for Qwen/Mixtral-style keys; Nemotron-H instead reports
     # its expert count via n_routed_experts, so n_routed_experts > 0 also indicates MoE.
@@ -1546,6 +1551,9 @@ def make_dspark_draft_config(
         attention_scaling=_get_attention_scaling(
             llm_dict, head_dim, default_attention_scale_value),
         attention_k_eq_v=bool(llm_dict.get("attention_k_eq_v", False)),
+        attention_sink_bias=bool(
+            dspark_config.get("attention_sink_bias",
+                              llm_dict.get("attention_sink_bias", False))),
         final_logit_softcapping=llm_dict.get("final_logit_softcapping", None),
         torch_dtype=llm_dict.get("torch_dtype",
                                  llm_dict.get("dtype", "bfloat16")),
@@ -1556,6 +1564,12 @@ def make_dspark_draft_config(
         raw_layer_types=raw_layer_types,
         rope_parameters=llm_dict.get("rope_parameters", None),
         is_dspark_draft_flag=True,
+        dspark_causal_proposal=bool(
+            dspark_config.get(
+                "causal",
+                llm_dict.get("dflash_query_causal",
+                             (llm_dict.get("dflash_config")
+                              or {}).get("causal", False)))),
         dspark_target_layer_ids=target_layer_ids,
         dspark_block_size=int(
             dspark_config.get("block_size", llm_dict.get("block_size", 7))),
@@ -1566,6 +1580,9 @@ def make_dspark_draft_config(
         dspark_enable_confidence_head=bool(
             dspark_config.get("enable_confidence_head",
                               llm_dict.get("enable_confidence_head", False))),
+        dspark_sample_from_anchor=bool(
+            dspark_config.get("sample_from_anchor",
+                              llm_dict.get("sample_from_anchor", True))),
         dspark_confidence_head_with_markov=bool(
             dspark_config.get(
                 "confidence_head_with_markov",

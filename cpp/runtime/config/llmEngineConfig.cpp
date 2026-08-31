@@ -374,6 +374,12 @@ void parseDSparkFields(
     cfg.dsparkHeadsFile = dsparkConfig.value("heads_file", std::string(binding_names::kDSparkHeadsFileName));
     cfg.dsparkHeadsInfoFile
         = dsparkConfig.value("heads_info_file", std::string(binding_names::kDSparkHeadsInfoFileName));
+    cfg.dsparkContiguousQuerySwa = dsparkConfig.value("contiguous_query_swa", false);
+    cfg.specDraftCausalHead = dsparkConfig.value("causal_head", false);
+    // Selects which draft query slots carry proposals. When true the anchor slot is
+    // itself a proposal and the block is block_size wide; when false slot 0 is the
+    // bonus token and the block carries one extra mask slot.
+    cfg.dsparkSampleFromAnchor = dsparkConfig.value("sample_from_anchor", true);
 
     ELLM_CHECK(cfg.specDraftBlockSize > 0,
         "parseEngineConfig: invalid DSpark block_size: " + std::to_string(cfg.specDraftBlockSize)
@@ -1751,7 +1757,8 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
                 + " for binding '" + convBindingName + "'. Re-export the engine with matching conv_state_dtype.");
 
         if (config.isSpecDecodeBase && config.numLinearAttnLayers > 0
-            && (config.specDecodeType == SpecDecodeMode::kMTP || isCachedBlockDraftMode(config.specDecodeType)))
+            && (config.specDecodeType == SpecDecodeMode::kMTP || isCachedBlockDraftMode(config.specDecodeType)
+                || config.specDecodeType == SpecDecodeMode::kDSpark))
         {
             ELLM_CHECK(executor.hasIOTensor(binding_names::kSpecVerifyPhaseMarker),
                 std::string("Missing spec-verify phase marker binding (") + engineLabel + "): expected '"

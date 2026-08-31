@@ -161,6 +161,11 @@ private:
     half const* resolveNormGammaInput(
         nvinfer1::PluginTensorDesc const* inputDesc, void const* const* inputs, int32_t inputIdx) const;
 
+    //! Resolve the learned attention-sink engine-weight input to a device
+    //! pointer (nullptr when absent). Length must equal numQHeads.
+    float const* resolveAttentionSinkInput(
+        nvinfer1::PluginTensorDesc const* inputDesc, void const* const* inputs, int32_t inputIdx) const;
+
 protected:
     trt_edgellm::XQAJitKey getXQAJitKey() const noexcept;
     bool canCompileXQAJitKernel() const noexcept;
@@ -185,6 +190,15 @@ protected:
     //! Whether this layer reads K/V from a donated (shared) cache: the packed input carries
     //! Q only [B, S, Hq*D] and the plugin skips the KV-cache write.
     int32_t mEnableKVShared{};
+    //! Whether this layer's speculative query block occupies CONSECUTIVE positions
+    //! (a linear proposal chain, e.g. DSpark). The contiguous-query XQA SWA variant
+    //! derives each row's position as firstQueryPosition + queryRow, so it is only
+    //! valid here; tree-shaped drafts (EAGLE) must leave this off.
+    int32_t mEnableContiguousQuerySwa{};
+    //! Whether a learned per-Q-head attention sink is merged into the softmax denominator.
+    //! When set, the FP32 sink engine-weight constant is wired as the last optional input.
+    //! Only the XQA decode path implements sinks; the FMHA prefill backends do not.
+    int32_t mEnableAttentionSink{};
 
     //! Datatype of QKV and KV cache. Only supports FP16 as of now.
     nvinfer1::DataType const mDataType{nvinfer1::DataType::kHALF};

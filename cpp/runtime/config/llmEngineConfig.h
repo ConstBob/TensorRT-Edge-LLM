@@ -233,6 +233,15 @@ struct LLMEngineConfig
     int32_t dsparkMarkovRank{0};
     std::string dsparkHeadsFile{};
     std::string dsparkHeadsInfoFile{};
+    //! Whether the draft engine baked the contiguous-query sliding-window XQA
+    //! variant, which reconstructs each query row's position as
+    //! firstQueryPosition + queryRow. Valid only for a linear proposal chain, so
+    //! DDTree drafting (draftingTopK > 1) must be rejected against such engines.
+    bool dsparkContiguousQuerySwa{false};
+    //! When true the anchor slot itself is a proposal and the draft query block is
+    //! `block_size` wide; when false slot 0 is the bonus token, the block carries one
+    //! extra mask slot and proposals start at slot 1.
+    bool dsparkSampleFromAnchor{true};
 
     // --- Per-layer type routing (hybrid cache) ---
 

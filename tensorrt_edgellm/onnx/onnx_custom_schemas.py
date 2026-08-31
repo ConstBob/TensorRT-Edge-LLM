@@ -140,6 +140,16 @@ _attention_plugin_schema = OpSchema(
             type_str="tensor(int8)",
             param_option=OpSchema.FormalParameterOption.Optional,
         ),
+        OpSchema.FormalParameter(
+            name="attention_sinks",
+            description=
+            "Per-Q-head learned attention sink logits (FP32, 1-D, length == "
+            "num_q_heads, ordered [num_kv_heads][q_heads_per_kv]). Fed as a "
+            "Constant initializer so TRT bakes it into the engine as weights at "
+            "build time. Optional: only wired when enable_attention_sink=1.",
+            type_str="tensor(float)",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
     ],
     outputs=[
         OpSchema.FormalParameter(
@@ -272,6 +282,25 @@ _attention_plugin_schema = OpSchema(
             description=
             "Whether this layer reads K/V from a donated (shared) cache; the packed qkv "
             "input then carries Q only [B, S, Hq*D] (0(false), 1(true)).",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="enable_contiguous_query_swa",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Whether this layer's speculative query block occupies CONSECUTIVE positions "
+            "(a linear proposal chain, e.g. DSpark) (0(false), 1(true)). The contiguous-query "
+            "XQA sliding-window variant reconstructs each row's position as "
+            "firstQueryPosition + queryRow, so tree-shaped drafts (EAGLE) must leave this off.",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="enable_attention_sink",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Whether a learned per-Q-head attention sink is merged into the softmax "
+            "denominator (0(false), 1(true)). When 1, the attention_sinks optional "
+            "input must be wired. Only the XQA decode path implements sinks.",
             required=False,
         ),
     ],

@@ -117,6 +117,10 @@ private:
     Tensor mHostAcceptLengths;    //!< [B] INT32 (CPU)
     Tensor mHostAcceptedTokenIds; //!< [B, verifyLen] INT32 (CPU)
 
+    //! Proposal self-attention inside the draft block is causal rather than
+    //! bidirectional. Sourced from dspark_config.causal_head.
+    bool mCausalProposalMask{false};
+
     SpecCommonStateTracker mCommonStateTracker;
     Tensor mHostDraftInputIds;      //!< [B, proposalLen] INT32 (CPU)
     Tensor mHostLastAcceptedTokens; //!< [B] INT32 (CPU)
@@ -178,6 +182,10 @@ private:
     bool mUseTreeScheduler{false}; //!< scheduler!=off in tree mode: log(conf) bias on ddtree growth scores
     int32_t mProposalLen{7};
     int32_t mVerifyLen{8};
+    int32_t mDraftBlockLen{0};
+    //! Index of the first draft query slot that carries a proposal. 0 when the checkpoint
+    //! samples from the anchor, 1 when slot 0 is the bonus token (the validated layout).
+    int32_t mDraftSlotOffset{1};
     int32_t mCurrentProposalLen{7};
     int32_t mCurrentVerifyLen{8};
     int32_t mMaskTokenId{151669};

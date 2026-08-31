@@ -111,7 +111,7 @@ def _make_flat_wrapper_mamba(model: nn.Module,
                              Na: int,
                              Nm: int,
                              mtp_base: bool = False,
-                             dflash_base: bool = False) -> nn.Module:
+                             target_hidden_base: bool = False) -> nn.Module:
     """Build an explicit flat forward wrapper for hybrid Mamba+Attention models.
 
     Extends the transformer wrapper with ``conv_state_i`` and ``ssm_state_i``
@@ -133,7 +133,7 @@ def _make_flat_wrapper_mamba(model: nn.Module,
             "kv_page_table", "last_token_ids"
         ] + [f"conv_state_{i}"
              for i in range(Nm)] + [f"recurrent_state_{i}" for i in range(Nm)])
-    spec_base = mtp_base or dflash_base
+    spec_base = mtp_base or target_hidden_base
     if spec_base:
         param_names += [
             "attention_pos_id", "attention_mask", "spec_verify_phase_marker"
@@ -147,7 +147,7 @@ def _make_flat_wrapper_mamba(model: nn.Module,
                                          for i in range(Nm))) if Nm else "()"
 
     if spec_base:
-        second = "dflash_hidden_concat" if dflash_base else "hidden_states"
+        second = "dflash_hidden_concat" if target_hidden_base else "hidden_states"
         body = (
             f"    (logits, {second}, present_key_values, "
             f"present_conv_states, present_ssm_states, "
@@ -1251,7 +1251,10 @@ class NemotronHCausalLM(nn.Module):
 
         mtp_base = bool(getattr(config, "mtp_base", False))
         dflash_base = bool(getattr(config, "dflash_base", False))
-        spec = mtp_base or dflash_base
+        # DSpark reuses the DFlash target-hidden binding contract verbatim.
+        dspark_base = bool(getattr(config, "dspark_base", False))
+        target_hidden_base = dflash_base or dspark_base
+        spec = mtp_base or target_hidden_base
 
         batch = torch.export.Dim("batch", min=1, max=256)
         seq = torch.export.Dim("seq_len", min=1, max=32768)
@@ -1339,11 +1342,12 @@ class NemotronHCausalLM(nn.Module):
                 [f"replay_u_state_{i}" for i in range(Nm)] +
                 [f"replay_b_state_{i}" for i in range(Nm)])
 
-        wrapped = _make_flat_wrapper_mamba(self,
-                                           Na,
-                                           Nm,
-                                           mtp_base=mtp_base,
-                                           dflash_base=dflash_base)
+        wrapped = _make_flat_wrapper_mamba(
+            self,
+            Na,
+            Nm,
+            mtp_base=mtp_base,
+            target_hidden_base=target_hidden_base)
         wrapped.eval()
 
         return OnnxSpec(wrapped=wrapped,
@@ -1369,9 +1373,15 @@ class NemotronHCausalLM(nn.Module):
     ) -> Tuple:
         mtp_base = bool(getattr(self.config, "mtp_base", False))
         dflash_base = bool(getattr(self.config, "dflash_base", False))
-        dflash_target_ids = (self.config.dflash_target_layer_ids
-                             if dflash_base else None)
-        spec = mtp_base or dflash_base
+        dspark_base = bool(getattr(self.config, "dspark_base", False))
+        target_hidden_base = dflash_base or dspark_base
+        if dflash_base:
+            dflash_target_ids = self.config.dflash_target_layer_ids
+        elif dspark_base:
+            dflash_target_ids = self.config.dspark_target_layer_ids
+        else:
+            dflash_target_ids = None
+        spec = mtp_base or target_hidden_base
         if spec:
             (hidden_states, present_key_values, present_conv_states,
              present_ssm_states, intermediate_conv_states, replay_da_states,
@@ -1395,7 +1405,7 @@ class NemotronHCausalLM(nn.Module):
             # gathered predicted-token positions.
             selected = torch.ops.trt.gather_nd(hidden_states, last_token_ids)
             logits = self.lm_head(selected).to(torch.float32)
-            if dflash_base:
+            if target_hidden_base:
                 return (logits, dflash_hidden_concat, present_key_values,
                         present_conv_states, present_ssm_states,
                         intermediate_conv_states, replay_da_states,

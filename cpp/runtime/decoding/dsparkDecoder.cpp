@@ -119,11 +119,24 @@ DSparkDecoder::DSparkDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
         "DSparkDecoder Phase 1 supports markov_head_type=vanilla only; got '" + markovType + "'.");
     ELLM_CHECK(draftCfg.dsparkMarkovRank > 0, "DSparkDecoder requires dspark_config.markov_rank > 0.");
 
+    mCausalProposalMask = draftCfg.specDraftCausalHead;
     mUseTree = draftingConfig.draftingTopK > 1;
+    // The contiguous-query SWA kernel variant is baked into the draft engine and
+    // assumes proposal rows sit at consecutive positions. DDTree drafting breaks
+    // that assumption, so refuse rather than silently mis-window the attention.
+    ELLM_CHECK(!(mUseTree && draftCfg.dsparkContiguousQuerySwa),
+        "DSparkDecoder: DDTree drafting (specDraftTopK > 1) is not supported by a draft engine built with "
+        "sliding-window attention; the contiguous-query SWA kernel assumes a linear proposal chain. Run with "
+        "specDraftTopK = 1 or rebuild the draft engine without sliding-window attention.");
     mVerifyLen = deployment.specConfig->verifySize;
     // Tree mode drafts the full block; verifySize is the DDTree node budget, not blockSize + 1.
     mProposalLen = mUseTree ? draftCfg.specDraftBlockSize : mVerifyLen - 1;
     mCurrentProposalLen = mProposalLen;
+    // sample_from_anchor selects the block layout. When set, the anchor slot is itself a
+    // proposal and the block is exactly mProposalLen wide. When clear, slot 0 is the bonus
+    // token, proposals start at slot 1 and the block carries one extra mask slot.
+    mDraftSlotOffset = draftCfg.dsparkSampleFromAnchor ? 0 : 1;
+    mDraftBlockLen = mProposalLen + mDraftSlotOffset;
     mCurrentVerifyLen = mVerifyLen;
     ELLM_CHECK(mProposalLen > 0, "DSparkDecoder requires verifySize >= 2.");
     ELLM_CHECK(
@@ -156,20 +169,20 @@ DSparkDecoder::DSparkDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
 
     ELLM_CHECK(mDraftExecutor != nullptr, "DSpark decoding requires a validated draft engine.");
 
-    mDraftInputsEmbeds = Tensor({maxBatch, mProposalLen, mDraftHiddenSize}, DeviceType::kGPU, nvinfer1::DataType::kHALF,
-        "DSpark::draftInputsEmbeds");
+    mDraftInputsEmbeds = Tensor({maxBatch, mDraftBlockLen, mDraftHiddenSize}, DeviceType::kGPU,
+        nvinfer1::DataType::kHALF, "DSpark::draftInputsEmbeds");
     mDraftTargetHidden = Tensor({maxBatch, maxSeqForDraft, mBaseOutputHiddenDim}, DeviceType::kGPU,
         nvinfer1::DataType::kHALF, "DSpark::draftTargetHidden");
-    mDraftOutputLogits = Tensor({maxBatch, mProposalLen, mDraftVocabSize}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT,
-        "DSpark::draftOutputLogits");
-    mDraftHiddenStates = Tensor({maxBatch, mProposalLen, mDraftHiddenSize}, DeviceType::kGPU, nvinfer1::DataType::kHALF,
-        "DSpark::draftHiddenStates");
+    mDraftOutputLogits = Tensor({maxBatch, mDraftBlockLen, mDraftVocabSize}, DeviceType::kGPU,
+        nvinfer1::DataType::kFLOAT, "DSpark::draftOutputLogits");
+    mDraftHiddenStates = Tensor({maxBatch, mDraftBlockLen, mDraftHiddenSize}, DeviceType::kGPU,
+        nvinfer1::DataType::kHALF, "DSpark::draftHiddenStates");
 
-    int32_t const packedMaskLen = divUp(mProposalLen, 32);
-    mDraftPackedAttentionMask = Tensor({maxBatch, mProposalLen, packedMaskLen}, DeviceType::kGPU,
+    int32_t const packedMaskLen = divUp(mDraftBlockLen, 32);
+    mDraftPackedAttentionMask = Tensor({maxBatch, mDraftBlockLen, packedMaskLen}, DeviceType::kGPU,
         nvinfer1::DataType::kINT32, "DSpark::draftPackedMask");
-    mDraftAttentionPosId
-        = Tensor({maxBatch, mProposalLen}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "DSpark::draftAttentionPosId");
+    mDraftAttentionPosId = Tensor(
+        {maxBatch, mDraftBlockLen}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "DSpark::draftAttentionPosId");
     mDraftContextLengths
         = Tensor({maxBatch}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "DSpark::draftContextLengths");
     mDraftDeltaLenCommit
@@ -234,7 +247,7 @@ DSparkDecoder::DSparkDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
     mHostAcceptedTokenIds
         = Tensor({maxBatch, mVerifyLen}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "DSpark::hostAcceptedIds");
     mHostDraftInputIds
-        = Tensor({maxBatch, mProposalLen}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "DSpark::hostDraftInputIds");
+        = Tensor({maxBatch, mDraftBlockLen}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "DSpark::hostDraftInputIds");
     mHostLastAcceptedTokens
         = Tensor({maxBatch}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "DSpark::hostLastAcceptedTokens");
     mHostDeltaLens = Tensor({maxBatch}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "DSpark::hostDeltaLens");
@@ -322,7 +335,10 @@ DSparkDecoder::DSparkDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
 
 DecodingKvHeadroom DSparkDecoder::requiredKvHeadroom() const
 {
-    return {mVerifyLen, mProposalLen};
+    // One execution places the draft block at targetLen .. targetLen + mDraftBlockLen - 1,
+    // where targetLen is the committed endpoint, so it reaches the full block width past
+    // that endpoint. mProposalLen is short by the anchor slot when slot 0 is the bonus token.
+    return {mVerifyLen, mDraftBlockLen};
 }
 
 void DSparkDecoder::loadHeadSidecars(std::filesystem::path const& engineDir, cudaStream_t stream)
@@ -423,6 +439,7 @@ std::vector<int32_t> const& DSparkDecoder::commonMaterializedStateLengths() cons
 void DSparkDecoder::dsparkBiasMarkovGreedy(
     DecodingInferenceContext& context, int32_t activeBatchSize, int32_t proposalLen)
 {
+    int32_t const logitsStride = mDraftBlockLen;
     int32_t constexpr topK = 1;
     int32_t const proposalDepthSize = proposalLen + 1;
     check::check(mDraftStepLogits.reshape({activeBatchSize, mDraftVocabSize}), "Tensor reshape failed");
@@ -437,7 +454,8 @@ void DSparkDecoder::dsparkBiasMarkovGreedy(
     for (int32_t step = 0; step < proposalLen; ++step)
     {
         kernel::dsparkBuildMarkovLogits(mDraftOutputLogits, mMarkovW1, mMarkovW2, mLastAcceptedTokens, mDraftTokenIds,
-            mDraftStepLogits, activeBatchSize, step, proposalLen, mDraftVocabSize, mMarkovRank, context.stream);
+            mDraftStepLogits, activeBatchSize, step, proposalLen, mDraftVocabSize, mMarkovRank, context.stream,
+            logitsStride, mDraftSlotOffset);
         applyLogitBias(mRuntime.logitBias, mDraftStepLogits, context, context.stream);
         if (mUseTree)
         {
@@ -459,12 +477,14 @@ void DSparkDecoder::dsparkBiasMarkovGreedy(
 void DSparkDecoder::dsparkBiasMarkovSample(
     DecodingInferenceContext& context, int32_t activeBatchSize, int32_t proposalLen)
 {
+    int32_t const logitsStride = mDraftBlockLen;
     check::check(mDraftStepLogits.reshape({activeBatchSize, mDraftVocabSize}), "Tensor reshape failed");
     check::check(mDraftStepProbabilities.reshape({activeBatchSize, mDraftVocabSize}), "Tensor reshape failed");
     for (int32_t step = 0; step < proposalLen; ++step)
     {
         kernel::dsparkBuildMarkovLogits(mDraftOutputLogits, mMarkovW1, mMarkovW2, mLastAcceptedTokens, mDraftTokenIds,
-            mDraftStepLogits, activeBatchSize, step, proposalLen, mDraftVocabSize, mMarkovRank, context.stream);
+            mDraftStepLogits, activeBatchSize, step, proposalLen, mDraftVocabSize, mMarkovRank, context.stream,
+            logitsStride, mDraftSlotOffset);
         applyLogitBias(mRuntime.logitBias, mDraftStepLogits, context, context.stream);
         kernel::dsparkLogitsToProbabilities(mDraftStepLogits, mDraftStepProbabilities, activeBatchSize, mDraftVocabSize,
             context.temperature, static_cast<int32_t>(context.topK), context.topP, context.stream);
@@ -489,27 +509,28 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
 
     int32_t const activeBatchSize = context.activeBatchSize;
     int32_t const proposalLen = mProposalLen;
+    int32_t const blockLen = mDraftBlockLen;
 
-    check::check(mRuntime.preprocess.idsInput.reshape({activeBatchSize, proposalLen}), "Tensor reshape failed");
-    check::check(mHostDraftInputIds.reshape({activeBatchSize, proposalLen}), "Tensor reshape failed");
+    check::check(mRuntime.preprocess.idsInput.reshape({activeBatchSize, blockLen}), "Tensor reshape failed");
+    check::check(mHostDraftInputIds.reshape({activeBatchSize, blockLen}), "Tensor reshape failed");
     check::check(mHostLastAcceptedTokens.reshape({activeBatchSize}), "Tensor reshape failed");
     int32_t* hostDraftInputIds = mHostDraftInputIds.dataPointer<int32_t>();
     int32_t* hostLastAccepted = mHostLastAcceptedTokens.dataPointer<int32_t>();
     for (int32_t b = 0; b < activeBatchSize; ++b)
     {
         hostLastAccepted[b] = context.tokenIds[b].back();
-        hostDraftInputIds[b * proposalLen] = hostLastAccepted[b];
-        for (int32_t j = 1; j < proposalLen; ++j)
+        hostDraftInputIds[b * blockLen] = hostLastAccepted[b];
+        for (int32_t j = 1; j < blockLen; ++j)
         {
-            hostDraftInputIds[b * proposalLen + j] = mMaskTokenId;
+            hostDraftInputIds[b * blockLen + j] = mMaskTokenId;
         }
     }
     CUDA_CHECK(cudaMemcpyAsync(mRuntime.preprocess.idsInput.rawPointer(), mHostDraftInputIds.rawPointer(),
-        activeBatchSize * proposalLen * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
+        activeBatchSize * blockLen * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
     CUDA_CHECK(cudaMemcpyAsync(mLastAcceptedTokens.rawPointer(), mHostLastAcceptedTokens.rawPointer(),
         activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
 
-    check::check(mDraftInputsEmbeds.reshape({activeBatchSize, proposalLen, mDraftHiddenSize}), "Tensor reshape failed");
+    check::check(mDraftInputsEmbeds.reshape({activeBatchSize, blockLen, mDraftHiddenSize}), "Tensor reshape failed");
     kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
         mRuntime.preprocess.embedding.scalesAsOptional(), mDraftInputsEmbeds, context.stream);
 
@@ -558,26 +579,26 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
             cudaMemcpyDeviceToDevice, context.stream));
     }
 
-    int32_t const pmLen = divUp(proposalLen, 32);
-    check::check(mDraftPackedAttentionMask.reshape({activeBatchSize, proposalLen, pmLen}), "Tensor reshape failed");
-    check::check(mDraftAttentionPosId.reshape({activeBatchSize, proposalLen}), "Tensor reshape failed");
+    int32_t const pmLen = divUp(blockLen, 32);
+    check::check(mDraftPackedAttentionMask.reshape({activeBatchSize, blockLen, pmLen}), "Tensor reshape failed");
+    check::check(mDraftAttentionPosId.reshape({activeBatchSize, blockLen}), "Tensor reshape failed");
     check::check(mDraftContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
     Tensor const& draftCacheLengths = mDraftCacheManager.getKVCacheLengths();
     kernel::launchDFlashPrepareProposalInputs(draftCacheLengths.dataPointer<int32_t>(),
-        mDraftDeltaLens.dataPointer<int32_t>(), proposalLen, mDraftPackedAttentionMask.dataPointer<int32_t>(),
-        mDraftAttentionPosId.dataPointer<int32_t>(), mDraftContextLengths.dataPointer<int32_t>(), false,
+        mDraftDeltaLens.dataPointer<int32_t>(), blockLen, mDraftPackedAttentionMask.dataPointer<int32_t>(),
+        mDraftAttentionPosId.dataPointer<int32_t>(), mDraftContextLengths.dataPointer<int32_t>(), mCausalProposalMask,
         activeBatchSize, context.stream);
 
-    check::check(mDraftOutputLogits.reshape({activeBatchSize, proposalLen, mDraftVocabSize}), "Tensor reshape failed");
-    check::check(mDraftHiddenStates.reshape({activeBatchSize, proposalLen, mDraftHiddenSize}), "Tensor reshape failed");
+    check::check(mDraftOutputLogits.reshape({activeBatchSize, blockLen, mDraftVocabSize}), "Tensor reshape failed");
+    check::check(mDraftHiddenStates.reshape({activeBatchSize, blockLen, mDraftHiddenSize}), "Tensor reshape failed");
 
     int32_t const draftKVCapacity = mRuntime.deployment.draft->maxKVCacheCapacity;
     InferenceDims const draftDims{
         /*.batch=*/activeBatchSize,
-        /*.seqLen=*/proposalLen,
+        /*.seqLen=*/blockLen,
         /*.kvLen=*/draftKVCapacity,
         /*.selectLen=*/static_cast<int64_t>(maxDeltaLen),
-        /*.attnMaskSeqLen=*/proposalLen,
+        /*.attnMaskSeqLen=*/blockLen,
         /*.ropeBatch=*/1,
         /*.packedMaskLen=*/static_cast<int64_t>(pmLen),
         /*.contextMaskSelectorLen=*/0,
@@ -646,7 +667,7 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
             {
                 kernel::dsparkBuildMarkovLogits(mDraftOutputLogits, mMarkovW1, mMarkovW2, mLastAcceptedTokens,
                     mDraftTokenIds, mDraftStepLogits, activeBatchSize, step, proposalLen, mDraftVocabSize, mMarkovRank,
-                    context.stream);
+                    context.stream, blockLen, mDraftSlotOffset);
                 // GCOVR_EXCL_START
                 if (context.hasLogitBias)
                 {
@@ -673,7 +694,7 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
                 kernel::dsparkVanillaMarkovSample(mDraftOutputLogits, mMarkovW1, mMarkovW2, mLastAcceptedTokens,
                     mDraftUniforms, mDraftTokenIds, mDraftProbabilities, mDraftStepLogits, mDraftStepProbabilities,
                     activeBatchSize, proposalLen, mDraftVocabSize, mMarkovRank, context.temperature,
-                    static_cast<int32_t>(context.topK), context.topP, context.stream);
+                    static_cast<int32_t>(context.topK), context.topP, context.stream, blockLen, mDraftSlotOffset);
             }
         }
     }
@@ -710,7 +731,7 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
                         kernel::dsparkMarkovGreedyFusedStepFp8(mDraftOutputLogits, mMarkovW1, mMarkovW2Fp8,
                             mMarkovW2RowScales, mLastAcceptedTokens, mMarkovGreedySlots,
                             mUseTree ? &mStackedMarkovLogits : nullptr, step + 1, activeBatchSize, step, proposalLen,
-                            mDraftVocabSize, mMarkovRank, context.stream);
+                            mDraftVocabSize, mMarkovRank, context.stream, blockLen, mDraftSlotOffset);
                     }
                 }
                 else
@@ -719,7 +740,8 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
                     {
                         kernel::dsparkMarkovGreedyFusedStep(mDraftOutputLogits, mMarkovW1, mMarkovW2,
                             mLastAcceptedTokens, mMarkovGreedySlots, mUseTree ? &mStackedMarkovLogits : nullptr,
-                            step + 1, activeBatchSize, step, proposalLen, mDraftVocabSize, mMarkovRank, context.stream);
+                            step + 1, activeBatchSize, step, proposalLen, mDraftVocabSize, mMarkovRank, context.stream,
+                            blockLen, mDraftSlotOffset);
                     }
                 }
                 kernel::dsparkFinalizeGreedyDraftTokens(
@@ -735,7 +757,7 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
                 {
                     kernel::dsparkBuildMarkovLogits(mDraftOutputLogits, mMarkovW1, mMarkovW2, mLastAcceptedTokens,
                         mDraftTokenIds, mDraftStepLogits, activeBatchSize, step, proposalLen, mDraftVocabSize,
-                        mMarkovRank, context.stream);
+                        mMarkovRank, context.stream, blockLen, mDraftSlotOffset);
                     if (mUseTree)
                     {
                         // Step logits become the depth-(step+1) candidate row (row 0 is the root placeholder).
@@ -765,14 +787,16 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
             kernel::dsparkComputeConfidenceAndSPSProposalLengths(mDraftHiddenStates, mMarkovW1, mConfidenceWeight,
                 mConfidenceBias, mLastAcceptedTokens, mDraftTokenIds, mConfidenceScores, mProposalLengths,
                 activeBatchSize, proposalLen, mDraftHiddenSize, mMarkovRank, mConfidenceHeadWithMarkov,
-                mConfidenceThreshold, mMinScheduledProposalLen, mMaxScheduledProposalLen, context.stream);
+                mConfidenceThreshold, mMinScheduledProposalLen, mMaxScheduledProposalLen, context.stream,
+                mDraftBlockLen, mDraftSlotOffset);
         }
         else
         {
             kernel::dsparkComputeConfidenceAndProposalLengths(mDraftHiddenStates, mMarkovW1, mConfidenceWeight,
                 mConfidenceBias, mLastAcceptedTokens, mDraftTokenIds, mConfidenceScores, mProposalLengths,
                 activeBatchSize, proposalLen, mDraftHiddenSize, mMarkovRank, mConfidenceHeadWithMarkov,
-                mConfidenceThreshold, mMinScheduledProposalLen, mMaxScheduledProposalLen, context.stream);
+                mConfidenceThreshold, mMinScheduledProposalLen, mMaxScheduledProposalLen, context.stream,
+                mDraftBlockLen, mDraftSlotOffset);
         }
 
         check::check(mHostProposalLengths.reshape({activeBatchSize}), "Tensor reshape failed");
@@ -805,7 +829,7 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
             check::check(mConfidenceScores.reshape({activeBatchSize, proposalLen}), "Tensor reshape failed");
             kernel::dsparkComputeConfidenceScores(mDraftHiddenStates, mMarkovW1, mConfidenceWeight, mConfidenceBias,
                 mLastAcceptedTokens, mDraftTokenIds, mConfidenceScores, activeBatchSize, proposalLen, mDraftHiddenSize,
-                mMarkovRank, mConfidenceHeadWithMarkov, context.stream);
+                mMarkovRank, mConfidenceHeadWithMarkov, context.stream, mDraftBlockLen, mDraftSlotOffset);
         }
         return buildTreeVerifyInputs(activeBatchSize, context.stream, mUseTreeScheduler);
     }
@@ -1128,24 +1152,21 @@ bool DSparkDecoder::captureCudaGraphs(cudaStream_t stream)
         mRuntime.base.cacheManager.resetForNewSequences(simCacheLensTensor, stream);
         mDraftCacheManager.resetForNewSequences(simCacheLensTensor, stream);
 
-        int32_t const draftPmLen = divUp(proposalLen, 32);
+        int32_t const blockLen = mDraftBlockLen;
+        int32_t const draftPmLen = divUp(blockLen, 32);
         // Delta = last round's accept length; capped by the draft profile (block + 1),
         // which tree-mode verifyLen (node budget) can exceed.
         int32_t const maxSimDeltaLen = std::min(proposalLen + 1, verifyLen);
         for (int32_t simDeltaLen = 1; simDeltaLen <= maxSimDeltaLen; ++simDeltaLen)
         {
-            check::check(
-                mDraftInputsEmbeds.reshape({batchSize, proposalLen, mDraftHiddenSize}), "Tensor reshape failed");
+            check::check(mDraftInputsEmbeds.reshape({batchSize, blockLen, mDraftHiddenSize}), "Tensor reshape failed");
             check::check(
                 mDraftTargetHidden.reshape({batchSize, static_cast<int64_t>(simDeltaLen), mBaseOutputHiddenDim}),
                 "Tensor reshape failed");
-            check::check(
-                mDraftOutputLogits.reshape({batchSize, proposalLen, mDraftVocabSize}), "Tensor reshape failed");
-            check::check(
-                mDraftHiddenStates.reshape({batchSize, proposalLen, mDraftHiddenSize}), "Tensor reshape failed");
-            check::check(
-                mDraftPackedAttentionMask.reshape({batchSize, proposalLen, draftPmLen}), "Tensor reshape failed");
-            check::check(mDraftAttentionPosId.reshape({batchSize, proposalLen}), "Tensor reshape failed");
+            check::check(mDraftOutputLogits.reshape({batchSize, blockLen, mDraftVocabSize}), "Tensor reshape failed");
+            check::check(mDraftHiddenStates.reshape({batchSize, blockLen, mDraftHiddenSize}), "Tensor reshape failed");
+            check::check(mDraftPackedAttentionMask.reshape({batchSize, blockLen, draftPmLen}), "Tensor reshape failed");
+            check::check(mDraftAttentionPosId.reshape({batchSize, blockLen}), "Tensor reshape failed");
             check::check(mDraftContextLengths.reshape({batchSize}), "Tensor reshape failed");
 
             std::vector<int32_t> simDeltaLens(batchSize, simDeltaLen);
@@ -1155,16 +1176,16 @@ bool DSparkDecoder::captureCudaGraphs(cudaStream_t stream)
 
             Tensor const& draftCacheLengths = mDraftCacheManager.getKVCacheLengths();
             kernel::launchDFlashPrepareProposalInputs(draftCacheLengths.dataPointer<int32_t>(),
-                mDraftDeltaLens.dataPointer<int32_t>(), proposalLen, mDraftPackedAttentionMask.dataPointer<int32_t>(),
-                mDraftAttentionPosId.dataPointer<int32_t>(), mDraftContextLengths.dataPointer<int32_t>(), false,
-                batchSize, stream);
+                mDraftDeltaLens.dataPointer<int32_t>(), blockLen, mDraftPackedAttentionMask.dataPointer<int32_t>(),
+                mDraftAttentionPosId.dataPointer<int32_t>(), mDraftContextLengths.dataPointer<int32_t>(),
+                mCausalProposalMask, batchSize, stream);
 
             InferenceDims const draftDims{
                 /*.batch=*/batchSize,
-                /*.seqLen=*/proposalLen,
+                /*.seqLen=*/blockLen,
                 /*.kvLen=*/draftKVCapacity,
                 /*.selectLen=*/static_cast<int64_t>(simDeltaLen),
-                /*.attnMaskSeqLen=*/proposalLen,
+                /*.attnMaskSeqLen=*/blockLen,
                 /*.ropeBatch=*/1,
                 /*.packedMaskLen=*/static_cast<int64_t>(draftPmLen),
                 /*.contextMaskSelectorLen=*/0,
@@ -1270,23 +1291,23 @@ bool DSparkDecoder::runSystemPromptPrefill(DecodingInferenceContext& context)
 {
     int32_t const activeBatchSize = context.activeBatchSize;
     int64_t const prefillLen = mRuntime.base.pipelineIO.baseHiddenStates.getShape()[1];
-    int32_t const proposalLen = mProposalLen;
+    int32_t const blockLen = mDraftBlockLen;
 
-    check::check(mRuntime.preprocess.idsInput.reshape({activeBatchSize, proposalLen}), "Tensor reshape failed");
-    check::check(mHostDraftInputIds.reshape({activeBatchSize, proposalLen}), "Tensor reshape failed");
+    check::check(mRuntime.preprocess.idsInput.reshape({activeBatchSize, blockLen}), "Tensor reshape failed");
+    check::check(mHostDraftInputIds.reshape({activeBatchSize, blockLen}), "Tensor reshape failed");
     int32_t* hostDraftInputIds = mHostDraftInputIds.dataPointer<int32_t>();
     for (int32_t b = 0; b < activeBatchSize; ++b)
     {
-        hostDraftInputIds[b * proposalLen] = context.tokenIds[b].back();
-        for (int32_t j = 1; j < proposalLen; ++j)
+        hostDraftInputIds[b * blockLen] = context.tokenIds[b].back();
+        for (int32_t j = 1; j < blockLen; ++j)
         {
-            hostDraftInputIds[b * proposalLen + j] = mMaskTokenId;
+            hostDraftInputIds[b * blockLen + j] = mMaskTokenId;
         }
     }
     CUDA_CHECK(cudaMemcpyAsync(mRuntime.preprocess.idsInput.rawPointer(), mHostDraftInputIds.rawPointer(),
-        activeBatchSize * proposalLen * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
+        activeBatchSize * blockLen * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
 
-    check::check(mDraftInputsEmbeds.reshape({activeBatchSize, proposalLen, mDraftHiddenSize}), "Tensor reshape failed");
+    check::check(mDraftInputsEmbeds.reshape({activeBatchSize, blockLen, mDraftHiddenSize}), "Tensor reshape failed");
     kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
         mRuntime.preprocess.embedding.scalesAsOptional(), mDraftInputsEmbeds, context.stream);
 
@@ -1304,21 +1325,21 @@ bool DSparkDecoder::runSystemPromptPrefill(DecodingInferenceContext& context)
     CUDA_CHECK(cudaMemcpyAsync(mDraftDeltaLens.rawPointer(), mHostDeltaLens.rawPointer(),
         activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
 
-    int32_t const pmLen = divUp(proposalLen, 32);
-    check::check(mDraftPackedAttentionMask.reshape({activeBatchSize, proposalLen, pmLen}), "Tensor reshape failed");
-    check::check(mDraftAttentionPosId.reshape({activeBatchSize, proposalLen}), "Tensor reshape failed");
+    int32_t const pmLen = divUp(blockLen, 32);
+    check::check(mDraftPackedAttentionMask.reshape({activeBatchSize, blockLen, pmLen}), "Tensor reshape failed");
+    check::check(mDraftAttentionPosId.reshape({activeBatchSize, blockLen}), "Tensor reshape failed");
     check::check(mDraftContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
 
     Tensor const& draftCacheLengths = mDraftCacheManager.getKVCacheLengths();
     kernel::launchDFlashPrepareProposalInputs(draftCacheLengths.dataPointer<int32_t>(),
-        mDraftDeltaLens.dataPointer<int32_t>(), proposalLen, mDraftPackedAttentionMask.dataPointer<int32_t>(),
-        mDraftAttentionPosId.dataPointer<int32_t>(), mDraftContextLengths.dataPointer<int32_t>(), false,
+        mDraftDeltaLens.dataPointer<int32_t>(), blockLen, mDraftPackedAttentionMask.dataPointer<int32_t>(),
+        mDraftAttentionPosId.dataPointer<int32_t>(), mDraftContextLengths.dataPointer<int32_t>(), mCausalProposalMask,
         activeBatchSize, context.stream);
 
-    check::check(mDraftOutputLogits.reshape({activeBatchSize, proposalLen, mDraftVocabSize}), "Tensor reshape failed");
-    check::check(mDraftHiddenStates.reshape({activeBatchSize, proposalLen, mDraftHiddenSize}), "Tensor reshape failed");
+    check::check(mDraftOutputLogits.reshape({activeBatchSize, blockLen, mDraftVocabSize}), "Tensor reshape failed");
+    check::check(mDraftHiddenStates.reshape({activeBatchSize, blockLen, mDraftHiddenSize}), "Tensor reshape failed");
     int32_t const draftKVCapacity = mRuntime.deployment.draft->maxKVCacheCapacity;
-    InferenceDims const draftDims{activeBatchSize, proposalLen, draftKVCapacity, prefillLen, proposalLen, 1,
+    InferenceDims const draftDims{activeBatchSize, blockLen, draftKVCapacity, prefillLen, blockLen, 1,
         static_cast<int64_t>(pmLen), 0, activeBatchSize, 0, 0, 0};
 
     cudaGetLastError();
