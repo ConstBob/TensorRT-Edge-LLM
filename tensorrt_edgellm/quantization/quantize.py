@@ -104,6 +104,18 @@ def _is_phi4mm_model(model_dir: str) -> bool:
         return False
 
 
+def _is_qwen3_tts_model(model_dir: str) -> bool:
+    """True if ``<model_dir>/config.json`` declares a Qwen3-TTS checkpoint."""
+    config_path = os.path.join(model_dir, "config.json")
+    if not os.path.exists(config_path):
+        return False
+    try:
+        with open(config_path) as f:
+            return json.load(f).get("model_type") == "qwen3_tts"
+    except (OSError, ValueError):
+        return False
+
+
 def _pre_register_phi4mm_attention_for_kv_quant(
         model: torch.nn.Module) -> None:
     # ModelOpt's register_hf_attentions_on_the_fly short-circuits when ANY
@@ -249,6 +261,13 @@ def _load_model(model_dir, dtype="fp16", device="cuda"):
         from tensorrt_edgellm.lora import load_phi4mm_model
         model = load_phi4mm_model(model_dir, torch_dtype)
         model.to(device)
+    elif _is_qwen3_tts_model(model_dir):
+        # No released transformers registers model_type="qwen3_tts" and the
+        # checkpoint ships no modeling code, so the AutoModel factories below
+        # cannot build it.
+        from .models.qwen3_tts import Qwen3TTSForCalibration
+        model = Qwen3TTSForCalibration.from_pretrained(model_dir, torch_dtype,
+                                                       device)
     elif is_qwen3_asr_model(model_dir):
         # Qwen3-ASR HF ckpt declares model_type="qwen3_asr" but ships no
         # modeling code, so the AutoModel factories below would fail. We
@@ -715,9 +734,9 @@ def _skip_resmooth_for_hybrid(model, quantization: str = ""):
     # Multimodal wrappers have no top-level ``forward``; resmooth's dummy
     # ``model(fake_input)`` crashes on them. Resmooth is a no-op without
     # AWQ pre_quant_scales, so skipping is safe here.
-    should_skip = ((_is_hybrid_model(model) and not is_nvfp4)
-                   or model_type in ("phi4mm", "phi4_multimodal", "qwen3_omni",
-                                     "qwen3_omni_moe", "qwen3_omni_next")
+    should_skip = ((_is_hybrid_model(model) and not is_nvfp4) or model_type
+                   in ("phi4mm", "phi4_multimodal", "qwen3_omni",
+                       "qwen3_omni_moe", "qwen3_omni_next", "qwen3_tts")
                    or (is_int4_awq and not _is_moe_model(model)))
     if not should_skip:
         yield
@@ -995,6 +1014,15 @@ def quantize_and_export(
             raise ValueError(
                 "Joint --quantization + --cp_quantization is not supported "
                 "on this MoE thinker wrapper via the generic path.")
+        # The joint loop prepends a backbone pass that calls ``model(...)``,
+        # which the calibration model does not implement -- it is driven
+        # through ``model.talker`` instead.
+        if (cp_quantization is not None and quantization is not None
+                and _is_qwen3_tts_model(model_dir)):
+            raise ValueError(
+                "Joint --quantization + --cp_quantization is not supported "
+                "for Qwen3-TTS; the Talker stays FP16, so pass "
+                "--cp_quantization fp8 on its own.")
         quant_cfg = build_quant_config(
             quantization,
             lm_head_quantization,

@@ -18,6 +18,18 @@ prompt contract from `tts_model_type` in the engine configuration.
 
 > **Note:** Unlike Qwen3-Omni, Qwen3-TTS has no Thinker or visual encoder. The text embedding is self-contained in the Talker and exported as `text_embedding.safetensors`.
 
+> **Note:** Export the CodePredictor from the quantize output and every other component from the
+> checkpoint — the quantize output has no `speech_tokenizer/`, which Code2Wav export requires:
+>
+> ```bash
+> export QUANT_ROOT=$MODEL_ROOT/cp_fp8
+>
+> tensorrt-edgellm-quantize llm --model_dir "$MODEL_ID" \
+>     --output_dir "$QUANT_ROOT" --cp_quantization fp8
+> tensorrt-edgellm-export "$MODEL_ID" "$MODEL_ROOT/onnx"
+> tensorrt-edgellm-export "$QUANT_ROOT" "$MODEL_ROOT/onnx" --components code_predictor
+> ```
+
 > **Prerequisites:** Complete the [Installation Guide](../getting_started/installation.md) before proceeding.
 
 ---
