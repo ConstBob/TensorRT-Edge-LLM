@@ -435,6 +435,141 @@ def test_code_predictor_quantization():
 
 
 # --------------------------------------------------------------------------- #
+# CP calibration loop: text and codec token domains must stay separate
+# --------------------------------------------------------------------------- #
+_TTS_TEXT_VOCAB = 64
+_TTS_CODEC_VOCAB = 32
+_TTS_CP_VOCAB = 8
+_TTS_CODE_GROUPS = 4
+_TTS_TEXT_HIDDEN = 32
+
+
+class _TTSCodePredictorStub(nn.Module):
+    """Records the ids handed to the per-codebook embeddings."""
+
+    def __init__(self):
+        super().__init__()
+        self.codec_embedding = nn.ModuleList([
+            nn.Embedding(_TTS_CP_VOCAB, _DIM)
+            for _ in range(_TTS_CODE_GROUPS - 1)
+        ])
+        self.generate_calls = 0
+
+    def get_input_embeddings(self):
+        return self.codec_embedding
+
+    def generate(self, **kwargs):
+        self.generate_calls += 1
+
+
+class _TTSTalkerStub(nn.Module):
+    """Qwen3-TTS Talker shape: codec and text tokens live in different tables
+    of different sizes, and text must be resized by ``text_projection``."""
+
+    def __init__(self):
+        super().__init__()
+        self.codec_embedding = nn.Embedding(_TTS_CODEC_VOCAB, _DIM)
+        self.text_embedding = nn.Embedding(_TTS_TEXT_VOCAB, _TTS_TEXT_HIDDEN)
+        self.text_projection = nn.Linear(_TTS_TEXT_HIDDEN, _DIM)
+        self.code_predictor = _TTSCodePredictorStub()
+        self.codec_ids_seen = []
+        self.codec_embedding.register_forward_pre_hook(
+            lambda _m, args: self.codec_ids_seen.append(args[0]))
+
+    @property
+    def dtype(self):
+        return self.codec_embedding.weight.dtype
+
+    def get_input_embeddings(self):
+        return self.codec_embedding
+
+    def get_text_embeddings(self):
+        return self.text_embedding
+
+    def forward(self, inputs_embeds=None, **kwargs):
+        return SimpleNamespace(hidden_states=((inputs_embeds, ), None))
+
+
+class _TTSModelStub(nn.Module):
+    """Qwen3-TTS has no Thinker, and its talker config has no ``text_config``
+    sub-config -- only a flat codec ``vocab_size``."""
+
+    def __init__(self):
+        super().__init__()
+        self.talker = _TTSTalkerStub()
+        self.config = SimpleNamespace(talker_config=SimpleNamespace(
+            vocab_size=_TTS_CODEC_VOCAB,
+            text_vocab_size=_TTS_TEXT_VOCAB,
+            text_hidden_size=_TTS_TEXT_HIDDEN,
+            num_code_groups=_TTS_CODE_GROUPS,
+            code_predictor_config=SimpleNamespace(
+                vocab_size=_TTS_CP_VOCAB, num_code_groups=_TTS_CODE_GROUPS)))
+
+
+def test_cp_embeddings_stay_unquantized():
+    """The per-codebook lookup tables must never get a weight quantizer.
+
+    ModelOpt >= 0.45 attaches one to ``nn.Embedding`` too, and the exporter
+    copies those rows into ``codec_embeddings.safetensors`` verbatim, so an FP8
+    table ships at half size and the runtime reads it as fp16 garbage.
+    """
+
+    class _CPWithEmbeddings(nn.Module):
+
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(_DIM, _DIM, bias=False)
+            self.codec_embedding = nn.ModuleList([nn.Embedding(32, _DIM)])
+
+        def forward(self, x):
+            index = torch.zeros(1, dtype=torch.long)
+            return self.q_proj(x) + self.codec_embedding[0](index)
+
+    model = nn.Module()
+    model.talker = nn.Module()
+    model.talker.add_module("code_predictor", _CPWithEmbeddings())
+    model.forward = model.talker.code_predictor.forward
+
+    mtq.quantize(model,
+                 build_quant_config("fp8", cp_quantization="fp8"),
+                 forward_loop=lambda m: m(torch.randn(2, _DIM)))
+
+    cp = model.talker.code_predictor
+    assert _wq(cp.q_proj)[0], "CP Linear should still be quantized"
+    quantizer = getattr(cp.codec_embedding[0], "weight_quantizer", None)
+    assert quantizer is None or not quantizer.is_enabled, (
+        "CP codec embeddings must stay unquantized -- the exporter copies "
+        "them out verbatim")
+
+
+def test_cp_calibration_keeps_text_and_codec_domains_separate():
+    """Qwen3-TTS text ids must go through the text table + ``text_projection``,
+    never the codec table, and the CP seed token must stay inside codebook 0.
+
+    Text ids above the codec vocab would index out of bounds if the loop
+    reused ``get_input_embeddings()`` (the codec table) for text.
+    """
+    module_path = os.path.normpath(
+        os.path.join(_THIS_DIR, "..", "..", "tensorrt_edgellm", "quantization",
+                     "qwen3_cp_loader.py"))
+    spec = importlib.util.spec_from_file_location("_cp_loader_under_test",
+                                                  module_path)
+    cp_loader = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cp_loader)
+
+    model = _TTSModelStub().eval()
+    text_ids = torch.tensor([[_TTS_CODEC_VOCAB + 1, _TTS_TEXT_VOCAB - 1]])
+    cp_loader.qwen3_cp_calibration_loop(model, [text_ids], num_cp_samples=1)
+
+    assert model.talker.code_predictor.generate_calls == 1
+    seen = torch.cat([ids.flatten() for ids in model.talker.codec_ids_seen])
+    assert seen.numel() > 0, "codec table never used for the CP seed token"
+    assert int(seen.max()) < _TTS_CODEC_VOCAB, (
+        "CP seed token must be bounded by the Talker codec table it indexes, "
+        "not by a text vocabulary")
+
+
+# --------------------------------------------------------------------------- #
 # Speculative draft models: standalone draft and Qwen3.5-style base+MTP
 # --------------------------------------------------------------------------- #
 def test_eagle3_draft_model_quantized():
