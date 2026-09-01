@@ -46,6 +46,7 @@ _GLIBC_BASELINES = {
     ("jetson", "jp71"): (2, 39),
     ("jetson", "jp72"): (2, 39),
     ("drive", "7.2"): (2, 39),
+    ("igx-thor", "current"): (2, 39),
     ("dgx-spark", "current"): (2, 39),
 }
 
