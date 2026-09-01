@@ -394,7 +394,7 @@ void writeModeSpecificCsvHeader(std::ofstream& csvFile, BenchOutputParams const&
     case BenchMode::kDECODE: csvFile << ",past_kv_len"; break;
     case BenchMode::kEAGLE_VERIFY: csvFile << ",verify_tree_size,past_kv_len"; break;
     case BenchMode::kEAGLE_DRAFT_PROPOSAL: csvFile << ",draft_tree_size,past_kv_len"; break;
-    case BenchMode::kEAGLE_DRAFT_ACCEPT: csvFile << ",accept_len,past_kv_len"; break;
+    case BenchMode::kEAGLE_DRAFT_ACCEPT: csvFile << ",draft_step,accept_len,past_kv_len"; break;
     case BenchMode::kDFLASH_DRAFT_PROPOSAL: csvFile << ",seed,block_size,draft_delta_len,past_kv_len"; break;
     case BenchMode::kDFLASH_DRAFT_FIRST_ROUND: csvFile << ",seed,block_size,input_len"; break;
     case BenchMode::kDFLASH_VERIFY: csvFile << ",seed,verify_tree_size,past_kv_len"; break;
@@ -417,7 +417,9 @@ void writeModeSpecificCsvData(std::ofstream& csvFile, BenchOutputParams const& p
     case BenchMode::kDECODE: csvFile << "," << params.pastKVLen; break;
     case BenchMode::kEAGLE_VERIFY: csvFile << "," << params.verifyTreeSize << "," << params.pastKVLen; break;
     case BenchMode::kEAGLE_DRAFT_PROPOSAL: csvFile << "," << params.draftTreeSize << "," << params.pastKVLen; break;
-    case BenchMode::kEAGLE_DRAFT_ACCEPT: csvFile << "," << params.acceptLen << "," << params.pastKVLen; break;
+    case BenchMode::kEAGLE_DRAFT_ACCEPT:
+        csvFile << "," << params.draftStep << "," << params.acceptLen << "," << params.pastKVLen;
+        break;
     case BenchMode::kDFLASH_DRAFT_PROPOSAL:
         csvFile << "," << params.seed << "," << params.blockSize << "," << params.draftDeltaLen << ","
                 << params.pastKVLen;
@@ -562,8 +564,8 @@ std::string buildLayerCsvPath(std::string const& outputDir, BenchOutputParams co
             + std::to_string(params.pastKVLen);
         break;
     case BenchMode::kEAGLE_DRAFT_ACCEPT:
-        path += "eagle_draft_accept_acceptlen" + std::to_string(params.acceptLen) + "_pastkvlen"
-            + std::to_string(params.pastKVLen);
+        path += "eagle_draft_accept_draftstep" + std::to_string(params.draftStep) + "_acceptlen"
+            + std::to_string(params.acceptLen) + "_pastkvlen" + std::to_string(params.pastKVLen);
         break;
     case BenchMode::kDFLASH_DRAFT_PROPOSAL:
         path += "dflash_draft_proposal_bs" + std::to_string(params.blockSize) + "_delta"
@@ -615,8 +617,8 @@ std::string buildE2ECsvPath(std::string const& outputDir, BenchOutputParams cons
             + std::to_string(params.pastKVLen);
         break;
     case BenchMode::kEAGLE_DRAFT_ACCEPT:
-        path += "eagle_draft_accept_acceptlen" + std::to_string(params.acceptLen) + "_pastkvlen"
-            + std::to_string(params.pastKVLen);
+        path += "eagle_draft_accept_draftstep" + std::to_string(params.draftStep) + "_acceptlen"
+            + std::to_string(params.acceptLen) + "_pastkvlen" + std::to_string(params.pastKVLen);
         break;
     case BenchMode::kDFLASH_DRAFT_PROPOSAL:
         path += "dflash_draft_proposal_bs" + std::to_string(params.blockSize) + "_delta"
@@ -674,6 +676,7 @@ void logBenchConfig(BenchOutputParams const& params, int64_t imageTokens)
         break;
     case BenchMode::kEAGLE_DRAFT_ACCEPT:
         LOG_INFO("  Past KV Len: %d", params.pastKVLen);
+        LOG_INFO("  Draft Step: %d", params.draftStep);
         LOG_INFO("  Accept Len: %d", params.acceptLen);
         break;
     case BenchMode::kEAGLE_DRAFT_PREFILL:
@@ -784,7 +787,8 @@ void logResultsSummary(BenchOutputParams const& params, std::vector<KernelTimes>
         }
         case BenchMode::kEAGLE_DRAFT_ACCEPT:
         {
-            LOG_INFO("AcceptLen: %d, PastKVLen: %d, OSL: %d", params.acceptLen, params.pastKVLen, params.osl);
+            LOG_INFO("DraftStep: %d, AcceptLen: %d, PastKVLen: %d, OSL: %d", params.draftStep, params.acceptLen,
+                params.pastKVLen, params.osl);
             if (params.osl > 1)
             {
                 LOG_INFO("Tokens/sec (E2E): %.1f", ((params.osl - 1) * 1000.0) / e2eTimeMsResult);

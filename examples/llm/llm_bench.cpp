@@ -205,8 +205,8 @@ void printUsage(char const* programName)
     std::cerr << "    --draftTreeSize         Draft tree size. Required." << std::endl;
     std::cerr << "    --pastKVLen             Past KV cache length. Required." << std::endl;
     std::cerr << "  For spec_draft_accept mode:" << std::endl;
-    std::cerr << "    --acceptLen             Tokens caught up per accept pass (default: draftStep+1"
-              << " = production's fixed depth)." << std::endl;
+    std::cerr << "    --acceptLen             Tokens caught up per accept pass (default: draftStep+1; pass"
+              << " --draftStep matching your deployment's drafting_step)." << std::endl;
     std::cerr << "    --pastKVLen             Past KV cache length per batch. Required." << std::endl;
     std::cerr << "    --verifyTreeSize        Optional; defaults to draftStep+1 (chain-MTP engines"
               << " require verifySize == draftStep+1)." << std::endl;
@@ -553,6 +553,21 @@ bool validateArgs(ProfileBenchArgs const& args)
         return false;
     }
 
+    bool const isSpecMode = args.mode == BenchMode::kEAGLE_VERIFY || args.mode == BenchMode::kEAGLE_DRAFT_PROPOSAL
+        || args.mode == BenchMode::kEAGLE_DRAFT_PREFILL || args.mode == BenchMode::kEAGLE_DRAFT_ACCEPT
+        || args.mode == BenchMode::kDFLASH_DRAFT_PROPOSAL || args.mode == BenchMode::kDFLASH_DRAFT_FIRST_ROUND
+        || args.mode == BenchMode::kDFLASH_VERIFY || args.mode == BenchMode::kDFLASH_DDTREE_BUILD;
+    if (isSpecMode && args.acceptRate <= 0)
+    {
+        LOG_ERROR("--acceptRate must be positive for speculative decoding modes");
+        return false;
+    }
+    if (isSpecMode && args.draftStep < 1)
+    {
+        LOG_ERROR("--draftStep must be at least 1 for speculative decoding modes");
+        return false;
+    }
+
     if (args.mode == BenchMode::kDFLASH_DDTREE_BUILD && !args.noProfile)
     {
         LOG_ERROR(
@@ -734,18 +749,13 @@ int main(int argc, char** argv)
         return EXIT_FAILURE;
     }
 
-    // spec_draft_accept defaults are fully arg-determined (chain geometry), so
-    // resolve them here: before the drafting-config synthesis — the MTP
-    // linear-chain gate requires verifySize == draftingStep+1, so the
-    // documented pastKVLen-only invocation must not leave verifyTreeSize
-    // at -1 — and before logBenchConfig, so the config header prints the
-    // effective values rather than the -1 sentinels.
+    // Resolve the chain geometry before deployment creation and configuration logging.
     if (args.mode == BenchMode::kEAGLE_DRAFT_ACCEPT)
     {
-        int32_t const chainStep = std::max(args.draftStep, 1); // mirrors the drafting-config synthesis
+        int32_t const chainStep = args.draftStep;
         if (args.acceptLen <= 0)
         {
-            args.acceptLen = chainStep + 1; // production's fixed catch-up depth
+            args.acceptLen = chainStep + 1;
         }
         if (args.verifyTreeSize <= 0)
         {
@@ -952,6 +962,24 @@ int main(int argc, char** argv)
                 "uses a denoise/sample/commit runtime state machine. Use llm_inference or add a dedicated "
                 "diffusion_decode bench mode for end-to-end DG decode timing.");
             return EXIT_FAILURE;
+        }
+
+        if (args.mode == BenchMode::kEAGLE_DRAFT_ACCEPT)
+        {
+            ELLM_CHECK(deployment.draft.has_value(), "spec_draft_accept requires a draft engine");
+            ELLM_CHECK(args.acceptLen <= deployment.draft->maxDraftTreeSize,
+                "spec_draft_accept acceptLen (" + std::to_string(args.acceptLen)
+                    + ") exceeds the draft engine maxDraftTreeSize ("
+                    + std::to_string(deployment.draft->maxDraftTreeSize) + ")");
+
+            int64_t const decodeStepsForCapacity
+                = args.osl > 1 ? (static_cast<int64_t>(args.osl) - 1 + args.acceptRate - 1) / args.acceptRate : 0;
+            int64_t const requiredDraftCacheLength = static_cast<int64_t>(args.pastKVLen) + args.acceptLen
+                + decodeStepsForCapacity * static_cast<int64_t>(args.acceptRate);
+            ELLM_CHECK(requiredDraftCacheLength <= static_cast<int64_t>(deployment.draft->maxKVCacheCapacity),
+                "spec_draft_accept requires pastKVLen + acceptLen + decodeSteps * acceptRate ("
+                    + std::to_string(requiredDraftCacheLength) + ") to fit the draft engine maxKVCacheCapacity ("
+                    + std::to_string(deployment.draft->maxKVCacheCapacity) + ")");
         }
 
         // --- DFlash: engine-config consistency + CLI-default resolution ---
@@ -1458,15 +1486,11 @@ int main(int argc, char** argv)
     }
     else if (args.mode == BenchMode::kEAGLE_DRAFT_ACCEPT)
     {
-        // The draft accept-token catch-up pass: one draft-engine execute over
-        // the accepted tokens (production runs it at maxAcceptDepth =
-        // draftStep+1 every iteration — see MTPDecoder::runDraftModelAcceptToken).
-        // --acceptLen sweeps the depth to expose how weight-streaming-bound
-        // the pass is; the default (draftStep+1, production's fixed depth) is
-        // resolved right after validateArgs so logBenchConfig prints it.
+        // One draft-engine execute advances state across the accepted token span.
         int32_t const acceptLen = args.acceptLen;
         modeName = "Spec Draft Accept";
-        LOG_INFO("Spec Draft Accept mode: AcceptLen=%d, PastKVLen=%d", acceptLen, args.pastKVLen);
+        LOG_INFO("Spec Draft Accept mode: AcceptLen=%d, DraftStep=%d, PastKVLen=%d", acceptLen, args.draftStep,
+            args.pastKVLen);
         LOG_INFO(args.noCudaGraph ? "CUDA graph disabled; using non-CUDA-graph execution" : "CUDA graph enabled");
 
         pastKVLenVec.assign(B, args.pastKVLen);
@@ -1508,8 +1532,7 @@ int main(int argc, char** argv)
         if (args.osl > 1)
         {
             useSequentialE2E = true;
-            // One accept pass per spec-decode iteration (minus the first, but
-            // keep per-iteration cadence for simple tokens/sec math).
+            // One accept pass runs per speculative-decoding iteration.
             decodeSteps = (args.osl - 1 + args.acceptRate - 1) / args.acceptRate;
             postStep = [&](int32_t) {
                 resources->cacheManagers[kvCacheIndex]->commitSequenceLength(args.acceptRate, stream);
