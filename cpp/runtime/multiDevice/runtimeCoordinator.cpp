@@ -1029,6 +1029,17 @@ LLMGenerationRequest RuntimeCoordinator::prepareRequestState(LLMGenerationReques
 
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
+        bool const hasPreTokenizedInput
+            = i < static_cast<int32_t>(request.preTokenizedInputIds.size()) && !request.preTokenizedInputIds[i].empty();
+        if (hasPreTokenizedInput)
+        {
+            preparedRequest.preTokenizedInputIds[i] = request.preTokenizedInputIds[i];
+            if (request.requests[i].messages.empty())
+            {
+                continue;
+            }
+        }
+
         bool const formatted
             = mTokenizer->applyChatTemplate(preparedRequest.requests[i], preparedRequest.formattedRequests[i],
                 preparedRequest.applyChatTemplate, preparedRequest.addGenerationPrompt, preparedRequest.enableThinking);
@@ -1036,17 +1047,14 @@ LLMGenerationRequest RuntimeCoordinator::prepareRequestState(LLMGenerationReques
         {
             throw std::runtime_error(format::fmtstr("Failed to apply chat template for request %d in batch.", i));
         }
+        if (hasPreTokenizedInput)
+        {
+            continue;
+        }
 
-        if (i < static_cast<int32_t>(request.preTokenizedInputIds.size()) && !request.preTokenizedInputIds[i].empty())
-        {
-            preparedRequest.preTokenizedInputIds[i] = request.preTokenizedInputIds[i];
-        }
-        else
-        {
-            // The formatted chat request already carries the model template's special-token policy.
-            preparedRequest.preTokenizedInputIds[i]
-                = mTokenizer->encode(preparedRequest.formattedRequests[i].formattedCompleteRequest, false);
-        }
+        // The formatted chat request already carries the model template's special-token policy.
+        preparedRequest.preTokenizedInputIds[i]
+            = mTokenizer->encode(preparedRequest.formattedRequests[i].formattedCompleteRequest, false);
         if (preparedRequest.preTokenizedInputIds[i].empty())
         {
             throw std::runtime_error(format::fmtstr("Failed to tokenize input text for request %d in batch.", i));
