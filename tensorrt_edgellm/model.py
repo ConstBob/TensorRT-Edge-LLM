@@ -352,7 +352,8 @@ class AutoModel:
                 if os.path.isfile(draft_cfg_path):
                     with open(draft_cfg_path) as f:
                         draft_cfg = json.load(f)
-                    dspark_cfg = draft_cfg.get("dspark_config", {})
+                    dspark_cfg = (draft_cfg.get("dspark_config")
+                                  or draft_cfg.get("dflash_config", {}) or {})
                     config.dspark_target_layer_ids = (
                         dspark_cfg.get("target_layer_ids")
                         or draft_cfg.get("target_layer_ids", []))

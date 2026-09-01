@@ -1434,7 +1434,8 @@ def make_dspark_draft_config(
         default_attention_scale: Callable[[int], float]) -> ModelConfig:
     """Build a DSpark draft ModelConfig from a DeepSpec DSpark checkpoint."""
     _, llm_dict = load_checkpoint_config_dicts(draft_dir)
-    dspark_config = llm_dict.get("dspark_config", {}) or {}
+    dspark_config = (llm_dict.get("dspark_config")
+                     or llm_dict.get("dflash_config", {}) or {})
 
     quant = _parse_quant(draft_dir, llm_dict)
     target_layer_ids = list(
