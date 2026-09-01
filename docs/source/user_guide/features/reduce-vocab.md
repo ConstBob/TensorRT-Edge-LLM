@@ -127,6 +127,31 @@ The export writes `draft_vocab_map.safetensors` next to the draft engine. At run
 
 ---
 
+## MTP Speculative Decoding Support
+
+Chain-MTP can reduce only the draft LM head while preserving the base model's full vocabulary. Use this path with `--specDraftTopK 1`; reduced-vocabulary tree-MTP is not supported because its tree path would require a direct map while the MTP decoder stores an offset map. Unlike EAGLE, chain-MTP does not require a `d2t` constraint. Base reduction through `--reduced-vocab-dir` and draft reduction through `--draft-reduced-vocab-dir` are independent and may be used separately or together.
+
+```bash
+# Step 1: Generate a draft vocabulary map
+tensorrt-edgellm-reduce-vocab \
+  --model_dir Qwen/Qwen3.6-27B \
+  --output_dir draft_reduced_vocab \
+  --reduced_vocab_size 65536 \
+  --method input_aware \
+  --max_samples 50000
+
+# Step 2: Export the MTP draft with reduced logits
+tensorrt-edgellm-export \
+  Qwen/Qwen3.6-27B \
+  qwen3_6_27b/onnx \
+  --mtp \
+  --draft-reduced-vocab-dir draft_reduced_vocab/
+```
+
+The draft engine config declares the reduced vocabulary size. When that value is positive, `draft_vocab_map.safetensors` is required in the engine directory; when it is zero, a stray sidecar is ignored. The sidecar stores direct reduced-to-full token IDs, and the MTP runtime converts them once at load time to the offset representation used by the proposal kernels.
+
+---
+
 ## Script Reference
 
 | Argument | Required | Default | Description |

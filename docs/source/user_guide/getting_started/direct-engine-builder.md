@@ -287,12 +287,14 @@ are in `--checkpointDir`.
 |---|---|
 | Runtime LoRA inputs | `--max-lora-rank N` |
 | Reduced vocabulary | `--reduced-vocab-dir DIR` |
-| DFlash draft vocabulary | `--draft-reduced-vocab-dir DIR` |
+| DFlash V1 draft vocabulary | `--draft-reduced-vocab-dir DIR` |
 | FP8 embedding sidecar | `--fp8-embedding` |
 | Tensor parallel rank | `--tp-size N --tp-rank R` |
 | Detailed TensorRT profiling names | `--profiling-detailed` |
 | Partial component rebuild | `--components NAME[,NAME...]` |
 | First N decoder layers only | `--num-decoder-layer N` |
+
+JetSpec and chain-MTP draft vocabulary reduction use the ONNX export workflow described in [Vocabulary Reduction](../features/reduce-vocab.md); the direct engine builder currently accepts `--draft-reduced-vocab-dir` only for DFlash V1 drafts.
 
 `--num-decoder-layer` truncates the LLM to its first N decoder layers, for the
 few-layer numeric validation (`scripts/few-layer-validation.sh`). Weights are read

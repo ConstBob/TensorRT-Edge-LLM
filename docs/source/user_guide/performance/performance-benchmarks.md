@@ -145,6 +145,7 @@ For synthetic component timing, run `llm_bench` on the same engines:
 | Visual encoder | `--mode visual --imageSize 1024x2048 --warmup 3 --iterations 10 --profile` |
 | Spec draft prefill | `--mode spec_draft_prefill --batchSize <batch> --inputLen 2048 --warmup 3 --iterations 10 --profile` |
 | Spec draft proposal | `--mode spec_draft_proposal --batchSize <batch> --draftTreeSize <draft_tree_size> --pastKVLen 2048 --warmup 3 --iterations 10 --profile` |
+| Spec draft accept | `--mode spec_draft_accept --batchSize <batch> --draftStep <drafting_step> --pastKVLen 2048 --warmup 3 --iterations 10 --profile` |
 | Spec verify | `--mode spec_verify --batchSize <batch> --verifyTreeSize <verify_tree_size> --pastKVLen 2048 --warmup 3 --iterations 10 --profile` |
 
 Use `draftTreeSize` / `verifyTreeSize` values of `60` for EAGLE3, `4` for MTP,
@@ -1267,6 +1268,7 @@ The v0.8.0 release benchmarks use `llm_bench` for synthetic component timing. Th
 # Speculative decoding component timing
 ./build/examples/llm/llm_bench --engineDir <engine_dir> --mode spec_draft_prefill --batchSize <batch_size> --inputLen <input_len> --warmup 2 --iterations 10 --profile
 ./build/examples/llm/llm_bench --engineDir <engine_dir> --mode spec_draft_proposal --batchSize <batch_size> --draftTreeSize <draft_tree_size> --pastKVLen <past_kv_len> --warmup 2 --iterations 10 --profile
+./build/examples/llm/llm_bench --engineDir <engine_dir> --mode spec_draft_accept --batchSize <batch_size> --draftStep <drafting_step> --pastKVLen <past_kv_len> --warmup 2 --iterations 10 --profile
 ./build/examples/llm/llm_bench --engineDir <engine_dir> --mode spec_verify --batchSize <batch_size> --verifyTreeSize <verify_tree_size> --pastKVLen <past_kv_len> --warmup 2 --iterations 10 --profile
 
 # Visual encoder timing

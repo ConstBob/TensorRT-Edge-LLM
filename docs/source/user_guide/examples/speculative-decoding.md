@@ -252,7 +252,8 @@ A branching Qwen3.5 DDTree requires `--dflash-tree-base` during export and a
 runtime `--specDraftTopK` greater than 1. Linear and DDTree base engines are
 not interchangeable. See
 [Reduce Vocabulary](../features/reduce-vocab.md#dflash-speculative-decoding-support)
-for optional DFlash draft vocabulary reduction.
+for optional DFlash draft vocabulary reduction. Chain-MTP draft reduction is
+documented in [MTP Speculative Decoding Support](../features/reduce-vocab.md#mtp-speculative-decoding-support).
 
 ## DFlash V2
 
