@@ -42,6 +42,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <memory>
@@ -69,6 +70,15 @@ constexpr char const* kXQA_JIT_KERNELS_FIELD{"xqa_jit_kernels"};
 static inline DataType selectKvCacheDataType(bool enableFp8KVCache)
 {
     return enableFp8KVCache ? DataType::kFP8 : DataType::kHALF;
+}
+
+bool requestRopeXqaPdl()
+{
+    static bool const enabled = []() {
+        char const* const value = std::getenv("EDGELLM_ENABLE_ROPE_XQA_PDL");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
 }
 
 bool isFp8KVCacheSupportedSM(int32_t smVersion)
@@ -2278,6 +2288,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
     // ==================== Decode path (vanilla or tree) ====================
     else
     {
+        bool const enableRopeXqaPdl = requestRopeXqaPdl();
         // RoPE setup: sharedKV → Q only; own-KV → packed kernel (Q to qScratch + KV cache
         // write). Decode reads K/V from the KV cache via XQA — no scratch K/V needed.
         if (sharedKV)
@@ -2294,7 +2305,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                     tokenPosIds, packedQKVTensor, qInputTensor, kvCacheTensor, kScale, vScale, stream, pageTable,
                     maxPagesPerSeq, nullptr /* kScratch */, nullptr /* vScratch */, nullptr /* fp8QOut */,
                     1.0F /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal, std::nullopt,
-                    false /* writeKVCache */);
+                    false /* writeKVCache */, enableRopeXqaPdl);
             }
             else
             {
@@ -2323,7 +2334,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
             kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor, rt::OptionalInputTensor{contextLengthTensor},
                 rt::OptionalInputTensor{attentionPosIdTensor}, packedQKVTensor, qInputTensor, kvCacheTensor, kScale,
                 vScale, stream, pageTable, maxPagesPerSeq, nullptr /* kScratch */, nullptr /* vScratch */,
-                nullptr /* fp8QOut */, 1.0f /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal);
+                nullptr /* fp8QOut */, 1.0f /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal,
+                std::nullopt, true /* writeKVCache */, enableRopeXqaPdl);
         }
         else
         {
@@ -2334,7 +2346,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
             kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor, rt::OptionalInputTensor{contextLengthTensor},
                 rt::OptionalInputTensor{}, packedQKVTensor, qInputTensor, kvCacheTensor, kScale, vScale, stream,
                 pageTable, maxPagesPerSeq, nullptr /* kScratch */, nullptr /* vScratch */, nullptr /* fp8QOut */,
-                1.0f /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal);
+                1.0f /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal, std::nullopt,
+                true /* writeKVCache */, enableRopeXqaPdl);
         }
 
         // Vision-block decode goes to XQA (a hard construction-time

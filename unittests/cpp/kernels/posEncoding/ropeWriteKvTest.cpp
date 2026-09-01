@@ -1061,7 +1061,7 @@ TEST(RopePackedSharedKV, ProducesScratchWithoutWritingCache)
         std::nullopt, false);
     launchApplyRopeFromPackedToSplit(cosSinCacheTensor, std::nullopt, std::nullopt, packedTensor, qOnlyTensor,
         qOnlyCacheTensor, 1.0F, 1.0F, stream, pageTableTensor.dataPointer<int32_t>(), maxPagesPerSeq, nullptr, nullptr,
-        nullptr, 1.0F, nullptr, nullptr, 1e-6F, std::nullopt, false);
+        nullptr, 1.0F, nullptr, nullptr, 1e-6F, std::nullopt, false /* writeKVCache */, true /* enablePdl */);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
 
