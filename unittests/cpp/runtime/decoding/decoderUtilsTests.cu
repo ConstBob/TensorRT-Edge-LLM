@@ -24,10 +24,40 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 using namespace trt_edgellm;
 using namespace nvinfer1;
+
+TEST(DecoderUtilsTests, IdentityDirectVocabMapConvertsToZeroOffsets)
+{
+    std::vector<int32_t> vocabMap{0, 1, 2, 3, 4};
+
+    rt::decoder_utils::directVocabMapToOffsets(vocabMap, 5);
+
+    EXPECT_EQ(vocabMap, std::vector<int32_t>({0, 0, 0, 0, 0}));
+}
+
+TEST(DecoderUtilsTests, PermutedDirectVocabMapConvertsToReconstructableOffsets)
+{
+    std::vector<int32_t> const directMap{3, 0, 4, 1, 2};
+    std::vector<int32_t> offsets = directMap;
+
+    rt::decoder_utils::directVocabMapToOffsets(offsets, 5);
+
+    for (size_t draftTokenId = 0; draftTokenId < offsets.size(); ++draftTokenId)
+    {
+        EXPECT_EQ(static_cast<int32_t>(draftTokenId) + offsets[draftTokenId], directMap[draftTokenId]);
+    }
+}
+
+TEST(DecoderUtilsTests, OutOfRangeDirectVocabMapEntryThrows)
+{
+    std::vector<int32_t> vocabMap{0, 5, 2};
+
+    EXPECT_THROW(rt::decoder_utils::directVocabMapToOffsets(vocabMap, 5), std::runtime_error);
+}
 
 TEST(DecoderUtilsTests, FinishedSlotsIgnoreAcceptedTokens)
 {
