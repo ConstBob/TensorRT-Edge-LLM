@@ -65,6 +65,7 @@ constexpr char const* kATTENTION_PLUGIN_VERSION{"1"};
 constexpr char const* kATTENTION_PLUGIN_NAME{"AttentionPlugin"};
 //! Self-describing blob of (XQAJitKey, cubin) pairs; see serializeXQAJitKernels.
 constexpr char const* kXQA_JIT_KERNELS_FIELD{"xqa_jit_kernels"};
+constexpr int32_t kROPE_MIN_PDL_SM_VERSION{90};
 
 // Select KV cache storage datatype based on FP8 enablement
 static inline DataType selectKvCacheDataType(bool enableFp8KVCache)
@@ -2288,7 +2289,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
     // ==================== Decode path (vanilla or tree) ====================
     else
     {
-        bool const enableRopeXqaPdl = requestRopeXqaPdl();
+        bool const enableRopeXqaPdl = requestRopeXqaPdl() && mSMVersion >= kROPE_MIN_PDL_SM_VERSION;
         // RoPE setup: sharedKV → Q only; own-KV → packed kernel (Q to qScratch + KV cache
         // write). Decode reads K/V from the KV cache via XQA — no scratch K/V needed.
         if (sharedKV)
