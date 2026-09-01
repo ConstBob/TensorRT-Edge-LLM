@@ -392,6 +392,58 @@ TEST_F(RuntimeAssemblyTest, DrivesPrefillAndOneDecodeRoundPerGeneratedToken)
     EXPECT_EQ(response.finishReasons[0], rt::FinishReason::kLength);
 }
 
+TEST_F(RuntimeAssemblyTest, UsesPreTokenizedInputWithoutMessages)
+{
+    using ::testing::_;
+
+    auto engine = makeEngine();
+    auto& mock = *engine;
+    EXPECT_CALL(mock, execute(_)).WillOnce(emit({}));
+
+    auto artifacts = makeVanillaArtifacts(mModelDir, std::move(engine), mStream);
+    rt::LLMInferenceRuntime runtime{
+        std::move(artifacts), mModelDir.string(), /*multimodalEngineDir=*/"", {}, std::nullopt, mStream};
+
+    rt::LLMGenerationRequest request{};
+    request.requests.emplace_back();
+    request.preTokenizedInputIds.push_back({0});
+    request.temperature = 0.0F;
+    request.topK = 1;
+    request.topP = 1.0F;
+    request.maxGenerateLength = 1;
+
+    rt::LLMGenerationResponse response;
+    ASSERT_TRUE(runtime.handleRequest(request, response, mStream));
+
+    expectResponseCoversEverySlot(response, 1);
+    EXPECT_EQ(response.inputTokenCounts[0], 1);
+    EXPECT_THAT(response.outputIds[0], ::testing::ElementsAre(kZeroLogitsToken));
+}
+
+TEST_F(RuntimeAssemblyTest, PreservesPreTokenizedInputWhileFormattingMessages)
+{
+    using ::testing::_;
+
+    auto engine = makeEngine();
+    auto& mock = *engine;
+    EXPECT_CALL(mock, execute(_)).WillOnce(emit({}));
+
+    auto artifacts = makeVanillaArtifacts(mModelDir, std::move(engine), mStream);
+    rt::LLMInferenceRuntime runtime{
+        std::move(artifacts), mModelDir.string(), /*multimodalEngineDir=*/"", {}, std::nullopt, mStream};
+
+    auto request = makeGreedyRequest("a", /*maxGenerateLength=*/1);
+    request.preTokenizedInputIds.push_back({0, 0});
+
+    rt::LLMGenerationResponse response;
+    ASSERT_TRUE(runtime.handleRequest(request, response, mStream));
+
+    expectResponseCoversEverySlot(response, 1);
+    EXPECT_EQ(response.inputTokenCounts[0], 2);
+    ASSERT_EQ(request.formattedRequests.size(), 1U);
+    EXPECT_EQ(request.formattedRequests[0].formattedCompleteRequest, "a");
+}
+
 TEST_F(RuntimeAssemblyTest, StopsAtTheEosTokenTheEngineProduces)
 {
     using ::testing::_;

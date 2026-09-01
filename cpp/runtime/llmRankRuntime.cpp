@@ -1826,9 +1826,11 @@ bool LLMRankRuntime::validateRequestConfig(LLMGenerationRequest const& request)
     }
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        if (request.requests[i].messages.empty())
+        bool const hasPreTokenizedInput
+            = i < static_cast<int32_t>(request.preTokenizedInputIds.size()) && !request.preTokenizedInputIds[i].empty();
+        if (request.requests[i].messages.empty() && !hasPreTokenizedInput)
         {
-            LOG_ERROR("Request %d in batch is empty: no messages provided", i);
+            LOG_ERROR("Request %d in batch is empty: no messages or pre-tokenized input provided", i);
             return false;
         }
         if (request.requests[i].guidedDecoding.has_value())
