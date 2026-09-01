@@ -154,7 +154,7 @@ Spark payloads. The runtime selects one exact platform payload before loading
 native code, so newer mutually exclusive payloads do not raise the x86_64
 installation floor. Payload verification audits ELF architecture, dependencies,
 RPATHs, and target-library resolution before fan-in; release validation rejects
-other platform tags before Artifactory or Kitmaker.
+other platform tags before publication.
 
 ## Low-level commands
 
