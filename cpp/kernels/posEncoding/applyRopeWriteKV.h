@@ -179,8 +179,8 @@ void launchApplyRopeQOnlyTreeDecoding(
 //!             ragged prefill. Rows at or beyond the actual per-batch length have Q zeroed and skip all K/V writes.
 //! @param[in]  writeKVCache Whether to persist K/V through @p pageTable. Shared-KV consumers pass false because
 //!             their donor layer already owns and populated the cache.
-//! @param[in]  enablePdl Allow this kernel to overlap its producer, wait before reading @p packedQKV, and trigger
-//!             programmatic dependents after every CTA has completed its output stores.
+//! @param[in]  enablePdl Allow this kernel to overlap its producer, wait before reading producer-owned position
+//!             metadata or @p packedQKV, and trigger dependents after every CTA has completed its output stores.
 //! @throws std::runtime_error if tensor shape or data type is incorrect.
 void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::OptionalInputTensor kvCacheEndLens,
     rt::OptionalInputTensor tokenPosIds, rt::Tensor const& packedQKV, rt::Tensor& qScratch, rt::Tensor& kvCache,

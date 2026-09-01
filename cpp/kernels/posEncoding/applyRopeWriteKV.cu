@@ -748,6 +748,16 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
     // Ragged prefill padding must be identified before page-table or RoPE-cache
     // indexing. It cannot early-return because fused qk_norm uses warp collectives.
     int32_t const rowInBatch = static_cast<int32_t>(clampedTokenIdx % qSeqLen);
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    if constexpr (kEnablePdl)
+    {
+        // Position metadata and packedQKV can be produced by the preceding grid.
+        // Keep only dependency-independent scalar setup above this wait.
+        asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    }
+#endif
+
     int32_t actualQSeqLen = qSeqLen;
     if (cuQSeqLens != nullptr)
     {
@@ -791,15 +801,6 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
     uint32_t const paddedLanesPerHead = blockDim.x;
     uint32_t const actualLanesPerHead = static_cast<uint32_t>(headDim) / DVec<T>::vec_size;
     bool const isActiveLane = (tIdx < actualLanesPerHead);
-
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-    if constexpr (kEnablePdl)
-    {
-        // packedQKV is produced by the preceding grid. Keep the independent
-        // position/cos-sin setup above the dependency wait.
-        asm volatile("griddepcontrol.wait;\n" ::: "memory");
-    }
-#endif
 
     if (headIdx < numQHead)
     {
