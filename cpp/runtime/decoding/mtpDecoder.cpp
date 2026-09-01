@@ -57,8 +57,9 @@ constexpr int32_t kPrefillProfile{0};
 constexpr int32_t kDecodeProfile{1};
 } // namespace
 
-MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, SpecDecodeDraftingConfig const& draftingConfig,
-    std::unique_ptr<EngineExecutor> draftExecutor, ExternalWeightManager draftWeights, cudaStream_t stream)
+MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, std::filesystem::path const& engineDir,
+    SpecDecodeDraftingConfig const& draftingConfig, std::unique_ptr<EngineExecutor> draftExecutor,
+    ExternalWeightManager draftWeights, cudaStream_t stream)
     : mRuntime(runtime)
     , mDraftCacheManager(*runtime.base.sharedResources.cacheManagers[1])
     , mDraftExecutor(std::move(draftExecutor))
@@ -158,16 +159,11 @@ MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, SpecDecodeDraftingConfig
 
     if (mRuntime.deployment.draft->reducedVocabSize > 0)
     {
-        // Chain-mode reduced draft vocabulary. The proposal-translation
-        // kernels (initializeDraftTreeTables / computeCuScoresAndTranslateToken)
-        // already consume this table with OFFSET semantics
-        // (baseTokenId = draftIdx + T[draftIdx]); the export sidecar
-        // draft_vocab_map.safetensors is a DIRECT map (full = T[reduced]).
-        // Convert once at load, like EagleDecoder normalizes d2t.
+        // The sidecar is DIRECT (full = T[i]), while the EAGLE utility kernels consume
+        // OFFSETS (full = i + T[i]); normalize it once at load.
         ELLM_CHECK(!mUseTree,
-            "MTP tree drafting does not support a reduced draft vocabulary: "
-            "ddtreeBuild is not wired for the draft vocab map (chain mode, "
-            "draftingTopK=1, is supported)");
+            "MTP tree drafting (draftingTopK > 1) does not support a reduced draft vocabulary; use "
+            "--specDraftTopK 1 or re-export the draft without --draft-reduced-vocab-dir.");
         auto const draftVocabMapPath = engineDir / binding_names::kDraftVocabMapFileName;
         ELLM_CHECK(std::filesystem::exists(draftVocabMapPath),
             "Draft engine declares reduced_vocab_size > 0 but " + std::string(binding_names::kDraftVocabMapFileName)
@@ -192,13 +188,7 @@ MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, SpecDecodeDraftingConfig
         CUDA_CHECK(cudaMemcpyAsync(hostMap.data(), vocabMapTensors[0].dataPointer<int32_t>(),
             static_cast<size_t>(reducedVocabSize) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        for (int32_t draftTokenId = 0; draftTokenId < reducedVocabSize; ++draftTokenId)
-        {
-            int32_t const fullTokenId = hostMap[static_cast<size_t>(draftTokenId)];
-            check::check(fullTokenId >= 0 && fullTokenId < baseVocabSize,
-                "draft vocab_map entries must be valid base-vocab token ids");
-            hostMap[static_cast<size_t>(draftTokenId)] = fullTokenId - draftTokenId;
-        }
+        decoder_utils::directVocabMapToOffsets(hostMap, baseVocabSize);
         CUDA_CHECK(cudaMemcpyAsync(mDraftVocabMappingTable.dataPointer<int32_t>(), hostMap.data(),
             static_cast<size_t>(reducedVocabSize) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
         LOG_INFO(
@@ -616,11 +606,8 @@ bool MTPDecoder::buildTreeVerifyInputs(int32_t activeBatchSize, cudaStream_t str
     check::check(
         mRuntime.base.pipelineIO.selectTokenIndices.reshape({activeBatchSize, verifySize}), "Tensor reshape failed");
 
-    // Reduced-vocab MTP is chain-only (the constructor rejects tree drafting),
-    // so no reduced-to-full mapping is passed here. If tree support is ever
-    // wired: ddtreeBuild's map slot expects the DIRECT map (full = T[reduced],
-    // what DFlashDecoder passes) — mDraftVocabMappingTable holds OFFSETS
-    // (full = draftIdx + T[draftIdx]) and must NOT be passed as-is.
+    // Reduced-vocabulary MTP is chain-only. ddtreeBuild expects a DIRECT map
+    // (full = T[i]), while mDraftVocabMappingTable holds OFFSETS (full = i + T[i]).
     Tensor const& baseKVCacheLengths = mRuntime.base.cacheManager.getKVCacheLengths();
     kernel::DDTreeBuildParams const buildParams{{mStackedDraftLogits, mDraftRootTokenId, baseKVCacheLengths, nullptr},
         {mTreeTokenIds, mRuntime.base.pipelineIO.specTreeDepths, mRuntime.base.pipelineIO.specTreeParentIds,

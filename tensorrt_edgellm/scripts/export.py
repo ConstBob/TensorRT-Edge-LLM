@@ -1380,36 +1380,27 @@ def _export_mtp_draft(model_dir: str,
     output_path = os.path.join(draft_out_dir, "model.onnx")
 
     logger.info("[MTP Draft] Loading checkpoint from %s", model_dir)
+    if draft_reduced_vocab_dir:
+        logger.info("[MTP Draft] Applying vocab reduction from %s",
+                    draft_reduced_vocab_dir)
     try:
         from ..model import AutoModel
-        model = AutoModel.from_pretrained(model_dir,
-                                          device="cpu",
-                                          mtp_draft=True)
-    except (OSError, ValueError, RuntimeError, ImportError) as exc:
+        model = AutoModel.from_pretrained(
+            model_dir,
+            device="cpu",
+            mtp_draft=True,
+            reduced_vocab_dir=draft_reduced_vocab_dir or None)
+    except (OSError, ValueError, RuntimeError, ImportError, KeyError,
+            TypeError) as exc:
         logger.exception("[MTP Draft] Failed to load checkpoint")
         raise SystemExit(1) from exc
 
-    # --- Optional: reduce draft lm_head vocabulary ---
     full_size = model.config.vocab_size
     reduced_size = None
     if draft_reduced_vocab_dir:
-        if not hasattr(model, "lm_head"):
-            logger.error(
-                "[MTP Draft] Vocab reduction requires the draft model to "
-                "carry an lm_head module")
-            raise SystemExit(1)
-        logger.info("[MTP Draft] Applying vocab reduction from %s",
-                    draft_reduced_vocab_dir)
-        try:
-            from ..vocab_reduction.onnx_export import \
-                apply_reduced_vocab_from_dir
-            apply_reduced_vocab_from_dir(model, draft_reduced_vocab_dir)
-            reduced_size = model.config.reduced_vocab_size
-            logger.info("[MTP Draft] lm_head reduced: %d → %d", full_size,
-                        reduced_size)
-        except (OSError, ValueError, RuntimeError, ImportError) as exc:
-            logger.exception("[MTP Draft] Vocab reduction failed")
-            raise SystemExit(1) from exc
+        reduced_size = model.config.reduced_vocab_size
+        logger.info("[MTP Draft] lm_head reduced: %d → %d", full_size,
+                    reduced_size)
 
     logger.info("[MTP Draft] Exporting to %s", output_path)
     try:
@@ -4076,9 +4067,8 @@ def main() -> None:
         help=
         ("Directory containing vocab_map.safetensors for a spec-decode draft "
          "model (from tensorrt_edgellm/scripts/reduce_vocab.py). Reduces the "
-         "draft lm_head output dimension. Supported for DFlash, JetSpec, and "
-         "chain-MTP drafts (MTP requires the checkpoint's own mtp.lm_head.*; "
-         "tree-MTP is rejected by the runtime)."),
+         "draft lm_head output dimension. Supported for DFlash V1, JetSpec, "
+         "and chain-MTP drafts (tree-MTP is rejected)."),
     )
     p.add_argument(
         "--mtp",
@@ -4289,6 +4279,21 @@ def main() -> None:
     config = _load_config(model_dir)
     model_type: str = config.get("model_type", "unknown")
     dtype = _dtype_from_str(args.dtype)
+    is_gemma4_target = model_type in _GEMMA4_MODEL_TYPES
+
+    if args.mtp_tree_base:
+        args.mtp = True
+        if args.draft_reduced_vocab_dir:
+            p.error("--draft-reduced-vocab-dir is not supported with "
+                    "--mtp-tree-base (chain-MTP only, --specDraftTopK 1)")
+
+    gemma4_mtp_requested = args.mtp and is_gemma4_target
+    consumes_draft_reduced_vocab = ((args.mtp and not gemma4_mtp_requested)
+                                    or args.dflash_draft or args.jetspec_draft)
+    if args.draft_reduced_vocab_dir and not consumes_draft_reduced_vocab:
+        p.error("--draft-reduced-vocab-dir requires a consuming draft stage: "
+                "chain-MTP (--mtp), DFlash V1 (--dflash-draft), or JetSpec "
+                "(--jetspec-draft)")
 
     # Cosmos3-Edge checkpoints carry two model families that run on DIFFERENT
     # runtime paths; ``--task`` selects which artifact set this invocation
@@ -4356,9 +4361,7 @@ def main() -> None:
         return
 
     has_mtp_draft = _has_mtp(config)
-    is_gemma4_target = model_type in _GEMMA4_MODEL_TYPES
     mtp_draft_dir_arg = args.mtp_draft_dir or args.gemma4_mtp_assistant_dir
-    gemma4_mtp_requested = args.mtp and is_gemma4_target
     gemma4_mtp_assistant_dir = ""
     gemma4_kv_sharing_map: list[dict] = []
     externalize_weights = resolve_externalize_weights(args.externalize_weights)
@@ -4369,8 +4372,6 @@ def main() -> None:
             "Only Qwen3-TTS CustomVoice / VoiceDesign / Base checkpoints are "
             f"supported. Got tts_model_type={config.get('tts_model_type')!r}.")
 
-    if args.mtp_tree_base:
-        args.mtp = True
     if args.tp_size > 1 and (args.eagle_base or args.mtp or args.dflash_base
                              or args.dflash_tree_base or args.dflash_draft
                              or args.dspark_base or args.dspark_draft
@@ -4768,6 +4769,9 @@ def main() -> None:
     logger.info("DSpark draft  : %s", "yes" if args.dspark_draft else "no")
     logger.info("Reduced vocab : %s",
                 args.reduced_vocab_dir if args.reduced_vocab_dir else "no")
+    logger.info(
+        "Draft reduced vocab: %s",
+        args.draft_reduced_vocab_dir if args.draft_reduced_vocab_dir else "no")
     logger.info(
         "External weights: %s",
         ", ".join(externalize_weights) if externalize_weights else "no")

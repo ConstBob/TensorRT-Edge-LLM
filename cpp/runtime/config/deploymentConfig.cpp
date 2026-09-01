@@ -577,6 +577,9 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
                 }
                 else
                 {
+                    ELLM_CHECK(cfg.draft->reducedVocabSize == 0,
+                        "MTP tree drafting (draftingTopK > 1) does not support a reduced draft vocabulary; use "
+                        "--specDraftTopK 1 or re-export the draft without --draft-reduced-vocab-dir.");
                     // Tree drafting: the chain drafter keeps one full logits row per depth and
                     // ddtreeBuild grows a prefix-closed, score-prioritized tree of verifySize
                     // nodes with candidateFanout=draftingTopK. The limits below come from the

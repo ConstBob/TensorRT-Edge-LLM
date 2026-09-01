@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <vector>
 
 namespace trt_edgellm
 {
@@ -37,6 +38,9 @@ namespace decoder_utils
 //! @brief Load the draft engine from disk and return an EngineExecutor.
 std::unique_ptr<EngineExecutor> loadDraftEngine(
     std::filesystem::path const& engineDir, DeploymentConfig const& deployment);
+
+//! @brief Validate a DIRECT reduced-to-full vocabulary map and convert it in place to OFFSETS.
+void directVocabMapToOffsets(std::vector<int32_t>& vocabMap, int32_t baseVocabSize);
 
 //! @brief Append one sampled token per active slot to the host-side token lists.
 //!

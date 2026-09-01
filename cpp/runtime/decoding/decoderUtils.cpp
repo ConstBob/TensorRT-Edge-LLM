@@ -59,6 +59,20 @@ std::unique_ptr<EngineExecutor> loadDraftEngine(
     return draftExecutor;
 }
 
+void directVocabMapToOffsets(std::vector<int32_t>& vocabMap, int32_t baseVocabSize)
+{
+    check::check(baseVocabSize > 0, "base vocabulary size must be positive");
+    for (int32_t const fullTokenId : vocabMap)
+    {
+        check::check(fullTokenId >= 0 && fullTokenId < baseVocabSize,
+            "draft vocab_map entries must be valid base-vocab token ids");
+    }
+    for (size_t draftTokenId = 0; draftTokenId < vocabMap.size(); ++draftTokenId)
+    {
+        vocabMap[draftTokenId] -= static_cast<int32_t>(draftTokenId);
+    }
+}
+
 void appendSampledTokens(DecodingInferenceContext& context, int32_t const* sampledTokenIds, int32_t activeBatchSize)
 {
     for (int32_t i = 0; i < activeBatchSize; ++i)
