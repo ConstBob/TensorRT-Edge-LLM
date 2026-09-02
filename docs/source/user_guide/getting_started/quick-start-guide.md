@@ -1,16 +1,23 @@
 # Quick Start
 
-This guide runs the image-capable
-[Qwen/Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B) checkpoint through
-CPU ONNX export, TensorRT engine build, C++ vision-language inference, and the
-OpenAI-compatible server. Complete [Installation](installation.md) first.
+This guide provides two independent ways to run the image-capable
+[Qwen/Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B) checkpoint:
+
+1. CPU ONNX export, TensorRT engine build, and C++ vision-language inference.
+2. Checkpoint-direct engine build and inference through the Python
+   OpenAI-compatible server.
+
+Complete [Installation](installation.md) first. You do not need to complete the
+ONNX workflow before using the Python server.
 
 ```bash
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace/Qwen3.5-0.8B
 mkdir -p "$WORKSPACE_DIR"
 ```
 
-## 1. Export the Checkpoint
+## Option 1: ONNX and C++ runtime
+
+### 1. Export the Checkpoint
 
 Run export in the active Edge-LLM Python environment. Unquantized and supported
 pre-quantized checkpoints export on CPU:
@@ -34,7 +41,7 @@ run `tensorrt-edgellm-quantize` on an x86 GPU host before export. Quantization
 changes model accuracy; validate a generated checkpoint against its source
 model before deployment. See [Quantization](../features/quantization.md).
 
-## 2. Build the Engines
+### 2. Build the Engines
 
 Run both builders on the target from the repository root. Engine profile values
 are deployment limits; increase them only when the workload requires it.
@@ -55,7 +62,7 @@ are deployment limits; increase them only when the workload requires it.
   --maxImageTokensPerImage 512
 ```
 
-## 3. Run Vision-Language Inference
+### 3. Run Vision-Language Inference
 
 The repository includes the image used below. Create `$WORKSPACE_DIR/input.json`:
 
@@ -101,24 +108,20 @@ cat "$WORKSPACE_DIR/output.json"
 The response contains generated text, token IDs, token counts, and the finish
 reason.
 
-## 4. Start the OpenAI-Compatible Server
+## Option 2: One-line Python server
 
-The server is a separate checkpoint-direct workflow; it does not consume the
-ONNX engines built in Steps 1-3. Install the wheel's `server` extra as described
-in [Installation](installation.md#install-a-wheel-file). Then start the server
-from the repository root. The first launch downloads the checkpoint, builds
-the components required by that model, and stores the complete runtime bundle
-in the configured cache. Local media is disabled by default; the final option
-grants access only to the example-image directory.
+The server does not consume the ONNX engines from Option 1. First complete the
+[C++ source build with the optional Python frontend enabled](installation.md#optional-python-frontend),
+including `BUILD_PYTHON_BINDINGS=ON`. After the native build finishes,
+[install Edge-LLM and the server dependencies](installation.md#install-and-launch-the-python-server).
+
+With that environment active, launch from the repository root. The first
+launch downloads the checkpoint, builds every component required by the model,
+and stores the runtime bundle in the server cache. The media option grants
+access only to the example-image directory.
 
 ```bash
-tensorrt-edgellm-serve Qwen/Qwen3.5-0.8B \
-  --cache-dir "$WORKSPACE_DIR/server-cache" \
-  --max-input-len 4096 \
-  --max-kv-cache-capacity 4096 \
-  --allowed-local-media-path "$PWD/examples/multimodal/pics" \
-  --host 127.0.0.1 \
-  --port 8000
+tensorrt-edgellm-serve Qwen/Qwen3.5-0.8B --allowed-local-media-path "$PWD/examples/multimodal/pics"
 ```
 
 In another terminal, run the request from the repository root:
