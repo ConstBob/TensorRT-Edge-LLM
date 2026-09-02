@@ -1348,7 +1348,7 @@ TEST_F(EmbeddingLookupTest, GenerateMultimodalIndicesGlobalAccumulation)
     EXPECT_EQ(result, expected);
 }
 
-// Test generateMultimodalIndices GPU kernel with per-row offsets (bug 6627733 fix)
+// Test generateMultimodalIndices GPU kernel with per-row offsets.
 TEST_F(EmbeddingLookupTest, GenerateMultimodalIndicesPerRowOffsets)
 {
     int32_t constexpr kImageTok = 50;
@@ -1382,7 +1382,7 @@ TEST_F(EmbeddingLookupTest, GenerateMultimodalIndicesPerRowOffsets)
     EXPECT_EQ(result, expected);
 }
 
-// Test that per-row offsets correctly handle context-reuse scenario (bug 6627733)
+// Test per-row offsets when context reuse skips media tokens in a prefix.
 // When batch_size=2 and context cache skips a prefix containing image tokens,
 // each row must start indexing at the number of image tokens already consumed by its prefix.
 TEST_F(EmbeddingLookupTest, GenerateMultimodalIndicesContextReuseScenario)

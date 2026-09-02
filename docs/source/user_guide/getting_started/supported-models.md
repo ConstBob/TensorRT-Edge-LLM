@@ -21,6 +21,7 @@ The model class names were checked against the upstream [Transformers model sour
 - FP8 KV cache is detected automatically from checkpoint metadata by `tensorrt_edgellm`.
 - `tensorrt-edgellm-export` exports visual encoders. Use `tensorrt-edgellm-quantize llm --visual_quantization fp8` before export when FP8 visual weights are required.
 - MXFP8 and FP4/NVFP4 require Blackwell-class hardware for runtime execution.
+- For platform-specific NVFP4 MoE layouts, follow [Export NVFP4 MoE for SM12x](../features/quantization.md#export-nvfp4-moe-for-sm12x) before building the engine.
 
 ## Text Generation
 

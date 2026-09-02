@@ -144,7 +144,8 @@ Good examples:
 
 * `tests/python-unittests/test_attention_plugin.py` validates plugin output
   against a numpy reference.
-* `unittests/hybridCacheManagerTests.cpp` validates cache reset/capture/restore.
+* `unittests/cpp/runtime/state/hybridCacheManagerTests.cpp` validates cache
+  reset/capture/restore.
 * `tests/test_lists/l0_pipeline_*.yml` provides end-to-end engine coverage.
 
 If no direct test exists, say so briefly and describe the expected test to

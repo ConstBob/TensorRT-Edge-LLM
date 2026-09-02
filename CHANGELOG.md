@@ -13,6 +13,7 @@
 - Added DART visual-token pruning to reduce VLM prefill work
 - Added a media artifact cache that retains ViT and audio encoder embeddings across repeated media prefixes
 - Added NVFP4 W4A16 export for official LM heads and Qwen3 A16 MoE
+- Added NVFP4 MoE build and runtime support for NVIDIA Nemotron 3 Super 120B-A12B checkpoints with 512 routed experts and top-32 routing
 - Added Blackwell SM110 dense NVFP4-A16 GEMM and GEMV kernels
 - Improved Blackwell performance with single-launch D80 SSD prefill, faster SM12x fused MoE, fused GDN projections, and one less per-layer KV copy
 - Added a CuTe DSL RMSNorm plugin and upgraded CuTe DSL to 4.7.0

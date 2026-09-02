@@ -245,7 +245,15 @@ Top-level `logit_bias` applies to every request by default. A request-level `log
 }
 ```
 
-**Speculative decoding limitation:** Requests with a non-empty `logit_bias` map are rejected while speculative decoding is active. Set `disable_spec_decode: true` to explicitly use vanilla decoding for that batch before sending logit bias.
+`logit_bias` remains active during speculative decoding. The runtime applies
+the request's map to every verification row and to fallback sampling for EAGLE,
+MTP, DFlash, JetSpec, and DSpark. `disable_spec_decode: true` may still be used
+to force vanilla decoding for comparison, but it is not required for logit
+bias.
+
+Token IDs use the full tokenizer vocabulary. With a reduced-vocabulary engine,
+a token omitted from the engine vocabulary cannot be restored by positive
+bias; the runtime ignores that entry and logs a warning.
 
 ### Top-N Log-Probabilities
 
@@ -313,6 +321,5 @@ When a stop string triggers termination, the request's finish reason is `stop-wo
 
 - System prompt: Uses provided system message, or model default from chat template
 - LoRA: All requests in same batch must use same adapter
-- Logit bias: Supported through vanilla decoding; active speculative decoding must be explicitly disabled first.
 - Paths: Use absolute or relative paths for images/videos
 - Format: Follows OpenAI chat completion API structure

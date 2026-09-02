@@ -20,7 +20,7 @@ See the [experimental server guide](experimental-server.md) for setup details.
 Start the server in one terminal:
 
 ```bash
-python -m experimental.server \
+tensorrt-edgellm-serve \
   Qwen/Qwen2.5-0.5B-Instruct \
   --port 8000
 ```

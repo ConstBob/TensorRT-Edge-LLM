@@ -16,7 +16,7 @@
       "cpp/kernels/multiDeviceKernels/shmAllReduce.h",
       "cpp/runtime/multiDevice/backends/shm/tensorParallelShmResources.cpp",
       "cpp/runtime/multiDevice/backends/shm/tensorParallelShmResources.h",
-      "unittests/shmAllReduceTests.cu"
+      "unittests/cpp/kernels/multiDeviceKernels/shmAllReduceTests.cu"
     ],
     "strip_paths": [
       ".dockerignore",
@@ -41,7 +41,7 @@
       "cpp/runtime/multiDevice/tensorParallelPluginResources.h",
       "docs/source/user_guide/features/multi-device.md",
       "examples/llm/llm_inference.cpp",
-      "unittests/parallelConfigTest.cpp"
+      "unittests/cpp/runtime/multiDevice/parallelConfigTest.cpp"
     ],
     "forbidden_patterns": [
       "edge-llm-internal-release",

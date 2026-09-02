@@ -31,7 +31,6 @@ TensorRT Edge-LLM supports the deployment of a wide selection of LLM/VLM/Omni/VL
 - **💾 Memory Efficient**: Supporting 4-bit quantization for reduced memory footprint, with [FP8 KV cache](user_guide/features/FP8KV.md) support for additional memory savings
 - **🔄 Production Ready**: C++-only runtime with no Python dependencies, designed for deployment on edge devices
 - **🎯 Edge Optimized**: Built specifically for NVIDIA Jetson, DRIVE, and DGX Spark platforms with platform-specific optimizations
-- **🔧 Rich Feature Set**: Supports [LoRA adapters](user_guide/features/lora.md), EAGLE3, MTP, and DFlash speculative decoding, [system prompt caching](user_guide/features/system-prompt-cache.md), vision-language models with [visual-token pruning](user_guide/features/visual-token-pruning.md), and an [experimental high-level Python API/server](user_guide/examples/experimental-server.md)
 - **📊 Complete Toolkit**: End-to-end workflow from checkpoint export to C++ runtime, with engine builder and examples
 
 ## Deployment Workflows
@@ -67,15 +66,13 @@ quantized checkpoint.
 
 ## Runtime Capabilities
 
-- Paged attention, FP8 KV cache, LoRA, streaming, and KV cache reuse
+- Paged attention, FP8 KV cache, LoRA, streaming, and [KV Cache Reuse](user_guide/features/kv-cache-reuse.md)
 - EAGLE3, MTP, DFlash, and DSpark speculative decoding on supported models
 - Image and audio encoders, speech generation, ASR, and action generation
 - Model-specific runtimes for pipelines whose I/O contract is not LLM-shaped
 - Experimental Python API and OpenAI-compatible server over the C++ runtime
 
-Feature availability depends on the model and deployment. In particular,
-[KV cache reuse](user_guide/getting_started/support-matrix.md#kv-cache-reuse-support)
-has a narrower support boundary than ordinary inference.
+Feature availability depends on the model and deployment.
 
 ## Start Here
 

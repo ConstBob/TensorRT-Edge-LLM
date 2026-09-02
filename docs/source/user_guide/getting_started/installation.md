@@ -78,69 +78,80 @@ python -m pip install \
     "tensorrt-edgellm[tools] @ file://$EDGELLM_WHEEL"
 ```
 
-### Build an engine and run a prompt
+### Build all model components directly
 
-Save the following standalone script as `run_edgellm.py`. It imports only the
-installed package, builds a TensorRT engine through the public
-`experimental.server.LLM` API, and runs one prompt through the selected native
-payload:
-
-```python
-import sys
-from pathlib import Path
-
-from experimental.server import LLM, SamplingParams
-
-
-model_dir = Path(sys.argv[1]).resolve(strict=True)
-engine_dir = Path(sys.argv[2]).resolve()
-llm = LLM(
-    model=str(model_dir),
-    cache_dir=str(engine_dir),
-    clear_engine_cache=True,
-    max_input_len=128,
-    max_kv_cache_capacity=256,
-    max_batch_size=1,
-)
-try:
-    outputs = llm.generate(
-        ["Please introduce NVIDIA."],
-        SamplingParams(
-            temperature=0.7,
-            top_p=0.9,
-            top_k=50,
-            max_tokens=32,
-        ),
-    )
-finally:
-    llm.close()
-
-print(outputs[0].text)
-```
-
-Run it with a local checkpoint and an engine-cache directory:
+The base wheel installs the checkpoint-direct builder. Give it a local
+Hugging Face checkpoint directory; `--components all` builds every component
+owned by that model family in one invocation:
 
 ```bash
-python run_edgellm.py \
-    /path/to/Qwen2.5-0.5B-Instruct /tmp/edgellm-engine
+tensorrt-edgellm-build \
+  --model-dir /path/to/Qwen3.5-0.8B \
+  --engine-dir "$HOME/edgellm-engines/qwen3.5-0.8b" \
+  --components all \
+  --max-input-len 4096 \
+  --max-kv-cache-capacity 8192 \
+  --max-batch-size 1
 ```
 
-Keep the model checkpoint at its build-time path while using the engine;
-checkpoint-backed weights remain external to reduce engine duplication.
+The installed wheel selects its matching native payload. The builder detects
+the checkpoint precision, writes all model-specific engines and runtime
+artifacts under `--engine-dir`, and does not create ONNX files. Keep the
+checkpoint at the recorded path while using the engines because supported
+weights remain checkpoint-backed. See [Direct Engine Builder](direct-engine-builder.md)
+for component layouts, supported precisions, speculative decoding, and C++
+runtime commands.
+
+### Launch the OpenAI-compatible server
+
+Install the `server` extra shown above, then pass a Hugging Face model ID or a
+local checkpoint directory directly to the server:
+
+```bash
+tensorrt-edgellm-serve Qwen/Qwen3.5-0.8B \
+  --cache-dir "$HOME/.cache/tensorrt-edgellm" \
+  --max-input-len 4096 \
+  --max-kv-cache-capacity 8192 \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+On its first launch, the server downloads the checkpoint when necessary and
+uses the checkpoint-direct builder to compile all required components. Later
+launches reuse the matching bundle from `--cache-dir`. The server accepts a
+checkpoint, not the manually built `--engine-dir` from the previous example.
+
+Send a request from another terminal:
+
+```bash
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "messages": [{"role": "user", "content": "Explain paged KV caches."}],
+    "temperature": 0,
+    "max_tokens": 64
+  }'
+```
+
+See [Experimental Python API and Server](../examples/experimental-server.md)
+for streaming, multimodal requests, tool calling, speculative decoding, cache
+controls, and the offline Python API.
 
 ### Hosts with different GPU architectures
 
 If visible GPUs have different SMs, EdgeLLM fails before loading native code
-rather than selecting an ambiguous payload. Run one process per selected GPU,
-using the stable UUID reported by `nvidia-smi`:
+rather than selecting an ambiguous payload. Run one build or server process
+per selected GPU, using the stable UUID reported by `nvidia-smi`:
 
 ```bash
 nvidia-smi --query-gpu=uuid,name,compute_cap --format=csv,noheader
 
 CUDA_VISIBLE_DEVICES="GPU-<SM86-UUID>" \
-    python run_edgellm.py /path/to/model /tmp/engine-sm86
+    tensorrt-edgellm-build --model-dir /path/to/model \
+    --engine-dir /tmp/engine-sm86
 CUDA_VISIBLE_DEVICES="GPU-<SM120-UUID>" \
-    python run_edgellm.py /path/to/model /tmp/engine-sm120
+    tensorrt-edgellm-build --model-dir /path/to/model \
+    --engine-dir /tmp/engine-sm120
 ```
 
 `CUDA_VISIBLE_DEVICES` remaps the selected physical GPU to CUDA device `0`
@@ -429,6 +440,47 @@ cmake .. \
     -DENABLE_CUTE_DSL=ALL
 ```
 
+**QNX Standard 8.0 (AArch64 cross-compilation)**
+
+QNX is a C++ source-deployment workflow. Install the QNX SDP 8.0 host and
+target trees, a cross-capable host CUDA Toolkit, the matching QNX CUDA target
+package, and a QNX TensorRT package. `QNX_HOST` must contain the host `qcc` and
+`q++` tools; `QNX_TARGET` is the AArch64 QNX sysroot. The TensorRT root passed
+to CMake must expose target headers and libraries under `include` and `lib`, or
+under the `include/aarch64-qnx` and `lib/aarch64-qnx` subdirectories.
+
+```bash
+export QNX_HOST=/path/to/qnx800/host/linux/x86_64
+export QNX_TARGET=/path/to/qnx800/target/qnx
+
+cmake -S . -B build-qnx \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_qnx_toolchain.cmake \
+    -DTRT_PACKAGE_DIR=/path/to/tensorrt-qnx \
+    -DCUDA_CTK_VERSION=13.3 \
+    -DCUDA_TOOLKIT_ROOT=/usr/local/cuda-13.3 \
+    -DQNX_CUDA_TARGET_ROOT=/usr/local/cuda-safe-13.3 \
+    -DENABLE_CUTE_DSL=OFF
+
+cmake --build build-qnx --parallel "$(nproc)"
+```
+
+`QNX_CUDA_TARGET_ROOT` must contain `targets/aarch64-qnx`. The toolchain also
+uses `${QNX_CUDA_TARGET_ROOT}/thor/targets/aarch64-qnx` by default; override
+`CUDA_TARGET_DIR` when that additional target tree is elsewhere. CUDA Toolkit
+13.x defaults to SM110a. CUDA Toolkit 12.7 through 12.x defaults to SM101a;
+set `CMAKE_CUDA_ARCHITECTURES` explicitly for another supported target.
+
+Deploy the cross-built binaries and libraries from `build-qnx/` with the
+matching QNX CUDA and TensorRT runtime libraries. CuTe DSL kernels are not
+available for QNX; CMake rejects `ENABLE_CUTE_DSL` values other than `OFF`.
+The standard autoregressive LLM and VLM paths require CuTe DSL FMHA for
+prefill, so their `llm_build` and `llm_inference` workflows are not supported
+by this QNX build. Components implemented entirely with TensorRT-native or
+CUDA operators can be cross-compiled, but this release does not claim a
+model-level QNX qualification for them. Python wheels and the experimental
+Python server are not part of this cross-compilation workflow.
+
 **Alternative: Building on x86 GPU Systems (Optional for Developers)**
 
 If you want to build and test on an x86 workstation with NVIDIA GPU (for development purposes before deploying to Edge devices), you can use this configuration instead:
@@ -514,7 +566,9 @@ Build time: ~1-2 minutes depending on hardware.
 
 ## Next Steps
 
-After installation, proceed to the [Quick Start Guide](quick-start-guide.md) for a complete end-to-end workflow, or see the [Examples](../examples/index.md) for detailed pipeline stages and advanced use cases.
+For the maintained ONNX and C++ workflow, proceed to the
+[Quick Start Guide](quick-start-guide.md). For model-specific input and output
+contracts, see [Examples](../examples/index.md).
 
 ---
 
