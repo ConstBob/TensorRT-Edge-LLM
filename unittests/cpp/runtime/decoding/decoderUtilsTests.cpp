@@ -27,6 +27,8 @@
 #include <stdexcept>
 #include <vector>
 
+// This test uses only host-side CUDA runtime APIs; compiling it as C++ avoids
+// routing unrelated host-only JSON headers through the CUDA front end.
 using namespace trt_edgellm;
 using namespace nvinfer1;
 
