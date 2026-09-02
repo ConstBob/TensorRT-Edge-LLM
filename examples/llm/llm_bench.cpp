@@ -1481,9 +1481,11 @@ int main(int argc, char** argv)
         if (deployment.specDecodeMode() == rt::SpecDecodeMode::kMTP)
         {
             ELLM_CHECK(deployment.specConfig.has_value(), "MTP draft proposal requires drafting configuration");
-            proposalSize = static_cast<int64_t>(deployment.specConfig->draftingStep)
-                * static_cast<int64_t>(deployment.specConfig->draftingTopK);
-            selectLen = deployment.specConfig->draftingTopK;
+            int32_t const effectiveDraftTopK
+                = deployment.specConfig->draftingTopK > 1 ? 1 : deployment.specConfig->draftingTopK;
+            proposalSize
+                = static_cast<int64_t>(deployment.specConfig->draftingStep) * static_cast<int64_t>(effectiveDraftTopK);
+            selectLen = effectiveDraftTopK;
         }
         ELLM_CHECK(proposalSize > 0 && selectLen > 0 && proposalSize <= std::numeric_limits<int32_t>::max()
                 && static_cast<int64_t>(args.pastKVLen) + proposalSize <= std::numeric_limits<int32_t>::max(),
