@@ -175,11 +175,6 @@ public:
         return DecodingTokenStateContract::kCommittedPlusLookahead;
     }
 
-    virtual ContextCacheCommitPolicy contextCacheCommitPolicy(ContextCacheCommitPolicy requested) const noexcept
-    {
-        return requested;
-    }
-
     virtual bool decodeStep(DecodingInferenceContext& context) = 0;
     virtual bool captureCudaGraphs(cudaStream_t stream) = 0;
 

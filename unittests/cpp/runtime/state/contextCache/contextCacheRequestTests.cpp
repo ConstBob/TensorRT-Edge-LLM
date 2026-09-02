@@ -360,13 +360,13 @@ TEST_F(ContextCacheRequestTests, AdmissionUsesValidatedCoordinatorContract)
     ASSERT_TRUE(vanilla->finish());
 }
 
-TEST_F(ContextCacheRequestTests, FullyCommittedContractPublishesOnlyPromptState)
+TEST_F(ContextCacheRequestTests, FullyCommittedContractPublishesCommittedDecodeState)
 {
     DecodingInferenceContext context = makeContext({makeTokens(kTOKENS_PER_PAGE)}, mStream);
     LLMGenerationRequest requestConfig{};
     std::optional<ContextCacheRequest> request = ContextCacheRequest::begin(*mCoordinator, requestConfig, context,
         /*speculativeRequest=*/false, DecodingKvHeadroom{1, 0}, {}, DecodingTokenStateContract::kFullyCommitted,
-        ContextCacheCommitPolicy::kPrefillStateOnly);
+        ContextCacheCommitPolicy::kIncludingGeneratedTokens);
     ASSERT_TRUE(request.has_value());
 
     ASSERT_TRUE(request->preparePrefill());
@@ -379,13 +379,15 @@ TEST_F(ContextCacheRequestTests, FullyCommittedContractPublishesOnlyPromptState)
     EXPECT_GT(afterPrefill.publicationAttempts, 0U);
 
     ASSERT_TRUE(request->prepareDecodeStep(context, DecodingKvHeadroom{1, 0}));
-    context.tokenIds[0].push_back(9101);
-    context.tokenIds[0].push_back(9102);
-    context.currentGenerateLengths[0] = 2;
+    for (int32_t token = 0; token < kTOKENS_PER_PAGE; ++token)
+    {
+        context.tokenIds[0].push_back(9101 + token);
+    }
+    context.currentGenerateLengths[0] = kTOKENS_PER_PAGE;
     context.finishedStates[0] = 1;
     context.slotStreams[0].terminalReason = FinishReason::kLength;
     ASSERT_TRUE(request->completeDecodeStep(context, {}));
-    EXPECT_EQ(mCoordinator->metrics().publicationAttempts, afterPrefill.publicationAttempts);
+    EXPECT_GT(mCoordinator->metrics().publicationAttempts, afterPrefill.publicationAttempts);
     ASSERT_TRUE(request->finish());
 }
 

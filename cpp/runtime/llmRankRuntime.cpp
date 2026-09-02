@@ -1191,8 +1191,7 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
 
     DecodingKvHeadroom const kvHeadroom = decodingStrategy.requiredKvHeadroom();
     DecodingTokenStateContract const tokenStateContract = decodingStrategy.tokenStateContract();
-    ContextCacheCommitPolicy const contextCacheCommitPolicy
-        = decodingStrategy.contextCacheCommitPolicy(request.contextCacheCommitPolicy);
+    ContextCacheCommitPolicy const contextCacheCommitPolicy = request.contextCacheCommitPolicy;
     ELLM_CHECK(
         kvHeadroom.baseExtraTokens > 0 && kvHeadroom.draftExtraTokens >= 0, "Decoder returned invalid KV headroom");
     ELLM_CHECK(!enableSpecDecode || kvHeadroom.draftExtraTokens == 0 || mDeployment.draft.has_value(),
