@@ -136,14 +136,12 @@ inputs automatically. The
 `disable_spec_decode` request field can disable drafting for one request,
 except with a Gemma MTP verification engine; use a standalone target bundle
 for target-only Gemma inference.
-`logit_bias` remains active on the speculative path; native verification and
-fallback sampling honor it without forcing vanilla decoding.
+See [Logit Bias](../format/input-format.md#logit-bias) for speculative-decoding
+behavior and validation limits.
 
 ## KV Cache Reuse
 
-Context reuse is an opt-in, in-memory runtime cache for matching token prefixes.
-It is separate from both `--max-kv-cache-capacity` and the on-disk engine cache:
-the retained pages and records are released when the server exits.
+Context reuse is disabled by default. Enable it when constructing the server:
 
 ```bash
 tensorrt-edgellm-serve Qwen/Qwen3.5-0.8B \
@@ -172,28 +170,21 @@ request. `cache_generated_tokens=False` publishes only the prefill endpoint.
 The OpenAI chat request exposes the same controls as strict boolean
 `reuse_context` and `cache_generated_tokens` fields.
 
-The native support boundary is text-only execution: vanilla attention,
-recurrent/hybrid models, EAGLE with independent base and draft caches, and MTP
-on a hybrid base. Any attention KV cache must use FP16.
-Hybrid and pure-recurrent models also require positive recurrent snapshot pool
-capacity; hybrid models require partial-KV snapshot capacity. Configure those
-preallocated device pools with
+See the authoritative [KV Cache Reuse support matrix](../features/kv-cache-reuse.md#support-matrix)
+for supported model and speculative-decoding contracts. Configure the server's
+recurrent snapshot pools with
 `--context-cache-recurrent-snapshot-pool-bytes` and
-`--context-cache-partial-kv-snapshot-pool-bytes`. DFlash, DSpark, JetSpec,
-Gemma MTP, block diffusion, and multimodal execution are rejected at runtime
-rather than silently running without reuse.
+`--context-cache-partial-kv-snapshot-pool-bytes`.
 
-MTP on a hybrid base reuses only what prefill produced, so it needs
-`cache_generated_tokens=False` on the request; a batch of one and text-only
-input are required as for every reusing request. With a chat template that
-folds a thinking marker into the generation prompt (Qwen3 under
-`enable_thinking=false`, for example), the server publishes the checkpoint
-before that marker and replays the few unstable tail tokens, so the record
-stays valid as a prefix of the next turn.
+With a chat template that folds a thinking marker into the generation prompt
+(Qwen3 under `enable_thinking=false`, for example), the server publishes the
+checkpoint before that marker and replays the few unstable tail tokens, so the
+record stays valid as a prefix of the next turn.
 
-One enabled runtime is one trusted cache domain. The native cache does not have
-a per-request tenant or salt key, so use separate server processes for mutually
-untrusted tenants. Context reuse is disabled by default.
+For encoder-cache behavior and server configuration limits, see
+[Encoder Embedding Cache](../features/kv-cache-reuse.md#configuring-the-encoder-embedding-cache).
+
+For tenant isolation, follow the [cache-domain requirements](../features/kv-cache-reuse.md#cache-domain).
 
 ## OpenAI Chat
 

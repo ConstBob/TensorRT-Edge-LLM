@@ -153,7 +153,7 @@ graph TD
 
 == Testing
 
-* `unittests/hybridCacheManagerTests.cpp` validates cache reset, capture, and
-  restore behavior.
+* `unittests/cpp/runtime/state/hybridCacheManagerTests.cpp` validates cache
+  reset, capture, and restore behavior.
 * `tests/test_lists/l0_pipeline_*.yml` covers KV cache behavior through prefill
   and decode inference flows.

@@ -108,7 +108,7 @@ and rebuild.
 ## Validation
 
 The split-path backend is covered by the
-[SM100/101/110 runner smoke and accuracy tests](../../../unittests/nvfp4MoeCuteDslSm110Tests.cu).
+[SM100/101/110 runner smoke and accuracy tests](../../../unittests/cpp/kernels/moe/nvfp4MoeCuteDslSm110Tests.cu).
 Avoid validating production routing by instantiating Python-only helper
 modules directly; model integration should be tested at the export path
 that explicitly emits `Nvfp4MoePlugin` for an SM100/101/110 target.

@@ -144,7 +144,8 @@ corresponding decoder layer index.
 
 == Testing
 
-* `unittests/embeddingLookupTests.cpp` covers `assembleDeepstackEmbedding()`
+* `unittests/cpp/kernels/embeddingKernels/embeddingLookupTests.cpp` covers
+  `assembleDeepstackEmbedding()`
   accuracy, out-of-bounds handling, explicit image-token IDs,
   `multimodalIndices`, and shape-error handling.
 * There is currently no separate engine-level test for deepstack binding

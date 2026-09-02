@@ -102,5 +102,6 @@ per-layer decoder KV flow.
 Prefix reuse is validated through pipeline tests exercising cache-hit and
 cache-miss paths. Correctness is confirmed by comparing reuse-enabled
 and reuse-disabled outputs for the same prompt. Cache capture/restore
-behavior is unit-tested in `unittests/hybridCacheManagerTests.cpp`;
+behavior is unit-tested in
+`unittests/cpp/runtime/state/hybridCacheManagerTests.cpp`;
 pipeline lists live under `tests/test_lists/l0_pipeline_*.yml`.

@@ -103,27 +103,19 @@ reason.
 
 ## 4. Start the OpenAI-Compatible Server
 
-The server uses the same engines built above. It requires the `server` package
-extra and the C++ Python binding. From the repository root, install the extra
-in the active Edge-LLM environment and reconfigure the existing build directory
-without changing its platform settings:
+The server is a separate checkpoint-direct workflow; it does not consume the
+ONNX engines built in Steps 1-3. Install the wheel's `server` extra as described
+in [Installation](installation.md#install-a-wheel-file). Then start the server
+from the repository root. The first launch downloads the checkpoint, builds
+the components required by that model, and stores the complete runtime bundle
+in the configured cache. Local media is disabled by default; the final option
+grants access only to the example-image directory.
 
 ```bash
-python -m pip install -e ".[server,native-build]"
-
-cmake -S . -B build \
-  -DBUILD_PYTHON_BINDINGS=ON \
-  -Dpybind11_DIR="$(python -c 'import pybind11; print(pybind11.get_cmake_dir())')"
-cmake --build build --target _edgellm_runtime -j$(nproc)
-```
-
-Start the server from the repository root. Local media is disabled by default;
-the final option grants access only to the example-image directory.
-
-```bash
-python -m experimental.server \
-  --model "$WORKSPACE_DIR/engines/llm" \
-  --multimodal-engine-dir "$WORKSPACE_DIR/engines" \
+tensorrt-edgellm-serve Qwen/Qwen3.5-0.8B \
+  --cache-dir "$WORKSPACE_DIR/server-cache" \
+  --max-input-len 4096 \
+  --max-kv-cache-capacity 4096 \
   --allowed-local-media-path "$PWD/examples/multimodal/pics" \
   --host 127.0.0.1 \
   --port 8000
@@ -138,12 +130,12 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   --data-binary @- <<EOF
 {
-  "model": "Qwen3.5-0.8B",
+  "model": "Qwen/Qwen3.5-0.8B",
   "messages": [
     {
       "role": "user",
       "content": [
-        {"type": "image", "image": "$IMAGE_PATH"},
+        {"type": "image_url", "image_url": {"url": "file://$IMAGE_PATH"}},
         {"type": "text", "text": "Describe this image."}
       ]
     }

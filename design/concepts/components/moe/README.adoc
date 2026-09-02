@@ -169,12 +169,13 @@ separate shared expert's dense ReLU-squared MLP output.
 
 == Testing
 
-* `unittests/nvfp4MoeCuteDslSm12xTests.cu` validates the CuTeDSL SM12x
-  NVFP4 MoE path.
-* `unittests/nvfp4MoeCuteDslSm110Tests.cu` validates the CuTeDSL SM110
-  NVFP4 MoE path.
-* `unittests/nvfp4MoESupportKernelTest.cu` validates NVFP4 MoE support
-  kernels.
-* `unittests/moeTopkSoftmaxKernelTests.cpp` validates top-k softmax routing.
-* `unittests/moeSigmoidGroupTopkKernelTests.cpp` validates the sigmoid
-  grouped-top-k routing kernel used by Nemotron-H-style routing.
+* `unittests/cpp/kernels/moe/nvfp4MoeCuteDslSm12xTests.cu` validates the
+  CuTeDSL SM12x NVFP4 MoE path.
+* `unittests/cpp/kernels/moe/nvfp4MoeCuteDslSm110Tests.cu` validates the
+  CuTeDSL SM110 NVFP4 MoE path.
+* `unittests/cpp/kernels/moe/nvfp4MoESupportKernelTest.cu` validates NVFP4 MoE
+  support kernels.
+* `unittests/cpp/kernels/moe/moeTopkSoftmaxKernelTests.cpp` validates top-k
+  softmax routing.
+* `unittests/cpp/kernels/moe/moeSigmoidGroupTopkKernelTests.cpp` validates the
+  sigmoid grouped-top-k routing kernel used by Nemotron-H-style routing.

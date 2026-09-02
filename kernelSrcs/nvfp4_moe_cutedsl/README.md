@@ -220,7 +220,7 @@ for SM110.
 ## Validation
 
 The SM110 NVFP4 MoE contract is validated by the
-[`CuteDslNvfp4MoeSm110Test`](../../unittests/nvfp4MoeCuteDslSm110Tests.cu)
+[`CuteDslNvfp4MoeSm110Test`](../../unittests/cpp/kernels/moe/nvfp4MoeCuteDslSm110Tests.cu)
 smoke and accuracy tests.
 
 ## File Map

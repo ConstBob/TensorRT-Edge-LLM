@@ -110,8 +110,9 @@ spec-decode XQA path when the runtime sequence contains a candidate tree.
 
 * `tests/python-unittests/test_attention_plugin.py` validates plugin tree
   attention against a numpy reference.
-* `unittests/xqaTreeAttentionDecodingTest.cu` covers XQA tree decode kernels.
-* `unittests/eagleUtilkernelTests.cu` covers EAGLE tree-mask packing and base
-  tree-decoding input preparation.
+* `unittests/cpp/kernels/decodeAttentionKernels/xqaTreeAttentionDecodingTest.cu`
+  covers XQA tree decode kernels.
+* `unittests/cpp/kernels/speculative/eagleUtilkernelTests.cu` covers EAGLE
+  tree-mask packing and base tree-decoding input preparation.
 * `tests/test_lists/l0_pipeline_thor_2.yml` and related EAGLE pipeline lists
   exercise end-to-end speculative decoding.
