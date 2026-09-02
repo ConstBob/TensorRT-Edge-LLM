@@ -1000,6 +1000,7 @@ TEST(RopePackedRaggedPrefill, SkipsPaddingBeforePagedWrite)
 TEST(RopePackedSharedKV, ProducesScratchWithoutWritingCache)
 {
     cudaStream_t stream{nullptr};
+    int32_t constexpr kMIN_PDL_SM_VERSION{90};
     int32_t constexpr batchSize = 1;
     int32_t constexpr qSeqLen = 17;
     int32_t constexpr numQHeads = 4;
@@ -1059,9 +1060,10 @@ TEST(RopePackedSharedKV, ProducesScratchWithoutWritingCache)
         readOnlyCacheTensor, 1.0F, 1.0F, stream, pageTableTensor.dataPointer<int32_t>(), maxPagesPerSeq,
         kReadOnlyTensor.rawPointer(), vReadOnlyTensor.rawPointer(), nullptr, 1.0F, nullptr, nullptr, 1e-6F,
         std::nullopt, false);
+    bool const enablePdl = getSMVersion() >= kMIN_PDL_SM_VERSION;
     launchApplyRopeFromPackedToSplit(cosSinCacheTensor, std::nullopt, std::nullopt, packedTensor, qOnlyTensor,
         qOnlyCacheTensor, 1.0F, 1.0F, stream, pageTableTensor.dataPointer<int32_t>(), maxPagesPerSeq, nullptr, nullptr,
-        nullptr, 1.0F, nullptr, nullptr, 1e-6F, std::nullopt, false /* writeKVCache */, true /* enablePdl */);
+        nullptr, 1.0F, nullptr, nullptr, 1e-6F, std::nullopt, false /* writeKVCache */, enablePdl);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
 
