@@ -1026,6 +1026,7 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
     auto const launchKernel = [&](auto* kvCachePtr, void* fp8QOutput, float qScaleOrig, auto pdlTag) {
         using TCache = std::remove_pointer_t<decltype(kvCachePtr)>;
         constexpr bool kEnablePdl = decltype(pdlTag)::value;
+#if SUPPORTS_PROGRAMMATIC_DEPENDENT_LAUNCH
         if constexpr (kEnablePdl)
         {
             cudaLaunchAttribute pdlAttribute{};
@@ -1050,6 +1051,7 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
                 maxPagesPerSeq, writeKVCache));
         }
         else
+#endif // SUPPORTS_PROGRAMMATIC_DEPENDENT_LAUNCH
         {
             applyRopeFromPackedToSplitKernel<half, TCache, kEnablePdl><<<grid, block, 0, stream>>>(packedPtr,
                 qScratchPtr, kScratchPtr, vScratchPtr, kvCachePtr, fp8QOutput, cosSinCachePtr, kvCacheEndLensPtr,
