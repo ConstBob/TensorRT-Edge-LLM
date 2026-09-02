@@ -68,6 +68,29 @@ def test_draft_reduced_vocab_requires_consuming_stage(monkeypatch, tmp_path,
     assert "requires a consuming draft stage" in capsys.readouterr().err
 
 
+def test_component_filter_cannot_silently_drop_mtp_draft_reduction(
+        monkeypatch, tmp_path, capsys):
+    checkpoint = _checkpoint(tmp_path, "qwen3_5")
+
+    with pytest.raises(SystemExit, match="2"):
+        _run_export_main(monkeypatch, checkpoint, tmp_path, "--mtp",
+                         "--draft-reduced-vocab-dir", "reduced",
+                         "--components", "thinker")
+
+    assert "requires a consuming draft stage" in capsys.readouterr().err
+
+
+def test_cosmos_export_cannot_silently_drop_mtp_draft_reduction(
+        monkeypatch, tmp_path, capsys):
+    checkpoint = _checkpoint(tmp_path, "cosmos3_edge")
+
+    with pytest.raises(SystemExit, match="2"):
+        _run_export_main(monkeypatch, checkpoint, tmp_path, "--mtp",
+                         "--draft-reduced-vocab-dir", "reduced")
+
+    assert "requires a consuming draft stage" in capsys.readouterr().err
+
+
 def test_mtp_draft_forwards_reduced_vocab_to_model_loader(
         monkeypatch, tmp_path):
     captured = {}

@@ -4280,6 +4280,12 @@ def main() -> None:
     model_type: str = config.get("model_type", "unknown")
     dtype = _dtype_from_str(args.dtype)
     is_gemma4_target = model_type in _GEMMA4_MODEL_TYPES
+    requested_components = {
+        c.strip()
+        for c in args.components.split(",") if c.strip()
+    }
+    is_cosmos3_target = (model_type in ("cosmos3_edge", "cosmos3_omni")
+                         or _is_cosmos3_checkpoint(model_dir))
 
     if args.mtp_tree_base:
         args.mtp = True
@@ -4288,8 +4294,14 @@ def main() -> None:
                     "--mtp-tree-base (chain-MTP only, --specDraftTopK 1)")
 
     gemma4_mtp_requested = args.mtp and is_gemma4_target
-    consumes_draft_reduced_vocab = ((args.mtp and not gemma4_mtp_requested)
-                                    or args.dflash_draft or args.jetspec_draft)
+    consumes_chain_mtp_draft = (args.mtp and not gemma4_mtp_requested
+                                and not is_cosmos3_target
+                                and (not requested_components
+                                     or "mtp_draft" in requested_components))
+    consumes_standalone_draft = (not is_cosmos3_target
+                                 and (args.dflash_draft or args.jetspec_draft))
+    consumes_draft_reduced_vocab = (consumes_chain_mtp_draft
+                                    or consumes_standalone_draft)
     if args.draft_reduced_vocab_dir and not consumes_draft_reduced_vocab:
         p.error("--draft-reduced-vocab-dir requires a consuming draft stage: "
                 "chain-MTP (--mtp), DFlash V1 (--dflash-draft), or JetSpec "
@@ -4304,8 +4316,7 @@ def main() -> None:
     #     the standard llm_build + visual_build + llm_inference VLM flow.
     # Both the root ``model_type`` and the diffusers ``model_index.json``
     # identify them.
-    if model_type in ("cosmos3_edge",
-                      "cosmos3_omni") or _is_cosmos3_checkpoint(model_dir):
+    if is_cosmos3_target:
         has_reasoner = model_type == "cosmos3_edge"
         if args.task == "reasoning" and not has_reasoner:
             p.error("--task reasoning requires a cosmos3_edge checkpoint "
@@ -4500,10 +4511,6 @@ def main() -> None:
         "thinker", "mtp_draft", "dflash_draft", "jetspec_draft",
         "dspark_draft", "talker", "code_predictor", "visual", "audio",
         "code2wav", "action", "dllm"
-    }
-    requested_components = {
-        c.strip()
-        for c in args.components.split(",") if c.strip()
     }
     unknown = requested_components - _VALID_COMPONENTS
     if unknown:

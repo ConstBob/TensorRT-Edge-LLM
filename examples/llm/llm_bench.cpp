@@ -24,6 +24,7 @@
 #include "common/logger.h"
 #include "common/tensor.h"
 #include "common/trtUtils.h"
+#include "kernels/speculative/eagleUtilKernels.h"
 #include "multimodal/common/multimodalRunner.h"
 #include "profiling/layerProfiler.h"
 #include "runtime/config/deploymentConfig.h"
@@ -45,6 +46,7 @@
 #include <functional>
 #include <getopt.h>
 #include <iostream>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <sstream>
 #include <string>
@@ -207,6 +209,7 @@ void printUsage(char const* programName)
     std::cerr << "  For spec_draft_accept mode:" << std::endl;
     std::cerr << "    --acceptLen             Tokens caught up per accept pass (default: draftStep+1; pass"
               << " --draftStep matching your deployment's drafting_step)." << std::endl;
+    std::cerr << "                            With osl>1, acceptRate must not exceed acceptLen." << std::endl;
     std::cerr << "    --pastKVLen             Past KV cache length per batch. Required." << std::endl;
     std::cerr << "    --verifyTreeSize        Optional; defaults to draftStep+1 (chain-MTP engines"
               << " require verifySize == draftStep+1)." << std::endl;
@@ -539,6 +542,9 @@ bool parseArgs(ProfileBenchArgs& args, int argc, char* argv[])
     return true;
 }
 
+static bool isDFlashMode(BenchMode mode);
+static bool isSpecDecodeMode(BenchMode mode);
+
 bool validateArgs(ProfileBenchArgs const& args)
 {
     if (args.engineDir.empty())
@@ -553,10 +559,7 @@ bool validateArgs(ProfileBenchArgs const& args)
         return false;
     }
 
-    bool const isSpecMode = args.mode == BenchMode::kEAGLE_VERIFY || args.mode == BenchMode::kEAGLE_DRAFT_PROPOSAL
-        || args.mode == BenchMode::kEAGLE_DRAFT_PREFILL || args.mode == BenchMode::kEAGLE_DRAFT_ACCEPT
-        || args.mode == BenchMode::kDFLASH_DRAFT_PROPOSAL || args.mode == BenchMode::kDFLASH_DRAFT_FIRST_ROUND
-        || args.mode == BenchMode::kDFLASH_VERIFY || args.mode == BenchMode::kDFLASH_DDTREE_BUILD;
+    bool const isSpecMode = isSpecDecodeMode(args.mode);
     if (isSpecMode && args.acceptRate <= 0)
     {
         LOG_ERROR("--acceptRate must be positive for speculative decoding modes");
@@ -565,6 +568,14 @@ bool validateArgs(ProfileBenchArgs const& args)
     if (isSpecMode && args.draftStep < 1)
     {
         LOG_ERROR("--draftStep must be at least 1 for speculative decoding modes");
+        return false;
+    }
+    if (args.mode == BenchMode::kEAGLE_DRAFT_ACCEPT && args.osl > 1 && args.acceptRate > args.acceptLen)
+    {
+        LOG_ERROR(
+            "--acceptRate (%d) cannot exceed --acceptLen (%d) for spec_draft_accept with --osl > 1; "
+            "increase --acceptLen or reduce --acceptRate",
+            args.acceptRate, args.acceptLen);
         return false;
     }
 
@@ -719,7 +730,7 @@ bool isDraftEngineMode(BenchMode mode)
         || mode == BenchMode::kDFLASH_DRAFT_FIRST_ROUND;
 }
 
-bool isSpecDecodeMode(BenchMode mode)
+static bool isSpecDecodeMode(BenchMode mode)
 {
     return mode == BenchMode::kEAGLE_VERIFY || mode == BenchMode::kEAGLE_DRAFT_PROPOSAL
         || mode == BenchMode::kEAGLE_DRAFT_PREFILL || mode == BenchMode::kEAGLE_DRAFT_ACCEPT || isDFlashMode(mode);
@@ -743,24 +754,32 @@ int main(int argc, char** argv)
         return EXIT_SUCCESS;
     }
 
+    // Resolve the chain geometry before deployment creation and configuration logging.
+    if (args.mode == BenchMode::kEAGLE_DRAFT_ACCEPT)
+    {
+        int64_t const chainVerifySize = static_cast<int64_t>(args.draftStep) + 1;
+        if ((args.acceptLen <= 0 || args.verifyTreeSize <= 0) && chainVerifySize > std::numeric_limits<int32_t>::max())
+        {
+            LOG_ERROR(
+                "--draftStep is too large to derive the default acceptLen/verifyTreeSize; pass a value no "
+                "greater than %d",
+                std::numeric_limits<int32_t>::max() - 1);
+            return EXIT_FAILURE;
+        }
+        if (args.acceptLen <= 0)
+        {
+            args.acceptLen = static_cast<int32_t>(chainVerifySize);
+        }
+        if (args.verifyTreeSize <= 0)
+        {
+            args.verifyTreeSize = static_cast<int32_t>(chainVerifySize);
+        }
+    }
+
     if (!validateArgs(args))
     {
         printUsage(argv[0]);
         return EXIT_FAILURE;
-    }
-
-    // Resolve the chain geometry before deployment creation and configuration logging.
-    if (args.mode == BenchMode::kEAGLE_DRAFT_ACCEPT)
-    {
-        int32_t const chainStep = args.draftStep;
-        if (args.acceptLen <= 0)
-        {
-            args.acceptLen = chainStep + 1;
-        }
-        if (args.verifyTreeSize <= 0)
-        {
-            args.verifyTreeSize = chainStep + 1;
-        }
     }
 
     if (args.debug)
@@ -1254,6 +1273,8 @@ int main(int argc, char** argv)
 
     std::function<void(int32_t)> postStep = [](int32_t) {};
     std::function<bool()> captureGraph = []() { return false; };
+    std::function<void()> prepareDraftAcceptInputs = []() {};
+    rt::Tensor draftAcceptLengths;
     int32_t decodeSteps = 1;
     bool useSequentialE2E = false;
 
@@ -1498,24 +1519,30 @@ int main(int argc, char** argv)
         int32_t const draftHiddenSize = deployment.draft->hiddenSize;
         check::check(io->inputsEmbeds.reshape({B, acceptLen, draftHiddenSize}), "inputsEmbeds reshape failed");
 
-        // selectTokenIndices: the accept pass emits logits for ONE selected
-        // token per batch entry (the frontier).
+        // Mirror the production accept pass metadata. For one-pass component
+        // timing, every batch entry accepts the whole engine input. Sequential
+        // timing advances by acceptRate, while acceptLen remains the fixed
+        // engine input shape and upper bound.
+        check::check(io->packedAttentionMask.reshape({B, acceptLen, static_cast<int64_t>(divUp(acceptLen, 32))}),
+            "packedAttentionMask reshape failed");
+        check::check(io->specDecodePositionIds.reshape({B, acceptLen}), "specDecodePositionIds reshape failed");
         check::check(io->selectTokenIndices.reshape({B, 1}), "selectTokenIndices reshape failed");
-        CUDA_CHECK(cudaMemsetAsync(
-            io->selectTokenIndices.rawPointer(), 0, io->selectTokenIndices.getMemoryCapacity(), stream));
-
         check::check(io->contextLengths.reshape({B}), "contextLengths reshape failed");
-        {
-            std::vector<int32_t> ctxVec(B, args.pastKVLen + acceptLen);
-            CUDA_CHECK(cudaMemcpyAsync(
-                io->contextLengths.rawPointer(), ctxVec.data(), B * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-        }
+        draftAcceptLengths = rt::Tensor({B}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "draft_accept_lengths");
+        int32_t const acceptedTokensPerPass = args.osl > 1 ? args.acceptRate : acceptLen;
+        fillInt32(draftAcceptLengths, acceptedTokensPerPass);
+        prepareDraftAcceptInputs = [&]() {
+            kernel::prepareEagleAcceptDecodeTokenInputs(resources->cacheManagers[kvCacheIndex]->getKVCacheLengths(),
+                draftAcceptLengths, io->packedAttentionMask, io->specDecodePositionIds, io->selectTokenIndices,
+                io->contextLengths, stream);
+        };
 
         auto const dims = deployment.draft->acceptDims(B, acceptLen);
 
         resetState = [&]() {
             std::memcpy(reuseKVCacheLengths.rawPointer(), pastKVLenVec.data(), pastKVLenVec.size() * sizeof(int32_t));
             resources->cacheManagers[kvCacheIndex]->resetForNewSequences(reuseKVCacheLengths, stream);
+            prepareDraftAcceptInputs();
         };
         step = [&, dims]() {
             if (!executor->prepare(kDecodeProfile, dims, tensorMap, stream))
@@ -1536,6 +1563,7 @@ int main(int argc, char** argv)
             decodeSteps = (args.osl - 1 + args.acceptRate - 1) / args.acceptRate;
             postStep = [&](int32_t) {
                 resources->cacheManagers[kvCacheIndex]->commitSequenceLength(args.acceptRate, stream);
+                prepareDraftAcceptInputs();
             };
         }
     }
@@ -1867,9 +1895,10 @@ int main(int argc, char** argv)
     }
     else if (useSequentialE2E)
     {
-        e2eTimeMsResult = runSequentialE2ETiming(
-            modeName, decodeSteps, resetState, step, postStep, !args.noCudaGraph, captureGraph, stream);
-        e2eNumTokens = decodeSteps;
+        int32_t const sequentialNumTokens = args.mode == BenchMode::kEAGLE_DRAFT_ACCEPT ? args.osl - 1 : decodeSteps;
+        e2eTimeMsResult = runSequentialE2ETiming(modeName, decodeSteps, sequentialNumTokens, resetState, step, postStep,
+            !args.noCudaGraph, captureGraph, stream);
+        e2eNumTokens = sequentialNumTokens;
     }
     else
     {
