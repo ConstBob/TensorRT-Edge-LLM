@@ -936,37 +936,48 @@ int main(int argc, char** argv)
 
         std::optional<std::filesystem::path> draftConfigPath;
         std::optional<rt::SpecDecodeDraftingConfig> draftingConfig;
-        if (hasSpecDecode)
-        {
-            draftConfigPath = dir / "draft_config.json";
-            // Bench needs a SpecDecodeDraftingConfig to create DeploymentConfig.
-            // Use verifyTreeSize/draftTreeSize from args; draftingTopK/draftingStep are
-            // only needed for the full pipeline. Set reasonable defaults so the config
-            // factory's positivity checks pass.
-            rt::SpecDecodeDraftingConfig dc;
-            if (isDFlashMode(args.mode))
-            {
-                // DFlash configs use different fields (topK is candidate branching factor,
-                // step is fixed to 1) — leave whatever args provided (or 1s) so the factory
-                // accepts, then fold engine-derived values into args after the deployment
-                // is loaded (see DFlash defaults block below).
-                dc.draftingStep = 1;
-                dc.draftingTopK = args.candidateTopK > 0 ? args.candidateTopK : 1;
-                dc.verifySize = args.verifyTreeSize > 0 ? args.verifyTreeSize : 1;
-                dc.dflashBlockSize = args.blockSize > 0 ? args.blockSize : 0;
-            }
-            else
-            {
-                dc.draftingTopK = std::max(args.draftTreeSize, 1);
-                dc.draftingStep = std::max(args.draftStep, 1);
-                dc.verifySize = std::max(args.verifyTreeSize, 1);
-            }
-            draftingConfig = dc;
-        }
-
-        // --- Parse configs and create DeploymentConfig ---
         try
         {
+            if (hasSpecDecode)
+            {
+                draftConfigPath = dir / "draft_config.json";
+                // Bench needs a SpecDecodeDraftingConfig to create DeploymentConfig.
+                // Most isolated modes use their requested tensor width as a harmless
+                // synthetic drafting shape. MTP proposal width is not branching,
+                // however: it remains a linear chain regardless of draftTreeSize.
+                rt::SpecDecodeDraftingConfig dc;
+                if (isDFlashMode(args.mode))
+                {
+                    // DFlash configs use different fields (topK is candidate branching factor,
+                    // step is fixed to 1) — leave whatever args provided (or 1s) so the factory
+                    // accepts, then fold engine-derived values into args after the deployment
+                    // is loaded (see DFlash defaults block below).
+                    dc.draftingStep = 1;
+                    dc.draftingTopK = args.candidateTopK > 0 ? args.candidateTopK : 1;
+                    dc.verifySize = args.verifyTreeSize > 0 ? args.verifyTreeSize : 1;
+                    dc.dflashBlockSize = args.blockSize > 0 ? args.blockSize : 0;
+                }
+                else if (rt::parseEngineConfig(baseConfigPath).specDecodeType == rt::SpecDecodeMode::kMTP)
+                {
+                    int64_t const chainVerifySize = static_cast<int64_t>(args.draftStep) + 1;
+                    ELLM_CHECK(chainVerifySize <= std::numeric_limits<int32_t>::max(),
+                        "--draftStep is too large to derive MTP chain verifySize; pass a value no greater than "
+                            + std::to_string(std::numeric_limits<int32_t>::max() - 1));
+                    dc.draftingTopK = 1;
+                    dc.draftingStep = args.draftStep;
+                    dc.verifySize
+                        = args.verifyTreeSize > 0 ? args.verifyTreeSize : static_cast<int32_t>(chainVerifySize);
+                }
+                else
+                {
+                    dc.draftingTopK = std::max(args.draftTreeSize, 1);
+                    dc.draftingStep = std::max(args.draftStep, 1);
+                    dc.verifySize = std::max(args.verifyTreeSize, 1);
+                }
+                draftingConfig = dc;
+            }
+
+            // --- Parse configs and create DeploymentConfig ---
             deployment = rt::createDeploymentConfig(baseConfigPath, draftConfigPath, draftingConfig);
         }
         catch (std::exception const& e)
