@@ -204,7 +204,9 @@ void printUsage(char const* programName)
     std::cerr << "    --verifyTreeSize        Verify tree size. Required." << std::endl;
     std::cerr << "    --pastKVLen             Past KV cache length. Required." << std::endl;
     std::cerr << "  For spec_draft_proposal mode:" << std::endl;
-    std::cerr << "    --draftTreeSize         Draft tree size. Required." << std::endl;
+    std::cerr << "    --draftTreeSize         Draft proposal size for EAGLE/tree-MTP. Required." << std::endl;
+    std::cerr << "                            Chain-MTP instead uses the production proposal geometry"
+              << " draftStep*draftingTopK (with draftingTopK=1)." << std::endl;
     std::cerr << "    --pastKVLen             Past KV cache length. Required." << std::endl;
     std::cerr << "  For spec_draft_accept mode:" << std::endl;
     std::cerr << "    --acceptLen             Tokens caught up per accept pass (default: draftStep+1; pass"
@@ -957,22 +959,35 @@ int main(int argc, char** argv)
                     dc.verifySize = args.verifyTreeSize > 0 ? args.verifyTreeSize : 1;
                     dc.dflashBlockSize = args.blockSize > 0 ? args.blockSize : 0;
                 }
-                else if (rt::parseEngineConfig(baseConfigPath).specDecodeType == rt::SpecDecodeMode::kMTP)
-                {
-                    int64_t const chainVerifySize = static_cast<int64_t>(args.draftStep) + 1;
-                    ELLM_CHECK(chainVerifySize <= std::numeric_limits<int32_t>::max(),
-                        "--draftStep is too large to derive MTP chain verifySize; pass a value no greater than "
-                            + std::to_string(std::numeric_limits<int32_t>::max() - 1));
-                    dc.draftingTopK = 1;
-                    dc.draftingStep = args.draftStep;
-                    dc.verifySize
-                        = args.verifyTreeSize > 0 ? args.verifyTreeSize : static_cast<int32_t>(chainVerifySize);
-                }
                 else
                 {
-                    dc.draftingTopK = std::max(args.draftTreeSize, 1);
-                    dc.draftingStep = std::max(args.draftStep, 1);
-                    dc.verifySize = std::max(args.verifyTreeSize, 1);
+                    rt::SpecDecodeMode const engineSpecMode = rt::parseEngineConfig(baseConfigPath).specDecodeType;
+                    if (args.mode == BenchMode::kEAGLE_DRAFT_ACCEPT)
+                    {
+                        ELLM_CHECK(
+                            engineSpecMode == rt::SpecDecodeMode::kEAGLE || engineSpecMode == rt::SpecDecodeMode::kMTP,
+                            "spec_draft_accept supports only spec_decode_type=eagle3 or mtp; engine config uses "
+                                + std::string(rt::specDecodeModeName(engineSpecMode))
+                                + ". Use the benchmark mode dedicated to that speculative family.");
+                    }
+
+                    if (engineSpecMode == rt::SpecDecodeMode::kMTP)
+                    {
+                        bool const explicitTree = args.verifyTreeSize > 0 && args.draftTreeSize > 1;
+                        int64_t const chainVerifySize = static_cast<int64_t>(args.draftStep) + 1;
+                        ELLM_CHECK(explicitTree || chainVerifySize <= std::numeric_limits<int32_t>::max(),
+                            "--draftStep is too large to derive MTP chain verifySize; pass a value no greater than "
+                                + std::to_string(std::numeric_limits<int32_t>::max() - 1));
+                        dc.draftingTopK = explicitTree ? args.draftTreeSize : 1;
+                        dc.draftingStep = args.draftStep;
+                        dc.verifySize = explicitTree ? args.verifyTreeSize : static_cast<int32_t>(chainVerifySize);
+                    }
+                    else
+                    {
+                        dc.draftingTopK = std::max(args.draftTreeSize, 1);
+                        dc.draftingStep = std::max(args.draftStep, 1);
+                        dc.verifySize = std::max(args.verifyTreeSize, 1);
+                    }
                 }
                 draftingConfig = dc;
             }
@@ -1461,30 +1476,40 @@ int main(int argc, char** argv)
     else if (args.mode == BenchMode::kEAGLE_DRAFT_PROPOSAL)
     {
         modeName = "Spec Draft";
-        LOG_INFO("Spec Draft mode: DraftTreeSize=%d, PastKVLen=%d", args.draftTreeSize, args.pastKVLen);
+        int64_t proposalSize = args.draftTreeSize;
+        int64_t selectLen = args.draftTreeSize;
+        if (deployment.specDecodeMode() == rt::SpecDecodeMode::kMTP)
+        {
+            ELLM_CHECK(deployment.specConfig.has_value(), "MTP draft proposal requires drafting configuration");
+            proposalSize = static_cast<int64_t>(deployment.specConfig->draftingStep)
+                * static_cast<int64_t>(deployment.specConfig->draftingTopK);
+            selectLen = deployment.specConfig->draftingTopK;
+        }
+        ELLM_CHECK(proposalSize > 0 && selectLen > 0 && proposalSize <= std::numeric_limits<int32_t>::max()
+                && static_cast<int64_t>(args.pastKVLen) + proposalSize <= std::numeric_limits<int32_t>::max(),
+            "spec_draft_proposal production geometry exceeds the supported int32 tensor/context range");
+        LOG_INFO("Spec Draft mode: RequestedDraftTreeSize=%d, ProposalSize=%ld, SelectLen=%ld, PastKVLen=%d",
+            args.draftTreeSize, proposalSize, selectLen, args.pastKVLen);
         LOG_INFO(args.noCudaGraph ? "CUDA graph disabled; using non-CUDA-graph execution" : "CUDA graph enabled");
 
         pastKVLenVec.assign(B, args.pastKVLen);
 
         int32_t const draftHiddenSize = deployment.draft->hiddenSize;
-        check::check(io->inputsEmbeds.reshape({B, args.draftTreeSize, draftHiddenSize}), "inputsEmbeds reshape failed");
+        check::check(io->inputsEmbeds.reshape({B, proposalSize, draftHiddenSize}), "inputsEmbeds reshape failed");
 
-        // selectTokenIndices: for proposal, select draftTreeSize tokens
-        check::check(io->selectTokenIndices.reshape({B, args.draftTreeSize}), "selectTokenIndices reshape failed");
+        check::check(io->selectTokenIndices.reshape({B, selectLen}), "selectTokenIndices reshape failed");
         CUDA_CHECK(cudaMemsetAsync(
             io->selectTokenIndices.rawPointer(), 0, io->selectTokenIndices.getMemoryCapacity(), stream));
 
         // contextLengths: dummy values
         check::check(io->contextLengths.reshape({B}), "contextLengths reshape failed");
         {
-            std::vector<int32_t> ctxVec(B, args.pastKVLen + args.draftTreeSize);
+            std::vector<int32_t> ctxVec(B, static_cast<int32_t>(args.pastKVLen + proposalSize));
             CUDA_CHECK(cudaMemcpyAsync(
                 io->contextLengths.rawPointer(), ctxVec.data(), B * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
         }
 
-        // The draft proposal uses proposalDims. draftTopK = draftTreeSize for bench
-        // (the actual topK doesn't matter for timing — it only affects selectLen).
-        auto const dims = deployment.draft->proposalDims(B, args.draftTreeSize, args.draftTreeSize);
+        auto const dims = deployment.draft->proposalDims(B, proposalSize, selectLen);
 
         resetState = [&]() {
             std::memcpy(reuseKVCacheLengths.rawPointer(), pastKVLenVec.data(), pastKVLenVec.size() * sizeof(int32_t));

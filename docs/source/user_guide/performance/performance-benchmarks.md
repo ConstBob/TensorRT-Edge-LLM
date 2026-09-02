@@ -1268,7 +1268,6 @@ The v0.8.0 release benchmarks use `llm_bench` for synthetic component timing. Th
 # Speculative decoding component timing
 ./build/examples/llm/llm_bench --engineDir <engine_dir> --mode spec_draft_prefill --batchSize <batch_size> --inputLen <input_len> --warmup 2 --iterations 10 --profile
 ./build/examples/llm/llm_bench --engineDir <engine_dir> --mode spec_draft_proposal --batchSize <batch_size> --draftTreeSize <draft_tree_size> --pastKVLen <past_kv_len> --warmup 2 --iterations 10 --profile
-./build/examples/llm/llm_bench --engineDir <engine_dir> --mode spec_draft_accept --batchSize <batch_size> --draftStep <drafting_step> --pastKVLen <past_kv_len> --warmup 2 --iterations 10 --profile
 ./build/examples/llm/llm_bench --engineDir <engine_dir> --mode spec_verify --batchSize <batch_size> --verifyTreeSize <verify_tree_size> --pastKVLen <past_kv_len> --warmup 2 --iterations 10 --profile
 
 # Visual encoder timing
