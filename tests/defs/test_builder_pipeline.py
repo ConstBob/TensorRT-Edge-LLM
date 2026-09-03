@@ -61,8 +61,13 @@ def _speculative_build_args(config: TestConfig) -> List[str]:
     return []
 
 
-def _build_command(config: TestConfig, model_dir: str, engine_dir: str,
-                   env_config: EnvironmentConfig) -> List[str]:
+def _build_command(config: TestConfig,
+                   model_dir: str,
+                   engine_dir: str,
+                   env_config: EnvironmentConfig,
+                   tp_size: int = 1,
+                   tp_rank: int = 0) -> List[str]:
+    components = "llm" if tp_size > 1 else "all"
     command = [
         sys.executable,
         "-m",
@@ -72,7 +77,7 @@ def _build_command(config: TestConfig, model_dir: str, engine_dir: str,
         "--engine-dir",
         engine_dir,
         "--components",
-        "all",
+        components,
         "--plugin-path",
         os.path.join(env_config.build_dir, "libNvInfer_edgellm_plugin.so"),
         "--max-input-len",
@@ -99,6 +104,8 @@ def _build_command(config: TestConfig, model_dir: str, engine_dir: str,
         str(config.max_time_steps or 6000),
     ]
     command.extend(_speculative_build_args(config))
+    if tp_size > 1:
+        command.extend(["--tp-size", str(tp_size), "--tp-rank", str(tp_rank)])
     if config.fp8_embedding:
         command.append("--fp8-embedding")
     if config.debug:
@@ -106,8 +113,11 @@ def _build_command(config: TestConfig, model_dir: str, engine_dir: str,
     return command
 
 
-def _runtime_command(config: TestConfig, model_dir: str, engine_dir: str,
-                     executables: Dict[str, str]) -> List[str]:
+def _runtime_command(config: TestConfig,
+                     model_dir: str,
+                     engine_dir: str,
+                     executables: Dict[str, str],
+                     tp_size: int = 1) -> List[str]:
     common = [
         f"--inputFile={config.get_test_case_file()}",
         f"--outputFile={config.get_output_json_file()}",
@@ -156,6 +166,8 @@ def _runtime_command(config: TestConfig, model_dir: str, engine_dir: str,
             f"--code2wavEngineDir={os.path.join(engine_dir, 'code2wav')}",
             f"--outputAudioDir={config.get_output_audio_dir()}",
         ])
+    if tp_size > 1:
+        command.append(f"--tpSize={tp_size}")
     if config.batch_size is not None:
         command.append(f"--batchSize={config.batch_size}")
     if config.output_seq_len is not None:
@@ -163,8 +175,10 @@ def _runtime_command(config: TestConfig, model_dir: str, engine_dir: str,
     return command
 
 
-def _assert_component_engines(model_dir: str, engine_dir: str,
-                              config: TestConfig) -> None:
+def _assert_component_engines(model_dir: str,
+                              engine_dir: str,
+                              config: TestConfig,
+                              tp_size: int = 1) -> None:
     from experimental.builder.core import contracts
     from experimental.builder.core.config import BundleConfig
 
@@ -172,15 +186,24 @@ def _assert_component_engines(model_dir: str, engine_dir: str,
     speculative = bool(config.is_eagle or config.is_mtp or config.is_dflash
                        or config.is_jetspec)
     expected = []
-    for component in bundle.components:
-        spec = contracts.component_spec(component)
-        if component == contracts.Component.LLM and speculative:
-            expected.extend((
-                spec.output_path(engine_dir, contracts.SpecRole.BASE),
-                spec.output_path(engine_dir, contracts.SpecRole.DRAFT),
-            ))
-        else:
-            expected.append(spec.output_path(engine_dir))
+    if tp_size > 1:
+        # A tensor-parallel build emits the LLM component alone, one per rank.
+        spec = contracts.component_spec(contracts.Component.LLM)
+        expected = [
+            spec.output_path(engine_dir, tp_size=tp_size, tp_rank=rank)
+            for rank in range(tp_size)
+        ]
+    else:
+        for component in bundle.components:
+            spec = contracts.component_spec(component)
+            if component == contracts.Component.LLM and speculative:
+                expected.extend((
+                    spec.output_path(engine_dir, contracts.SpecRole.BASE),
+                    spec.output_path(engine_dir, contracts.SpecRole.DRAFT),
+                ))
+            else:
+                expected.append(spec.output_path(engine_dir))
+
     missing = [path for path in expected if not os.path.isfile(path)]
     empty = [
         path for path in expected
@@ -259,6 +282,12 @@ def test_build_and_run(test_param: str, executable_files: Dict[str, str],
                                           TaskType.CHECKPOINT_BUILD,
                                           env_config)
     config.check_trt_native_attn()
+    tp_size = config.tp_size or 1
+    if tp_size > 1 and (config.is_eagle or config.is_mtp or config.is_dflash
+                        or config.is_jetspec):
+        pytest.fail(
+            "Tensor-parallel direct builds do not support speculative decoding."
+        )
     model_dir = config.get_torch_model_dir()
     engine_dir = _engine_dir(config)
     shutil.rmtree(engine_dir, ignore_errors=True)
@@ -268,14 +297,19 @@ def test_build_and_run(test_param: str, executable_files: Dict[str, str],
 
     with timer_context(f"direct build and runtime for {config.model_name}",
                        test_logger):
-        _run(_build_command(config, model_dir, engine_dir,
-                            env_config), "single all-component engine build",
-             7200, env_config, test_logger)
-        _assert_component_engines(model_dir, engine_dir, config)
+        for tp_rank in range(tp_size):
+            label = ("single all-component engine build" if tp_size == 1 else
+                     f"engine build for rank {tp_rank}/{tp_size}")
+            _run(
+                _build_command(config, model_dir, engine_dir, env_config,
+                               tp_size, tp_rank), label, 7200, env_config,
+                test_logger)
+        _assert_component_engines(model_dir, engine_dir, config, tp_size)
 
-        _run(_runtime_command(config, model_dir, engine_dir, executable_files),
-             "single end-to-end runtime execution", 6000, env_config,
-             test_logger)
+        _run(
+            _runtime_command(config, model_dir, engine_dir, executable_files,
+                             tp_size), "single end-to-end runtime execution",
+            6000, env_config, test_logger)
 
     output_file = config.get_output_json_file()
     with open(output_file, encoding="utf-8") as stream:

@@ -16,7 +16,8 @@
       "cpp/kernels/multiDeviceKernels/shmAllReduce.h",
       "cpp/runtime/multiDevice/backends/shm/tensorParallelShmResources.cpp",
       "cpp/runtime/multiDevice/backends/shm/tensorParallelShmResources.h",
-      "unittests/cpp/kernels/multiDeviceKernels/shmAllReduceTests.cu"
+      "unittests/cpp/kernels/multiDeviceKernels/shmAllReduceTests.cu",
+      "unittests/cpp/plugins/allReducePlugin/allReducePluginShmTest.cpp"
     ],
     "strip_paths": [
       ".dockerignore",
@@ -41,6 +42,10 @@
       "cpp/runtime/multiDevice/tensorParallelPluginResources.h",
       "docs/source/user_guide/features/multi-device.md",
       "examples/llm/llm_inference.cpp",
+      "tests/defs/config.py",
+      "tests/defs/utils/command_execution.py",
+      "tests/defs/utils/command_generation.py",
+      "tests/test_lists/l0_pipeline_super_thor.yml",
       "unittests/cpp/runtime/multiDevice/parallelConfigTest.cpp"
     ],
     "forbidden_patterns": [

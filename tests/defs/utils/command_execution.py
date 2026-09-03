@@ -24,7 +24,7 @@ import json
 import os
 import re
 import subprocess
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import pytest
 from conftest import EnvironmentConfig, RemoteConfig
@@ -499,6 +499,26 @@ def _check_baseline_regression(config: TestConfig,
     return True
 
 
+def _get_arg_value(cmd: List[str], name: str) -> Optional[str]:
+    prefix = f"--{name}="
+    for index, arg in enumerate(cmd):
+        if arg.startswith(prefix):
+            return arg.split("=", 1)[1]
+        if arg == f"--{name}" and index + 1 < len(cmd):
+            return cmd[index + 1]
+    return None
+
+
+def _llm_build_engine_candidates(cmd: List[str],
+                                 default: List[str]) -> List[str]:
+    """Per-rank engine name for a tensor-parallel build, else the default."""
+    tp_size = int(_get_arg_value(cmd, "tpSize") or 1)
+    tp_rank = int(_get_arg_value(cmd, "tpRank") or 0)
+    if tp_size <= 1:
+        return default
+    return [f"llm_world{tp_size}_rank{tp_rank}.engine"]
+
+
 def execute_build_test(
         config: TestConfig, executable_files: Dict[str, str],
         remote_config: Optional[RemoteConfig], logger,
@@ -527,6 +547,9 @@ def execute_build_test(
             logger.info(f"Starting {task_name}: {' '.join(cmd)}")
 
         engine_candidates = engine_file_map.get(cmd[0], [])
+        if cmd[0] == executable_files['llm_build']:
+            engine_candidates = _llm_build_engine_candidates(
+                cmd, engine_candidates)
         engine_dir = next((arg.split('=', 1)[1]
                            for arg in cmd if arg.startswith('--engineDir=')),
                           None) if engine_candidates else None
@@ -705,6 +728,27 @@ def execute_inference_test(
                 'output': '\n'.join(all_outputs),
                 'test_type': TaskType.INFERENCE.value
             }
+
+    # {$edge-llm-internal-release begin}
+    # The runtime silently falls back to NCCL when the SHM path fails to
+    # register, so an arshm case passes even when SHM never ran. Require the
+    # positive marker from tensorParallelPluginResources.
+    if config.allreduce_backend == "shm":
+        joined = '\n'.join(all_outputs)
+        if "shm=registered" not in joined:
+            return {
+                'success':
+                False,
+                'error':
+                ("The case requested the SHM all-reduce path, but the "
+                 "runtime did not register it. Expected "
+                 "'shm=registered' in the log."),
+                'output':
+                joined,
+                'test_type':
+                TaskType.INFERENCE.value
+            }
+    # {$edge-llm-internal-release end}
 
     # Calculate metrics based on dataset type
     final_result = {

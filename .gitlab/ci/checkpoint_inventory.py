@@ -483,6 +483,9 @@ PUBLIC_CHECKPOINTS_BY_HF_ID = {
                 "NVFP4-LMNVFP4",
                 "NVFP4-LMNVFP4-FP8-KV",
             ),
+            "paths": {
+                "NVFP4": ("quantized_models/Qwen3-0.6B-NVFP4", ),
+            },
         },
     },
     "Qwen/Qwen3-1.7B": {

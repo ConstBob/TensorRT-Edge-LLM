@@ -64,6 +64,27 @@ pre_commit_checks:
     - echo "Pipeline end time:$(date)"
   interruptible: true
 
+oss_release_sanitizer:
+  extends:
+    - .precheck_rules
+  image:
+    name: "python:3.12-slim-bookworm"
+    entrypoint: [""]
+  stage: precheck
+  allow_failure: false
+  variables:
+    CUDA_VERSION: "12.9"
+  tags:
+    - cpu-k8s
+  script:
+    - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
+    - echo "Installing dependencies"
+    - bash .gitlab/ci/scripts/ci_apt.sh install python3 git
+    - echo "Sanitizing a staging tree and checking it for internal leaks"
+    - python3 scripts/check_oss_release_sanitizer.py
+    - echo "Pipeline end time:$(date)"
+  interruptible: true
+
 ci_script_tests:
   extends:
     - .gitlab_junit_report

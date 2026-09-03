@@ -65,6 +65,10 @@ def _build_project(env_config: EnvironmentConfig,
         'cmake', '..', '-DBUILD_UNIT_TESTS=ON',
         '-DENABLE_CUTEDSL_MODULE_TEST_HOOK=ON'
     ]
+    if os.environ.get('ENABLE_MULTI_DEVICE') == 'ON':
+        cmake_cmd.append('-DENABLE_MULTI_DEVICE=ON')
+    if os.environ.get('ENABLE_MULTI_DEVICE_MPI') == 'ON':
+        cmake_cmd.append('-DENABLE_MULTI_DEVICE_MPI=ON')
 
     # Opt-in for jobs whose test lists import the pybind runtime (the
     # preprocessing suites); resolved from the pytest interpreter's pybind11.
@@ -139,7 +143,7 @@ def _build_project(env_config: EnvironmentConfig,
     with timer_context(f"Building ({execution_mode})", test_logger):
         result = run_command(cmd=['bash', '-c', build_cmd],
                              remote_config=remote_config,
-                             timeout=600,
+                             timeout=1800,
                              logger=test_logger)
         success = result['success']
 

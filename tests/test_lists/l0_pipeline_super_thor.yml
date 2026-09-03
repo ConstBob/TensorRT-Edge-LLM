@@ -1,0 +1,17 @@
+tests:
+  - tests/defs/test_common.py::test_build_project
+  - tests/defs/test_common.py::test_unit_tests
+  - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen3-0.6B-NVFP4-nvfp4-mxsl2048-mxbs1-mxil1024-tp2]
+  - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen3-0.6B-NVFP4-nvfp4-mxsl2048-mxbs1-mxil1024]
+  - tests/defs/test_llm_pipeline.py::test_inference[Qwen3-0.6B-NVFP4-nvfp4-mxsl2048-mxbs1-mxil1024-llm_basic]
+  - tests/defs/test_llm_pipeline.py::test_inference[Qwen3-0.6B-NVFP4-nvfp4-mxsl2048-mxbs1-mxil1024-tp2-llm_basic]
+  - tests/defs/test_llm_pipeline.py::test_inference[Qwen3-0.6B-NVFP4-nvfp4-mxsl2048-mxbs1-mxil1024-tp2-mdmpi-llm_basic]
+  # ONNX-less build: engines come straight from the checkpoint, and the builder
+  # shards the weights at load time. It writes its own onnxless- engine dir.
+  - tests/defs/test_builder_pipeline.py::test_build_and_run[Qwen3-0.6B-NVFP4-nvfp4-mxsl2048-mxbs1-mxil1024-tp2-llm_basic]
+
+  # {$edge-llm-internal-release begin}
+  # SHM needs every rank in one process (tensorParallelShmResources.cpp:125
+  # requires localRanks == tpSize), so mpirun and arshm do not combine.
+  - tests/defs/test_llm_pipeline.py::test_inference[Qwen3-0.6B-NVFP4-nvfp4-mxsl2048-mxbs1-mxil1024-tp2-arshm-llm_basic]
+  # {$edge-llm-internal-release end}
