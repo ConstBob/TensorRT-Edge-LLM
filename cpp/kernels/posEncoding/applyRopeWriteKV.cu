@@ -1027,41 +1027,37 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
         using TCache = std::remove_pointer_t<decltype(kvCachePtr)>;
         constexpr bool kEnablePdl = decltype(pdlTag)::value;
 #if SUPPORTS_PROGRAMMATIC_DEPENDENT_LAUNCH
+        cudaLaunchAttribute pdlAttribute{};
+        cudaLaunchConfig_t launchConfig{};
+        launchConfig.gridDim = grid;
+        launchConfig.blockDim = block;
+        launchConfig.dynamicSmemBytes = 0;
+        launchConfig.stream = stream;
+        launchConfig.attrs = kEnablePdl ? &pdlAttribute : nullptr;
+        launchConfig.numAttrs = kEnablePdl ? 1U : 0U;
+
         if constexpr (kEnablePdl)
         {
-            cudaLaunchAttribute pdlAttribute{};
             pdlAttribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
             pdlAttribute.val.programmaticStreamSerializationAllowed = 1;
-
-            cudaLaunchConfig_t launchConfig{};
-            launchConfig.gridDim = grid;
-            launchConfig.blockDim = block;
-            launchConfig.dynamicSmemBytes = 0;
-            launchConfig.stream = stream;
-            launchConfig.attrs = &pdlAttribute;
-            launchConfig.numAttrs = 1;
-
-            CUDA_CHECK(cudaLaunchKernelEx(&launchConfig, applyRopeFromPackedToSplitKernel<half, TCache, kEnablePdl>,
-                packedPtr, qScratchPtr, kScratchPtr, vScratchPtr, kvCachePtr, fp8QOutput, cosSinCachePtr,
-                kvCacheEndLensPtr, tokenPosIdsPtr, cuQSeqLensPtr, qNormGamma, kNormGamma, rmsNormEps, qScaleOrig,
-                kScale, vScale, static_cast<int32_t>(runtimeSeqLen), static_cast<int32_t>(totalNumTokens),
-                static_cast<int32_t>(numPages), static_cast<uint32_t>(numQHeads), static_cast<uint32_t>(numKVHeads),
-                static_cast<uint32_t>(headDim), static_cast<uint32_t>(rotaryDim),
-                static_cast<int32_t>(cosSinCacheBatchSize), static_cast<int32_t>(cosSinCacheSeqLen), pageTable,
-                maxPagesPerSeq, writeKVCache));
         }
-        else
+
+        CUDA_CHECK(cudaLaunchKernelEx(&launchConfig, applyRopeFromPackedToSplitKernel<half, TCache, kEnablePdl>,
+            packedPtr, qScratchPtr, kScratchPtr, vScratchPtr, kvCachePtr, fp8QOutput, cosSinCachePtr, kvCacheEndLensPtr,
+            tokenPosIdsPtr, cuQSeqLensPtr, qNormGamma, kNormGamma, rmsNormEps, qScaleOrig, kScale, vScale,
+            static_cast<int32_t>(runtimeSeqLen), static_cast<int32_t>(totalNumTokens), static_cast<int32_t>(numPages),
+            static_cast<uint32_t>(numQHeads), static_cast<uint32_t>(numKVHeads), static_cast<uint32_t>(headDim),
+            static_cast<uint32_t>(rotaryDim), static_cast<int32_t>(cosSinCacheBatchSize),
+            static_cast<int32_t>(cosSinCacheSeqLen), pageTable, maxPagesPerSeq, writeKVCache));
+#else
+        applyRopeFromPackedToSplitKernel<half, TCache, kEnablePdl><<<grid, block, 0, stream>>>(packedPtr, qScratchPtr,
+            kScratchPtr, vScratchPtr, kvCachePtr, fp8QOutput, cosSinCachePtr, kvCacheEndLensPtr, tokenPosIdsPtr,
+            cuQSeqLensPtr, qNormGamma, kNormGamma, rmsNormEps, qScaleOrig, kScale, vScale,
+            static_cast<int32_t>(runtimeSeqLen), static_cast<int32_t>(totalNumTokens), static_cast<int32_t>(numPages),
+            static_cast<uint32_t>(numQHeads), static_cast<uint32_t>(numKVHeads), static_cast<uint32_t>(headDim),
+            static_cast<uint32_t>(rotaryDim), static_cast<int32_t>(cosSinCacheBatchSize),
+            static_cast<int32_t>(cosSinCacheSeqLen), pageTable, maxPagesPerSeq, writeKVCache);
 #endif // SUPPORTS_PROGRAMMATIC_DEPENDENT_LAUNCH
-        {
-            applyRopeFromPackedToSplitKernel<half, TCache, kEnablePdl><<<grid, block, 0, stream>>>(packedPtr,
-                qScratchPtr, kScratchPtr, vScratchPtr, kvCachePtr, fp8QOutput, cosSinCachePtr, kvCacheEndLensPtr,
-                tokenPosIdsPtr, cuQSeqLensPtr, qNormGamma, kNormGamma, rmsNormEps, qScaleOrig, kScale, vScale,
-                static_cast<int32_t>(runtimeSeqLen), static_cast<int32_t>(totalNumTokens),
-                static_cast<int32_t>(numPages), static_cast<uint32_t>(numQHeads), static_cast<uint32_t>(numKVHeads),
-                static_cast<uint32_t>(headDim), static_cast<uint32_t>(rotaryDim),
-                static_cast<int32_t>(cosSinCacheBatchSize), static_cast<int32_t>(cosSinCacheSeqLen), pageTable,
-                maxPagesPerSeq, writeKVCache);
-        }
     };
 
     if (dt == nvinfer1::DataType::kHALF)
