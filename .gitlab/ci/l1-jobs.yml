@@ -63,6 +63,7 @@ l1_dataset_prep:
     - python prepare_dataset.py --dataset COCO --output_dir "$DATA/coco" 2>&1 | tee "$TEST_LOG_DIR/coco.log"
     # Audio / Omni
     - python prepare_dataset.py --dataset LibriSpeech --output_dir "$DATA/librispeech_clean_test" 2>&1 | tee "$TEST_LOG_DIR/librispeech.log"
+    - python prepare_dataset.py --dataset LibriSpeech_Lite --dataset_name_or_dir "$DATA/librispeech_clean_test/librispeech_clean_test.json" --output_dir "$DATA/librispeech_clean_test-lite" --lite_sample_count 524 2>&1 | tee "$TEST_LOG_DIR/librispeech_lite.log"
     - python prepare_dataset.py --dataset OmniBench --output_dir "$DATA/OmniBench" 2>&1 | tee "$TEST_LOG_DIR/omnibench.log"
     # TTS multilingual (auto-downloads from HF)
     - python prepare_dataset.py --dataset MiniMaxMultilingual --output_dir "$DATA/MiniMaxMultilingual" --language en 2>&1 | tee "$TEST_LOG_DIR/minimax_en.log"

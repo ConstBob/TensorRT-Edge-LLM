@@ -57,7 +57,9 @@ def check_accuracy_with_dataset(output_json_file,
     ]
 
     # Datasets that use WER (Word Error Rate) for ASR / LibriSpeech
-    WER_DATASETS = ["librispeech_clean_test", "asr_basic"]
+    WER_DATASETS = [
+        "librispeech_clean_test", "librispeech_clean_test_lite", "asr_basic"
+    ]
 
     # Datasets that use minADE for VLA trajectory prediction.
     MINADE_DATASETS = ["alpamayo_action_644", "alpamayo_action_chat"]
@@ -98,6 +100,7 @@ def check_accuracy_with_dataset(output_json_file,
     # WER threshold (%). Lower is better; pass if WER <= threshold.
     WER_THRESHOLDS = {
         "librispeech_clean_test": 25.0,
+        "librispeech_clean_test_lite": 25.0,
         "asr_basic": 25.0,
     }
 
