@@ -530,6 +530,32 @@ TEST(RegistryBuilderTest, MtpBaseAddsIntermediateStateOutputs)
     EXPECT_EQ(iconvIt->shape[3].value, 4);       // convKernel
 }
 
+TEST(RegistryBuilderTest, DSparkBaseAddsSpecVerifyPhaseMarker)
+{
+    LLMEngineConfig cfg = makeBasicLLMConfig();
+    cfg.numAttentionLayers = 2;
+    cfg.numDecoderLayers = 4;
+    cfg.isSpecDecodeBase = true;
+    cfg.specDecodeType = SpecDecodeMode::kDSpark;
+    cfg.numLinearAttnLayers = 2;
+    cfg.recurrentStateNumHeads = 16;
+    cfg.recurrentStateHeadDim = 64;
+    cfg.recurrentStateSize = 128;
+    cfg.convDim = 256;
+    cfg.convKernel = 4;
+
+    populateHybridFieldsFromScalars(cfg);
+    auto const specs = buildRegistryForLLM(cfg).allExpandedSpecs();
+    auto const markerIt = std::find_if(specs.begin(), specs.end(),
+        [](TensorSpec const& spec) { return spec.name == trt_edgellm::binding_names::kSpecVerifyPhaseMarker; });
+
+    ASSERT_NE(markerIt, specs.end());
+    EXPECT_EQ(markerIt->io, TensorIO::kInput);
+    ASSERT_EQ(markerIt->shape.size(), 1U);
+    EXPECT_TRUE(markerIt->shape[0].isSymbolic());
+    EXPECT_EQ(markerIt->shape[0].symbol, &InferenceDims::specVerifyPhaseLen);
+}
+
 TEST(RegistryBuilderTest, NoIntermediateStatesWhenSpecDecodeDisabled)
 {
     // Hybrid base WITHOUT SpecDecode → no intermediate state outputs.

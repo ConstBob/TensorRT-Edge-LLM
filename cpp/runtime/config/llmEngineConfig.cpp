@@ -1762,13 +1762,12 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
         {
             ELLM_CHECK(executor.hasIOTensor(binding_names::kSpecVerifyPhaseMarker),
                 std::string("Missing spec-verify phase marker binding (") + engineLabel + "): expected '"
-                    + binding_names::kSpecVerifyPhaseMarker
-                    + "'. Re-export the hybrid MTP/cached block-draft base engine.");
+                    + binding_names::kSpecVerifyPhaseMarker + "'. Re-export the hybrid speculative base engine.");
             auto const markerEngineDtype = executor.getBindingDataType(binding_names::kSpecVerifyPhaseMarker);
             ELLM_CHECK(markerEngineDtype == nvinfer1::DataType::kINT32,
                 std::string("Spec-verify phase marker dtype mismatch (") + engineLabel + "): engine reports "
                     + getDataTypeString(markerEngineDtype) + " for binding '" + binding_names::kSpecVerifyPhaseMarker
-                    + "'. Re-export the hybrid MTP/cached block-draft base engine.");
+                    + "'. Re-export the hybrid speculative base engine.");
         }
     }
 }

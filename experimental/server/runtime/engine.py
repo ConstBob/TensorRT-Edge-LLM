@@ -66,6 +66,9 @@ _MAX_LOGIT_BIAS = 100.0
 _DEFAULT_MAX_INPUT_LEN = 4096
 _DEFAULT_MAX_BATCH_SIZE = 1
 _DEFAULT_MAX_KV_CACHE_CAPACITY = 8192
+_DEFAULT_DRAFT_TOP_K = 10
+_DEFAULT_DRAFT_STEP = 6
+_DEFAULT_VERIFY_TREE_SIZE = 60
 
 # ---------------------------------------------------------------------------
 # Public data classes
@@ -363,6 +366,115 @@ def _read_bundle_builder_config(bundle_dir: str) -> dict:
     return {}
 
 
+@dataclass(frozen=True)
+class _SpecDecodeRuntimeOptions:
+    """Drafting shape resolved from one speculative engine bundle."""
+
+    top_k: int
+    step: int
+    verify_size: int
+    dflash_block_size: int = 0
+
+
+def _read_json(path: str) -> dict:
+    with open(path, encoding="utf-8") as file:
+        return json.load(file)
+
+
+def _resolve_spec_decode_runtime_options(
+    bundle_dir: str,
+    method: str,
+    num_speculative_tokens: Optional[int],
+    draft_top_k: Optional[int],
+    draft_step: Optional[int],
+    verify_tree_size: Optional[int],
+) -> _SpecDecodeRuntimeOptions:
+    """Resolve method-specific defaults against the compiled engine profile."""
+    if method == "none":
+        return _SpecDecodeRuntimeOptions(
+            draft_top_k or _DEFAULT_DRAFT_TOP_K,
+            draft_step or _DEFAULT_DRAFT_STEP,
+            verify_tree_size or _DEFAULT_VERIFY_TREE_SIZE,
+        )
+
+    base = _read_json(os.path.join(bundle_dir, "base_config.json"))
+    draft = _read_json(os.path.join(bundle_dir, "draft_config.json"))
+    engine_method = str(base.get("spec_decode_type", method))
+    compatible_methods = {method}
+    if method == "mtp":
+        compatible_methods.add("gemma4_mtp")
+    if engine_method not in compatible_methods:
+        raise ValueError(
+            f"requested speculative method {method!r}, but the compiled "
+            f"bundle uses {engine_method!r}")
+    max_verify_size = int(
+        base.get("builder_config", {}).get("max_verify_tree_size",
+                                           _DEFAULT_VERIFY_TREE_SIZE))
+
+    if engine_method == "eagle3":
+        return _SpecDecodeRuntimeOptions(
+            draft_top_k or _DEFAULT_DRAFT_TOP_K,
+            num_speculative_tokens or draft_step or _DEFAULT_DRAFT_STEP,
+            verify_tree_size or max_verify_size,
+        )
+
+    if engine_method in {"mtp", "gemma4_mtp"}:
+        top_k = draft_top_k or 1
+        if engine_method == "gemma4_mtp" and top_k != 1:
+            raise ValueError("Gemma4 MTP supports linear drafting only; "
+                             "set draft_top_k=1")
+        step = num_speculative_tokens or draft_step or _DEFAULT_DRAFT_STEP
+        verify_size = (verify_tree_size
+                       or (step + 1 if top_k == 1 else max_verify_size))
+        return _SpecDecodeRuntimeOptions(top_k, step, verify_size)
+
+    if engine_method in {"dflash", "jetspec"}:
+        if draft_step not in (None, 1):
+            raise ValueError(
+                f"{engine_method} emits a complete block in one draft step; "
+                "set draft_step=1")
+        mode_config = (draft.get(f"{engine_method}_config")
+                       or draft.get("dflash_config") or {})
+        checkpoint_block_size = int(
+            mode_config.get("block_size", draft.get("block_size", 0)))
+        block_size = num_speculative_tokens or checkpoint_block_size
+        if checkpoint_block_size < 2:
+            raise ValueError(
+                f"compiled {engine_method} draft has an invalid proposal "
+                f"block size {checkpoint_block_size}")
+        if not 2 <= block_size <= checkpoint_block_size:
+            raise ValueError(
+                f"{engine_method} num_speculative_tokens must be within the "
+                f"compiled proposal block size [2, {checkpoint_block_size}]")
+        top_k = draft_top_k or 1
+        verify_size = (verify_tree_size
+                       or (block_size if top_k == 1 else max_verify_size))
+        return _SpecDecodeRuntimeOptions(top_k, 1, verify_size, block_size)
+
+    if engine_method == "dspark":
+        if draft_step not in (None, 1):
+            raise ValueError(
+                "dspark emits a complete block in one draft step; set "
+                "draft_step=1")
+        mode_config = draft.get("dspark_config") or {}
+        block_size = int(
+            mode_config.get("block_size", draft.get("block_size", 0)))
+        proposal_size = num_speculative_tokens or block_size
+        if not 1 <= proposal_size <= block_size:
+            raise ValueError(
+                "dspark num_speculative_tokens must be within the compiled "
+                f"proposal block size [1, {block_size}]")
+        top_k = draft_top_k or 1
+        if top_k > 1 and proposal_size != block_size:
+            raise ValueError(
+                "dspark tree drafting always uses the complete checkpoint "
+                "proposal block")
+        verify_size = verify_tree_size or proposal_size + 1
+        return _SpecDecodeRuntimeOptions(top_k, 1, verify_size)
+
+    raise ValueError(f"unsupported speculative engine mode {engine_method!r}")
+
+
 def _ensure_plugin_path() -> None:
     """Set EDGELLM_PLUGIN_PATH if not already set.
 
@@ -651,9 +763,9 @@ class LLM:
         max_input_len: int = _DEFAULT_MAX_INPUT_LEN,
         max_batch_size: int = _DEFAULT_MAX_BATCH_SIZE,
         max_kv_cache_capacity: int = _DEFAULT_MAX_KV_CACHE_CAPACITY,
-        draft_top_k: int = 10,
-        draft_step: int = 6,
-        verify_tree_size: int = 60,
+        draft_top_k: Optional[int] = None,
+        draft_step: Optional[int] = None,
+        verify_tree_size: Optional[int] = None,
         build_options: Optional["BuildOptions"] = None,
         speculative_config: Optional[Any] = None,
         context_cache_config: Optional[Union[ContextCacheConfig,
@@ -665,11 +777,21 @@ class LLM:
                 or not math.isfinite(engine_cache_max_size_gb)
                 or engine_cache_max_size_gb <= 0):
             raise ValueError("engine_cache_max_size_gb must be positive")
+        for name, value in (("draft_top_k", draft_top_k),
+                            ("draft_step", draft_step), ("verify_tree_size",
+                                                         verify_tree_size)):
+            if value is None:
+                continue
+            if (isinstance(value, bool) or not isinstance(value, int)
+                    or value <= 0):
+                raise ValueError(f"{name} must be a positive integer")
 
         self._model_id = _derive_model_id(model)
-        self._draft_top_k = draft_top_k
-        self._draft_step = draft_step
-        self._verify_tree_size = verify_tree_size
+        self._draft_top_k = draft_top_k or _DEFAULT_DRAFT_TOP_K
+        self._draft_step = draft_step or _DEFAULT_DRAFT_STEP
+        self._verify_tree_size = (verify_tree_size
+                                  or _DEFAULT_VERIFY_TREE_SIZE)
+        self._dflash_block_size = 0
         self._max_input_len = max_input_len
         self._max_batch_size = max_batch_size
         self._max_kv_cache_capacity = max_kv_cache_capacity
@@ -698,6 +820,8 @@ class LLM:
             max_batch_size=max_batch_size,
             max_kv_cache_capacity=max_kv_cache_capacity,
         )
+        spec_method = options.spec_type
+        num_speculative_tokens = None
         if speculative_config:
             from ..config import SpeculativeConfig
 
@@ -705,8 +829,17 @@ class LLM:
             options = replace(options,
                               spec_type=spec.method,
                               draft_model_dir=spec.draft_model)
-            if spec.num_speculative_tokens is not None:
-                self._draft_step = spec.num_speculative_tokens
+            spec_method = spec.method
+            num_speculative_tokens = spec.num_speculative_tokens
+
+        resolved_top_k = draft_top_k or (10 if spec_method == "eagle3" else 1)
+        if (options.builder_spec_type == "gemma4_mtp" and resolved_top_k != 1):
+            raise ValueError("Gemma4 MTP supports linear drafting only; "
+                             "set draft_top_k=1")
+        tree_base = (resolved_top_k > 1 and options.builder_spec_type
+                     in {"mtp", "dflash", "jetspec"})
+        if options.spec_type != "none":
+            options = replace(options, tree_base=tree_base)
 
         prepared = prepare_model(
             model,
@@ -718,6 +851,18 @@ class LLM:
         self._cache_dir = cache_root(cache_dir)
         self._model_dir = prepared.model_dir
         self._draft_model_dir = prepared.draft_model_dir
+        runtime_options = _resolve_spec_decode_runtime_options(
+            prepared.bundle_dir,
+            spec_method,
+            num_speculative_tokens,
+            draft_top_k,
+            draft_step,
+            verify_tree_size,
+        )
+        self._draft_top_k = runtime_options.top_k
+        self._draft_step = runtime_options.step
+        self._verify_tree_size = runtime_options.verify_size
+        self._dflash_block_size = runtime_options.dflash_block_size
         self._init_from_bundle(prepared.bundle_dir)
 
         self._load_runtime()
@@ -757,10 +902,12 @@ class LLM:
         logger.info("Loading runtime bundle from %s", self._bundle_dir)
         if self._layout.engine_type == EngineType.SPEC_DECODE:
             logger.info(
-                "Speculative decoding enabled (top_k=%d, step=%d, tree=%d)",
+                "Speculative decoding enabled (top_k=%d, step=%d, "
+                "verify_size=%d, block_size=%d)",
                 self._draft_top_k,
                 self._draft_step,
                 self._verify_tree_size,
+                self._dflash_block_size,
             )
             self._runtime = self._rt.LLMRuntime(
                 self._bundle_dir,
@@ -772,6 +919,7 @@ class LLM:
                 self._model_dir,
                 self._draft_model_dir,
                 context_cache_config,
+                self._dflash_block_size,
             )
         else:
             self._runtime = self._rt.LLMRuntime(
@@ -842,7 +990,8 @@ class LLM:
         cached = getattr(self, "_video_family_cache", None)
         if cached is not None:
             return cached
-        model_type = self._visual_config().get("model_type", "")
+        config = self._visual_config()
+        model_type = config.get("model_type", "")
         qwen_video_types = ("qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_5",
                             "qwen3_omni")
         # Audio-side model types have no video path (qwen3_omni_audio_encoder,
@@ -855,7 +1004,8 @@ class LLM:
             os.path.join(root, "visual", "visual.engine"))
         if "internvl" in model_type and has_visual:
             family = "internvl"
-        elif "nemotron" in model_type and not is_audio_type and has_visual:
+        elif ("nemotron" in model_type and not is_audio_type and has_visual
+              and config.get("supports_video", True)):
             family = "nemotron"
         elif (model_type.startswith(qwen_video_types) and not is_audio_type
               and has_visual):
@@ -1624,13 +1774,15 @@ class TTS:
                 or not math.isfinite(engine_cache_max_size_gb)
                 or engine_cache_max_size_gb <= 0):
             raise ValueError("engine_cache_max_size_gb must be positive")
-
         from .engine_build import BuildOptions, cache_root, prepare_model
         options = build_options or BuildOptions(
             max_input_len=max_input_len,
             max_batch_size=max_batch_size,
             max_kv_cache_capacity=max_kv_cache_capacity,
         )
+        if options.spec_type != "none":
+            raise ValueError(
+                "standalone TTS models do not support speculative decoding")
         prepared = prepare_model(
             model,
             cache_dir,
@@ -1733,6 +1885,35 @@ class TTS:
 
         config = ApiConfig(host=host, port=port)
         run_http_server(EngineClient(self, config), config)
+
+
+def load_model(**kwargs):
+    """Select the model-specific runtime from provider checkpoint metadata."""
+    from .engine_build import resolve_model_dir
+
+    original_model = kwargs["model"]
+    resolved = resolve_model_dir(original_model, kwargs.get("cache_dir", ""))
+    with open(os.path.join(resolved, "config.json"), encoding="utf-8") as file:
+        model_type = json.load(file).get("model_type")
+    if model_type == "qwen3_tts":
+        runtime_class = TTS
+        for name in ("draft_top_k", "draft_step", "verify_tree_size"):
+            if kwargs.pop(name, None) is not None:
+                raise ValueError(
+                    f"standalone TTS models do not support {name}")
+        if kwargs.pop("speculative_config", None):
+            raise ValueError(
+                "standalone TTS models do not support speculative decoding")
+        context_cache = ContextCacheConfig.parse(
+            kwargs.pop("context_cache_config", None))
+        if context_cache.enabled:
+            raise ValueError(
+                "standalone TTS models do not use a KV context cache")
+    else:
+        runtime_class = LLM
+    runtime = runtime_class(**{**kwargs, "model": resolved})
+    runtime._model_id = _derive_model_id(original_model)
+    return runtime
 
 
 # ---------------------------------------------------------------------------

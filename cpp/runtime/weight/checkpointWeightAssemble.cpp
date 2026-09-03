@@ -965,13 +965,13 @@ void assembleNvfp4Alpha(CheckpointReader const& checkpoint, Json const& binding,
     Json const& keys = checkpointKeys(binding);
     int32_t const numExperts = binding.value("num_experts", 0);
     int32_t const keysPerExpert = binding.value("keys_per_expert", 1);
-    ELLM_CHECK(numExperts > 0 && numExperts <= 256 && keysPerExpert > 0
+    ELLM_CHECK(numExperts > 0 && numExperts <= 512 && keysPerExpert > 0
             && static_cast<int32_t>(keys.size()) == numExperts * keysPerExpert,
         "NVFP4 alpha key count does not match the expert layout");
     validateOutput(output, Coords{numExperts}, nvinfer1::DataType::kFLOAT, "NVFP4 alpha output");
 
     bool const reciprocal = binding.value("reciprocal_alpha", false);
-    std::array<float, 256> values{};
+    std::array<float, 512> values{};
     for (int32_t expert = 0; expert < numExperts; ++expert)
     {
         size_t const base = static_cast<size_t>(expert * keysPerExpert);

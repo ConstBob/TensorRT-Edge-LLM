@@ -584,6 +584,80 @@ class _GenericToolParser:
         return [{"type": "content", "text": text}], False
 
 
+class StreamingAssistantOutputParser:
+    """Incrementally emit ordered reasoning, content, and tool-call events.
+
+    Event-dict facade over ``StreamingToolParser`` for consumers that want
+    complete tool calls (the Anthropic bridge): head/args/done triples are
+    assembled into one "tool_call" event, while content and reasoning still
+    stream incrementally.
+    """
+
+    def __init__(self, tool_config: ToolConfig, model_dir: str,
+                 tool_parser: str, reasoning_parser: str) -> None:
+        parser = _select_parser(model_dir, tool_parser)
+        self._tools = parser.stream(
+            tool_config) if tool_config.parse_output else None
+        reasoning = REASONING_PARSERS.resolve(reasoning_parser, model_dir)
+        self._reasoning = (reasoning.stream(
+            allow_implicit=not tool_config.parse_output)
+                           if reasoning else None)
+        self._calls: Dict[int, ToolCall] = {}
+
+    def feed(self, text: str) -> Iterable[Dict[str, Any]]:
+        if self._tools is None:
+            yield from self._split_reasoning(text)
+            return
+        yield from self._convert(self._tools.feed(text))
+
+    def flush(self) -> Iterable[Dict[str, Any]]:
+        if self._tools is not None:
+            yield from self._convert(self._tools.flush())
+        if self._reasoning:
+            yield from self._reasoning_events(self._reasoning.flush())
+
+    def _convert(
+            self,
+            events: Iterable["ToolStreamEvent"]) -> Iterable[Dict[str, Any]]:
+        for event in events:
+            if event.kind == "content":
+                yield from self._split_reasoning(event.text)
+            elif event.kind == "tool_head":
+                self._calls[event.index] = ToolCall(id=event.call_id,
+                                                    name=event.name,
+                                                    arguments="")
+            elif event.kind == "tool_args":
+                self._calls[event.index].arguments += event.text
+            elif event.kind == "tool_done":
+                if self._reasoning:
+                    yield from self._reasoning_events(self._reasoning.flush())
+                yield {
+                    "type": "tool_call",
+                    "tool_call": self._calls.pop(event.index),
+                }
+
+    def _split_reasoning(self, text: str) -> Iterable[Dict[str, Any]]:
+        if self._reasoning:
+            yield from self._reasoning_events(self._reasoning.feed(text))
+        elif text:
+            yield {"type": "content", "text": text}
+
+    @staticmethod
+    def _reasoning_events(deltas: Iterable[Any]) -> Iterable[Dict[str, Any]]:
+        for delta in deltas:
+            yield {"type": delta.field, "text": delta.text}
+
+
+def stream_assistant_output(
+        tool_config: ToolConfig,
+        model_dir: str,
+        tool_parser: str = "auto",
+        reasoning_parser: str = "none") -> StreamingAssistantOutputParser:
+    """Create incremental parsing state for one assistant response."""
+    return StreamingAssistantOutputParser(tool_config, model_dir, tool_parser,
+                                          reasoning_parser)
+
+
 class _ToolParserRegistry:
 
     def __init__(self):

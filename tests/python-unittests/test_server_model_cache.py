@@ -295,5 +295,6 @@ def test_llm_pairs_cached_bundle_with_resolved_checkpoints(
     assert llm.model_id == "Qwen/Qwen3-1.7B"
     assert llm.model_dir == str(base)
     assert llm.bundle_dir == str(bundle)
-    assert llm._runtime.args[-3:-1] == (str(base), str(draft))
-    assert not llm._runtime.args[-1].enabled
+    assert llm._runtime.args[-4:-2] == (str(base), str(draft))
+    assert not llm._runtime.args[-2].enabled
+    assert llm._runtime.args[-1] == 0

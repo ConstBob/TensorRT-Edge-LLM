@@ -110,5 +110,5 @@ Decoder KV correctness is validated through pipeline tests exercising
 the decoder KV bindings end-to-end, builder-level validation of layer counts
 and dtype consistency, and runtime binding validation of per-layer view
 slicing. Unit coverage for cache reset/capture/restore lives in
-`unittests/hybridCacheManagerTests.cpp`; end-to-end coverage lives in
-`tests/test_lists/l0_pipeline_*.yml`.
+`unittests/cpp/runtime/state/hybridCacheManagerTests.cpp`; end-to-end coverage
+lives in `tests/test_lists/l0_pipeline_*.yml`.

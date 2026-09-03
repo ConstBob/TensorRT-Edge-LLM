@@ -290,16 +290,23 @@ def _detect_key_prefix(keys: list) -> Tuple[str, str]:
 
 
 def _resolve_shard(model_dir: str, shard: str) -> str:
-    """Return the absolute shard path, asserting it stays inside model_dir."""
+    """Return the shard path, asserting the index-declared location stays
+    inside model_dir. The containment check is lexical (it does NOT follow the
+    final-component symlink) so a Hugging Face cache layout -- where
+    ``snapshots/<rev>/x.safetensors`` is a symlink into ``../../blobs/<hash>``
+    -- is accepted, while a genuine ``..``/absolute path-escape encoded in the
+    checkpoint index is still rejected."""
     base = pathlib.Path(model_dir).resolve()
-    resolved = (base / shard).resolve()
+    # os.path.join lets an absolute ``shard`` override base (caught below);
+    # normpath collapses ``..`` lexically WITHOUT dereferencing symlinks.
+    candidate = pathlib.Path(os.path.normpath(os.path.join(str(base), shard)))
     try:
-        resolved.relative_to(base)
+        candidate.relative_to(base)
     except ValueError:
         raise ValueError(
             f"Shard path {shard!r} in checkpoint index escapes model_dir "
             f"{model_dir!r}. This may indicate a malformed checkpoint.")
-    return str(resolved)
+    return str(candidate)
 
 
 def _build_shard_map(model_dir: str) -> Dict[str, str]:

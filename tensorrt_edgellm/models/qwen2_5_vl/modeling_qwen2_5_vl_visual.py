@@ -292,7 +292,11 @@ class Qwen2_5VLVisualModel(nn.Module):
     def __init__(self, config: dict, model_config: "ModelConfig") -> None:
         super().__init__()
         self.hidden_size: int = config["hidden_size"]
-        self.num_heads: int = config["num_heads"]
+        # AWQ/quantized Qwen2.5-VL checkpoints re-serialize the vision config
+        # via a newer transformers, which names this field `num_attention_heads`
+        # while the stock release uses `num_heads`.
+        self.num_heads: int = config.get("num_heads",
+                                         config.get("num_attention_heads"))
         self.head_dim = self.hidden_size // self.num_heads
         self.in_channels: int = config.get("in_chans",
                                            config.get("in_channels", 3))

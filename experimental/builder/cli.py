@@ -296,10 +296,11 @@ def _add_build_args(parser: argparse.ArgumentParser) -> None:
               ", ".join(contracts.component_build_order()) + "."))
     parser.add_argument(
         "--spec-type",
-        choices=("none", "eagle3", "mtp", "dflash", "dspark", "gemma4_mtp"),
+        choices=("none", "eagle3", "mtp", "dflash", "jetspec", "dspark",
+                 "gemma4_mtp"),
         default="none",
         help=("Build both speculative engines in this single invocation. "
-              "EAGLE3, DFlash, dSpark, and Gemma4 MTP require "
+              "EAGLE3, DFlash, JetSpec, dSpark, and Gemma4 MTP require "
               "--draft-model-dir."))
     parser.add_argument("--dense",
                         choices=("auto", "nvfp4-qdq", "fp16"),

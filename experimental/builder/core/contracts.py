@@ -43,6 +43,7 @@ class Component(str, Enum):
     CODE_PREDICTOR = "code-predictor"
     VISUAL = "visual"
     AUDIO = "audio"
+    RNNT = "rnnt"
     CODE2WAV = "code2wav"
     SPEAKER_ENCODER = "speaker-encoder"
     SPEECH_TOKENIZER_ENCODER = "speech-tokenizer-encoder"
@@ -220,6 +221,8 @@ _COMPONENT_SPECS: Dict[Component, ComponentSpec] = {
                   "audio",
                   "audio_encoder.engine",
                   external_weight_kinds=_ENGINE_WEIGHT_KINDS),
+    Component.RNNT:
+    ComponentSpec(Component.RNNT, "rnnt", "rnnt_step.engine"),
     Component.CODE2WAV:
     ComponentSpec(Component.CODE2WAV,
                   "code2wav",
@@ -249,6 +252,7 @@ _COMPONENT_BUILD_ORDER: Tuple[Component, ...] = (
     Component.LLM,
     Component.VISUAL,
     Component.AUDIO,
+    Component.RNNT,
     Component.TALKER,
     Component.CODE_PREDICTOR,
     Component.CODE2WAV,

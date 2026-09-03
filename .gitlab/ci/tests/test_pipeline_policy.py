@@ -42,6 +42,7 @@ SETUP_JOBS = _load_config(CI_DIRECTORY / "setup-jobs.yml")
 L0_JOBS = _load_config(CI_DIRECTORY / "l0-jobs.yml")
 L1_JOBS = _load_config(CI_DIRECTORY / "l1-jobs.yml")
 CUTEDSL_JOBS = _load_config(CI_DIRECTORY / "cutedsl-jobs.yml")
+WHEEL_JOBS = _load_config(CI_DIRECTORY / "wheel-jobs.yml")
 SONAR_JOBS = _load_config(CI_DIRECTORY / "sonar-jobs.yml")
 LOCAL_BOARD_JOBS = _load_config(CI_DIRECTORY / "local-board-jobs.yml")
 EXPERIMENTAL_DOCKER_JOBS = _load_config(CI_DIRECTORY /
@@ -51,6 +52,7 @@ MR_WORK_CONFIGS = {
     "setup": SETUP_JOBS,
     "l0": L0_JOBS,
     "cutedsl": CUTEDSL_JOBS,
+    "wheel": WHEEL_JOBS,
     "sonar": SONAR_JOBS,
     "local_board": LOCAL_BOARD_JOBS,
     "experimental_docker": EXPERIMENTAL_DOCKER_JOBS,

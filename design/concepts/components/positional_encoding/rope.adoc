@@ -172,6 +172,7 @@ runtime validation enforces this before engine enqueue.
 == Testing
 
 Unit tests compare plugin RoPE output against a reference implementation,
-including position-offset scenarios. `unittests/ropeInitializeTests.cu`
+including position-offset scenarios.
+`unittests/cpp/kernels/posEncoding/ropeInitializeTests.cu`
 tests Long RoPE and MRoPE cache initialization; pipeline coverage lives
 under `tests/test_lists/l0_pipeline_*.yml`.

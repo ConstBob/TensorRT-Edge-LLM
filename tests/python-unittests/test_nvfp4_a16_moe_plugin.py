@@ -696,3 +696,16 @@ def test_create_plugin_accepts_256_experts():
                                    trt.PluginFieldCollection(fields),
                                    trt.TensorRTPhase.BUILD)
     assert plugin is not None
+
+
+def test_create_plugin_accepts_512_experts():
+    """Nemotron-3-Super-120B uses 512 routed experts; createPlugin must not reject it."""
+    PluginRunner()
+    creator = trt.get_plugin_registry().get_creator(_PLUGIN_NAME,
+                                                    _PLUGIN_VERSION, "")
+    assert creator is not None
+    fields = _plugin_fields(replace(_QWEN_CASE, num_experts=512))
+    plugin = creator.create_plugin(_PLUGIN_NAME,
+                                   trt.PluginFieldCollection(fields),
+                                   trt.TensorRTPhase.BUILD)
+    assert plugin is not None

@@ -71,9 +71,8 @@ tokenizer count operation exists only for the explicit token-count endpoint.
 Context reuse is a runtime-construction option, not an engine-build profile.
 When enabled, the native coordinator owns retained pages, records, request
 policies, and metrics. `EngineClient` continues to serialize requests so the
-coordinator's single-writer contract is preserved. One runtime is one trusted
-cache domain; protocol adapters must not claim tenant isolation or accept a
-cache salt until the native cache identity supports one.
+coordinator's single-writer contract is preserved. Protocol adapters must
+follow the user-facing [cache-domain requirements](../../user_guide/features/kv-cache-reuse.md#cache-domain).
 
 The admission lease and native lock have separate roles. `EngineClient` owns
 the asynchronous queue and request-scoped media buffers. `LLM._infer_lock`

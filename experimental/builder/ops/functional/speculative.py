@@ -40,13 +40,14 @@ def hidden_state_feedback(hidden_states,
             raise ValueError("EAGLE3 target-layer IDs are out of range")
         return F.concatenate(
             tuple(all_hidden_states[index] for index in indices), 2)
-    if config.spec_decode_type in ("dflash", "dspark"):
+    if config.spec_decode_type in ("dflash", "jetspec", "dspark"):
         if config.spec_decode_type == "dspark":
             indices = config.dspark_target_layer_ids
             algorithm = "DSpark"
         else:
             indices = config.dflash_target_layer_ids or [1, 8, 15, 22, 29]
-            algorithm = "DFlash"
+            algorithm = ("JetSpec"
+                         if config.spec_decode_type == "jetspec" else "DFlash")
         selected = [
             all_hidden_states[index] for index in indices
             if index < len(all_hidden_states)

@@ -193,7 +193,7 @@ def test_cli_forwards_http_configuration(monkeypatch, tmp_path):
                                          context_reuse=False),
         )
 
-    monkeypatch.setattr(cli, "LLM", create_llm)
+    monkeypatch.setattr(cli, "load_model", create_llm)
     monkeypatch.setattr(cli, "EngineClient", create_client)
     monkeypatch.setattr(
         cli,
