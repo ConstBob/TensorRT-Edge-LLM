@@ -46,6 +46,13 @@ std::unique_ptr<EngineExecutor> loadDraftEngine(
 //! step with each other.
 void appendSampledTokens(DecodingInferenceContext& context, int32_t const* sampledTokenIds, int32_t activeBatchSize);
 
+//! @brief Zero the region @p tensor's current shape covers, not its whole allocation.
+//!
+//! The spec-decode hidden-state buffers are sized for max_input_len but reshaped down to the few
+//! tokens a step binds, so clearing getMemoryCapacity() would cost O(max_input_len) per token. The
+//! bound region is a contiguous prefix of the allocation, so shape.volume() is sufficient.
+void zeroActiveRegion(Tensor& tensor, cudaStream_t stream);
+
 //! @brief Copy accepted tokens from device buffers into the host-side context token lists.
 //! On return, hostAcceptLengths holds the number of tokens actually appended per slot.
 void appendAcceptedTokens(DecodingInferenceContext& context, Tensor& hostAcceptLengths, Tensor& hostAcceptedTokenIds,

@@ -267,8 +267,7 @@ bool MTPDecoder::runDraftModelPrefill(DecodingInferenceContext& context)
         "Tensor reshape failed");
     check::check(mRuntime.base.pipelineIO.hostContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
 
-    CUDA_CHECK(cudaMemsetAsync(mRuntime.base.pipelineIO.draftHiddenStatesIn.rawPointer(), 0,
-        mRuntime.base.pipelineIO.draftHiddenStatesIn.getMemoryCapacity(), context.stream));
+    decoder_utils::zeroActiveRegion(mRuntime.base.pipelineIO.draftHiddenStatesIn, context.stream);
 
     check::check(
         mRuntime.sampling.hostPackedTokenIds.reshape({activeBatchSize, inputIdsLength}), "Tensor reshape failed");
@@ -394,11 +393,6 @@ bool MTPDecoder::constructDraftProposal(DecodingInferenceContext& context)
         mDraftVocabMappingTable, mDraftTokenIdsFullTable, mDraftTokenScoreFullTable, mDraftTokenPredecessorFullTable,
         draftTopK, context.stream);
 
-    CUDA_CHECK(cudaMemsetAsync(mRuntime.base.pipelineIO.baseHiddenStates.rawPointer(), 0,
-        mRuntime.base.pipelineIO.baseHiddenStates.getMemoryCapacity(), context.stream));
-    CUDA_CHECK(cudaMemsetAsync(mRuntime.base.pipelineIO.draftHiddenStatesIn.rawPointer(), 0,
-        mRuntime.base.pipelineIO.draftHiddenStatesIn.getMemoryCapacity(), context.stream));
-
     int32_t const paddedDraftProposalSize = mRuntime.deployment.specConfig->draftingStep * draftTopK;
     check::check(
         mRuntime.preprocess.idsInput.reshape({activeBatchSize, paddedDraftProposalSize}), "Tensor reshape failed");
@@ -408,6 +402,11 @@ bool MTPDecoder::constructDraftProposal(DecodingInferenceContext& context)
     check::check(mRuntime.base.pipelineIO.draftHiddenStatesIn.reshape(
                      {activeBatchSize, paddedDraftProposalSize, draftHiddenSize}),
         "Tensor reshape failed");
+
+    // Must stay below the reshapes: only the bound region is cleared.
+    decoder_utils::zeroActiveRegion(mRuntime.base.pipelineIO.baseHiddenStates, context.stream);
+    decoder_utils::zeroActiveRegion(mRuntime.base.pipelineIO.draftHiddenStatesIn, context.stream);
+
     check::check(mDraftProposalSize.reshape({activeBatchSize}), "Tensor reshape failed");
     check::check(mDraftAttentionMask.reshape({activeBatchSize, paddedDraftProposalSize, paddedDraftProposalSize}),
         "Tensor reshape failed");
@@ -801,8 +800,7 @@ bool MTPDecoder::runDraftModelAcceptToken(DecodingInferenceContext& context)
     check::check(mRuntime.base.pipelineIO.draftHiddenStatesOut.reshape({activeBatchSize, draftHiddenSize}),
         "Tensor reshape failed");
 
-    CUDA_CHECK(cudaMemsetAsync(mRuntime.base.pipelineIO.draftHiddenStatesIn.rawPointer(), 0,
-        mRuntime.base.pipelineIO.draftHiddenStatesIn.getMemoryCapacity(), context.stream));
+    decoder_utils::zeroActiveRegion(mRuntime.base.pipelineIO.draftHiddenStatesIn, context.stream);
 
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {

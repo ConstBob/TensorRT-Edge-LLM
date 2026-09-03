@@ -698,6 +698,11 @@ def _is_dflash_base_export(config: ModelConfig) -> bool:
     return bool(getattr(config, "dflash_base", False))
 
 
+def _is_dspark_base_export(config: ModelConfig) -> bool:
+    """Return True when exporting the Qwen3.5 hybrid base for DSpark verify."""
+    return bool(getattr(config, "dspark_base", False))
+
+
 def _is_spec_tree_base_export(config: ModelConfig) -> bool:
     """Return True when exporting DDTree metadata for Qwen3.5 hybrid state.
 
@@ -1017,6 +1022,8 @@ class Qwen3_5CausalLM(nn.Module):
             "Qwen3.5 requires gdn_cfg when any layer is GDN")
         mtp_base = _is_mtp_base_export(config)
         dflash_base = _is_dflash_base_export(config)
+        dspark_base = _is_dspark_base_export(config)
+        target_hidden_base = dflash_base or dspark_base
         spec_tree_base = _is_spec_tree_base_export(config)
         device = next(itertools.chain(self.parameters(),
                                       self.buffers())).device
@@ -1058,7 +1065,7 @@ class Qwen3_5CausalLM(nn.Module):
                                     1,
                                     dtype=torch.int32,
                                     device=device)
-        spec_base = mtp_base or dflash_base
+        spec_base = mtp_base or target_hidden_base
         select_len = 2 if spec_base else 1
         last_token_ids = torch.zeros(batch_size,
                                      select_len,
@@ -1179,7 +1186,7 @@ class Qwen3_5CausalLM(nn.Module):
                                             Na,
                                             Ng,
                                             mtp_base=mtp_base,
-                                            dflash_base=dflash_base,
+                                            dflash_base=target_hidden_base,
                                             dflash_tree_base=spec_tree_base)
         wrapped.eval()
 
@@ -1208,8 +1215,11 @@ class Qwen3_5CausalLM(nn.Module):
     ) -> Tuple:
         mtp_base = _is_mtp_base_export(self.config)
         dflash_base = _is_dflash_base_export(self.config)
-        dflash_target_ids = (self.config.dflash_target_layer_ids
-                             if dflash_base else None)
+        dspark_base = _is_dspark_base_export(self.config)
+        target_hidden_base = dflash_base or dspark_base
+        target_layer_ids = (
+            self.config.dspark_target_layer_ids if dspark_base else
+            self.config.dflash_target_layer_ids if dflash_base else None)
         (hidden_states, present_key_values, present_conv_states,
          present_recurrent_states, intermediate_conv_states,
          intermediate_recurrent_states, dflash_hidden_concat) = self.model(
@@ -1226,15 +1236,15 @@ class Qwen3_5CausalLM(nn.Module):
              spec_verify_phase_marker=spec_verify_phase_marker,
              tree_parent_ids=tree_parent_ids,
              tree_depths=tree_depths,
-             collect_intermediate_states=(mtp_base or dflash_base),
-             dflash_target_layer_ids=dflash_target_ids,
+             collect_intermediate_states=(mtp_base or target_hidden_base),
+             dflash_target_layer_ids=target_layer_ids,
          )
         # Select hidden states for specified token positions before lm_head.
         selected_hidden_states = torch.ops.trt.gather_nd(
             hidden_states, last_token_ids)
 
         logits = self.lm_head(selected_hidden_states).to(torch.float32)
-        if dflash_base:
+        if target_hidden_base:
             return (logits, dflash_hidden_concat, present_key_values,
                     present_conv_states, present_recurrent_states,
                     intermediate_conv_states, intermediate_recurrent_states)

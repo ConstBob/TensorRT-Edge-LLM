@@ -135,8 +135,8 @@ imports Torch via `int4_reference`.
 
 | File | Role |
 |---|---|
-| `unittests/int4Fp16GemmCuteDslTests.cu` | gtest: random inputs → CPU FP32 reference → launch → compare. Covers all 16 baked GEMM variants plus residual-M and non-64-aligned-N cases; tolerance `relErr < 0.05`. |
-| `unittests/int4Fp16GemvCuteDslTests.cu` | gtest for the eight decode GEMV variants, including non-64-aligned `N`. |
+| `unittests/kernelSrcs/int4_fp16_gemm_cutedsl/int4Fp16GemmCuteDslTests.cu` | gtest: random inputs → CPU FP32 reference → launch → compare. Covers all 16 baked GEMM variants plus residual-M and non-64-aligned-N cases; tolerance `relErr < 0.05`. |
+| `unittests/kernelSrcs/int4_fp16_gemm_cutedsl/int4Fp16GemvCuteDslTests.cu` | gtest for the eight decode GEMV variants, including non-64-aligned `N`. |
 
 The tests drive the AOT artifact directly, independently of
 `Int4GroupwiseGemmPluginV2`: an X-macro table generates module declarations,

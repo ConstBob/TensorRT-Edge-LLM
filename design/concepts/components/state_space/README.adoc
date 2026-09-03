@@ -150,9 +150,11 @@ flowchart LR
   Mamba export case.
 * `tests/defs/test_checkpoint_export.py` validates export artifact generation
   for the hybrid model path.
-* `unittests/mambaCausalConv1dTests.cu` covers causal-convolution prefill,
+* `unittests/cpp/kernels/mamba/mambaCausalConv1dTests.cu` covers
+  causal-convolution prefill,
   decode, padding/context-length handling, and conv-state capture.
-* `unittests/mambaSelectiveStateUpdateTests.cu` covers Mamba selective-state
-  update kernels across basic, padded, multi-step, and Nemotron-like cases.
-* `unittests/gdnCuteDslTests.cu` covers GDN decode, prefill, padding, and
-  Qwen3.5-shaped Blackwell prefill paths.
+* `unittests/cpp/kernels/mamba/mambaSelectiveStateUpdateTests.cu` covers Mamba
+  selective-state update kernels across basic, padded, multi-step, and
+  Nemotron-like cases.
+* `unittests/cpp/kernels/gdnKernels/gdnCuteDslTests.cu` covers GDN decode,
+  prefill, padding, and Qwen3.5-shaped Blackwell prefill paths.

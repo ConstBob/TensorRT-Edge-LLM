@@ -222,7 +222,7 @@ def build_runtime_config(cfg: DeviceConfig, args) -> Dict[str, Any]:
             out["base_model_hidden_size"] = target_hidden * len(target_layers)
         elif args.spec_type == "mtp":
             out["base_model_hidden_size"] = cfg.hidden_size
-        elif args.spec_type == "dflash":
+        elif args.spec_type in ("dflash", "jetspec"):
             targets = cfg.dflash_target_layer_ids or [1, 8, 15, 22, 29]
             out["base_model_hidden_size"] = len(targets) * cfg.hidden_size
             out["block_size"] = cfg.dflash_block_size
@@ -284,6 +284,14 @@ def build_runtime_config(cfg: DeviceConfig, args) -> Dict[str, Any]:
             })
         out["dflash_config"] = dflash
         out["dflash_tree_base"] = cfg.dflash_tree_base
+    if args.spec_type == "jetspec":
+        out["jetspec_config"] = {
+            "target_layer_ids": cfg.dflash_target_layer_ids,
+            "block_size": cfg.dflash_block_size,
+            "mask_token_id": cfg.dflash_mask_token_id,
+            "causal_head": True,
+        }
+        out["jetspec_tree_base"] = cfg.dflash_tree_base
     if args.spec_type == "mtp":
         out["mtp_tree_base"] = cfg.mtp_tree_base
     if args.spec_type == "dspark":

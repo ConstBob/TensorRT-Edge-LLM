@@ -565,6 +565,8 @@ SPECULATIVE_DRAFTS = {
     _component("dflash.modeling_dflash_draft", "DFlashDraftModel"),
     "dflash2":
     _component("dflash2.modeling_dflash2_draft", "DFlash2DraftModel"),
+    "jetspec":
+    _component("dflash.modeling_dflash_draft", "DFlashDraftModel"),
     "dspark":
     _component("dspark.modeling_dspark_draft", "DSparkDraftModel"),
     "gemma4_mtp":
@@ -577,6 +579,7 @@ SPECULATIVE_WEIGHT_CONVERSIONS = {
     "mtp": "qwen3_5.weights",
     "dflash": "dflash.weights",
     "dflash2": "dflash2.weights",
+    "jetspec": "dflash.weights",
     "dspark": "dspark.weights",
     "gemma4_mtp": "gemma4.weights",
 }
@@ -586,6 +589,7 @@ SPECULATIVE_CONFIGURATIONS = {
     "mtp": "qwen3_5.configuration",
     "dflash": "dflash.configuration",
     "dflash2": "dflash2.configuration",
+    "jetspec": "jetspec.configuration",
     "dspark": "dspark.configuration",
     "gemma4_mtp": "gemma4.configuration",
 }

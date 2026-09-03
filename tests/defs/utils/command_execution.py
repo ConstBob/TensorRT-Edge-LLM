@@ -21,6 +21,7 @@ unnecessary abstraction layers.
 """
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -32,9 +33,10 @@ from pytest_helpers import check_file_exists, run_command, run_with_trt_env
 
 from ..config import ModelType, TaskType, TestConfig
 from .accuracy import check_accuracy_with_dataset
-from .baseline import (get_baseline, map_accuracy_result_to_csv,
-                       parse_perf_from_output, promote_baseline_if_better,
-                       save_to_baseline)
+from .baseline import (get_baseline, gpu_memory_metric_from_output,
+                       map_accuracy_result_to_csv, parse_perf_from_output,
+                       peak_gpu_memory_is_comparable,
+                       promote_baseline_if_better, save_to_baseline)
 from .command_generation import (generate_build_commands,
                                  generate_e2e_bench_commands,
                                  generate_inference_commands,
@@ -263,6 +265,29 @@ def _check_context_reuse_cold_hit_equivalence(config: TestConfig) -> None:
         )
 
 
+def _logprobs_equivalent(a: Any, b: Any, abs_tol: float = 1e-3) -> bool:
+    """Compare two logprobs structures, tolerating float noise in 'logprob' values.
+
+    Batch compaction reassigns a surviving sequence to a different batch-slot
+    index than an uncompacted replay of the same content, which changes
+    kernel-launch/reduction order and perturbs 'logprob' floats by ordinary
+    GPU non-associativity (~1e-4 to 1e-7 in practice) without changing the
+    generated token IDs. Everything else in the structure must still match
+    exactly.
+    """
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(
+            _logprobs_equivalent(x, y, abs_tol) for x, y in zip(a, b))
+    if isinstance(a, dict) and isinstance(b, dict):
+        if a.keys() != b.keys():
+            return False
+        return all(
+            math.isclose(a[key], b[key], abs_tol=abs_tol) if key ==
+            'logprob' else _logprobs_equivalent(a[key], b[key], abs_tol)
+            for key in a)
+    return a == b
+
+
 def _check_spec_prefill_evict_equivalence(config: TestConfig) -> None:
     """Require a survivor compacted after a first-token stop to match a later uncompacted replay."""
     with open(config.get_output_json_file(), encoding='utf-8') as output_file:
@@ -279,11 +304,16 @@ def _check_spec_prefill_evict_equivalence(config: TestConfig) -> None:
             "The speculative prefill-eviction fixture did not stop slot 0 on its first token."
         )
 
-    for field in ('output_text', 'finish_reason', 'logprobs'):
+    for field in ('output_text', 'finish_reason'):
         if compacted_survivor.get(field) != replayed_survivor.get(field):
             raise RuntimeError(
                 f"The compacted survivor differs from its replayed baseline in {field}."
             )
+    if not _logprobs_equivalent(compacted_survivor.get('logprobs'),
+                                replayed_survivor.get('logprobs')):
+        raise RuntimeError(
+            "The compacted survivor differs from its replayed baseline in logprobs."
+        )
 
 
 def _source_test_case_file(config: TestConfig) -> Optional[str]:
@@ -421,6 +451,21 @@ def _try_save_baseline(config: TestConfig, test_func: str,
             config.param_str, csv_path)
 
 
+_DEVICE_CONFIG = None
+
+
+def _detected_compute_capability(logger=None):
+    """Compute capability of the board under test, detected once per session."""
+    global _DEVICE_CONFIG
+    if _DEVICE_CONFIG is None:
+        try:
+            from .device import DeviceConfig
+            _DEVICE_CONFIG = DeviceConfig.auto_detect(None, logger)
+        except Exception:
+            _DEVICE_CONFIG = False
+    return getattr(_DEVICE_CONFIG, "compute_capability", None) or None
+
+
 def _check_baseline_regression(config: TestConfig,
                                test_func: str,
                                result: Dict[str, Any],
@@ -468,7 +513,13 @@ def _check_baseline_regression(config: TestConfig,
 
     if check_perf:
         raw_output = result.get('output', '')
-        current_perf = parse_perf_from_output(raw_output)
+        cc = _detected_compute_capability(logger)
+        current_perf = parse_perf_from_output(raw_output, cc)
+        if not peak_gpu_memory_is_comparable(raw_output, cc):
+            all_summaries.append(
+                "memory_usage_peak_gpu_memory (MB): skipped - this platform reports "
+                f"'{gpu_memory_metric_from_output(raw_output)}', which measures system "
+                "memory pressure, not this process's GPU allocation")
         # Merge accuracy metrics into perf dict; check_perf_regression
         # only looks at columns in PERF_LOWER/HIGHER_IS_BETTER, so extras
         # (e.g. rouge scores) are naturally ignored.

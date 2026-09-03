@@ -1319,6 +1319,27 @@ def test_load_video_buffer_nemotron_rejects_do_resize_false(tmp_path):
                              frame_limits=_NEMOTRON_LIMITS)
 
 
+def test_load_video_buffer_nemotron_bounds_presampled_tubelets(
+        tmp_path, monkeypatch):
+    frame_paths = []
+    for index in range(6):
+        path = tmp_path / f"frame-{index}.png"
+        path.write_bytes(b"image")
+        frame_paths.append(str(path))
+    monkeypatch.setattr(vs, "_probe_image_size", lambda _path: (64, 64))
+    limits = dict(_NEMOTRON_LIMITS,
+                  max_image_tokens=512,
+                  video_pruning_rate=0.9)
+    with pytest.raises(ValueError, match="visual engine profile holds 2"):
+        vs.load_video_buffer(_FakeRt(), {
+            "type": "video",
+            "frames": frame_paths,
+            "fps": 1.0,
+        },
+                             "nemotron",
+                             frame_limits=limits)
+
+
 def test_mid_stream_resolution_change_rejected(tmp_path, monkeypatch):
     # The (T, H, W, 3) stack requires uniform frames; a source whose frames
     # decode at differing sizes must be a client error, not a numpy

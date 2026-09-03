@@ -344,7 +344,8 @@ private:
     rt::Tensor mHostReuseKVCacheLengths; //!< Host pinned memory for reuse KV cache lengths
 
     // [5] Multimodal support tensors for audio/image token indexing
-    rt::Tensor mMultimodalIndices; //!< Multimodal indices tensor [batchSize, seqLen] for audio/image embeddings
+    rt::Tensor mMultimodalIndices;     //!< GPU [batchSize, seqLen] multimodal embedding indices
+    rt::Tensor mHostMultimodalIndices; //!< Host pinned [batchSize, seqLen] staging for CPU-computed indices
 
     // [6] Logprobs support tensors. Non-Diffusion paths allocate at construction to preserve existing behavior.
     // DiffusionGemma allocates lazily when a request asks for numLogprobs because its row count is B * canvasLen.

@@ -148,7 +148,7 @@ of emitting partial embeddings.
 |===
 | Test File | Coverage Area
 
-| `unittests/embeddingLookupTests.cpp`
+| `unittests/cpp/kernels/embeddingKernels/embeddingLookupTests.cpp`
 | Embedding lookup and multimodal embedding assembly kernels.
 
 | `tests/python-unittests/test_preprocess_audio.py`

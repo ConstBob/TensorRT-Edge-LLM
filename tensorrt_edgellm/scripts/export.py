@@ -630,19 +630,37 @@ def _find_token_id(model_dir: str, token_str: str) -> "Optional[int]":
 
 
 def _load_all_weights(model_dir: str) -> dict:
-    """Load all safetensors shards in *model_dir* into a flat dict."""
+    """Load all safetensors (or PyTorch ``.bin``) shards in *model_dir* into a
+    flat dict."""
     import glob
 
     from safetensors.torch import load_file
 
     shards = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
-    if not shards:
-        logger.error("No safetensors files found in %s", model_dir)
+    if shards:
+        weights: dict = {}
+        for shard in shards:
+            logger.info("  Loading shard: %s", os.path.basename(shard))
+            weights.update(load_file(shard, device="cpu"))
+        return weights
+
+    # Fallback: PyTorch pickle checkpoints. Some officially supported AWQ VLMs
+    # (e.g. InternVL3-*-AWQ) ship only ``pytorch_model*.bin`` and no safetensors.
+    # Mirror the ``.bin`` support the core weight loader already
+    # has (checkpoint/loader.py _build_shard_map).
+    import torch
+
+    bin_shards = sorted(glob.glob(os.path.join(model_dir, "pytorch_model*.bin"))) \
+        or sorted(glob.glob(os.path.join(model_dir, "*.bin")))
+    if not bin_shards:
+        logger.error("No safetensors or .bin weight files found in %s",
+                     model_dir)
         sys.exit(1)
-    weights: dict = {}
-    for shard in shards:
-        logger.info("  Loading shard: %s", os.path.basename(shard))
-        weights.update(load_file(shard, device="cpu"))
+    weights = {}
+    for shard in bin_shards:
+        logger.info("  Loading .bin shard: %s", os.path.basename(shard))
+        weights.update(torch.load(shard, map_location="cpu",
+                                  weights_only=True))
     return weights
 
 
@@ -2382,22 +2400,28 @@ def _export_audio(model_dir: str,
 
 
 def _copy_asr_tokenizer(model_dir: str, out_dir: str) -> None:
-    """Copy the RNN-T tokenizer sidecar into the engine dir.
+    """Copy the RNN-T tokenizer and prompt metadata into the export dir.
 
     ``NemotronAsrRuntime`` detokenizes emitted RNN-T tokens with
     ``tokenizer.json`` (``tokenizer_config.json`` is optional — special-token
     config). Copying them here keeps the exported engine dir self-contained.
     """
     import shutil
-    for name in ("tokenizer.json", "tokenizer_config.json"):
+    required = ("tokenizer.json", "processor_config.json")
+    missing = [
+        name for name in required
+        if not os.path.isfile(os.path.join(model_dir, name))
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "Nemotron-3.5-ASR checkpoint is missing required runtime "
+            f"artifacts: {', '.join(missing)}")
+    for name in ("tokenizer.json", "tokenizer_config.json",
+                 "processor_config.json"):
         src = os.path.join(model_dir, name)
         if os.path.exists(src):
             shutil.copy2(src, os.path.join(out_dir, name))
             logger.info("[Audio] Copied %s", name)
-        elif name == "tokenizer.json":
-            logger.warning(
-                "[Audio] %s not found in checkpoint — the RNN-T runtime "
-                "needs it to detokenize.", name)
 
 
 # ---------------------------------------------------------------------------

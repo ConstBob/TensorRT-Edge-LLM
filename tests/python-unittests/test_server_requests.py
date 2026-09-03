@@ -18,12 +18,14 @@ import asyncio
 import base64
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from experimental.server.api.errors import ServerOverloadedError
 from experimental.server.config import ApiConfig
-from experimental.server.runtime.engine import CompletionOutput, StreamDelta
+from experimental.server.runtime.engine import (CompletionOutput, LogprobEntry,
+                                                SamplingParams, StreamDelta)
 
 
 def _create_app(llm, config=None):
@@ -111,10 +113,19 @@ class _FakeLLM:
                                 finish_reason="stop")
 
     def generate_stream(self, _messages, _params, *, tools=None, **_kwargs):
-        text = ('<tool_call>{"name":"get_weather",'
-                '"arguments":{"city":"Paris"}}</tool_call>'
-                if tools else "hello")
-        yield StreamDelta(text=text,
+        if tools:
+            yield StreamDelta(text="Before<tool_",
+                              token_ids=[1],
+                              prompt_tokens=7)
+            yield StreamDelta(text=('call>{"name":"get_weather",'
+                                    '"arguments":{"city":"Paris"}}'
+                                    '</tool_call>'),
+                              token_ids=[2])
+            yield StreamDelta(text="After",
+                              finished=True,
+                              finish_reason="stop")
+            return
+        yield StreamDelta(text="hello",
                           token_ids=[1, 2],
                           prompt_tokens=7,
                           finished=True,
@@ -174,6 +185,14 @@ def test_video_model_family_nemotron(tmp_path):
     llm = eng.LLM.__new__(eng.LLM)
     llm._media_dir = str(root)
     assert llm._video_model_family() == "nemotron"
+
+    (root / "visual" / "config.json").write_text(
+        '{"model_type": "nemotron_omni_vision_encoder", '
+        '"supports_video": false}')
+    image_only = eng.LLM.__new__(eng.LLM)
+    image_only._media_dir = str(root)
+    with pytest.raises(ValueError, match="video input is not supported"):
+        image_only._video_model_family()
 
 
 def test_load_image_buffers_nemotron_minimum():
@@ -637,12 +656,86 @@ def test_streaming_tool_call_and_usage_share_one_contract(client_and_llm):
         payload for payload in payloads if payload.get("choices")
         and payload["choices"][0]["delta"].get("tool_calls")
     ]
+    choices = [
+        payload["choices"][0] for payload in payloads if payload.get("choices")
+    ]
     usage_chunks = [payload for payload in payloads if payload.get("usage")]
-    assert tool_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["function"][
-        "name"] == "get_weather"
+    initial_call = tool_chunks[0]["choices"][0]["delta"]["tool_calls"][0]
+    assert initial_call["index"] == 0
+    assert initial_call["type"] == "function"
+    assert initial_call["function"] == {
+        "name": "get_weather",
+        "arguments": "",
+    }
+    argument_delta = tool_chunks[1]["choices"][0]["delta"]["tool_calls"][0]
+    assert argument_delta["index"] == 0
+    assert json.loads(argument_delta["function"]["arguments"]) == {
+        "city": "Paris"
+    }
+    tool_position = next(i for i, choice in enumerate(choices)
+                         if choice["delta"].get("tool_calls"))
+    trailing_content = next(i for i, choice in enumerate(choices)
+                            if choice["delta"].get("content") == "After")
+    assert tool_position < trailing_content
+    assert choices[-1]["finish_reason"] == "tool_calls"
     assert len(usage_chunks) == 1
     assert usage_chunks[0]["choices"] == []
     assert usage_chunks[0]["usage"]["prompt_tokens"] == 7
+
+
+def test_tool_call_delta_does_not_wait_for_native_stream_end(tmp_path):
+    from experimental.server.api.protocol import ChatCompletionRequest
+    from experimental.server.api.serving_chat import (OpenAIServingChat,
+                                                      PreparedChatRequest)
+    from experimental.server.parsing.tool_calling import validate_tool_request
+
+    release_finish = asyncio.Event()
+
+    class BlockingClient:
+        llm = SimpleNamespace(model_dir=str(tmp_path))
+        model_name = "fake-model"
+
+        async def stream(self, *_args, **_kwargs):
+            yield StreamDelta(
+                text=('<tool_call>{"name":"get_weather","arguments":'
+                      '{"city":"Paris"}}</tool_call>'),
+                token_ids=[1],
+                prompt_tokens=7,
+            )
+            await release_finish.wait()
+            yield StreamDelta(finished=True, finish_reason="stop")
+
+    request = ChatCompletionRequest(
+        messages=[{
+            "role": "user",
+            "content": "Weather?"
+        }],
+        tools=[_tool()],
+        tool_choice="required",
+        stream=True,
+    )
+    prepared = PreparedChatRequest(
+        sampling=SamplingParams(),
+        tool_config=validate_tool_request(request.messages, request.tools,
+                                          request.tool_choice),
+        reasoning_parser="none",
+    )
+
+    async def exercise():
+        handler = OpenAIServingChat(BlockingClient(),
+                                    ApiConfig(enable_auto_tool_choice=True))
+        chunks = handler._stream_tools(request, prepared, "chatcmpl-test", 0,
+                                       False, None)
+        first = await anext(chunks)
+        assert not release_finish.is_set()
+        payload = json.loads(first.removeprefix("data: "))
+        call = payload["choices"][0]["delta"]["tool_calls"][0]
+        assert call["function"]["name"] == "get_weather"
+        release_finish.set()
+        tail = [chunk async for chunk in chunks]
+        assert tail[-1] == "data: [DONE]\n\n"
+
+    asyncio.run(exercise())
 
 
 def test_streaming_with_tools_keeps_plain_text_incremental(client_and_llm):
@@ -881,6 +974,125 @@ def test_streaming_tools_with_thinking_splits_reasoning(client_and_llm):
     assert len(heads) == 1 and heads[0]["function"]["name"] == "get_weather"
 
 
+def _stream_with_logprobs(pieces):
+    """One delta per piece, each carrying its own single-token logprob step."""
+
+    def stream(_messages, _params, **_kwargs):
+        for i, piece in enumerate(pieces):
+            last = i == len(pieces) - 1
+            yield StreamDelta(text=piece,
+                              token_ids=[i],
+                              prompt_tokens=7,
+                              logprobs=[[
+                                  LogprobEntry(token_id=i,
+                                               logprob=-0.5,
+                                               token=piece,
+                                               bytes=list(piece.encode()))
+                              ]],
+                              finished=last,
+                              finish_reason="stop" if last else None)
+
+    return stream
+
+
+# Deltas short enough that the tool and reasoning parsers withhold them, which
+# is the normal shape of token-by-token streaming.
+_LOGPROB_CASES = {
+    "plain": ["Sun", "ny", " today", "."],
+    "thinking": ["The", " sky", " is", "</think>", "Sun", "ny."],
+    "tools": [
+        "Sure. ",
+        "<tool_",
+        'call>{"name": "get_weather", "arguments": {"city": "Par',
+        'is"}}</tool_call>',
+    ],
+    "tools+thinking": [
+        "plan",
+        " it</think>",
+        "ok ",
+        '<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>',
+    ],
+}
+
+
+def _stream_logprob_request(client, case, extra):
+    body = {
+        "messages": [{
+            "role": "user",
+            "content": "Weather?"
+        }],
+        "stream": True,
+        "enable_thinking": "thinking" in case,
+        **extra,
+    }
+    if "tools" in case:
+        body["tools"] = [_tool()]
+        body["tool_choice"] = "auto"
+    return client.post("/v1/chat/completions", json=body)
+
+
+@pytest.mark.parametrize("case", sorted(_LOGPROB_CASES))
+@pytest.mark.parametrize("extra", [{}, {
+    "logprobs": True
+}, {
+    "logprobs": True,
+    "top_logprobs": 2
+}],
+                         ids=["off", "on", "on+top"])
+def test_streaming_logprobs_hold_across_tool_and_thinking_combos(
+        client_and_llm, case, extra):
+    # #719 follow-up: both streaming paths dropped the logprobs of any delta
+    # whose bytes the tool or reasoning parser withheld, while the
+    # non-streaming path returned them for the same request.
+    client, llm = client_and_llm
+    pieces = _LOGPROB_CASES[case]
+    llm.generate_stream = _stream_with_logprobs(pieces)
+
+    response = _stream_logprob_request(client, case, extra)
+    assert response.status_code == 200, response.text
+    choices = [
+        payload["choices"][0] for payload in _sse_payloads(response)
+        if payload.get("choices")
+    ]
+    entries = [
+        entry for choice in choices if choice["logprobs"]
+        for entry in choice["logprobs"]["content"]
+    ]
+    if extra:
+        # Concatenating the chunks reproduces the generated token sequence:
+        # every delta delivers its logprobs exactly once, in order.
+        assert [entry["token_id"]
+                for entry in entries] == list(range(len(pieces)))
+        assert all(
+            bool(entry["top_logprobs"]) == ("top_logprobs" in extra)
+            for entry in entries)
+    else:
+        assert entries == []
+    assert choices[-1]["finish_reason"] == ("tool_calls"
+                                            if "tools" in case else "stop")
+
+
+def test_streaming_tools_carry_logprobs_on_head_and_empty_chunks(
+        client_and_llm):
+    # A delta reaches the wire in one of two shapes, and both must carry the
+    # logprobs: as the first of the chunks it expands into, or -- when the
+    # parser withheld all of its bytes -- as an otherwise empty delta.
+    client, llm = client_and_llm
+    llm.generate_stream = _stream_with_logprobs(_LOGPROB_CASES["tools"])
+
+    response = _stream_logprob_request(client, "tools", {"logprobs": True})
+    assert response.status_code == 200, response.text
+    carried = [
+        choice["delta"] for payload in _sse_payloads(response)
+        if payload.get("choices") for choice in [payload["choices"][0]]
+        if choice["logprobs"]
+    ]
+    assert carried[0]["content"] == "Sure. "
+    assert not any(carried[1][field] for field in ("content", "tool_calls"))
+    assert carried[2]["tool_calls"][0]["function"]["name"] == "get_weather"
+    assert carried[3]["tool_calls"][0]["function"]["arguments"]
+
+
 def test_streaming_audio_orders_text_pcm_usage_and_done(client_and_llm):
     client, _ = client_and_llm
     response = client.post("/v1/chat/completions",
@@ -1006,6 +1218,55 @@ def test_anthropic_stream_uses_valid_event_order(client_and_llm):
     assert events[-1] == "message_stop"
     assert events.index("content_block_start") < events.index(
         "content_block_stop")
+
+
+def test_anthropic_stream_orders_tool_and_following_content(client_and_llm):
+    client, _ = client_and_llm
+    response = client.post(
+        "/v1/messages",
+        json={
+            "model":
+            "fake-model",
+            "max_tokens":
+            8,
+            "stream":
+            True,
+            "messages": [{
+                "role": "user",
+                "content": "Weather?"
+            }],
+            "tools": [{
+                "name": "get_weather",
+                "description": "Get weather",
+                "input_schema": {
+                    "type": "object"
+                },
+            }],
+            "tool_choice": {
+                "type": "any"
+            },
+        },
+    )
+    assert response.status_code == 200, response.text
+    events = []
+    for frame in response.text.strip().split("\n\n"):
+        lines = frame.splitlines()
+        if len(lines) == 2 and lines[0].startswith("event: "):
+            events.append((lines[0].removeprefix("event: "),
+                           json.loads(lines[1].removeprefix("data: "))))
+
+    deltas = [(index, data["delta"])
+              for index, (event, data) in enumerate(events)
+              if event == "content_block_delta"]
+    tool_index, tool_delta = next(item for item in deltas
+                                  if item[1]["type"] == "input_json_delta")
+    after_index, _ = next(item for item in deltas
+                          if item[1].get("text") == "After")
+    assert json.loads(tool_delta["partial_json"]) == {"city": "Paris"}
+    assert tool_index < after_index
+    message_delta = next(data for event, data in events
+                         if event == "message_delta")
+    assert message_delta["delta"]["stop_reason"] == "tool_use"
 
 
 def test_anthropic_x_api_key_auth(tmp_path):

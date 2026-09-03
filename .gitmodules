@@ -5,7 +5,7 @@
 	url = https://github.com/google/googletest.git
 [submodule "3rdParty/nlohmannJson"]
 	path = 3rdParty/nlohmannJson
-	revision = 722c03495f9978eb727f480b6ea0742f652e06a9
+	revision = 55f93686c01528224f448c19128836e7df245f72
 	url = https://github.com/nlohmann/json.git
 [submodule "3rdParty/NVTX"]
 	path = 3rdParty/NVTX

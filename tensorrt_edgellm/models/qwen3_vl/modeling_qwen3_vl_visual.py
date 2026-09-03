@@ -365,7 +365,9 @@ class Qwen3VLVisualModel(nn.Module):
     def __init__(self, config: dict, model_config: "ModelConfig") -> None:
         super().__init__()
         self.hidden_size: int = config["hidden_size"]
-        self.num_heads: int = config["num_heads"]
+        # AWQ/quantized checkpoints may name this `num_attention_heads`.
+        self.num_heads: int = config.get("num_heads",
+                                         config.get("num_attention_heads"))
         self.head_dim: int = self.hidden_size // self.num_heads
         self.in_channels: int = config.get("in_channels", 3)
         self.patch_size: int = config["patch_size"]
