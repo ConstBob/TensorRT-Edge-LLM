@@ -711,7 +711,7 @@ void launchApplyRopeWriteKVSplitQKV(rt::Tensor const& cosSinCache, rt::Tensor co
 // Tree decoding via optional tokenPosIds (-1 = padding token).
 // =============================================================================
 
-template <typename T, typename TCache>
+template <typename T, typename TCache, bool kEnablePdl>
 __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV, T* __restrict__ qScratch,
     T* __restrict__ kScratch, T* __restrict__ vScratch, TCache* __restrict__ kvCache, void* __restrict__ fp8QOut,
     float const* __restrict__ cosSinCache, int32_t const* __restrict__ kvCacheEndLens,
@@ -748,6 +748,16 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
     // Ragged prefill padding must be identified before page-table or RoPE-cache
     // indexing. It cannot early-return because fused qk_norm uses warp collectives.
     int32_t const rowInBatch = static_cast<int32_t>(clampedTokenIdx % qSeqLen);
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    if constexpr (kEnablePdl)
+    {
+        // Position metadata and packedQKV can be produced by the preceding grid.
+        // Keep only dependency-independent scalar setup above this wait.
+        asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    }
+#endif
+
     int32_t actualQSeqLen = qSeqLen;
     if (cuQSeqLens != nullptr)
     {
@@ -915,13 +925,24 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
             }
         }
     }
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    if constexpr (kEnablePdl)
+    {
+        __syncthreads();
+        if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0)
+        {
+            asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+        }
+    }
+#endif
 }
 
 void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::OptionalInputTensor kvCacheEndLens,
     rt::OptionalInputTensor tokenPosIds, rt::Tensor const& packedQKV, rt::Tensor& qScratch, rt::Tensor& kvCache,
     float kScale, float vScale, cudaStream_t stream, int32_t const* pageTable, int32_t maxPagesPerSeq,
     void* kScratchOut, void* vScratchOut, void* fp8QOut, float qScale, half const* qNormGamma, half const* kNormGamma,
-    float rmsNormEps, rt::OptionalInputTensor cuQSeqLens, bool writeKVCache)
+    float rmsNormEps, rt::OptionalInputTensor cuQSeqLens, bool writeKVCache, bool enablePdl)
 {
     auto const dt = kvCache.getDataType();
     constexpr uint32_t kVEC_SIZE = DVec<half>::vec_size;
@@ -1002,28 +1023,67 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
     dim3 grid(gDimX, gDimY);
     dim3 block(bDimX, bDimY);
 
-    if (dt == nvinfer1::DataType::kHALF)
-    {
-        half* kvCachePtr = kvCache.dataPointer<half>();
-        applyRopeFromPackedToSplitKernel<half, half><<<grid, block, 0, stream>>>(packedPtr, qScratchPtr, kScratchPtr,
-            vScratchPtr, kvCachePtr, nullptr /* fp8QOut */, cosSinCachePtr, kvCacheEndLensPtr, tokenPosIdsPtr,
-            cuQSeqLensPtr, qNormGamma, kNormGamma, rmsNormEps, 1.0f /* qScaleQuantOrig */, kScale, vScale,
+    auto const launchKernel = [&](auto* kvCachePtr, void* fp8QOutput, float qScaleOrig, auto pdlTag) {
+        using TCache = std::remove_pointer_t<decltype(kvCachePtr)>;
+        constexpr bool kEnablePdl = decltype(pdlTag)::value;
+#if SUPPORTS_PROGRAMMATIC_DEPENDENT_LAUNCH
+        cudaLaunchAttribute pdlAttribute{};
+        cudaLaunchConfig_t launchConfig{};
+        launchConfig.gridDim = grid;
+        launchConfig.blockDim = block;
+        launchConfig.dynamicSmemBytes = 0;
+        launchConfig.stream = stream;
+        launchConfig.attrs = kEnablePdl ? &pdlAttribute : nullptr;
+        launchConfig.numAttrs = kEnablePdl ? 1U : 0U;
+
+        if constexpr (kEnablePdl)
+        {
+            pdlAttribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            pdlAttribute.val.programmaticStreamSerializationAllowed = 1;
+        }
+
+        CUDA_CHECK(cudaLaunchKernelEx(&launchConfig, applyRopeFromPackedToSplitKernel<half, TCache, kEnablePdl>,
+            packedPtr, qScratchPtr, kScratchPtr, vScratchPtr, kvCachePtr, fp8QOutput, cosSinCachePtr, kvCacheEndLensPtr,
+            tokenPosIdsPtr, cuQSeqLensPtr, qNormGamma, kNormGamma, rmsNormEps, qScaleOrig, kScale, vScale,
+            static_cast<int32_t>(runtimeSeqLen), static_cast<int32_t>(totalNumTokens), static_cast<int32_t>(numPages),
+            static_cast<uint32_t>(numQHeads), static_cast<uint32_t>(numKVHeads), static_cast<uint32_t>(headDim),
+            static_cast<uint32_t>(rotaryDim), static_cast<int32_t>(cosSinCacheBatchSize),
+            static_cast<int32_t>(cosSinCacheSeqLen), pageTable, maxPagesPerSeq, writeKVCache));
+#else
+        applyRopeFromPackedToSplitKernel<half, TCache, kEnablePdl><<<grid, block, 0, stream>>>(packedPtr, qScratchPtr,
+            kScratchPtr, vScratchPtr, kvCachePtr, fp8QOutput, cosSinCachePtr, kvCacheEndLensPtr, tokenPosIdsPtr,
+            cuQSeqLensPtr, qNormGamma, kNormGamma, rmsNormEps, qScaleOrig, kScale, vScale,
             static_cast<int32_t>(runtimeSeqLen), static_cast<int32_t>(totalNumTokens), static_cast<int32_t>(numPages),
             static_cast<uint32_t>(numQHeads), static_cast<uint32_t>(numKVHeads), static_cast<uint32_t>(headDim),
             static_cast<uint32_t>(rotaryDim), static_cast<int32_t>(cosSinCacheBatchSize),
             static_cast<int32_t>(cosSinCacheSeqLen), pageTable, maxPagesPerSeq, writeKVCache);
+#endif // SUPPORTS_PROGRAMMATIC_DEPENDENT_LAUNCH
+    };
+
+    if (dt == nvinfer1::DataType::kHALF)
+    {
+        half* kvCachePtr = kvCache.dataPointer<half>();
+        if (enablePdl)
+        {
+            launchKernel(kvCachePtr, nullptr /* fp8QOut */, 1.0f /* qScaleQuantOrig */, std::true_type{});
+        }
+        else
+        {
+            launchKernel(kvCachePtr, nullptr /* fp8QOut */, 1.0f /* qScaleQuantOrig */, std::false_type{});
+        }
     }
 #if SUPPORTS_FP8
     else if (dt == nvinfer1::DataType::kFP8)
     {
         __nv_fp8_e4m3* kvCachePtr = kvCache.dataPointer<__nv_fp8_e4m3>();
-        applyRopeFromPackedToSplitKernel<half, __nv_fp8_e4m3><<<grid, block, 0, stream>>>(packedPtr, qScratchPtr,
-            kScratchPtr, vScratchPtr, kvCachePtr, fp8QOut, cosSinCachePtr, kvCacheEndLensPtr, tokenPosIdsPtr,
-            cuQSeqLensPtr, qNormGamma, kNormGamma, rmsNormEps, qScale, kScale, vScale,
-            static_cast<int32_t>(runtimeSeqLen), static_cast<int32_t>(totalNumTokens), static_cast<int32_t>(numPages),
-            static_cast<uint32_t>(numQHeads), static_cast<uint32_t>(numKVHeads), static_cast<uint32_t>(headDim),
-            static_cast<uint32_t>(rotaryDim), static_cast<int32_t>(cosSinCacheBatchSize),
-            static_cast<int32_t>(cosSinCacheSeqLen), pageTable, maxPagesPerSeq, writeKVCache);
+        if (enablePdl)
+        {
+            launchKernel(kvCachePtr, fp8QOut, qScale, std::true_type{});
+        }
+        else
+        {
+            launchKernel(kvCachePtr, fp8QOut, qScale, std::false_type{});
+        }
     }
 #endif
     else

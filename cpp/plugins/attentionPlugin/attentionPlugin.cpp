@@ -42,6 +42,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <memory>
@@ -64,11 +65,21 @@ constexpr char const* kATTENTION_PLUGIN_VERSION{"1"};
 constexpr char const* kATTENTION_PLUGIN_NAME{"AttentionPlugin"};
 //! Self-describing blob of (XQAJitKey, cubin) pairs; see serializeXQAJitKernels.
 constexpr char const* kXQA_JIT_KERNELS_FIELD{"xqa_jit_kernels"};
+constexpr int32_t kROPE_MIN_PDL_SM_VERSION{90};
 
 // Select KV cache storage datatype based on FP8 enablement
 static inline DataType selectKvCacheDataType(bool enableFp8KVCache)
 {
     return enableFp8KVCache ? DataType::kFP8 : DataType::kHALF;
+}
+
+bool requestRopePdl()
+{
+    static bool const enabled = []() {
+        char const* const value = std::getenv("EDGELLM_ENABLE_ROPE_PDL");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
 }
 
 bool isFp8KVCacheSupportedSM(int32_t smVersion)
@@ -1603,6 +1614,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
     half const* kNormGammaDevicePtr
         = mEnableQKNorm ? resolveNormGammaInput(inputDesc, inputs, kNormGammaInputIdx()) : nullptr;
     float const rmsNormEpsVal = mRmsNormEps;
+    bool const enableRopePdl = requestRopePdl() && mSMVersion >= kROPE_MIN_PDL_SM_VERSION;
 
     // ==================== Prefill path ====================
     // Dispatch order: vision-block attention first (paged CuTe DSL or
@@ -1719,7 +1731,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                     rt::OptionalInputTensor{}, packedQKVTensor, qInputTensor, kvCacheTensor, kScale, vScale, stream,
                     pageTable, maxPagesPerSeq, useBoundedSwaCache ? kInputTensor.rawPointer() : nullptr,
                     useBoundedSwaCache ? vInputTensor.rawPointer() : nullptr, nullptr /* fp8QOut */, 1.0f /* qScale */,
-                    qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal, std::nullopt, !sharedKV);
+                    qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal, std::nullopt, !sharedKV, enableRopePdl);
             }
 
             if (useBoundedSwaCache)
@@ -1923,7 +1935,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                     useBoundedSwaCache ? kInputTensor.rawPointer() : nullptr,
                     useBoundedSwaCache ? vInputTensor.rawPointer() : nullptr, nullptr /* fp8QOut */, 1.0F /* qScale */,
                     qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal, rt::OptionalInputTensor{cuQSeqLensTensor},
-                    false /* writeKVCache */);
+                    false /* writeKVCache */, enableRopePdl);
             }
             else
             {
@@ -2081,7 +2093,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
             kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor, rt::OptionalInputTensor{kvCacheEndIdxsTensor},
                 rt::OptionalInputTensor{}, packedQKVTensor, qInputTensor, kvCacheTensor, kScale, vScale, stream,
                 pageTable, maxPagesPerSeq, kInputTensor.rawPointer(), vInputTensor.rawPointer(), nullptr /* fp8QOut */,
-                1.0F /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal);
+                1.0F /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal, std::nullopt,
+                true /* writeKVCache */, enableRopePdl);
 
             int32_t const workspaceSeqLen = mSlidingWindowSize + runtimeSeqLen;
             rt::Tensor kvWorkspaceTensor = assignTensorFromWorkspace(
@@ -2142,7 +2155,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                     rt::OptionalInputTensor{kvCacheEndIdxsTensor}, rt::OptionalInputTensor{}, packedQKVTensor,
                     qInputTensor, kvCacheTensor, kScale, vScale, stream, pageTable, maxPagesPerSeq,
                     nullptr /* kScratch */, nullptr /* vScratch */, fp8QTensor.rawPointer(), qScale,
-                    qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal);
+                    qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal, std::nullopt, true /* writeKVCache */,
+                    enableRopePdl);
 
                 if (!runner.runPaged(fp8QTensor.rawPointer(),      // Q  [b, s_q, h_q, d] FP8
                         kvCacheTensor.rawPointer(),                // paged KV pool [2, numPages, 128, h_k, d] FP8
@@ -2163,7 +2177,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                     rt::OptionalInputTensor{kvCacheEndIdxsTensor}, rt::OptionalInputTensor{}, packedQKVTensor,
                     qInputTensor, kvCacheTensor, kScale, vScale, stream, pageTable, maxPagesPerSeq,
                     nullptr /* kScratch */, nullptr /* vScratch */, nullptr /* fp8QOut */, 1.0f /* qScale */,
-                    qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal);
+                    qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal, std::nullopt, true /* writeKVCache */,
+                    enableRopePdl);
 
                 if (!runner.runPaged(qInputTensor.dataPointer<half>(), // Q  [b, s_q, h_q, d]
                         kvCacheTensor.rawPointer(),                    // paged KV pool [2, numPages, 128, h_k, d]
@@ -2195,7 +2210,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                     rt::OptionalInputTensor{kvCacheEndIdxsTensor}, rt::OptionalInputTensor{}, packedQKVTensor,
                     qInputTensor, kvCacheTensor, kScale, vScale, stream, pageTable, maxPagesPerSeq,
                     nullptr /* kScratch */, nullptr /* vScratch */, nullptr /* fp8QOut */, 1.0f /* qScale */,
-                    qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal, rt::OptionalInputTensor{cuQSeqLensTensor});
+                    qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal, rt::OptionalInputTensor{cuQSeqLensTensor},
+                    true /* writeKVCache */, enableRopePdl);
 
                 LOG_DEBUG(
                     "AttentionPlugin: own-KV %s prefill via native paged FP16 FMHA-v2 "
@@ -2223,7 +2239,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                         rt::OptionalInputTensor{kvCacheEndIdxsTensor}, rt::OptionalInputTensor{}, packedQKVTensor,
                         qInputTensor, kvCacheTensor, kScale, vScale, stream, pageTable, maxPagesPerSeq,
                         nullptr /* kScratch */, nullptr /* vScratch */, nullptr /* fp8QOut */, 1.0f /* qScale */,
-                        qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal);
+                        qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal, std::nullopt, true /* writeKVCache */,
+                        enableRopePdl);
 
                     int32_t const splitSeqLen = splitLenForFallback();
                     auto [kSplit, vSplit] = splitPagedKV(kvCacheTensor, pageTable,
@@ -2255,7 +2272,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                         rt::OptionalInputTensor{}, packedQKVTensor, qInputTensor, kvCacheTensor, kScale, vScale, stream,
                         pageTable, maxPagesPerSeq, kInputTensor.rawPointer(), vInputTensor.rawPointer(),
                         nullptr /* fp8QOut */, 1.0f /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr,
-                        rmsNormEpsVal);
+                        rmsNormEpsVal, std::nullopt, true /* writeKVCache */, enableRopePdl);
 
                     CuteDslFMHAV2Runner runner(
                         mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, runtimeSeqLen, true);
@@ -2294,7 +2311,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                     tokenPosIds, packedQKVTensor, qInputTensor, kvCacheTensor, kScale, vScale, stream, pageTable,
                     maxPagesPerSeq, nullptr /* kScratch */, nullptr /* vScratch */, nullptr /* fp8QOut */,
                     1.0F /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal, std::nullopt,
-                    false /* writeKVCache */);
+                    false /* writeKVCache */, enableRopePdl);
             }
             else
             {
@@ -2323,7 +2340,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
             kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor, rt::OptionalInputTensor{contextLengthTensor},
                 rt::OptionalInputTensor{attentionPosIdTensor}, packedQKVTensor, qInputTensor, kvCacheTensor, kScale,
                 vScale, stream, pageTable, maxPagesPerSeq, nullptr /* kScratch */, nullptr /* vScratch */,
-                nullptr /* fp8QOut */, 1.0f /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal);
+                nullptr /* fp8QOut */, 1.0f /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal,
+                std::nullopt, true /* writeKVCache */, enableRopePdl);
         }
         else
         {
@@ -2334,7 +2352,8 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
             kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor, rt::OptionalInputTensor{contextLengthTensor},
                 rt::OptionalInputTensor{}, packedQKVTensor, qInputTensor, kvCacheTensor, kScale, vScale, stream,
                 pageTable, maxPagesPerSeq, nullptr /* kScratch */, nullptr /* vScratch */, nullptr /* fp8QOut */,
-                1.0f /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal);
+                1.0f /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr, rmsNormEpsVal, std::nullopt,
+                true /* writeKVCache */, enableRopePdl);
         }
 
         // Vision-block decode goes to XQA (a hard construction-time
