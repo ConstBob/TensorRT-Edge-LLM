@@ -120,7 +120,18 @@ _FEW_LAYER_MODELS = {
 def _resolve_model_dir(env_config: EnvironmentConfig,
                        dir_name: str) -> Optional[str]:
     """Locate a checkpoint dir under the known model roots (recursive search)."""
-    for root in (env_config.llm_models_dir, env_config.edgellm_data_dir):
+    roots = tuple(
+        filter(None, (env_config.llm_models_dir, env_config.edgellm_data_dir)))
+    for root in roots:
+        for parent in (root, os.path.join(root, "models")):
+            found = _find_directory(parent,
+                                    dir_name,
+                                    max_depth=0,
+                                    require_files=_HF_CHECKPOINT_FILES)
+            if found:
+                return found
+
+    for root in roots:
         found = _find_directory(root,
                                 dir_name,
                                 require_files=_HF_CHECKPOINT_FILES)
