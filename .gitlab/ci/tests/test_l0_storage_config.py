@@ -50,6 +50,7 @@ EXPORT_PRODUCER_LANES = {
 EXPECTED_EXPORT_JOBS = {
     "l0_checkpoint_export": {
         "l0_checkpoint_export",
+        "l0_dspark_a30",
         "l0_rtx5080",
         "l0_b100",
         "l0_rtx5090",
@@ -85,6 +86,10 @@ NON_ENGINE_BUILDING_JOB_TEMPLATES = ({".checkpoint_export_template"}
                                      | UNIT_TEST_JOB_TEMPLATES)
 L0_JOB_TEMPLATES = (ENGINE_BUILDING_JOB_TEMPLATES
                     | NON_ENGINE_BUILDING_JOB_TEMPLATES)
+MANUAL_RUNNER_TAGS = {
+    "b100-edgellm-nvks",
+    "rtx5090-edgellm-nvks",
+}
 
 
 def _extends(config):
@@ -256,6 +261,23 @@ def test_l0_builder_receives_cutedsl_artifacts():
 
     assert "build_cutedsl_docker_matrix" in _needed_jobs(config)
     assert "build_cutedsl_docker_matrix" in _artifact_source_jobs(config)
+
+
+def test_5090_and_b100_l0_jobs_are_optional_manual_jobs():
+    covered_tags = set()
+    for name, config in _visible_l0_jobs().items():
+        runner_tags = set(config.get("tags", []))
+        matrix = config.get("parallel", {}).get("matrix", [])
+        runner_tags.update(row["RUNNER_TAG"] for row in matrix
+                           if "RUNNER_TAG" in row)
+        matched_tags = runner_tags & MANUAL_RUNNER_TAGS
+        if not matched_tags:
+            continue
+        covered_tags.update(matched_tags)
+        assert config.get("when") == "manual", name
+        assert config.get("allow_failure") is True, name
+
+    assert covered_tags == MANUAL_RUNNER_TAGS
 
 
 def test_only_engine_writers_receive_l0_engine_storage():

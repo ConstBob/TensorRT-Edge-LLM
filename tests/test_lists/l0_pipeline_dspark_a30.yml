@@ -1,0 +1,8 @@
+tests:
+  - tests/defs/test_common.py::test_build_project
+
+  # Qwen3-4B with the FP16 DeepSpec block7 draft.
+  - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen3-4B-fp16-mxsl2048-dspark-block7-mxbs1-mxil1024-mvts8-mdts7]
+  - tests/defs/test_llm_pipeline.py::test_inference[Qwen3-4B-fp16-mxsl2048-dspark-block7-mxbs1-mxil1024-mvts8-mdts7-llm_basic]
+  - tests/defs/test_llm_pipeline.py::test_inference[Qwen3-4B-fp16-mxsl2048-dspark-block7-mxbs1-mxil1024-mvts8-mdts7-llm_logit_bias]
+  - tests/defs/test_llm_pipeline.py::test_e2e_bench[Qwen3-4B-fp16-mxsl2048-dspark-block7-mxbs1-mxil1024-mvts8-mdts7-bs1-osl32-llm_basic]
