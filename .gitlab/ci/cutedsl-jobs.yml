@@ -94,13 +94,15 @@ build_cutedsl_docker_matrix:
   needs:
     - job: build_cutedsl_docker_image
   tags:
-    - rtx5090-edgellm-nvks
+    - a30-edgellm-nvks
   image:
     name: "$CUTE_DSL_BUILDER_IMAGE"
     entrypoint: [""]
   variables:
     CUTE_DSL_OUTPUT_DIR: "$CI_PROJECT_DIR/cutedsl-out/artifacts"
     CUTE_DSL_PREBUILT_DIR: "$CI_PROJECT_DIR/kernelSrcs/cuteDSLPrebuilt"
+    # Bound GPU-side AOT compilation below the A30 memory capacity.
+    CUTE_DSL_JOBS: "32"
   script:
     - echo "Pipeline start time:$(date)"
     - 'echo "Runner node:${NODE_NAME:-$(hostname)}"'

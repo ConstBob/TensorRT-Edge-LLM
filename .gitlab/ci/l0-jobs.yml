@@ -113,6 +113,29 @@ l0_a30:
     - .l0_rules
   interruptible: true
 
+l0_dspark_a30:
+  stage: l0_test
+  needs:
+    - l0_checkpoint_export
+    - job: build_cutedsl_docker_matrix
+      artifacts: true
+  variables:
+    CUDA_VERSION: "13.2"
+    TRT_CUDA_VERSION: "13.2"
+    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    PRIORITY: l0_pipeline_dspark_a30
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/a30.csv"
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .l0_storage_paths
+    - .l0_blackwell_exports
+    - .x86_test_template
+    - .l0_rules
+  interruptible: true
+
 l0_nemo_eval_a30:
   stage: l0_test
   when: manual
@@ -264,6 +287,7 @@ l0_rtx5080:
 # Building and testing with B100 Linux (x86 Blackwell, SM100)
 l0_b100:
   stage: l0_test
+  when: manual
   allow_failure: true
   needs:
     - l0_checkpoint_export
@@ -289,6 +313,8 @@ l0_b100:
 # Building and testing with RTX 5090 Linux (x86 Blackwell, SM120)
 l0_rtx5090:
   stage: l0_test
+  when: manual
+  allow_failure: true
   needs:
     - l0_checkpoint_export
     - job: build_cutedsl_docker_matrix
@@ -379,7 +405,6 @@ l0_unit_tests_x86:
     matrix:
       - RUNNER_TAG: a30-edgellm-nvks
       - RUNNER_TAG: rtx5080-edgellm-nvks
-      - RUNNER_TAG: rtx5090-edgellm-nvks
       - RUNNER_TAG: rtx3090-edgellm-nvks
   tags:
     - ${RUNNER_TAG}
@@ -408,7 +433,6 @@ l0_unit_tests_x86_trt11:
     matrix:
       - RUNNER_TAG: a30-edgellm-nvks
       - RUNNER_TAG: rtx5080-edgellm-nvks
-      - RUNNER_TAG: rtx5090-edgellm-nvks
       - RUNNER_TAG: rtx3090-edgellm-nvks
   tags:
     - ${RUNNER_TAG}
@@ -419,8 +443,9 @@ l0_unit_tests_x86_trt11:
     - .l0_rules
   interruptible: true
 
-l0_unit_tests_x86_b100:
+l0_unit_tests_x86_5090_b100:
   stage: l0_test
+  when: manual
   allow_failure: true
   needs:
     - job: init_l0_storage
@@ -434,8 +459,12 @@ l0_unit_tests_x86_b100:
     PRIORITY: l0_python_ut
     TRT_CUDA_VERSION: "13.2"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
+  parallel:
+    matrix:
+      - RUNNER_TAG: rtx5090-edgellm-nvks
+      - RUNNER_TAG: b100-edgellm-nvks
   tags:
-    - b100-edgellm-nvks
+    - ${RUNNER_TAG}
   image: "$IMAGE"
   extends:
     - .l0_storage_paths
@@ -443,8 +472,9 @@ l0_unit_tests_x86_b100:
     - .l0_rules
   interruptible: true
 
-l0_unit_tests_x86_trt11_b100:
+l0_unit_tests_x86_trt11_5090_b100:
   stage: l0_test
+  when: manual
   allow_failure: true
   needs:
     - job: init_l0_storage
@@ -458,8 +488,12 @@ l0_unit_tests_x86_trt11_b100:
     IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     PRIORITY: l0_python_ut
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
+  parallel:
+    matrix:
+      - RUNNER_TAG: rtx5090-edgellm-nvks
+      - RUNNER_TAG: b100-edgellm-nvks
   tags:
-    - b100-edgellm-nvks
+    - ${RUNNER_TAG}
   image: "$IMAGE"
   extends:
     - .l0_storage_paths
