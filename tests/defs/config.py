@@ -111,25 +111,27 @@ def _find_directory(
         if max_depth is not None and current_depth > max_depth:
             return None
 
+        candidate_path = os.path.join(current_dir, target_name)
+        if os.path.isdir(candidate_path) and _is_valid_match(candidate_path):
+            return candidate_path
+
+        if max_depth is not None and current_depth >= max_depth:
+            return None
+
         try:
             entries = os.listdir(current_dir)
         except PermissionError:
             return None
 
-        candidate_path = os.path.join(current_dir, target_name)
-        if os.path.isdir(candidate_path) and _is_valid_match(candidate_path):
-            return candidate_path
+        for entry in entries:
+            if entry == '.git':
+                continue
+            entry_path = os.path.join(current_dir, entry)
 
-        if max_depth is None or current_depth < max_depth:
-            for entry in entries:
-                if entry == '.git':
-                    continue
-                entry_path = os.path.join(current_dir, entry)
-
-                if os.path.isdir(entry_path):
-                    result = _search(entry_path, current_depth + 1)
-                    if result:
-                        return result
+            if os.path.isdir(entry_path):
+                result = _search(entry_path, current_depth + 1)
+                if result:
+                    return result
 
         return None
 
