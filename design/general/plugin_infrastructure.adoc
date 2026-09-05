@@ -61,7 +61,7 @@ infrastructure and conventions.
 
 | `Nvfp4A16BlackwellMoePlugin`
 | link:../concepts/components/moe/[MoE]
-| NVFP4-weight / FP16-activation routed-expert MoE for Thor SM110: tcgen05 grouped GEMM prefill and fused CUDA-core decode over one `BLACKWELL_MOE_N128_K64_V1` weight layout.
+| NVFP4-weight / FP16-activation routed-expert MoE for Thor SM110: tcgen05 grouped GEMM prefill and CUDA-core decode kernels over one `BLACKWELL_MOE_N128_K64_V1` weight layout.
 | Thor exports of Nemotron 3.5 Lightning; other platforms keep `Nvfp4A16MoePlugin` (Marlin).
 
 | `update_ssm_state` (`MambaPlugin`)

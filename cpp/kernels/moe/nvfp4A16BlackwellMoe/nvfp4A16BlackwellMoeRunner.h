@@ -68,7 +68,7 @@ struct Nvfp4A16BlackwellMoeParams
     void* output{nullptr};
 };
 
-//! Thor (SM110) W4A16 routed-MoE runner: fused CUDA-core decode kernels for
+//! Thor (SM110) W4A16 routed-MoE runner: CUDA-core decode kernels for
 //! small token counts, tcgen05 grouped GEMM (AOT group nvfp4_a16_blackwell_moe)
 //! otherwise, over ONE weight layout.  Mirrors Nvfp4A16BlackwellGemmRunner:
 //! prepare() from onShapeChange loads exactly the AOT variants the profile can

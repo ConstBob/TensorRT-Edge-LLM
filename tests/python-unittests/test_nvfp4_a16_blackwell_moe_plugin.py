@@ -323,6 +323,16 @@ def test_small_relu2_sigmoid_decode_and_prefill_dynamic_engine(backend):
     _execute_case(replace(_SMALL_CASE, backend=backend))
 
 
+def test_grouped_routing_decode_and_prefill_dynamic_engine():
+    if not _is_thor():
+        pytest.skip("Nvfp4A16BlackwellMoePlugin requires SM110 (Thor)")
+    # n_group > 1 takes the shared moeSigmoidGroupTopk routing in both the
+    # decode path (S=1) and the grouped-GEMM path (S=9 / S=64).
+    _execute_case(
+        replace(_SMALL_CASE, name="small_relu2_grouped", n_group=2,
+                topk_group=1))
+
+
 def test_nemotron_shape_decode_and_prefill_dynamic_engine():
     if not _is_thor():
         pytest.skip("Nvfp4A16BlackwellMoePlugin requires SM110 (Thor)")

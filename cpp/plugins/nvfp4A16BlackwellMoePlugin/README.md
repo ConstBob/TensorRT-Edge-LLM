@@ -23,9 +23,17 @@ weight layouts and distinct ONNX identities: an engine never carries both.
 
 ## Execution
 
-* `T = 1` (decode): `decodeFc1Kernel` (routing recomputed per CTA, dequant
-  GEMV, alpha, ReLU2) then `decodeFc2Kernel` (per-slot alpha * router weight,
-  fp32 accumulation, split-K 8) and its reduce: 3 GPU ops, deterministic.
+* `T = 1` (decode): warp-per-token sigmoid top-k routing (contracts with
+  `n_group > 1` or `E > 512` use the shared `moeSigmoidGroupTopk` instead) ->
+  `decodeFc1Kernel` (dequant GEMV over the routed expert, split-K 2) + reduce
+  (alpha, ReLU2) -> `decodeFc2Kernel` (per-slot alpha * router weight, fp32
+  accumulation, split-K 8) + reduce: 5 GPU ops, deterministic. FC1 is
+  launch-bounded to two CTAs per SM and FC2 to three; routing is a separate
+  kernel because fusing it into every FC1 CTA cost 131 registers (one CTA per
+  SM) and ~40% of FC1's streaming bandwidth inside the engine. The decode
+  workspace is sized for the largest FC1 split-K the benchmark override
+  (`EDGELLM_MOE_DECODE_FC1_SPLITK`) can select, so the size TensorRT records at
+  build time never depends on the environment.
 * `T >= 2` (prefill and batched decode): warp-per-token sigmoid top-k routing -> single-CTA
   expert-contiguous tile layout (`permuted_idx`, `tile_group_idx`,
   `num_valid_tiles`) -> permuted-row gather (routed rows only; pad rows are

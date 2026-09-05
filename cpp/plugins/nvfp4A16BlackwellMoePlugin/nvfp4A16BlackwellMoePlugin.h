@@ -32,8 +32,8 @@ namespace plugins
  * @brief Thor (SM110) TensorRT V3 plugin for FP16 activations and NVFP4 routed-expert weights in the
  * BLACKWELL_MOE_N128_K64_V1 layout (issue #944).
  *
- * One weight buffer per projection serves both backends: a tcgen05 grouped GEMM (prefill) and fused
- * CUDA-core kernels (decode). Inputs mirror Nvfp4A16MoePlugin except that the weights are rank-5
+ * One weight buffer per projection serves both backends: a tcgen05 grouped GEMM (prefill) and
+ * CUDA-core GEMV kernels (decode). Inputs mirror Nvfp4A16MoePlugin except that the weights are rank-5
  * `[E, N/128, K/64, 128, 32]` int8 codes (row bytes pre-swizzled with the TMA 32B pattern: rows with bit 2
  * of n%128 set swap their 16-byte halves) plus `[E, N/128, K/64, 128, 4]` raw E4M3 block scales, and the
  * per-expert global scales are the checkpoint's verbatim fp32 `weight_scale_2` (no Marlin 2**7 factor).

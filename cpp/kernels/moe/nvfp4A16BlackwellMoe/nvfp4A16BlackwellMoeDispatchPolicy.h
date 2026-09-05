@@ -30,7 +30,7 @@ namespace nvfp4_a16_blackwell_moe
 enum class Backend : int32_t
 {
     kAuto = 0,    //!< token-count policy below
-    kDecode = 1,  //!< force the fused CUDA-core decode kernels
+    kDecode = 1,  //!< force the CUDA-core decode kernels
     kPrefill = 2, //!< force the tcgen05 grouped GEMM
 };
 
@@ -67,7 +67,7 @@ inline constexpr int32_t kMaxTokenTiles{1024};
 //   weights streamed as 2 KB-row TMA boxes over the pre-swizzled layout:
 //
 //   tokens | uniform routing            | skewed routing (hot experts)
-//      1   |  decode  199 / 212         |  decode  197 / 209
+//      1   |  decode  169 / 225         |  decode  161 / 211
 //      2   |  tn8     347 / 361         |  tn8     335 / 336
 //      4   |  tn8     572 / 589         |  tn8     437 / 450
 //      8   |  tn8     950 / 995         |  tn8     730 / 753
@@ -80,12 +80,19 @@ inline constexpr int32_t kMaxTokenTiles{1024};
 //   1024   |  tn64   4335 / 6153        |  tn64   3448 / 5665
 //   2048   |  tn64   6244 / 10806       |  tn64   5607 / 10549
 //   (cold-mode numbers at T >= 512 vary by up to ~7% run to run in this
-//   protocol, e.g. 5810-6244 us at T=2048; warm-mode 5769 us is stable.)
+//   protocol, e.g. 5810-6244 us at T=2048; warm-mode 5769 us is stable.
+//   The T=1 row is the 2026-09-05 re-measurement after the decode kernels
+//   lost the fused routing (routing kernel + FC1 split-K 2 + FC2 split-K 8,
+//   launch bounds 256x2 / 256x3); it was 199/212 and 197/209 before.)
 //
 //   * decode kernels win only at T=1 (cold L2, the 23-layer reality): every
 //     routed row is its own CUDA-core GEMV, so from T=2 tokens sharing an
 //     expert re-read its weights while the grouped GEMM streams each expert
-//     once. FC2 split-K 8 is the best of {1,2,4,8} at T=1, FC1 split-K 1.
+//     once. FC2 split-K 8 and FC1 split-K 2 are the best of {1,2,4,8} at T=1
+//     (FC1 swept in the engine, see kDecodeFc1SplitK). The plugin-only bench
+//     overstates decode: inside the engine Marlin's 13 support kernels hide
+//     under the shared-expert GEMV on TensorRT's aux stream, so only GEMM
+//     streaming efficiency counts there (nsys graph-mode trace, 2026-09-05).
 //   * grouped path from T=2. The token tile is the per-expert padding
 //     granularity: small tiles remove the pad rows FC1 streams and writes
 //     (tn8 vs tn32 at T=16: -8 MB DRAM, -7% FC1 time) but a hot expert with
@@ -108,7 +115,19 @@ inline constexpr int32_t kMaxTokenTiles{1024};
 // independently.
 // ---------------------------------------------------------------------------
 inline constexpr int32_t kDecodeMaxTokens{1};
-inline constexpr int32_t kDecodeFc1SplitK{1};
+//! Decode FC1 split-K: FC1 has only N1_pad/128 * topK = 90 row tiles at T=1
+//! (2.25 waves of 40 resident CTAs on 20 SMs); split-K 2 doubles the CTA count
+//! and was the best of {1,2,4,8} in the engine (decode step 11.57 / 11.41 /
+//! 11.49 / 11.63 ms for split-K 1 / 2 / 4 / 8 at pastKV 128; 1/2/4 are means of
+//! three interleaved rounds, 8 a single run; 2 < 4 < 1 held in every round and
+//! at pastKV 2048). The fp32 partials (2 x 6 x 1920) cost one ~3 us reduce;
+//! decode stays deterministic.
+inline constexpr int32_t kDecodeFc1SplitK{2};
+//! Largest FC1 split-K the benchmark override may select; the decode workspace
+//! is sized for it so the size recorded at engine build never depends on the
+//! environment.
+inline constexpr int32_t kDecodeFc1MaxSplitK{8};
+static_assert(kDecodeFc1SplitK >= 1 && kDecodeFc1SplitK <= kDecodeFc1MaxSplitK, "sealed FC1 split-K out of range");
 inline constexpr int32_t kDecodeFc2SplitK{8};
 
 constexpr Backend resolveBackend(Backend const requested, int32_t const numTokens) noexcept

@@ -36,24 +36,19 @@ namespace nvfp4_a16_blackwell_moe
 //!   qweight      int8 [E, N_pad/128, K/64, 128, 32]
 //!   block_scales int8 [E, N_pad/128, K/64, 128, 4]   (raw E4M3)
 //!   global_scale fp32 [E]
-//! FC1 fuses the sigmoid group-top-k routing (recomputed per CTA from the router
-//! logits), the dequantized GEMV of one (token, slot) row against its expert,
-//! the per-expert alpha and ReLU^2.  FC2 loops over the token's top-k slots,
-//! folds alpha * router weight into the fp32 accumulation and writes the token
-//! output directly (deterministic; no atomics).  Split-K variants write fp32
-//! partials that a reduce kernel finalizes.
+//! A routing kernel (launchSigmoidTopkRoute, or moeSigmoidGroupTopk for grouped
+//! contracts) first writes topkIndices / topkWeights.  FC1 computes the
+//! dequantized GEMV of one (token, slot) row against its routed expert and
+//! applies the per-expert alpha and ReLU^2 (in-kernel at split-K 1, in the
+//! reduce otherwise).  FC2 loops over the token's top-k slots, folds
+//! alpha * router weight into the fp32 accumulation and writes the token output
+//! directly (deterministic; no atomics).  Split-K variants write fp32 partials
+//! that a reduce kernel finalizes.
 struct DecodeMoeParams
 {
-    // Routing inputs
-    float const* routerLogits{nullptr};   //!< [numTokens, numExperts] fp32
-    float const* correctionBias{nullptr}; //!< [numExperts] fp32 or nullptr
+    // Routing shape and results (written by the routing kernel, read by FC1/FC2/reduce)
     int32_t numExperts{0};
     int32_t topK{0};
-    int32_t nGroup{1};
-    int32_t topkGroup{1};
-    bool normTopkProb{true};
-    float routedScalingFactor{1.0f};
-    // Routing outputs (written by FC1, read by FC2)
     int32_t* topkIndices{nullptr}; //!< [numTokens, topK] int32
     float* topkWeights{nullptr};   //!< [numTokens, topK] fp32
     // Problem shape
@@ -93,7 +88,8 @@ size_t getDecodeFc2PartialBytes(DecodeMoeParams const& params);
 //! Host-side validation; returns nullptr on success or a static reason string.
 char const* validateDecodeParams(DecodeMoeParams const& params, DecodeDtype dtype);
 
-//! Launch routing + FC1 (+ reduce when fc1SplitK > 1). Returns cudaGetLastError().
+//! Launch FC1 (+ reduce when fc1SplitK > 1); topkIndices must already hold the
+//! routing (launchSigmoidTopkRoute / moeSigmoidGroupTopk). Returns cudaGetLastError().
 cudaError_t launchDecodeFc1(DecodeMoeParams const& params, DecodeDtype dtype, cudaStream_t stream);
 
 //! Launch FC2 (+ reduce when fc2SplitK > 1). Returns cudaGetLastError().

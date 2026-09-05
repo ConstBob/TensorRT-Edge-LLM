@@ -17,8 +17,6 @@
 
 #include "nvfp4A16BlackwellMoeDecodeKernels.h"
 
-#include "moeSigmoidGroupTopkDevice.cuh"
-
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp4.h>
@@ -53,8 +51,16 @@ constexpr int32_t kMaxSplitK{8};
 //! LPDDR5X latency is high; with one 16-byte load per lane per tile the kernel
 //! is latency bound (measured 84 us for 17 MB), with four it streams.
 constexpr int32_t kPrefetchTiles{4};
-//! Experts per lane of the warp-level routing fast path (numExperts <= 512).
-constexpr int32_t kMaxExpertsPerLane{16};
+//! CTAs per SM the FC1/FC2 kernels are register-bounded to (launch bounds).
+//! With 8 warps and kPrefetchTiles 16-byte loads per lane each CTA keeps 16 KB
+//! of weight traffic in flight; Thor's LPDDR5X needs >= 32 KB per SM to stream
+//! near its ~235 GB/s practical ceiling with only 20 SMs.  FC1 compiles to ~72
+//! registers once the routing lives outside the kernel.  FC2 (top-k slot loop)
+//! wants ~87 unbounded; the (256, 3) bound caps it at 80 (65536 / 768 rounded
+//! down to the 8-register allocation unit) and CUDA 13.2 lands at 77 with no
+//! spills, so the bound is binding by a few registers (-warn-spills guards it).
+constexpr int32_t kDecodeFc1CtasPerSm{2};
+constexpr int32_t kDecodeFc2CtasPerSm{3};
 constexpr int32_t kSmemBytesPerStagedTile{kSmemRowStride * static_cast<int32_t>(sizeof(float))};
 
 struct __align__(16) Uint4
@@ -211,91 +217,37 @@ __device__ __forceinline__ float dotRowTileHalf(RowTileHalf const& tile, float c
 }
 
 //! Streams K tiles [kBlockBegin, kBlockEnd) of one weight row (this lane's half)
-//! against the activation staged for the same range, kPrefetchTiles loads in flight.
+//! against the activation staged for the same range, kPrefetchTiles loads in
+//! flight.  One predicated loop (no separate tail copy) keeps the live tile
+//! array at kPrefetchTiles entries, which is what bounds the register count.
 __device__ __forceinline__ float streamRowRange(unsigned char const* __restrict__ const qweights,
     unsigned char const* __restrict__ const blockScales, long long const rowTileBase, int32_t const kBlockBegin,
     int32_t const kBlockEnd, int32_t const kHalf, float const* const stagedRange)
 {
     float acc = 0.0f;
     float const* const stagedHalf = stagedRange + kHalf * kSmemHalfStride;
-    int32_t kBlock = kBlockBegin;
-    for (; kBlock + kPrefetchTiles <= kBlockEnd; kBlock += kPrefetchTiles)
+    for (int32_t kBlock = kBlockBegin; kBlock < kBlockEnd; kBlock += kPrefetchTiles)
     {
         RowTileHalf tiles[kPrefetchTiles];
 #pragma unroll
         for (int32_t j = 0; j < kPrefetchTiles; ++j)
         {
-            tiles[j] = loadRowTileHalf(
-                qweights, blockScales, rowTileBase + static_cast<long long>(kBlock + j) * kNTile, kHalf);
+            if (kBlock + j < kBlockEnd)
+            {
+                tiles[j] = loadRowTileHalf(
+                    qweights, blockScales, rowTileBase + static_cast<long long>(kBlock + j) * kNTile, kHalf);
+            }
         }
 #pragma unroll
         for (int32_t j = 0; j < kPrefetchTiles; ++j)
         {
-            acc += dotRowTileHalf(tiles[j], stagedHalf + (kBlock + j - kBlockBegin) * kSmemRowStride);
-        }
-    }
-    RowTileHalf tail[kPrefetchTiles];
-#pragma unroll
-    for (int32_t j = 0; j < kPrefetchTiles; ++j)
-    {
-        if (kBlock + j < kBlockEnd)
-        {
-            tail[j] = loadRowTileHalf(
-                qweights, blockScales, rowTileBase + static_cast<long long>(kBlock + j) * kNTile, kHalf);
-        }
-    }
-#pragma unroll
-    for (int32_t j = 0; j < kPrefetchTiles; ++j)
-    {
-        if (kBlock + j < kBlockEnd)
-        {
-            acc += dotRowTileHalf(tail[j], stagedHalf + (kBlock + j - kBlockBegin) * kSmemRowStride);
+            if (kBlock + j < kBlockEnd)
+            {
+                acc += dotRowTileHalf(tiles[j], stagedHalf + (kBlock + j - kBlockBegin) * kSmemRowStride);
+            }
         }
     }
     return acc;
-}
-
-//! Routing shared-memory carve-out shared by FC1 CTAs.
-struct RoutingSmem
-{
-    float* sigmoid;
-    float* biased;
-    float* groupScores;
-    float* reduceVal;
-    float* topkWeight;
-    int32_t* groupSelected;
-    int32_t* reduceIdx;
-    int32_t* topkIdx;
-    float* activation;
-};
-
-__device__ __forceinline__ RoutingSmem carveRoutingSmem(
-    unsigned char* const base, int32_t const numExperts, int32_t const nGroup, int32_t const topK)
-{
-    RoutingSmem s{};
-    float* f = reinterpret_cast<float*>(base);
-    s.sigmoid = f;
-    f += numExperts;
-    s.biased = f;
-    f += numExperts;
-    s.groupScores = f;
-    f += nGroup;
-    s.reduceVal = f;
-    f += kWarpsPerBlock;
-    s.topkWeight = f;
-    f += topK;
-    int32_t* i = reinterpret_cast<int32_t*>(f);
-    s.groupSelected = i;
-    i += nGroup;
-    s.reduceIdx = i;
-    i += kWarpsPerBlock;
-    s.topkIdx = i;
-    i += topK;
-    // 16-byte align the activation staging buffer.
-    uintptr_t addr = reinterpret_cast<uintptr_t>(i);
-    addr = (addr + 15U) & ~static_cast<uintptr_t>(15U);
-    s.activation = reinterpret_cast<float*>(addr);
-    return s;
 }
 
 //! K tiles one CTA of a split-K launch stages (the largest split range).
@@ -304,11 +256,9 @@ __host__ __device__ __forceinline__ int32_t maxTilesPerSplit(int32_t const kBloc
     return (kBlocks + splitK - 1) / splitK;
 }
 
-__host__ __device__ __forceinline__ int32_t fc1SharedBytes(
-    int32_t const numExperts, int32_t const nGroup, int32_t const topK, int32_t const kBlocks, int32_t const splitK)
+__host__ __device__ __forceinline__ int32_t fc1SharedBytes(int32_t const kBlocks, int32_t const splitK)
 {
-    return sigmoidGroupTopkSharedBytes(numExperts, nGroup, topK, kThreadsPerBlock) + 16
-        + maxTilesPerSplit(kBlocks, splitK) * kSmemBytesPerStagedTile;
+    return maxTilesPerSplit(kBlocks, splitK) * kSmemBytesPerStagedTile;
 }
 
 __host__ __device__ __forceinline__ int32_t fc2SharedBytes(
@@ -317,19 +267,22 @@ __host__ __device__ __forceinline__ int32_t fc2SharedBytes(
     return topK * maxTilesPerSplit(kBlocks, splitK) * kSmemBytesPerStagedTile;
 }
 
-//! FC1: grid (N1_pad/128, numTokens*topK, fc1SplitK), 256 threads.
-//! Each CTA recomputes the routing of its token, resolves slot -> expert and
-//! computes one 128-row tile of relu(alpha * x[token] . W1[expert])^2.
+//! FC1: grid (N1_pad/128, numTokens*topK, fc1SplitK), 256 threads.  The routing
+//! kernel (launchSigmoidTopkRoute / moeSigmoidGroupTopk) has already resolved
+//! slot -> expert into topkIndices; each CTA stages its token's activation K
+//! range and computes one 128-row tile of relu(alpha * x[token] . W1[expert])^2,
+//! or an fp32 partial when split-K > 1.  Keeping the routing out of the kernel
+//! holds it at GEMV register pressure so kDecodeFc1CtasPerSm CTAs co-reside per SM
+//! (the fused version needed 131 registers, one CTA per SM, and streamed FC1 at
+//! ~150 GB/s inside the engine).
 template <typename T>
-__global__ __launch_bounds__(kThreadsPerBlock) void decodeFc1Kernel(DecodeMoeParams const params)
+__global__ __launch_bounds__(kThreadsPerBlock, kDecodeFc1CtasPerSm) void decodeFc1Kernel(DecodeMoeParams const params)
 {
     extern __shared__ __align__(16) unsigned char dynamicSmem[];
-    RoutingSmem const smem = carveRoutingSmem(dynamicSmem, params.numExperts, params.nGroup, params.topK);
+    float* const sharedActivation = reinterpret_cast<float*>(dynamicSmem);
 
     int32_t const slot = static_cast<int32_t>(blockIdx.y);
     int32_t const token = slot / params.topK;
-    int32_t const slotInToken = slot - token * params.topK;
-    float const* const logits = params.routerLogits + static_cast<long long>(token) * params.numExperts;
     int32_t const nFeatures = params.interSizePadded;
     int32_t const kFeatures = params.hiddenSize;
     int32_t const kBlocks = kFeatures / kKTile;
@@ -338,32 +291,10 @@ __global__ __launch_bounds__(kThreadsPerBlock) void decodeFc1Kernel(DecodeMoePar
     int32_t const kBlockEnd = kBlocks * (split + 1) / params.fc1SplitK;
     T const* const activationRow
         = static_cast<T const*>(params.hiddenStates) + static_cast<long long>(token) * kFeatures;
-    if (params.nGroup == 1 && params.numExperts <= kWarpSize * kMaxExpertsPerLane)
-    {
-        // Warp 0 routes in registers while the other warps stage the activation.
-        if (threadIdx.x < kWarpSize)
-        {
-            sigmoidTopkWarp<kMaxExpertsPerLane>(logits, params.correctionBias, params.numExperts, params.topK,
-                params.normTopkProb, params.routedScalingFactor, smem.sigmoid, smem.topkIdx, smem.topkWeight);
-        }
-        stageActivationRange<T>(activationRow, kBlockBegin, kBlockEnd, smem.activation);
-        __syncthreads();
-    }
-    else
-    {
-        sigmoidGroupTopkBlock<kThreadsPerBlock>(logits, params.correctionBias, params.numExperts, params.topK,
-            params.nGroup, params.topkGroup, params.normTopkProb, params.routedScalingFactor, smem.sigmoid, smem.biased,
-            smem.groupScores, smem.groupSelected, smem.reduceVal, smem.reduceIdx, smem.topkIdx, smem.topkWeight);
-        stageActivationRange<T>(activationRow, kBlockBegin, kBlockEnd, smem.activation);
-        __syncthreads();
-    }
-    int32_t const expert = smem.topkIdx[slotInToken];
-    if (blockIdx.x == 0 && blockIdx.z == 0 && static_cast<int32_t>(threadIdx.x) < params.topK)
-    {
-        int32_t const k = static_cast<int32_t>(threadIdx.x);
-        params.topkIndices[static_cast<long long>(token) * params.topK + k] = smem.topkIdx[k];
-        params.topkWeights[static_cast<long long>(token) * params.topK + k] = smem.topkWeight[k];
-    }
+    // Issue the (dependent) expert lookup before the staging loop so its latency overlaps it.
+    int32_t const expert = params.topkIndices[slot];
+    stageActivationRange<T>(activationRow, kBlockBegin, kBlockEnd, sharedActivation);
+    __syncthreads();
 
     int32_t const lane = static_cast<int32_t>(threadIdx.x) & (kWarpSize - 1);
     int32_t const warp = static_cast<int32_t>(threadIdx.x) / kWarpSize;
@@ -378,7 +309,7 @@ __global__ __launch_bounds__(kThreadsPerBlock) void decodeFc1Kernel(DecodeMoePar
         + static_cast<long long>(expert) * (expertPlaneCodes / 8);
 
     long long const rowTileBase = static_cast<long long>(nBlock) * kBlocks * kNTile + rowInTile;
-    float acc = streamRowRange(qweights, blockScales, rowTileBase, kBlockBegin, kBlockEnd, kHalf, smem.activation);
+    float acc = streamRowRange(qweights, blockScales, rowTileBase, kBlockBegin, kBlockEnd, kHalf, sharedActivation);
     acc += __shfl_xor_sync(0xFFFFFFFFU, acc, 1, kWarpSize);
     if (kHalf == 0)
     {
@@ -432,7 +363,7 @@ __global__ void decodeFc1ReduceKernel(DecodeMoeParams const params)
 //! for its 128 hidden features in fp32, then writes the token output (or an fp32
 //! partial when split-K > 1).  No atomics: the result is deterministic.
 template <typename T>
-__global__ __launch_bounds__(kThreadsPerBlock) void decodeFc2Kernel(DecodeMoeParams const params)
+__global__ __launch_bounds__(kThreadsPerBlock, kDecodeFc2CtasPerSm) void decodeFc2Kernel(DecodeMoeParams const params)
 {
     extern __shared__ __align__(16) unsigned char dynamicSmem[];
     float* const sharedActivation = reinterpret_cast<float*>(dynamicSmem);
@@ -530,8 +461,7 @@ template <typename T>
 cudaError_t launchFc1Typed(DecodeMoeParams const& params, cudaStream_t const stream)
 {
     dim3 const grid(params.interSizePadded / kNTile, params.numTokens * params.topK, params.fc1SplitK);
-    int32_t const smemBytes
-        = fc1SharedBytes(params.numExperts, params.nGroup, params.topK, params.hiddenSize / kKTile, params.fc1SplitK);
+    int32_t const smemBytes = fc1SharedBytes(params.hiddenSize / kKTile, params.fc1SplitK);
     cudaError_t const attr = optInDynamicSmem(decodeFc1Kernel<T>, smemBytes);
     if (attr != cudaSuccess)
     {
@@ -602,10 +532,6 @@ char const* validateDecodeParams(DecodeMoeParams const& p, DecodeDtype const dty
     {
         return "topK must be in [1, 32] and <= numExperts";
     }
-    if (p.nGroup <= 0 || p.numExperts % p.nGroup != 0 || p.topkGroup <= 0 || p.topkGroup > p.nGroup)
-    {
-        return "nGroup must divide numExperts and topkGroup must be in [1, nGroup]";
-    }
     if (p.hiddenSize <= 0 || p.hiddenSize % kNTile != 0)
     {
         return "hiddenSize must be a positive multiple of 128";
@@ -626,8 +552,8 @@ char const* validateDecodeParams(DecodeMoeParams const& p, DecodeDtype const dty
     {
         return "fc2SplitK out of range";
     }
-    if (p.routerLogits == nullptr || p.topkIndices == nullptr || p.topkWeights == nullptr || p.hiddenStates == nullptr
-        || p.fc1Output == nullptr || p.output == nullptr || p.fc1QWeights == nullptr || p.fc1BlockScales == nullptr
+    if (p.topkIndices == nullptr || p.topkWeights == nullptr || p.hiddenStates == nullptr || p.fc1Output == nullptr
+        || p.output == nullptr || p.fc1QWeights == nullptr || p.fc1BlockScales == nullptr
         || p.fc1GlobalScales == nullptr || p.fc2QWeights == nullptr || p.fc2BlockScales == nullptr
         || p.fc2GlobalScales == nullptr)
     {

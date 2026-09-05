@@ -152,6 +152,7 @@ tests:
   - tests/python-unittests/test_nvfp4_a16_blackwell_moe_layout.py::test_real_checkpoint_layer1_expert0_spot_check
   - tests/python-unittests/test_nvfp4_a16_blackwell_moe_plugin.py::test_small_relu2_sigmoid_decode_and_prefill_dynamic_engine
   - tests/python-unittests/test_nvfp4_a16_blackwell_moe_plugin.py::test_nemotron_shape_decode_and_prefill_dynamic_engine
+  - tests/python-unittests/test_nvfp4_a16_blackwell_moe_plugin.py::test_grouped_routing_decode_and_prefill_dynamic_engine
   - tests/python-unittests/test_nvfp4_a16_blackwell_moe_plugin.py::test_build_on_non_thor_gpu_is_rejected
   - tests/python-unittests/test_nvfp4_a16_blackwell_moe_plugin.py::test_build_rejects_marlin_layout_and_unknown_backend
   - tests/python-unittests/test_nvfp4_a16_blackwell_moe_plugin.py::test_build_rejects_unsupported_activation_or_routing

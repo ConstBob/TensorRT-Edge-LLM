@@ -61,6 +61,61 @@ size_t elementSize(moe::DecodeDtype const dtype) noexcept
     return 2; // FP16 and BF16
 }
 
+//! Decode FC1 split-K for a shape: the sealed policy value, or the benchmark-only
+//! override EDGELLM_MOE_DECODE_FC1_SPLITK=1|2|4|8 (read once), clamped to the
+//! K-tile count.  Only the launch and numGpuOps depend on it: the workspace is
+//! always sized for kDecodeFc1MaxSplitK so the size TensorRT records at engine
+//! build cannot disagree with a run-time override.
+int32_t decodeFc1SplitK(Nvfp4A16BlackwellMoeParams const& p) noexcept
+{
+    static int32_t const requested = []() {
+        char const* const env = std::getenv("EDGELLM_MOE_DECODE_FC1_SPLITK");
+        if (env != nullptr)
+        {
+            int32_t const v = std::atoi(env);
+            if ((v == 1 || v == 2 || v == 4 || v == 8) && v <= moe::kDecodeFc1MaxSplitK)
+            {
+                return v;
+            }
+        }
+        return moe::kDecodeFc1SplitK;
+    }();
+    return std::max<int32_t>(1, std::min<int32_t>(requested, p.hiddenSize / nvfp4_a16_blackwell::kKTile));
+}
+
+//! Sigmoid top-k routing into topkIndices / topkWeights: the warp-per-token fast
+//! path for the ungrouped contract (Nemotron), the shared grouped kernel otherwise.
+cudaError_t launchRouting(Nvfp4A16BlackwellMoeParams const& p, int32_t* const topkIndices, float* const topkWeights,
+    cudaStream_t const stream) noexcept
+{
+    if (p.nGroup == 1 && p.numExperts <= 512)
+    {
+        return moe::launchSigmoidTopkRoute(p.routerLogits, p.correctionBias, p.numTokens, p.numExperts, p.topK,
+            p.normTopkProb, p.routedScalingFactor, topkIndices, topkWeights, stream);
+    }
+    try
+    {
+        rt::Tensor const logits(const_cast<float*>(p.routerLogits), {p.numTokens, p.numExperts}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kFLOAT);
+        rt::Tensor weights(topkWeights, {p.numTokens, p.topK}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+        rt::Tensor indices(topkIndices, {p.numTokens, p.topK}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+        rt::Tensor const bias(
+            const_cast<float*>(p.correctionBias), {p.numExperts}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+        rt::OptionalInputTensor optionalBias = std::nullopt;
+        if (p.correctionBias != nullptr)
+        {
+            optionalBias = std::cref(bias);
+        }
+        moeSigmoidGroupTopk(logits, weights, indices, p.topK, p.nGroup, p.topkGroup, p.normTopkProb,
+            p.routedScalingFactor, stream, optionalBias);
+        return cudaGetLastError();
+    }
+    catch (...)
+    {
+        return cudaErrorUnknown;
+    }
+}
+
 //! Single source of truth for the workspace carve-out (sizing and run use it).
 struct WorkspaceLayout
 {
@@ -72,6 +127,7 @@ struct WorkspaceLayout
     size_t numValidTiles{0};
     size_t permutedActivations{0};
     size_t fc1Output{0};
+    size_t fc1Partials{0};
     size_t fc2Partials{0};
     size_t total{0};
     int64_t maxRowsPadded{0};
@@ -102,8 +158,18 @@ WorkspaceLayout buildWorkspaceLayout(Nvfp4A16BlackwellMoeParams const& p, int32_
     // fc1Output serves the prefill permuted intermediate [maxRowsPadded, I_pad]
     // and the decode slot intermediate [slots, I_pad]; the former dominates.
     place(l.fc1Output, static_cast<size_t>(std::max<int64_t>(l.maxRowsPadded, slots)) * p.interSizePadded * act);
+    // Decode split-K partials.  The decode kernels only run for numTokens <=
+    // kDecodeMaxTokens unless the backend is forced, so size the partials for
+    // that many tokens (a prefill profile up to 4096 tokens would otherwise
+    // reserve hundreds of MB for buffers it never touches).
+    int64_t const decodeTokens = p.backend == moe::Backend::kDecode
+        ? static_cast<int64_t>(p.numTokens)
+        : std::min<int64_t>(p.numTokens, moe::kDecodeMaxTokens);
+    // Sized for the largest FC1 split-K the launch may pick (never the env override).
+    place(l.fc1Partials,
+        static_cast<size_t>(moe::kDecodeFc1MaxSplitK) * decodeTokens * p.topK * p.interSizePadded * sizeof(float));
     size_t const fc2PartialBytes = moe::kDecodeFc2SplitK > 1
-        ? static_cast<size_t>(moe::kDecodeFc2SplitK) * p.numTokens * p.hiddenSize * sizeof(float)
+        ? static_cast<size_t>(moe::kDecodeFc2SplitK) * decodeTokens * p.hiddenSize * sizeof(float)
         : 0;
     place(l.fc2Partials, fc2PartialBytes);
     l.total = cursor;
@@ -313,32 +379,17 @@ cudaError_t runPrefill(
     try
     {
         int32_t const slots = p.numTokens * p.topK;
-        rt::Tensor const logits(const_cast<float*>(p.routerLogits), {p.numTokens, p.numExperts}, rt::DeviceType::kGPU,
-            nvinfer1::DataType::kFLOAT);
-        rt::Tensor topkWeights(
-            ws + l.topkWeights, {p.numTokens, p.topK}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-        rt::Tensor topkIndices(
-            ws + l.topkIndices, {p.numTokens, p.topK}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
-        rt::Tensor const bias(
-            const_cast<float*>(p.correctionBias), {p.numExperts}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-        rt::OptionalInputTensor optionalBias = std::nullopt;
-        if (p.correctionBias != nullptr)
+        cudaError_t err = launchRouting(
+            p, reinterpret_cast<int32_t*>(ws + l.topkIndices), reinterpret_cast<float*>(ws + l.topkWeights), stream);
+        if (err != cudaSuccess)
         {
-            optionalBias = std::cref(bias);
+            return err;
         }
-        cudaError_t err = cudaSuccess;
         if (p.nGroup == 1 && p.numExperts <= 512)
         {
-            // Ungrouped contract (Nemotron): warp-per-token routing and the
-            // parallel single-CTA layout builder (~10 us together at T=256
-            // versus ~75 us for the generic pair below).
-            err = moe::launchSigmoidTopkRoute(p.routerLogits, p.correctionBias, p.numTokens, p.numExperts, p.topK,
-                p.normTopkProb, p.routedScalingFactor, reinterpret_cast<int32_t*>(ws + l.topkIndices),
-                reinterpret_cast<float*>(ws + l.topkWeights), stream);
-            if (err != cudaSuccess)
-            {
-                return err;
-            }
+            // Ungrouped contract (Nemotron): the parallel single-CTA layout
+            // builder (~10 us with the warp-per-token routing at T=256 versus
+            // ~75 us for the generic pair).
             err = moe::launchBuildTileLayout(reinterpret_cast<int32_t const*>(ws + l.topkIndices), slots, p.numExperts,
                 l.tokenTile, reinterpret_cast<int32_t*>(ws + l.permutedIdx),
                 reinterpret_cast<int32_t*>(ws + l.tileGroupIdx), reinterpret_cast<int32_t*>(ws + l.numValidTiles),
@@ -350,9 +401,6 @@ cudaError_t runPrefill(
         }
         else
         {
-            moeSigmoidGroupTopk(logits, topkWeights, topkIndices, p.topK, p.nGroup, p.topkGroup, p.normTopkProb,
-                p.routedScalingFactor, stream, optionalBias);
-
             MoELayoutBuffers layout{};
             layout.tileIdxToGroupIdx = rt::Tensor(ws + l.tileGroupIdx, {static_cast<int32_t>(l.maxTiles)},
                 rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
@@ -422,14 +470,8 @@ cudaError_t runDecode(
     Nvfp4A16BlackwellMoeParams const& p, unsigned char* ws, WorkspaceLayout const& l, cudaStream_t stream) noexcept
 {
     moe::DecodeMoeParams d{};
-    d.routerLogits = p.routerLogits;
-    d.correctionBias = p.correctionBias;
     d.numExperts = p.numExperts;
     d.topK = p.topK;
-    d.nGroup = p.nGroup;
-    d.topkGroup = p.topkGroup;
-    d.normTopkProb = p.normTopkProb;
-    d.routedScalingFactor = p.routedScalingFactor;
     d.topkIndices = reinterpret_cast<int32_t*>(ws + l.topkIndices);
     d.topkWeights = reinterpret_cast<float*>(ws + l.topkWeights);
     d.numTokens = p.numTokens;
@@ -445,11 +487,18 @@ cudaError_t runDecode(
     d.fc2QWeights = p.fc2QWeights;
     d.fc2BlockScales = p.fc2BlockScales;
     d.fc2GlobalScales = p.fc2GlobalScales;
-    d.fc1SplitK = moe::kDecodeFc1SplitK;
+    d.fc1SplitK = decodeFc1SplitK(p);
     d.fc2SplitK = std::min<int32_t>(moe::kDecodeFc2SplitK, p.interSize / nvfp4_a16_blackwell::kKTile);
-    d.fc1Partials = nullptr;
+    d.fc1Partials = d.fc1SplitK > 1 ? reinterpret_cast<float*>(ws + l.fc1Partials) : nullptr;
     d.fc2Partials = d.fc2SplitK > 1 ? reinterpret_cast<float*>(ws + l.fc2Partials) : nullptr;
-    cudaError_t err = moe::launchDecodeFc1(d, p.dtype, stream);
+    // Routing runs as its own (tiny) kernel: fusing it into every FC1 CTA cost
+    // 131 registers, one CTA per SM and ~40% of FC1's streaming bandwidth.
+    cudaError_t err = launchRouting(p, d.topkIndices, d.topkWeights, stream);
+    if (err != cudaSuccess)
+    {
+        return err;
+    }
+    err = moe::launchDecodeFc1(d, p.dtype, stream);
     if (err != cudaSuccess)
     {
         return err;
@@ -530,7 +579,7 @@ int32_t Nvfp4A16BlackwellMoeRunner::numGpuOps(Nvfp4A16BlackwellMoeParams const& 
     {
         int32_t const fc2SplitK
             = std::min<int32_t>(moe::kDecodeFc2SplitK, params.interSize / nvfp4_a16_blackwell::kKTile);
-        return 2 + (moe::kDecodeFc1SplitK > 1 ? 1 : 0) + (fc2SplitK > 1 ? 1 : 0);
+        return 3 + (decodeFc1SplitK(params) > 1 ? 1 : 0) + (fc2SplitK > 1 ? 1 : 0); // routing, FC1, FC2 (+ reduces)
     }
     return 5; // routing, tile layout, gather, FC1, FC2
 }

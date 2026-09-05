@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <random>
 #include <vector>
 
@@ -418,9 +419,10 @@ protected:
 
 TEST_F(Nvfp4A16BlackwellMoeRunnerTest, DecodeAutoMatchesReferenceSmallShape)
 {
-    MoeFixture fixture(kSmall, 3, 11);
+    // T=1 is the only token count the auto policy routes to the decode kernels.
+    MoeFixture fixture(kSmall, 1, 11);
     runOnce(fixture, moe::Backend::kAuto, nullptr);
-    fixture.expectMatchesReference("decode auto T=3 small");
+    fixture.expectMatchesReference("decode auto T=1 small");
 }
 
 TEST_F(Nvfp4A16BlackwellMoeRunnerTest, PrefillAutoMatchesReferenceSmallShape)
@@ -443,9 +445,9 @@ TEST_F(Nvfp4A16BlackwellMoeRunnerTest, ForcedBackendsAgreeSmallShape)
 
 TEST_F(Nvfp4A16BlackwellMoeRunnerTest, DecodeMatchesReferenceNemotronShape)
 {
-    MoeFixture fixture(kNemotron, 2, 21);
+    MoeFixture fixture(kNemotron, 1, 21);
     runOnce(fixture, moe::Backend::kAuto, nullptr);
-    fixture.expectMatchesReference("decode auto T=2 nemotron");
+    fixture.expectMatchesReference("decode auto T=1 nemotron");
 }
 
 TEST_F(Nvfp4A16BlackwellMoeRunnerTest, PrefillMatchesReferenceNemotronShape)
@@ -555,7 +557,13 @@ TEST(Nvfp4A16BlackwellMoeRunnerShapeTest, RejectsUnsupportedShapesAndDtypes)
     if (baseline)
     {
         EXPECT_GT(Nvfp4A16BlackwellMoeRunner::getWorkspaceSize(p), 0U);
-        EXPECT_EQ(Nvfp4A16BlackwellMoeRunner::numGpuOps(p), 3); // FC1, FC2, FC2 split-K reduce
+        // routing, FC1, FC2, FC2 split-K reduce, plus the FC1 reduce when the FC1
+        // split-K is > 1; the runner honours the benchmark-only override
+        // EDGELLM_MOE_DECODE_FC1_SPLITK, so pin the sealed value only when it is unset.
+        if (std::getenv("EDGELLM_MOE_DECODE_FC1_SPLITK") == nullptr)
+        {
+            EXPECT_EQ(Nvfp4A16BlackwellMoeRunner::numGpuOps(p), 4 + (moe::kDecodeFc1SplitK > 1 ? 1 : 0));
+        }
         Nvfp4A16BlackwellMoeParams prefill = p;
         prefill.numTokens = moe::kDecodeMaxTokens + 1;
         EXPECT_EQ(Nvfp4A16BlackwellMoeRunner::numGpuOps(prefill), 5); // routing, layout, gather, FC1, FC2

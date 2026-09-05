@@ -32,8 +32,10 @@
 //! how the engine runs decode; the eager host cost per enqueue is reported
 //! alongside (``host`` columns) because it bounds eager prefill at small T.
 //! EDGELLM_MOE_BENCH_BACKEND=1|2 forces the Blackwell plugin's decode/grouped
-//! path and EDGELLM_MOE_FORCE_TILE=8|16|32|64|128 (read by the runner) forces the
-//! grouped GEMM token tile, the two knobs used to seal the dispatch policy.
+//! path, EDGELLM_MOE_FORCE_TILE=8|16|32|64|128 (read by the runner) forces the
+//! grouped GEMM token tile and EDGELLM_MOE_DECODE_FC1_SPLITK=1|2|4|8 (read by
+//! the runner; the workspace is sized for the largest value) forces the decode
+//! FC1 split-K: the three knobs used to seal the dispatch policy.
 //! The gate fails when Blackwell exceeds EDGELLM_MOE_BENCH_MAX_RATIO (default
 //! 1.05) times Marlin at any point. Sealed state (2026-09-05, cold L2): every
 //! point is at or below Marlin except skewed T=64 (1.02x) and uniform T=128
