@@ -1,0 +1,82 @@
+# `nvfp4_a16_blackwell_moe` — Thor (SM110) grouped W4A16 MoE GEMM
+
+Prefill kernels of `Nvfp4A16BlackwellMoePlugin` (issue #944): a tcgen05
+`kind::f16` mixed-input grouped GEMM for NVFP4 routed-expert weights with
+FP16 activations, sharing the SM110 mainloop of `nvfp4_a16_blackwell_gemm`
+(weights are the A/M operand, K-major, dequantized straight into TMEM; tokens
+are the B/N operand).
+
+## Weight layout (`BLACKWELL_MOE_N128_K64_V1`)
+
+One buffer per projection serves this kernel **and** the CUDA-core decode kernels
+in `cpp/kernels/moe/nvfp4A16BlackwellMoe/`:
+
+```
+qweight      int8 [E, N_pad/128, K/64, 128, 32]   64 E2M1 codes per row tile, low nibble = even k
+block_scales int8 [E, N_pad/128, K/64, 128, 4]    raw E4M3, one per 16 k
+global_scale fp32 [E]                             verbatim ModelOpt weight_scale_2
+```
+
+`tensorrt_edgellm/checkpoint/repacking.py::nvfp4_a16_blackwell_moe_offsets` is the
+executable specification; `repack_nvfp4_a16_blackwell_moe_experts` produces it as a
+pure byte permutation of the checkpoint. For Nemotron 3.5 Lightning: FC1
+`[E,15,42,128,32]` (I=1856 padded to 1920), FC2 `[E,21,29,128,32]` (K never padded).
+
+## Variants
+
+| Variant | Fusion | Token tile |
+|---|---|---|
+| `nvfp4_a16_blackwell_moe_fc1_relu2_fp16_tm128_tn{32,64,128}_tk64` | `relu(alpha*acc)^2`, TMA store to the permuted `[R_pad, N]` intermediate | 32 / 64 / 128 |
+| `nvfp4_a16_blackwell_moe_fc2_scatter_fp16_tm128_tn{32,64,128}_tk64` | `alpha * topk_weight * acc`, `red.global.v4.f16x2.add` scatter into `[T, N]` | 32 / 64 / 128 |
+
+Only FP16 is baked (the plugin rejects BF16). E, N, K, the padded row count,
+the token count and `top_k` are runtime arguments. The token tile is also the
+per-expert padding granularity of the permuted activation buffer; the runner
+selects it by token count (`nvfp4A16BlackwellMoeDispatchPolicy.h`).
+
+Grouping: `tile_group_idx[n_tile]` selects the expert as the L coordinate of the
+weight **and** block-scale TMA descriptors (one base pointer, no tensormap
+updates). Every scheduler-owning warp skips token tiles `>= num_valid_tiles[0]`,
+a device value written by the layout builder, so the host launches a
+CUDA-graph-stable conservative grid. `tile_group_idx` is staged into shared
+memory once per CTA (at most `MAX_TOKEN_TILES` = 1024 tiles per launch, enforced
+by the runner) so the TMA producer never waits on a global load between tiles.
+
+Occupancy: one persistent CTA per SM (384 threads x 168 registers fill the
+register file, and the pipeline takes the whole SMEM/TMEM budget). The
+`ctas_per_sm=2` knob of `Nvfp4A16BlackwellMoeGemmLaunch` halves the SMEM/TMEM
+budgets, but on Thor ncu still reported an occupancy limit of 1 block
+(registers and the 1 KB SMEM reserve), so the doubled persistent grid only
+queued CTAs and ran 2-13% slower; a real two-CTA variant would also need
+smaller `setmaxnreg` budgets per warp role. Left as an experiment knob. The
+host passes the SM count as `max_active_clusters`; the wrapper scales the
+persistent grid.
+
+Token tiles: tn8/16/32/64/128. The tile is also the per-expert padding
+granularity, so the runner picks small tiles when experts hold few rows
+(tn8 up to 16 tokens, tn16 up to 64, tn32 up to 256, tn64 up to 2048, tn128
+above). Extra N tiles of a hot expert re-read its weights through L2 (the
+tiles are adjacent in the persistent schedule), so DRAM bytes stay one pass
+per expert, but the re-reads cost L2 request bandwidth, which is why the
+thresholds are the best worst case over uniform and skewed routing.
+
+## Standalone oracle / micro-benchmark (on the board)
+
+```bash
+python kernelSrcs/nvfp4_a16_blackwell_moe/moe_gemm_oracle.py --tokens 128 --token_tile 32
+python kernelSrcs/nvfp4_a16_blackwell_moe/moe_gemm_oracle.py --tokens 2048 --token_tile 64 --bench --iters 30
+```
+
+Needs `numpy`, `cupy` and `nvidia-cutlass-dsl` (no torch). The oracle builds the
+routing, the permuted tile-padded activations and an fp32 NumPy reference from the
+dequantized weights and checks both fusions (`ORACLE PASS`).
+
+## Export
+
+```bash
+python kernelSrcs/build_cutedsl.py --kernels nvfp4_a16_blackwell_moe --gpu_arch sm_110 --arch aarch64
+```
+
+`cmake/CuteDsl.cmake` fails the configure when any of the six variants is
+missing from the artifact; the runner is compiled only when
+`CUTE_DSL_NVFP4_A16_BLACKWELL_MOE_ENABLED` is set.

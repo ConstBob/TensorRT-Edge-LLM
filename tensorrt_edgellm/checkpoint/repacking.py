@@ -41,6 +41,10 @@ __all__ = [
     "decode_modelopt_nvfp4",
     "unpack_nvfp4_codes",
     "repack_nvfp4_a16_blackwell_linear",
+    "NVFP4_A16_BLACKWELL_MOE_TILE_N",
+    "NVFP4_A16_BLACKWELL_MOE_TILE_K",
+    "nvfp4_a16_blackwell_moe_offsets",
+    "repack_nvfp4_a16_blackwell_moe_experts",
     "repack_nvfp4_a16_marlin_linear",
     "repack_nvfp4_a16_marlin_moe_experts",
     "repack_nvfp4_a16_marlin_gated_moe_experts",
@@ -1220,6 +1224,126 @@ _FP4_E2M1_POSITIVE_LEVELS = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
 # Midpoints between consecutive E2M1 levels (for searchsorted-based quantization).
 _E2M1_BOUNDS = np.array([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
                         dtype=np.float32)
+
+# ---------------------------------------------------------------------------
+# BLACKWELL_MOE_N128_K64_V1 -- Thor (SM110) routed-MoE NVFP4 W4A16 layout
+#
+# One weight buffer per projection serves both the tcgen05 grouped prefill GEMM
+# and the CUDA-core decode kernels of ``Nvfp4A16BlackwellMoePlugin`` (issue
+# #944); there is never a second copy of the MoE weights.  Per expert it is the
+# dense ``BLACKWELL_N128_K64_V1`` tile layout produced by
+# :func:`repack_nvfp4_a16_blackwell_linear`; the expert index is a leading mode
+# so one TMA descriptor with L = num_experts addresses every expert without
+# tensormap updates:
+#
+#   qweight      int8 [E, N_pad/128, K/64, 128, 32]  64 E2M1 codes per row tile,
+#                                                     low nibble = even k
+#   block_scales int8 [E, N_pad/128, K/64, 128, 4]   raw E4M3, one per 16 k
+#   global_scale fp32 [E]                            verbatim weight_scale_2
+#
+# N (output features) is zero-padded to a 128 multiple; K is never padded.  For
+# Nemotron 3.5 Lightning, FC1 [I=1856, H=2688] -> [E, 15, 42, 128, 32] and FC2
+# [H=2688, I=1856] -> [E, 21, 29, 128, 32].  The global scale is the checkpoint's
+# fp32 multiplier: unlike Marlin there is no 2**7 skip-flop factor and no fp16
+# narrowing, because the Blackwell kernels dequantize E2M1 with the exact
+# ``cvt.rn.*.e2m1x2`` instructions.
+# ---------------------------------------------------------------------------
+NVFP4_A16_BLACKWELL_MOE_TILE_N = 128
+NVFP4_A16_BLACKWELL_MOE_TILE_K = 64
+
+
+def nvfp4_a16_blackwell_moe_offsets(n: int, k: int,
+                                    num_k_tiles: int) -> Tuple[int, bool, int]:
+    """Closed-form addresses of logical weight element ``(n, k)`` in one expert plane.
+
+    Returns ``(qweight_byte, is_high_nibble, scale_byte)`` relative to the start
+    of the expert's plane; the caller adds the expert strides ``N_pad*K/2`` and
+    ``N_pad*K/16``.  This is the executable specification of
+    ``BLACKWELL_MOE_N128_K64_V1`` that the repacker, the grouped tcgen05 GEMM
+    and the decode kernels are all checked against.
+    """
+    tile_n = NVFP4_A16_BLACKWELL_MOE_TILE_N
+    tile_k = NVFP4_A16_BLACKWELL_MOE_TILE_K
+    row_tile = ((n // tile_n) * num_k_tiles +
+                (k // tile_k)) * tile_n + (n % tile_n)
+    qweight_byte = row_tile * (tile_k // 2) + (k % tile_k) // 2
+    scale_byte = (row_tile * (tile_k // _NVFP4_GROUP_SIZE) +
+                  (k % tile_k) // _NVFP4_GROUP_SIZE)
+    return qweight_byte, (k % 2) == 1, scale_byte
+
+
+def repack_nvfp4_a16_blackwell_moe_experts(
+    fc1_packed: "list",
+    fc1_scale: "list",
+    fc1_global: "list",
+    fc2_packed: "list",
+    fc2_scale: "list",
+    fc2_global: "list",
+) -> Tuple[torch.Tensor, ...]:
+    """Stack per-expert NVFP4 (W4A16) MoE weights into ``BLACKWELL_MOE_N128_K64_V1``.
+
+    Non-gated (ReLU2) contract for ``Nvfp4A16BlackwellMoePlugin``:
+
+      FC1 (up_proj):   per expert ``[I, H]``; N=I is zero-padded to a 128
+                       multiple inside the layout, K=H is not padded.
+      FC2 (down_proj): per expert ``[H, I]``; N=H must already be a 128
+                       multiple, K=I is not padded (K % 64 == 0).
+
+    Each argument is a list of the ``E`` per-expert checkpoint tensors (packed
+    codes ``[N, K/2]``, E4M3 scales ``[N, K/16]``, fp32 ``weight_scale_2``).
+    Every expert goes through :func:`repack_nvfp4_a16_blackwell_linear`, a pure
+    byte permutation, and the results are stacked so each expert plane is one
+    contiguous slab.
+
+    Returns ``(fc1_qweight [E,I_pad/128,H/64,128,32], fc1_block_scales
+    [E,I_pad/128,H/64,128,4], fc1_global [E] fp32, fc2_qweight
+    [E,H/128,I/64,128,32], fc2_block_scales [E,H/128,I/64,128,4], fc2_global [E]
+    fp32)``.
+    """
+    num_experts = len(fc1_packed)
+    if num_experts == 0:
+        raise ValueError("at least one expert is required")
+    lists = (fc1_scale, fc1_global, fc2_packed, fc2_scale, fc2_global)
+    if any(len(lst) != num_experts for lst in lists):
+        raise ValueError("per-expert weight, scale and global lists must have "
+                         f"the same length ({num_experts})")
+
+    def _stack(packed, scale, glob, name):
+        qs, ss, gs = [], [], []
+        shape0 = None
+        for e in range(num_experts):
+            q, s, g, n_logical, n_padded = repack_nvfp4_a16_blackwell_linear(
+                packed[e], scale[e], glob[e], pad_n_to=128)
+            k = q.shape[1] * NVFP4_A16_BLACKWELL_MOE_TILE_K
+            shape_e = (n_logical, n_padded, k)
+            if shape0 is None:
+                shape0 = shape_e
+            elif shape_e != shape0:
+                raise ValueError(f"{name}: expert {e} has (N, N_pad, K)="
+                                 f"{shape_e}, expected {shape0}")
+            qs.append(q)
+            ss.append(s)
+            gs.append(g)
+        return (torch.stack(qs, dim=0).contiguous(),
+                torch.stack(ss, dim=0).contiguous(),
+                torch.cat(gs, dim=0).contiguous(), shape0)
+
+    fc1_q, fc1_s, fc1_g, (fc1_n, fc1_n_pad,
+                          fc1_k) = _stack(fc1_packed, fc1_scale, fc1_global,
+                                          "fc1")
+    fc2_q, fc2_s, fc2_g, (fc2_n, fc2_n_pad,
+                          fc2_k) = _stack(fc2_packed, fc2_scale, fc2_global,
+                                          "fc2")
+    if fc2_k != fc1_n:
+        raise ValueError(f"FC2 K={fc2_k} must equal the logical FC1 N={fc1_n} "
+                         "(moe_inter_size); the layout never pads K")
+    if fc2_n != fc2_n_pad:
+        raise ValueError(f"FC2 N (hidden_size={fc2_n}) must be a multiple of "
+                         f"{NVFP4_A16_BLACKWELL_MOE_TILE_N}")
+    if fc1_k % NVFP4_A16_BLACKWELL_MOE_TILE_N != 0:
+        raise ValueError(f"FC1 K (hidden_size={fc1_k}) must be a multiple of "
+                         f"{NVFP4_A16_BLACKWELL_MOE_TILE_N}")
+    return fc1_q, fc1_s, fc1_g, fc2_q, fc2_s, fc2_g
 
 
 def decode_modelopt_nvfp4(
