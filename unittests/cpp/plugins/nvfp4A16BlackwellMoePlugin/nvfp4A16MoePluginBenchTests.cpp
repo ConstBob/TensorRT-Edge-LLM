@@ -35,10 +35,11 @@
 //! path and EDGELLM_MOE_FORCE_TILE=8|16|32|64|128 (read by the runner) forces the
 //! grouped GEMM token tile, the two knobs used to seal the dispatch policy.
 //! The gate fails when Blackwell exceeds EDGELLM_MOE_BENCH_MAX_RATIO (default
-//! 1.10) times Marlin at any point. Sealed state (2026-09-05, cold L2): T=1 and
-//! T>=128 (skewed) / T>=256 (uniform) win; T=2..128 trails Marlin by 1-7%
-//! (worst: uniform T=128 1.053, skewed T=64 1.068; see the dispatch policy
-//! header). Set the ratio to 1.0 to insist on a strict win. The Thor gate of issue #944 is:
+//! 1.05) times Marlin at any point. Sealed state (2026-09-05, cold L2): every
+//! point is at or below Marlin except skewed T=64 (1.02x) and uniform T=128
+//! (1.00x); see the dispatch policy header. Warm-L2 runs (cold=0) trip the gate
+//! at T=1 only because Marlin's 34 MB working set partly survives in the 32 MB
+//! L2 when one layer is replayed back to back, which real decode never sees. The Thor gate of issue #944 is:
 //! Blackwell median <= Marlin median at every token count.
 
 #include "testPluginLoader.h"
@@ -363,7 +364,7 @@ TEST(Nvfp4A16MoePluginBench, MarlinVsBlackwellThor)
     int32_t const warmup = envInt("EDGELLM_MOE_BENCH_WARMUP", 20);
     bool const cold = envInt("EDGELLM_MOE_BENCH_COLD", 0) != 0;
     bool const useGraph = envInt("EDGELLM_MOE_BENCH_GRAPH", 1) != 0;
-    float maxRatio = 1.10F;
+    float maxRatio = 1.05F;
     if (char const* r = std::getenv("EDGELLM_MOE_BENCH_MAX_RATIO"))
     {
         maxRatio = std::strtof(r, nullptr);

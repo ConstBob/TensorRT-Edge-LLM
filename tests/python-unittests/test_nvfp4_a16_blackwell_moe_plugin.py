@@ -281,7 +281,7 @@ def _execute_case(case: MoeCase) -> None:
         name: tensor.to("cuda").contiguous()
         for name, tensor in fixture.packed_inputs.items()
     }
-    # S=1 -> decode kernels, S=9 (tn8) and S=64 (tn16) -> grouped tcgen05 GEMM.
+    # S=1 -> decode kernels, S=9 (tn8) and S=64 (tn32) -> grouped tcgen05 GEMM.
     for sequence_length in (1, 9, _MAX_SEQUENCE_LENGTH):
         generator = torch.Generator().manual_seed(40000 + sequence_length)
         hidden_states = torch.randn(

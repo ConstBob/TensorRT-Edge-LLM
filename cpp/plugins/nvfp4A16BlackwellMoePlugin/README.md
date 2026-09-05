@@ -16,7 +16,7 @@ weight layouts and distinct ONNX identities: an engine never carries both.
 | `routing_mode` | 1 (sigmoid group top-k); `n_group`, `topk_group`, `norm_topk_prob`, `routed_scaling_factor` as in `Nvfp4A16MoePlugin` |
 | `num_experts` / `top_k` | {128, 256, 512} / 1..32 |
 | `moe_inter_size` | logical I, `I % 64 == 0`; FC1 N is padded to 128 inside the layout |
-| weights | `fc{1,2}_qweights` int8 `[E, N/128, K/64, 128, 32]`, `fc{1,2}_block_scales` int8 `[E, N/128, K/64, 128, 4]`, `fc{1,2}_global_scales` fp32 `[E]` (`BLACKWELL_MOE_N128_K64_V1`) |
+| weights | `fc{1,2}_qweights` int8 `[E, N/128, K/64, 128, 32]`, `fc{1,2}_block_scales` int8 `[E, N/128, K/64, 128, 4]`, `fc{1,2}_global_scales` fp32 `[E]` (`BLACKWELL_MOE_N128_K64_V1`; each 32-byte code row carries the TMA 32B swizzle image: rows 4-7 of every 8 swap their 16-byte halves) |
 | `layout` | 1 (`BLACKWELL_MOE_N128_K64_V1`) |
 | `backend` | 0 auto, 1 force decode kernels, 2 force grouped tcgen05 GEMM |
 | `max_routed_rows` | padded permuted-row capacity, 0 = resolve from the profile (`T*top_k + E*127`, rounded to 128) |
@@ -32,7 +32,7 @@ weight layouts and distinct ONNX identities: an engine never carries both.
   never read into anything that survives) + output zeroing -> FC1 grouped GEMM
   (ReLU2 fused) -> FC2 grouped GEMM (router weight + scatter-add fused): 5 GPU
   ops. Token tile (per-expert padding granularity) tn8 up to 16 tokens, tn16 up
-  to 64, tn32 up to 256, tn64 up to 2048, tn128 above. Contracts
+  to 32, tn32 up to 256, tn64 up to 2048, tn128 above. Contracts
   with `n_group > 1` fall back to the shared `moeSigmoidGroupTopk` +
   `buildLayoutGpu` pair for the first two ops.
 * Modules are loaded in `onShapeChange` (`Nvfp4A16BlackwellMoeRunner::prepare`);

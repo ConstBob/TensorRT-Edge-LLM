@@ -171,13 +171,16 @@ struct RowTileHalf
 };
 
 //! ``rowTileIndex`` addresses BLACKWELL_MOE_N128_K64_V1:
-//! ((n/128)*kBlocks + kBlock)*128 + n%128 inside the expert plane.
+//! ((n/128)*kBlocks + kBlock)*128 + n%128 inside the expert plane.  The 32 code
+//! bytes of a row carry the TMA SWIZZLE_32B image: rows with bit 2 of n%128 set
+//! store their two 16-byte halves swapped (bit 2 of rowTileIndex is that bit).
 __device__ __forceinline__ RowTileHalf loadRowTileHalf(unsigned char const* __restrict__ const qweights,
     unsigned char const* __restrict__ const blockScales, long long const rowTileIndex, int32_t const kHalf)
 {
     RowTileHalf tile{};
-    tile.codes
-        = loadGlobal128NoAllocate(qweights + rowTileIndex * kPackedBytesPerRowTile + kHalf * kPackedBytesPerThread);
+    int32_t const storedHalf = kHalf ^ static_cast<int32_t>((rowTileIndex >> 2) & 1);
+    tile.codes = loadGlobal128NoAllocate(
+        qweights + rowTileIndex * kPackedBytesPerRowTile + storedHalf * kPackedBytesPerThread);
     tile.scales = *reinterpret_cast<unsigned short const*>(blockScales + rowTileIndex * kScalesPerRowTile + kHalf * 2);
     return tile;
 }

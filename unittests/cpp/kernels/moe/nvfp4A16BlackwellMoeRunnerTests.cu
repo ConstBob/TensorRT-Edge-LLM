@@ -96,7 +96,11 @@ ExpertWeights makeExpert(int32_t const n, int32_t const nPad, int32_t const k, s
                 for (int32_t j = 0; j < 8; ++j)
                 {
                     uint8_t const codeByte = static_cast<uint8_t>(codeDist(rng));
-                    e.codes[rowTile * 32 + g * 8 + j] = codeByte;
+                    // BLACKWELL_MOE_N128_K64_V1 row bytes carry the TMA 32B swizzle:
+                    // rows with bit 2 set swap their 16-byte halves.
+                    int32_t const logicalByte = g * 8 + j;
+                    int32_t const storedByte = ((logicalByte / 16) ^ ((row >> 2) & 1)) * 16 + logicalByte % 16;
+                    e.codes[rowTile * 32 + storedByte] = codeByte;
                     int32_t const kk = kb * kTileK + g * 16 + j * 2;
                     e.dense[static_cast<size_t>(row) * k + kk] = e2m1ToFloat(codeByte & 0xFU) * e4m3ToFloat(scaleByte);
                     e.dense[static_cast<size_t>(row) * k + kk + 1]
@@ -421,7 +425,7 @@ TEST_F(Nvfp4A16BlackwellMoeRunnerTest, DecodeAutoMatchesReferenceSmallShape)
 
 TEST_F(Nvfp4A16BlackwellMoeRunnerTest, PrefillAutoMatchesReferenceSmallShape)
 {
-    // T=40 > kDecodeMaxTokens selects the grouped tcgen05 path (tn16).
+    // T=40 > kDecodeMaxTokens selects the grouped tcgen05 path (tn32).
     MoeFixture fixture(kSmall, 40, 12);
     runOnce(fixture, moe::Backend::kAuto, nullptr);
     fixture.expectMatchesReference("prefill auto T=40 small");
@@ -506,8 +510,9 @@ TEST(Nvfp4A16BlackwellMoeDispatchPolicyTest, LocksSealedPolicy)
     EXPECT_EQ(moe::selectTokenTile(2), moe::TokenTile::kTn8);
     EXPECT_EQ(moe::selectTokenTile(16), moe::TokenTile::kTn8);
     EXPECT_EQ(moe::selectTokenTile(17), moe::TokenTile::kTn16);
-    EXPECT_EQ(moe::selectTokenTile(64), moe::TokenTile::kTn16);
-    EXPECT_EQ(moe::selectTokenTile(65), moe::TokenTile::kTn32);
+    EXPECT_EQ(moe::selectTokenTile(32), moe::TokenTile::kTn16);
+    EXPECT_EQ(moe::selectTokenTile(33), moe::TokenTile::kTn32);
+    EXPECT_EQ(moe::selectTokenTile(64), moe::TokenTile::kTn32);
     EXPECT_EQ(moe::selectTokenTile(256), moe::TokenTile::kTn32);
     EXPECT_EQ(moe::selectTokenTile(257), moe::TokenTile::kTn64);
     EXPECT_EQ(moe::selectTokenTile(512), moe::TokenTile::kTn64);

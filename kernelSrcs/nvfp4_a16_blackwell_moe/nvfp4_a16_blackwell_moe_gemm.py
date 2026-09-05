@@ -41,6 +41,10 @@ What is added for grouping:
       ``permuted_idx`` (FC2); rows with ``permuted_idx < 0`` are padding.
 
 Weight layout ``BLACKWELL_MOE_N128_K64_V1``: ``qweight[E, N/128, K/64, 128, 32]``
+(row bytes carry the TMA SWIZZLE_32B image, i.e. CuTe Swizzle<1,4,3>: rows with
+bit 2 of n%128 set swap their two 16-byte halves, so the producer streams each
+4 KB row tile as one TMA box of 2 x 2 KB uint64 rows instead of 128 separate
+32-byte rows)
 E2M1 codes, ``block_scales[E, N/128, K/64, 128, 4]`` raw E4M3,
 ``global_scale[E]`` fp32 -- see ``tensorrt_edgellm/checkpoint/repacking.py``.
 """
@@ -326,6 +330,20 @@ class Nvfp4A16BlackwellMoeGemm:
             self.ctas_per_sm,
         )
 
+        # Weight row tiles are streamed as (256 x 2) uint64 words (2 KB rows):
+        # the gmem layout already carries the K_SW32 smem image, so the TMA box
+        # is a linear 4 KB copy.  128 x 32-byte box rows cap at ~230 GB/s on
+        # Thor; 2 KB rows reach ~260 GB/s (tma_bw_probe.cu).
+        self.a_words_shape = (256, 2)
+        self.smem_layout_a_words_per_stage = cute.make_composed_layout(
+            cute.make_swizzle(0, 4, 3), 0,
+            cute.make_layout(self.a_words_shape, stride=(1, 256)))
+        self.smem_layout_a_words = cute.append(
+            self.smem_layout_a_words_per_stage,
+            cute.make_layout(self.num_load2trans_stage,
+                             stride=cute.cosize(
+                                 self.smem_layout_a_words_per_stage.outer)))
+
         # Align TMEM columns for allocation
         # TMEM allocation requires power-of-2 column alignment
         # and must meet minimum allocation requirements
@@ -555,6 +573,35 @@ class Nvfp4A16BlackwellMoeGemm:
                            if a.element_type is cutlass.Float32 else None),
         )
 
+        # Weight tiles as uint64 words: ((256, m_tiles), (2, k_tiles), E) so a
+        # (256, 2) TMA box is one linear 4 KB row tile with 2 KB rows.
+        a_m_tiles = cute.size(a.layout.shape[0][1])
+        a_k_tiles = cute.size(a.layout.shape[1][1])
+        a_words_per_tile = 512
+        assert cute.size_in_bytes(
+            self.a_dtype, smem_layout_a_per_stage) == a_words_per_tile * 8
+        a_words = cute.make_tensor(
+            cute.recast_ptr(a.iterator, dtype=cutlass.Uint64),
+            cute.make_layout(
+                (
+                    (256, a_m_tiles),
+                    (2, a_k_tiles),
+                    cute.size(a.layout.shape[2]),
+                ),
+                stride=(
+                    (1, a_words_per_tile * a_k_tiles),
+                    (256, a_words_per_tile),
+                    a_words_per_tile * a_k_tiles * a_m_tiles,
+                ),
+            ),
+        )
+        tma_atom_a_words, tma_tensor_a_words = cpasync.make_tiled_tma_atom(
+            a_op,
+            a_words,
+            self.smem_layout_a_words_per_stage,
+            self.a_words_shape,
+        )
+
         tma_atom_scale, tma_tensor_scale = None, None
         if cutlass.const_expr(self.scale_mode == TransformMode.ConvertScale):
             scale_n_tiles = cute.size(a_scale.layout.shape[0][1])
@@ -704,6 +751,8 @@ class Nvfp4A16BlackwellMoeGemm:
             tiled_mma,
             tma_atom_a,
             tma_tensor_a,
+            tma_atom_a_words,
+            tma_tensor_a_words,
             tma_atom_scale,
             tma_tensor_scale,
             tma_atom_b,
@@ -720,6 +769,7 @@ class Nvfp4A16BlackwellMoeGemm:
             self.smem_layout_a,
             self.smem_layout_scale,
             self.smem_layout_scale_words,
+            self.smem_layout_a_words,
             self.smem_layout_a_transform,
             self.smem_layout_b,
             self.c_smem_layout_staged,
@@ -741,6 +791,8 @@ class Nvfp4A16BlackwellMoeGemm:
         tiled_mma: cute.TiledMma,
         tma_atom_a: cute.CopyAtom,
         mA_mkl: cute.Tensor,
+        tma_atom_a_words: cute.CopyAtom,
+        mA_words: cute.Tensor,
         tma_atom_s: Optional[cute.CopyAtom],
         mS_mkl: Optional[cute.Tensor],
         tma_atom_b: cute.CopyAtom,
@@ -757,6 +809,7 @@ class Nvfp4A16BlackwellMoeGemm:
         a_smem_layout: cute.ComposedLayout,
         scale_smem_layout: cute.ComposedLayout,
         scale_smem_layout_words: cute.ComposedLayout,
+        a_smem_layout_words: cute.ComposedLayout,
         a_smem_layout_transform: cute.ComposedLayout,
         b_smem_layout: cute.ComposedLayout,
         c_smem_layout_staged: cute.ComposedLayout,
@@ -772,6 +825,7 @@ class Nvfp4A16BlackwellMoeGemm:
         # Prefetch TMA descriptors
         if warp_idx == self.epilog_warp_id[0]:
             cpasync.prefetch_descriptor(tma_atom_a)
+            cpasync.prefetch_descriptor(tma_atom_a_words)
             cpasync.prefetch_descriptor(tma_atom_b)
             if cutlass.const_expr(
                     self.scale_mode == TransformMode.ConvertScale):
@@ -926,13 +980,11 @@ class Nvfp4A16BlackwellMoeGemm:
         ) if self.scale_mode is TransformMode.ConvertScale else None)
         sB_input = storage.smem_B.get_tensor(b_smem_layout.outer,
                                              swizzle=b_smem_layout.inner)
-        sA_transform = None
-        # Get smem tensor for transformed A when transform_a_source is SMEM
-        if cutlass.const_expr(
-                self.transform_a_source == tcgen05.OperandSource.SMEM):
-            sA_transform = storage.smem_A_transform.get_tensor(
-                a_smem_layout_transform.outer,
-                swizzle=a_smem_layout_transform.inner)
+        # uint64 word view of the A stage ring for the (256, 2) TMA boxes.
+        sA_words = cute.make_tensor(
+            cute.recast_ptr(storage.smem_A.data_ptr(), dtype=cutlass.Uint64),
+            a_smem_layout_words,
+        )
 
         # Compute multicast mask for A/B buffer full
         a_full_mcast_mask = None
@@ -952,6 +1004,9 @@ class Nvfp4A16BlackwellMoeGemm:
         gA_mkl = cute.local_tile(mA_mkl,
                                  cute.slice_(self.mma_tiler, (None, 0, None)),
                                  (None, None, None))
+        # (256 words, 2, loopM, loopK, loopL)
+        gA_words = cute.local_tile(mA_words, self.a_words_shape,
+                                   (None, None, None))
         # (scale-row, 1, loopM, loopK, loopL)
         gS_mkl = (cute.local_tile(
             mS_mkl,
@@ -1005,6 +1060,15 @@ class Nvfp4A16BlackwellMoeGemm:
             a_cta_layout,
             cute.group_modes(sA_input, 0, 3),
             cute.group_modes(tCgA, 0, 3),
+        )
+
+        # ((atom_v, rest_v), STAGE), ((atom_v, rest_v), loopM, loopK, loopL)
+        tAsA_w, tAgA_w = cpasync.tma_partition(
+            tma_atom_a_words,
+            block_in_cluster_coord_vmnk[2],
+            a_cta_layout,
+            cute.group_modes(sA_words, 0, 2),
+            cute.group_modes(gA_words, 0, 2),
         )
 
         tCsS = None
@@ -1089,8 +1153,8 @@ class Nvfp4A16BlackwellMoeGemm:
                         cur_tile_coord[2],
                     )
                     expert_idx = cutlass.Int32(sTileExpert[cur_tile_coord[1]])
-                    tAgA_slice = tAgA[(None, mma_tile_coord_mnl[0], None,
-                                       expert_idx)]
+                    tAgA_w_slice = tAgA_w[(None, mma_tile_coord_mnl[0], None,
+                                           expert_idx)]
                     tBgB_slice = tBgB[(None, mma_tile_coord_mnl[1], None, 0)]
 
                     a_load2trans_producer_state.reset_count()
@@ -1106,12 +1170,12 @@ class Nvfp4A16BlackwellMoeGemm:
                             peek_load2trans_empty_status)
                         b_load2mma_pipeline.producer_acquire(
                             b_load2mma_producer_state)
-                        # TMA load A/B
+                        # TMA load A (one linear 4 KB row tile as 2 x 2 KB rows) and B
                         cute.copy(
-                            tma_atom_a,
-                            tAgA_slice[(None,
-                                        a_load2trans_producer_state.count)],
-                            tAsA[(None, a_load2trans_producer_state.index)],
+                            tma_atom_a_words,
+                            tAgA_w_slice[(None,
+                                          a_load2trans_producer_state.count)],
+                            tAsA_w[(None, a_load2trans_producer_state.index)],
                             tma_bar_ptr=a_load2trans_pipeline.
                             producer_get_barrier(a_load2trans_producer_state),
                             mcast_mask=a_full_mcast_mask,

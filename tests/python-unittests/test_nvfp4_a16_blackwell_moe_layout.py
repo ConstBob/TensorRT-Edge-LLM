@@ -40,7 +40,7 @@ from tensorrt_edgellm.checkpoint.repacking import (  # noqa: E402
     NVFP4_A16_BLACKWELL_MOE_TILE_K, NVFP4_A16_BLACKWELL_MOE_TILE_N,
     decode_modelopt_nvfp4, nvfp4_a16_blackwell_moe_offsets,
     repack_nvfp4_a16_blackwell_linear, repack_nvfp4_a16_blackwell_moe_experts,
-    unpack_nvfp4_codes)
+    swizzle_nvfp4_a16_blackwell_moe_row_tiles, unpack_nvfp4_codes)
 
 _TILE_N = NVFP4_A16_BLACKWELL_MOE_TILE_N
 _TILE_K = NVFP4_A16_BLACKWELL_MOE_TILE_K
@@ -76,11 +76,21 @@ def _sample_coords(n: int, k: int):
     return coords
 
 
+def _unswizzle_rows(qweights: torch.Tensor) -> torch.Tensor:
+    """Undo the TMA SWIZZLE_32B image (rows 4-7 of every 8 swap 16-byte halves)."""
+    t = qweights.reshape(*qweights.shape[:-2], 16, 8, 2, 16)
+    out = t.clone()
+    out[..., 4:8, 0, :] = t[..., 4:8, 1, :]
+    out[..., 4:8, 1, :] = t[..., 4:8, 0, :]
+    return out.reshape(qweights.shape)
+
+
 def _unrepack(qweights: torch.Tensor, block_scales: torch.Tensor):
     """Inverse tile permutation: layout -> ``[N_pad, K/2]`` codes, ``[N_pad, K/16]`` scales."""
     n_tiles, k_tiles = qweights.shape[0], qweights.shape[1]
-    packed = (qweights.view(torch.uint8).permute(0, 2, 1, 3).reshape(
-        n_tiles * _TILE_N, k_tiles * (_TILE_K // 2)).contiguous())
+    packed = (_unswizzle_rows(qweights.view(torch.uint8)).permute(
+        0, 2, 1, 3).reshape(n_tiles * _TILE_N,
+                            k_tiles * (_TILE_K // 2)).contiguous())
     scales = (block_scales.permute(0, 2, 1, 3).reshape(
         n_tiles * _TILE_N, k_tiles * (_TILE_K // _GROUP)).contiguous())
     return packed, scales
@@ -93,6 +103,8 @@ def test_offsets_match_repack(shape):
     packed, scales, ws2 = _random_expert(n, k, seed=1)
     q, s, g, n_logical, n_padded = repack_nvfp4_a16_blackwell_linear(
         packed, scales, ws2, pad_n_to=_TILE_N)
+    q = swizzle_nvfp4_a16_blackwell_moe_row_tiles(
+        q)  # MoE layout = dense tiles + SW32 image
     assert n_logical == n
     assert n_padded == ((n + _TILE_N - 1) // _TILE_N) * _TILE_N
     assert tuple(q.shape) == (n_padded // _TILE_N, k // _TILE_K, _TILE_N,
@@ -123,6 +135,11 @@ def test_roundtrip_dequant_is_bit_exact(shape):
                                                              scales,
                                                              ws2,
                                                              pad_n_to=_TILE_N)
+    q = swizzle_nvfp4_a16_blackwell_moe_row_tiles(q)
+    # The swizzle is an involution and a pure permutation of each 4 KB tile.
+    assert torch.equal(
+        swizzle_nvfp4_a16_blackwell_moe_row_tiles(
+            swizzle_nvfp4_a16_blackwell_moe_row_tiles(q)), q)
     packed_rt, scales_rt = _unrepack(q, s)
     assert torch.equal(packed_rt[:n], packed)
     assert torch.equal(scales_rt[:n], scales)
@@ -188,16 +205,19 @@ def test_experts_stack_nemotron_shapes():
         fc2_g.shape) == (num_experts, ) and fc2_g.dtype == torch.float32
     for t in (fc1_q, fc1_s, fc2_q, fc2_s, fc1_g, fc2_g):
         assert t.is_contiguous()
-    # Each expert plane equals the standalone dense repack of that expert.
+    # Each expert plane equals the standalone dense repack of that expert plus
+    # the SW32 row-byte image (the MoE layout's only difference).
     for e in range(num_experts):
         q, s, g, _, _ = repack_nvfp4_a16_blackwell_linear(*fc1[e],
                                                           pad_n_to=_TILE_N)
-        assert torch.equal(fc1_q[e], q)
+        assert torch.equal(fc1_q[e],
+                           swizzle_nvfp4_a16_blackwell_moe_row_tiles(q))
         assert torch.equal(fc1_s[e], s)
         assert fc1_g[e].item() == g.item() == fc1[e][2].item()
         q, s, g, _, _ = repack_nvfp4_a16_blackwell_linear(*fc2[e],
                                                           pad_n_to=_TILE_N)
-        assert torch.equal(fc2_q[e], q)
+        assert torch.equal(fc2_q[e],
+                           swizzle_nvfp4_a16_blackwell_moe_row_tiles(q))
         assert torch.equal(fc2_s[e], s)
         assert fc2_g[e].item() == g.item() == fc2[e][2].item()
     # Expert stride in bytes is one contiguous plane: N_pad*K/2 and N_pad*K/16.

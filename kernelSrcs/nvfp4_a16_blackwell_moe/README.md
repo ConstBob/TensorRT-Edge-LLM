@@ -34,6 +34,15 @@ the token count and `top_k` are runtime arguments. The token tile is also the
 per-expert padding granularity of the permuted activation buffer; the runner
 selects it by token count (`nvfp4A16BlackwellMoeDispatchPolicy.h`).
 
+Weight bytes: every 32-byte code row inside a `[128, 32]` tile stores the TMA
+SWIZZLE_32B image (rows 4-7 of every 8 swap their 16-byte halves, measured on
+Thor with a tensor-map dump). The producer therefore streams each 4 KB row tile
+as one TMA box of 2 x 2 KB uint64 rows straight into the K_SW32 shared-memory
+image; 32-byte TMA box rows measured 230 GB/s on Thor against 258-270 GB/s for
+2 KB rows or 4 KB bulk copies
+(`tma_bw_probe.cu` and `tma_swizzle_dump.cu` next to this file are the standalone
+evidence tools). Block scales stay a 512-byte TMA transfer per tile.
+
 Grouping: `tile_group_idx[n_tile]` selects the expert as the L coordinate of the
 weight **and** block-scale TMA descriptors (one base pointer, no tensormap
 updates). Every scheduler-owning warp skips token tiles `>= num_valid_tiles[0]`,
@@ -54,7 +63,7 @@ persistent grid.
 
 Token tiles: tn8/16/32/64/128. The tile is also the per-expert padding
 granularity, so the runner picks small tiles when experts hold few rows
-(tn8 up to 16 tokens, tn16 up to 64, tn32 up to 256, tn64 up to 2048, tn128
+(tn8 up to 16 tokens, tn16 up to 32, tn32 up to 256, tn64 up to 2048, tn128
 above). Extra N tiles of a hot expert re-read its weights through L2 (the
 tiles are adjacent in the persistent schedule), so DRAM bytes stay one pass
 per expert, but the re-reads cost L2 request bandwidth, which is why the

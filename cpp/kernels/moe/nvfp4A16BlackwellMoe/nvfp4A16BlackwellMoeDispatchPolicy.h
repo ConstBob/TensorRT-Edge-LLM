@@ -63,21 +63,24 @@ inline constexpr int32_t kMaxTokenTiles{1024};
 // before every layer, flush cost subtracted), median of 7 batches of 50
 // layers, both plugins driven through the same enqueue path.
 //
-//   Layer time in us (Blackwell plugin / Marlin plugin), cold L2, graph replay:
+//   Layer time in us (Blackwell plugin / Marlin plugin), cold L2, graph replay,
+//   weights streamed as 2 KB-row TMA boxes over the pre-swizzled layout:
 //
 //   tokens | uniform routing            | skewed routing (hot experts)
-//      1   |  decode 196-206 / 212-214  |  decode 196-200 / 211-214
-//      2   |  tn8   364 / 363           |  tn8   347 / 337
-//      4   |  tn8   605 / 590           |  tn8   459 / 454
-//      8   |  tn8  1015 / 986           |  tn8   773 / 759
-//     16   |  tn8  1601 / 1574          |  tn8   887 / 879
-//     32   |  tn16 2061 / 2002          |  tn16 1065 / 1043
-//     64   |  tn16 2281 / 2236          |  tn16 1259 / 1195
-//    128   |  tn32 3100 / 2951          |  tn32 1542 / 1603
-//    256   |  tn32 3115 / 3096          |  tn32 2068 / 2258
-//    512   |  tn64 3543 / 4081          |  tn64 2419 / 3408
-//   1024   |  tn64 4102 / 6156          |  tn64 3317 / 5666
-//   2048   |  tn64 5865 / 10783         |  tn64 5396 / 10545
+//      1   |  decode  199 / 212         |  decode  197 / 209
+//      2   |  tn8     347 / 361         |  tn8     335 / 336
+//      4   |  tn8     572 / 589         |  tn8     437 / 450
+//      8   |  tn8     950 / 995         |  tn8     730 / 753
+//     16   |  tn8    1504 / 1580        |  tn8     845 / 880
+//     32   |  tn16   1954 / 2001        |  tn16   1033 / 1056
+//     64   |  tn32   2258 / 2227        |  tn32   1182 / 1203
+//    128   |  tn32   2932 / 2951        |  tn32   1483 / 1599
+//    256   |  tn32   2959 / 3092        |  tn32   2008 / 2257
+//    512   |  tn64   3614 / 4081        |  tn64   2444 / 3405
+//   1024   |  tn64   4335 / 6153        |  tn64   3448 / 5665
+//   2048   |  tn64   6244 / 10806       |  tn64   5607 / 10549
+//   (cold-mode numbers at T >= 512 vary by up to ~7% run to run in this
+//   protocol, e.g. 5810-6244 us at T=2048; warm-mode 5769 us is stable.)
 //
 //   * decode kernels win only at T=1 (cold L2, the 23-layer reality): every
 //     routed row is its own CUDA-core GEMV, so from T=2 tokens sharing an
@@ -87,18 +90,20 @@ inline constexpr int32_t kMaxTokenTiles{1024};
 //     granularity: small tiles remove the pad rows FC1 streams and writes
 //     (tn8 vs tn32 at T=16: -8 MB DRAM, -7% FC1 time) but a hot expert with
 //     more rows than the tile is re-streamed once per extra N tile (through
-//     L2, yet the 32-byte TMA requests make that costly: tn8 at skewed T=64
-//     was 1.25x Marlin). Thresholds are the best worst-case over both
-//     routings from the tile sweep (EDGELLM_MOE_FORCE_TILE):
-//       T=32:  tn8 1.01/1.05, tn16 1.03/1.02, tn32 1.07/1.05 (uniform/skewed vs Marlin)
-//       T=64:  tn8 1.02/1.25, tn16 1.02/1.05, tn32 1.06/1.03
-//       T=128: tn16 1.02/1.10, tn32 1.05/0.96, tn64 1.12/0.99
-//       T=256: tn16 1.07/1.20, tn32 1.01/0.92, tn64 1.07/0.85
-//       T=512: tn32 0.90/0.85, tn64 0.87/0.71
-//   * residual: T=2..128 trails Marlin by 1-5% on uniform routing (weights
-//     stream at ~230 GB/s vs Marlin's ~243 GB/s; the A/scale TMA boxes are
-//     32-byte rows, 1.1 L2 sectors per request versus Marlin's 128-byte
-//     cp.async lines). Tracked as the follow-up of issue #944.
+//     L2). Thresholds are the best worst-case over both routings from the
+//     tile sweep (EDGELLM_MOE_FORCE_TILE) on the 2 KB-row build:
+//       T=32:  tn8 0.96/1.01, tn16 0.97/0.97, tn32 1.01/1.00 (uniform/skewed vs Marlin)
+//       T=64:  tn8 0.98/1.21, tn16 0.97/1.03, tn32 1.01/0.98, tn64 1.09/1.06
+//       T=128: tn16 0.97/1.05, tn32 0.99/0.92, tn64 1.08/0.96
+//       T=256: tn16 1.03/1.17, tn32 0.95/0.89, tn64 1.03/0.83
+//   * weight streaming: the A operand is fetched as one (256 x 2) uint64 TMA
+//     box per 4 KB row tile (the layout carries the K_SW32 smem image). With
+//     the original 128 x 32-byte box rows the GEMM streamed ~230 GB/s against
+//     Marlin's ~243 GB/s and trailed it by 1-7% at T=2..128; Thor caps
+//     32-byte TMA rows at ~230 GB/s regardless of in-flight depth while 64 B+
+//     rows reach 258-270 GB/s (kernelSrcs/nvfp4_a16_blackwell_moe/tma_bw_probe.cu).
+//     Residual after the change: uniform T=64 1.01x (tn32; tn16 would trade it
+//     for skewed 1.03x), everything else at or below Marlin.
 // Values are policy hints, not support gates; the runner validates shapes
 // independently.
 // ---------------------------------------------------------------------------
@@ -124,7 +129,7 @@ constexpr TokenTile selectTokenTile(int32_t const numTokens) noexcept
     {
         return TokenTile::kTn8;
     }
-    if (numTokens <= 64)
+    if (numTokens <= 32)
     {
         return TokenTile::kTn16;
     }

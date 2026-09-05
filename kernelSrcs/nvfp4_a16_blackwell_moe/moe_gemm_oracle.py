@@ -101,6 +101,10 @@ def repack_blackwell(packed: np.ndarray, scales: np.ndarray):
     q = np.ascontiguousarray(
         wp.reshape(n_pad // _TILE_N, _TILE_N, k // _TILE_K,
                    _TILE_K // 2).transpose(0, 2, 1, 3))
+    # TMA SWIZZLE_32B image: rows 4-7 of every 8 swap their 16-byte halves.
+    t = q.reshape(n_pad // _TILE_N, k // _TILE_K, 16, 8, 2, 16).copy()
+    t[:, :, :, 4:8, :, :] = t[:, :, :, 4:8, ::-1, :]
+    q = np.ascontiguousarray(t.reshape(q.shape))
     s = np.ascontiguousarray(
         ws.reshape(n_pad // _TILE_N, _TILE_N, k // _TILE_K,
                    _TILE_K // _GROUP).transpose(0, 2, 1, 3))

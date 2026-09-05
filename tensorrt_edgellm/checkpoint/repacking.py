@@ -45,6 +45,7 @@ __all__ = [
     "NVFP4_A16_BLACKWELL_MOE_TILE_K",
     "nvfp4_a16_blackwell_moe_offsets",
     "repack_nvfp4_a16_blackwell_moe_experts",
+    "swizzle_nvfp4_a16_blackwell_moe_row_tiles",
     "repack_nvfp4_a16_marlin_linear",
     "repack_nvfp4_a16_marlin_moe_experts",
     "repack_nvfp4_a16_marlin_gated_moe_experts",
@@ -1266,10 +1267,37 @@ def nvfp4_a16_blackwell_moe_offsets(n: int, k: int,
     tile_k = NVFP4_A16_BLACKWELL_MOE_TILE_K
     row_tile = ((n // tile_n) * num_k_tiles +
                 (k // tile_k)) * tile_n + (n % tile_n)
-    qweight_byte = row_tile * (tile_k // 2) + (k % tile_k) // 2
+    # Row bytes carry the TMA SWIZZLE_32B image (CuTe Swizzle<1,4,3>): rows
+    # with bit 2 of their in-tile index set swap their two 16-byte halves, so
+    # a 4 KB row tile is one linear TMA box (2 x 2 KB rows) into the kernel's
+    # swizzled SMEM image.
+    byte_in_row = (k % tile_k) // 2
+    half = (byte_in_row // 16) ^ (((n % tile_n) >> 2) & 1)
+    qweight_byte = row_tile * (tile_k // 2) + half * 16 + byte_in_row % 16
     scale_byte = (row_tile * (tile_k // _NVFP4_GROUP_SIZE) +
                   (k % tile_k) // _NVFP4_GROUP_SIZE)
     return qweight_byte, (k % 2) == 1, scale_byte
+
+
+def swizzle_nvfp4_a16_blackwell_moe_row_tiles(
+        qweights: torch.Tensor) -> torch.Tensor:
+    """Bake the TMA SWIZZLE_32B image into ``[..., 128, 32]`` int8 row tiles.
+
+    Rows whose in-tile index has bit 2 set (rows 4-7 of every 8) swap their
+    two 16-byte halves; everything else is untouched.  This is exactly what
+    ``cp.async.bulk.tensor`` with ``CU_TENSOR_MAP_SWIZZLE_32B`` writes into
+    shared memory, measured on Thor, so the grouped GEMM can stream each 4 KB
+    row tile as one linear TMA box with 2 KB rows instead of 128 separate
+    32-byte rows (230 vs 260 GB/s on Thor).
+    """
+    if qweights.shape[-2:] != (NVFP4_A16_BLACKWELL_MOE_TILE_N,
+                               NVFP4_A16_BLACKWELL_MOE_TILE_K // 2):
+        raise ValueError("expected [..., 128, 32] row tiles")
+    tiles = qweights.reshape(*qweights.shape[:-2], 16, 8, 2, 16)
+    out = tiles.clone()
+    out[..., 4:8, 0, :] = tiles[..., 4:8, 1, :]
+    out[..., 4:8, 1, :] = tiles[..., 4:8, 0, :]
+    return out.reshape(qweights.shape).contiguous()
 
 
 def repack_nvfp4_a16_blackwell_moe_experts(
@@ -1291,8 +1319,10 @@ def repack_nvfp4_a16_blackwell_moe_experts(
 
     Each argument is a list of the ``E`` per-expert checkpoint tensors (packed
     codes ``[N, K/2]``, E4M3 scales ``[N, K/16]``, fp32 ``weight_scale_2``).
-    Every expert goes through :func:`repack_nvfp4_a16_blackwell_linear`, a pure
-    byte permutation, and the results are stacked so each expert plane is one
+    Every expert goes through :func:`repack_nvfp4_a16_blackwell_linear` followed
+    by :func:`swizzle_nvfp4_a16_blackwell_moe_row_tiles` (both pure byte permutations; the second
+    bakes the TMA 32-byte swizzle into each row tile so the grouped GEMM can load
+    it as one linear 4 KB box), and the results are stacked so each expert plane is one
     contiguous slab.
 
     Returns ``(fc1_qweight [E,I_pad/128,H/64,128,32], fc1_block_scales
@@ -1314,6 +1344,7 @@ def repack_nvfp4_a16_blackwell_moe_experts(
         for e in range(num_experts):
             q, s, g, n_logical, n_padded = repack_nvfp4_a16_blackwell_linear(
                 packed[e], scale[e], glob[e], pad_n_to=128)
+            q = swizzle_nvfp4_a16_blackwell_moe_row_tiles(q)
             k = q.shape[1] * NVFP4_A16_BLACKWELL_MOE_TILE_K
             shape_e = (n_logical, n_padded, k)
             if shape0 is None:

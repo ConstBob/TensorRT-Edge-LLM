@@ -86,7 +86,7 @@ flowchart LR
 | FP16 activations, NVFP4 expert weights with raw E4M3 block scales and fp32
   per-expert `weight_scale_2`, no activation quantization. `Nvfp4A16BlackwellMoePlugin`
   is SM110-only; other platforms keep the Marlin-based `Nvfp4A16MoePlugin`.
-| One `BLACKWELL_MOE_N128_K64_V1` weight buffer feeds both backends. `T = 1`: fused CUDA-core FC1 (routing + dequant GEMV + ReLU2) and FC2 (per-slot
+| One `BLACKWELL_MOE_N128_K64_V1` weight buffer (row bytes pre-swizzled with the TMA 32B pattern so the grouped GEMM loads each 4 KB tile as one linear TMA box) feeds both backends. `T = 1`: fused CUDA-core FC1 (routing + dequant GEMV + ReLU2) and FC2 (per-slot
   router weight, split-K, deterministic). `T >= 2`: warp-per-token sigmoid
   top-k routing, single-CTA expert-contiguous tile layout, permuted-row gather,
   tcgen05 grouped FC1 (ReLU2 fused) and FC2 (router-weighted `red.global`
