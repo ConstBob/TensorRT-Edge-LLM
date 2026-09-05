@@ -2084,8 +2084,189 @@ _gemma4_audio_attention_plugin_schema = OpSchema(
     ],
 )
 
+# ---------------------------------------------------------------------------
+# trt_edgellm::QsaAttentionPlugin (Qwen Sparse Attention, prefill-only v1)
+# ---------------------------------------------------------------------------
+
+_qsa_attention_plugin_schema = OpSchema(
+    name="QsaAttentionPlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc="Qwen Sparse Attention (QSA) plugin, prefill-only v1. A weight-free "
+    "block-compressed indexer selects the top-`indexer_budget` KV blocks of "
+    "`indexer_compress_ratio` tokens per query token, and a sparse GQA "
+    "attention attends only the listed tokens (no causal mask in the kernel; "
+    "causality lives in the token list). The plugin internally splits the "
+    "packed qkv, applies the per-head Gemma qk-norm + partial RoPE (rotary "
+    "dim 64), and writes the paged KV cache. All 11 inputs are required.",
+    inputs=[
+        OpSchema.FormalParameter(
+            name="qkv",
+            description=
+            "Packed QKV tensor [B, S, (H_q + 2*H_kv) * D] (concat on last "
+            "dim of separate Q/K/V projections)",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="index_qk",
+            description=
+            "Packed indexer q/k projections [B, S, (indexer_n_heads + 1) * "
+            "indexer_head_dim] (index_qk_proj GEMM output; q heads first, "
+            "then the single shared k)",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="past_key_value",
+            description=
+            "Paged KV cache pool [2, num_pages, KV_PAGE_SIZE, H_kv, D]",
+            type_str="T_KV",
+        ),
+        OpSchema.FormalParameter(
+            name="context_lengths",
+            description="Per-request valid token counts [B]",
+            type_str="tensor(int32)",
+        ),
+        OpSchema.FormalParameter(
+            name="rope_rotary_cos_sin",
+            description=
+            "Shared RoPE table [rope_batch, max_pos, 64] (FP32; cos in "
+            "[0:32], sin in [32:64]); consumed by both the main partial "
+            "rope-64 and the indexer rope",
+            type_str="tensor(float)",
+        ),
+        OpSchema.FormalParameter(
+            name="kvcache_start_index",
+            description=
+            "KV cache start index tensor [kv_batch]; runtime shape [0] is "
+            "the prefill sentinel (the only mode supported by v1)",
+            type_str="tensor(int32)",
+        ),
+        OpSchema.FormalParameter(
+            name="kv_page_table",
+            description=
+            "Per-request page table of shape [batch, 2, max_pages_per_seq]",
+            type_str="tensor(int32)",
+        ),
+        OpSchema.FormalParameter(
+            name="q_norm_gamma",
+            description=
+            "Main-path per-head RMSNorm gamma for Q (FP16, 1-D, length == "
+            "head_size), PRE-FOLDED as (1 + w) by the exporter. Fed as a "
+            "Constant initializer so TRT bakes it into the engine.",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="k_norm_gamma",
+            description=
+            "Main-path per-head RMSNorm gamma for K (FP16, 1-D, length == "
+            "head_size), PRE-FOLDED as (1 + w). Same conventions as "
+            "q_norm_gamma.",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="indexer_q_norm_gamma",
+            description="Indexer Gemma-norm gamma for q (FP16, 1-D, length == "
+            "indexer_head_dim), RAW w — the CUDA indexer kernel computes "
+            "(1 + w) internally.",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="indexer_k_norm_gamma",
+            description=
+            "Indexer Gemma-norm gamma for the compressed k (FP16, 1-D, "
+            "length == indexer_head_dim), RAW w — the CUDA indexer kernel "
+            "computes (1 + w) internally.",
+            type_str="T",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="attn_output",
+            description="Attention output [B, S, H_q, D]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="present_key_value",
+            description=
+            "Updated KV cache pool (aliased in-place to past_key_value)",
+            type_str="T_KV",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T",
+            ["tensor(float16)"],
+            "Packed QKV / indexer / gamma data type.",
+        ),
+        (
+            "T_KV",
+            ["tensor(float16)"],
+            "KV cache data type.",
+        ),
+    ],
+    attributes=[
+        OpSchema.Attribute(
+            name="num_q_heads",
+            type=OpSchema.AttrType.INT,
+            description="Number of query heads",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="num_kv_heads",
+            type=OpSchema.AttrType.INT,
+            description="Number of key-value heads",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="head_size",
+            type=OpSchema.AttrType.INT,
+            description="Size of each attention head",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="indexer_n_heads",
+            type=OpSchema.AttrType.INT,
+            description="Number of indexer query heads",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="indexer_head_dim",
+            type=OpSchema.AttrType.INT,
+            description="Indexer head dimension",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="indexer_budget",
+            type=OpSchema.AttrType.INT,
+            description="Top-k compressed blocks selected per query token",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="indexer_compress_ratio",
+            type=OpSchema.AttrType.INT,
+            description="Tokens per compressed indexer block",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="attention_scale",
+            type=OpSchema.AttrType.FLOAT,
+            description="Absolute multiplier applied to QK^T before softmax "
+            "(0.0 selects the default 1/sqrt(head_size)).",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="rms_norm_eps",
+            type=OpSchema.AttrType.FLOAT,
+            description=
+            "Epsilon for the main-path and indexer Gemma RMSNorm formulas.",
+            required=True,
+        ),
+    ],
+)
+
 _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _attention_plugin_schema,
+    _qsa_attention_plugin_schema,
     _vit_attention_plugin_schema,
     _trt_fp4_dynamic_quantize_schema,
     _trt_dequantize_linear_schema,

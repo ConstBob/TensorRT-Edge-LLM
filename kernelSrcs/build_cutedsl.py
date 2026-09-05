@@ -98,7 +98,7 @@ class KernelVariant:
 
     Attributes:
         name:          Unique identifier — used as --file_name / --function_prefix.
-        group:         Logical group ("gdn", "fmha", "f16_moe",
+        group:         Logical group ("gdn", "fmha", "qsa", "f16_moe",
                        "layernorm", "nvfp4_fused_moe", "nvfp4_moe",
                        "rmsnorm", "ssd", "nvfp4_a16_blackwell_gemm", or
                        "gemm").
@@ -135,6 +135,9 @@ class KernelVariant:
 #   gdn              — Gated Delta Net decode/prefill
 #   fmha             — FP16 Context/ViT FMHA, plus optimized Blackwell
 #                      persistent variants on SM100/101/110.
+#   qsa              — Qwen Sparse Attention (QSA) sparse-GQA prefill:
+#                      per-query top-k token-index gather attention
+#                      (Qwen3.8-Flash-Next).
 #   ssd              — Mamba2 SSM chunk-scan prefill
 #   gemm             — Talker MLP cuBLAS replacement (Ampere/Blackwell/BW GeForce)
 #   f16_moe          — FP16 grouped FC1/FC2 MoE (Ampere/Blackwell/SM12x)
@@ -938,6 +941,33 @@ KERNEL_VARIANTS = [
             "--dtype", "Float16", "--is_causal", "--fmha_v2_context", "--vision_block",
             "--window_size_left", "4096", "--num_head", "16", "--kv_group_size", "16",
             "--skip_rescale", "--export_only",
+        ],
+    ),
+    # --- QSA sparse-GQA group (Qwen3.8-Flash-Next prefill) ---
+    # One CTA per (query token, kv head); the M tile is the GQA head group
+    # and the KV traversal is a per-row cp.async gather over the indexer's
+    # top-k token-index list.  B/S/H_q/H_kv/topk stay runtime-dynamic; only
+    # head_dim and the (Br, Bc, threads) tuning are baked.
+    KernelVariant(
+        name="qsa_sparse_d256_fp16",
+        group="qsa",
+        supported_sms=[100, 101, 110],
+        script="qsa_cutedsl/qsa_sparse_gqa.py",
+        script_args=[
+            "--head_dim", "256",
+            "--m_block_size", "16", "--n_block_size", "16", "--num_threads", "32",
+            "--dtype", "Float16", "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="qsa_sparse_d256_bf16",
+        group="qsa",
+        supported_sms=[100, 101, 110],
+        script="qsa_cutedsl/qsa_sparse_gqa.py",
+        script_args=[
+            "--head_dim", "256",
+            "--m_block_size", "16", "--n_block_size", "16", "--num_threads", "32",
+            "--dtype", "BFloat16", "--export_only",
         ],
     ),
     # --- NvFP4 MoE group (decomposed FC1/FC2; SM110/Thor today) ---

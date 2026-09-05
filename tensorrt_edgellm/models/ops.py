@@ -2073,3 +2073,131 @@ def gemma4_audio_attention_plugin(
 def _(q_raw, k_raw, v, gamma, rel_key, valid, seq_len_carrier, chunk_size,
       left_horizon, context_size, logit_cap):
     return torch.empty_like(q_raw)
+
+
+# ---------------------------------------------------------------------------
+# Custom op: trt::qsa_attention_plugin  (Qwen Sparse Attention, prefill)
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt::qsa_attention_plugin", mutates_args=())
+def qsa_attention_plugin(
+    qkv: torch.Tensor,
+    index_qk: torch.Tensor,
+    past_key_value: torch.Tensor,
+    context_lengths: torch.Tensor,
+    rope_rotary_cos_sin: torch.Tensor,
+    kvcache_start_index: torch.Tensor,
+    kv_page_table: torch.Tensor,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    indexer_n_heads: int,
+    indexer_head_dim: int,
+    indexer_budget: int,
+    indexer_compress_ratio: int,
+    attention_scale: float,
+    rms_norm_eps: float,
+    q_norm_gamma: List[float],
+    k_norm_gamma: List[float],
+    indexer_q_norm_gamma: List[float],
+    indexer_k_norm_gamma: List[float],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Stub for ``QsaAttentionPlugin`` (Qwen Sparse Attention, prefill-only v1).
+
+    A weight-free block-compressed indexer selects the top-``indexer_budget``
+    KV blocks (of ``indexer_compress_ratio`` tokens each) per query token, and
+    a sparse GQA attention attends only the listed tokens. Causality lives in
+    the token list: the kernel applies no causal mask.
+
+    Inputs (ALL 11 are REQUIRED — there are no optional inputs, so the export
+    post-pass never compacts this node):
+
+    +----+---------------------+-------+------------------------------------------+
+    | #  | name                | dtype | shape                                    |
+    +====+=====================+=======+==========================================+
+    | 0  | qkv                 | FP16  | [B, S, (Hq + 2*Hkv) * D] packed          |
+    | 1  | index_qk            | FP16  | [B, S, (indexer_n_heads+1)*indexer_dim]  |
+    | 2  | past_key_value      | FP16  | [2, num_pages, KV_PAGE_SIZE, Hkv, D]     |
+    | 3  | context_lengths     | INT32 | [B]                                      |
+    | 4  | rope_rotary_cos_sin | FP32  | [rope_batch, max_pos, 64] (shared table: |
+    |    |                     |       | main partial-rope-64 + indexer; layout   |
+    |    |                     |       | cos [0:32], sin [32:64])                 |
+    | 5  | kvcache_start_index | INT32 | [kv_batch]; runtime shape [0] = prefill  |
+    |    |                     |       | sentinel (any other length is rejected)  |
+    | 6  | kv_page_table       | INT32 | [B, 2, max_pages_per_seq]                |
+    | 7  | q_norm_gamma        | FP16  | [D] Constant engine weights              |
+    | 8  | k_norm_gamma        | FP16  | [D] Constant engine weights              |
+    | 9  | indexer_q_norm_gamma| FP16  | [128] Constant engine weights            |
+    | 10 | indexer_k_norm_gamma| FP16  | [128] Constant engine weights            |
+    +----+---------------------+-------+------------------------------------------+
+
+    Gamma semantics (IMPORTANT):
+
+    * ``q_norm_gamma`` / ``k_norm_gamma`` (inputs 7/8, main-path per-head
+      Gemma qk-norm) are passed **PRE-FOLDED as (1 + w)** by the caller. The
+      plugin's fused rope/qk-norm kernel computes the llama convention
+      ``normalize(x) * gamma`` directly, so the Gemma ``+1`` must be folded
+      into the weights at export time.
+    * ``indexer_q_norm_gamma`` / ``indexer_k_norm_gamma`` (inputs 9/10) are
+      passed **RAW w** — the CUDA indexer kernel computes ``(1 + w)``
+      internally in FP32.
+
+    The four gammas are ``List[float]`` stub args; the ONNX translation
+    materializes them as ``Cast(Constant(value_floats), FLOAT16)`` so TRT
+    bakes them into the engine as weights at build time.
+
+    Outputs:
+
+    * ``attn_output`` FP16 ``[B, S, Hq, D]`` — the caller reshapes to
+      ``[B, S, Hq*D]``.
+    * ``present_key_value`` FP16 — same shape as ``past_key_value`` (the paged
+      pool is aliased in-place by the TRT plugin).
+
+    All attributes are REQUIRED with no defaults: ``torch.export`` strips
+    default-matching kwargs from the FX graph, which would break the
+    positional ONNX translation (same rule as ``attention_plugin``).
+    ``attention_scale == 0.0`` selects the default ``1 / sqrt(head_size)``.
+    ``rms_norm_eps`` is used by both the main-path and indexer Gemma norms.
+    """
+    batch_size, seq_len, _ = qkv.shape
+    attn_output = torch.zeros(batch_size,
+                              seq_len,
+                              num_q_heads,
+                              head_size,
+                              dtype=qkv.dtype,
+                              device=qkv.device)
+    present_key_value = torch.zeros_like(past_key_value)
+    return attn_output, present_key_value
+
+
+@qsa_attention_plugin.register_fake
+def _(
+    qkv,
+    index_qk,
+    past_key_value,
+    context_lengths,
+    rope_rotary_cos_sin,
+    kvcache_start_index,
+    kv_page_table,
+    num_q_heads,
+    num_kv_heads,
+    head_size,
+    indexer_n_heads,
+    indexer_head_dim,
+    indexer_budget,
+    indexer_compress_ratio,
+    attention_scale,
+    rms_norm_eps,
+    q_norm_gamma,
+    k_norm_gamma,
+    indexer_q_norm_gamma,
+    indexer_k_norm_gamma,
+):
+    batch_size, seq_len, _ = qkv.shape
+    return (torch.empty(batch_size,
+                        seq_len,
+                        num_q_heads,
+                        head_size,
+                        dtype=qkv.dtype,
+                        device=qkv.device), torch.empty_like(past_key_value))

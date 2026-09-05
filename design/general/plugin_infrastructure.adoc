@@ -24,6 +24,11 @@ infrastructure and conventions.
 | Fused Q/K/V, RoPE, KV cache, and SDPA.
 | Decoder attention.
 
+| `QsaAttentionPlugin`
+| link:../concepts/components/attention/[Attention]
+| Qwen Sparse Attention (QSA) prefill: fused RoPE/qk-norm/KV write, weight-free block indexer with top-512 selection, and sparse GQA over the selected tokens.
+| Qwen3.8-Flash-Next sparse-attention decoder layers (prefill).
+
 | `ViTAttentionPlugin`
 | link:../concepts/components/attention/[Attention], link:../concepts/components/vision/[Vision]
 | Vision-transformer attention.
