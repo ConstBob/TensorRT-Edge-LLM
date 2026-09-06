@@ -51,6 +51,19 @@ public:
         return false;
     }
 
+    DecodingKvHeadroom requiredKvHeadroom() const override
+    {
+        // Every denoise step materializes a full canvas in the base KV cache, irrespective of
+        // how many positions are eventually committed. Reserve it before prefill so decode
+        // cannot overrun a capacity that was sized only for the accepted prefix.
+        return {/*.baseExtraTokens=*/mCanvasLen, /*.draftExtraTokens=*/0};
+    }
+
+    DecodingTokenStateContract tokenStateContract() const noexcept override
+    {
+        return DecodingTokenStateContract::kFullyCommitted;
+    }
+
     bool decodeStep(DecodingInferenceContext& context) override;
     bool captureCudaGraphs(cudaStream_t stream) override;
 

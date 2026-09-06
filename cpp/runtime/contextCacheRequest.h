@@ -45,7 +45,9 @@ public:
     //!         on the host.
     static std::optional<ContextCacheRequest> begin(ContextCacheCoordinator& coordinator,
         LLMGenerationRequest const& request, DecodingInferenceContext const& context, bool speculativeRequest,
-        DecodingKvHeadroom const& headroom, std::vector<int32_t> const& mediaTokenIds = {});
+        DecodingKvHeadroom const& headroom, std::vector<int32_t> const& mediaTokenIds = {},
+        DecodingTokenStateContract tokenStateContract = DecodingTokenStateContract::kCommittedPlusLookahead,
+        ContextCacheCommitPolicy commitPolicy = ContextCacheCommitPolicy::kIncludingGeneratedTokens);
 
     ContextCacheRequest(ContextCacheRequest&&) noexcept = default;
     ContextCacheRequest& operator=(ContextCacheRequest&&) = delete;
@@ -79,11 +81,12 @@ public:
     bool finish();
 
 private:
-    ContextCacheRequest(
-        ContextCacheCoordinator& coordinator, ContextCacheCoordinator::AdmissionResult&& admission) noexcept;
+    ContextCacheRequest(ContextCacheCoordinator& coordinator, ContextCacheCoordinator::AdmissionResult&& admission,
+        DecodingTokenStateContract tokenStateContract) noexcept;
 
     ContextCacheCoordinator& mCoordinator;
     ContextCacheCoordinator::RequestHandle mRequest;
+    DecodingTokenStateContract mTokenStateContract{DecodingTokenStateContract::kCommittedPlusLookahead};
     std::vector<int32_t> mPrefillStarts;
     std::optional<std::vector<std::size_t>> mTokenCountsBeforeDecode;
 };

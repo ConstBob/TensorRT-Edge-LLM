@@ -199,7 +199,8 @@ bool contextCacheOperationSucceeded(ContextCacheCoordinatorStatus status, char c
 
 std::optional<ContextCacheRequest> ContextCacheRequest::begin(ContextCacheCoordinator& coordinator,
     LLMGenerationRequest const& request, DecodingInferenceContext const& context, bool speculativeRequest,
-    DecodingKvHeadroom const& headroom, std::vector<int32_t> const& mediaTokenIds)
+    DecodingKvHeadroom const& headroom, std::vector<int32_t> const& mediaTokenIds,
+    DecodingTokenStateContract tokenStateContract, ContextCacheCommitPolicy commitPolicy)
 {
     static std::vector<imageUtils::ImageData> const kEmptyImageBuffers;
     static std::vector<audioUtils::AudioData> const kEmptyAudioBuffers;
@@ -208,7 +209,8 @@ std::optional<ContextCacheRequest> ContextCacheRequest::begin(ContextCacheCoordi
     ContextCacheBatchAdmission admission;
     admission.speculativeRequest = speculativeRequest;
     admission.lookupPolicy = contextCacheLookupPolicy(request, context.outputThinkerEmbeddings, mediaTokenIds);
-    admission.commitPolicy = request.contextCacheCommitPolicy;
+    admission.tokenStateContract = tokenStateContract;
+    admission.commitPolicy = commitPolicy;
     admission.replayTailLength = request.contextCacheReplayTailLength;
 
     // Bypass neither looks up nor publishes, so the media hashes it would key on are not built.
@@ -230,13 +232,14 @@ std::optional<ContextCacheRequest> ContextCacheRequest::begin(ContextCacheCoordi
     {
         return std::nullopt;
     }
-    return ContextCacheRequest{coordinator, std::move(*admitted.admission)};
+    return ContextCacheRequest{coordinator, std::move(*admitted.admission), tokenStateContract};
 }
 
-ContextCacheRequest::ContextCacheRequest(
-    ContextCacheCoordinator& coordinator, ContextCacheCoordinator::AdmissionResult&& admission) noexcept
+ContextCacheRequest::ContextCacheRequest(ContextCacheCoordinator& coordinator,
+    ContextCacheCoordinator::AdmissionResult&& admission, DecodingTokenStateContract tokenStateContract) noexcept
     : mCoordinator(coordinator)
     , mRequest(std::move(admission.request))
+    , mTokenStateContract(tokenStateContract)
     , mPrefillStarts(std::move(admission.prefillStarts))
 {
 }
@@ -282,10 +285,23 @@ bool ContextCacheRequest::completePrefill(
     progress.reserve(static_cast<size_t>(context.activeBatchSize));
     for (int32_t slot = 0; slot < context.activeBatchSize; ++slot)
     {
-        ELLM_CHECK(context.currentGenerateLengths[slot] == 1 && !context.tokenIds[slot].empty(),
-            "Managed context-cache prefill did not produce one sampled lookahead token");
-        progress.push_back(ContextCacheSequenceAdvance{
-            &context.tokenIds[slot].back(), 1, static_cast<int32_t>(context.rawBatchedInputIds[slot].size())});
+        if (mTokenStateContract == DecodingTokenStateContract::kFullyCommitted)
+        {
+            size_t const suffixLength = context.tokenIds[slot].size();
+            size_t const fullInputLength = context.rawBatchedInputIds[slot].size();
+            ELLM_CHECK(context.currentGenerateLengths[slot] == 0
+                    && suffixLength == static_cast<size_t>(context.effectivePrefillLengths[slot]) && suffixLength > 0
+                    && suffixLength <= fullInputLength,
+                "Fully committed prefill must not append a sampled lookahead token");
+            progress.push_back(ContextCacheSequenceAdvance{nullptr, 0, static_cast<int32_t>(fullInputLength)});
+        }
+        else
+        {
+            ELLM_CHECK(context.currentGenerateLengths[slot] == 1 && !context.tokenIds[slot].empty(),
+                "Managed context-cache prefill did not produce one sampled lookahead token");
+            progress.push_back(ContextCacheSequenceAdvance{
+                &context.tokenIds[slot].back(), 1, static_cast<int32_t>(context.rawBatchedInputIds[slot].size())});
+        }
     }
     std::vector<int32_t> const* const commonStateLengthsPtr
         = commonStateLengths.empty() ? nullptr : &commonStateLengths;
@@ -337,7 +353,8 @@ bool ContextCacheRequest::completeDecodeStep(
             "Managed context-cache decode produced an invalid accepted-token delta");
         int32_t const acceptedTokenCount = static_cast<int32_t>(context.tokenIds[slot].size() - previousTokenCount);
         int64_t const committedStateLength = static_cast<int64_t>(context.rawBatchedInputIds[slot].size())
-            + static_cast<int64_t>(context.currentGenerateLengths[slot]) - 1;
+            + static_cast<int64_t>(context.currentGenerateLengths[slot])
+            - (mTokenStateContract == DecodingTokenStateContract::kFullyCommitted ? 0 : 1);
         ELLM_CHECK(committedStateLength <= static_cast<int64_t>(std::numeric_limits<int32_t>::max()),
             "Managed context-cache committed state length exceeds int32");
         progress.push_back(ContextCacheSequenceAdvance{context.tokenIds[slot].data() + previousTokenCount,

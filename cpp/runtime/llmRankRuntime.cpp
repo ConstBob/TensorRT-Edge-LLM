@@ -1190,6 +1190,8 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
     }
 
     DecodingKvHeadroom const kvHeadroom = decodingStrategy.requiredKvHeadroom();
+    DecodingTokenStateContract const tokenStateContract = decodingStrategy.tokenStateContract();
+    ContextCacheCommitPolicy const contextCacheCommitPolicy = request.contextCacheCommitPolicy;
     ELLM_CHECK(
         kvHeadroom.baseExtraTokens > 0 && kvHeadroom.draftExtraTokens >= 0, "Decoder returned invalid KV headroom");
     ELLM_CHECK(!enableSpecDecode || kvHeadroom.draftExtraTokens == 0 || mDeployment.draft.has_value(),
@@ -1238,9 +1240,9 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
     std::optional<ManagedKVCacheRequest> managedKVCacheRequest;
     if (mContextCache != nullptr || mBoundedSwaKVPageManager != nullptr)
     {
-        std::optional<ManagedKVCacheRequest> admitted
-            = ManagedKVCacheRequest::begin(mContextCache.get(), mBoundedSwaKVPageManager.get(), request, context,
-                decodingStrategy.isSpeculative(), kvHeadroom, mediaTokenIds);
+        std::optional<ManagedKVCacheRequest> admitted = ManagedKVCacheRequest::begin(mContextCache.get(),
+            mBoundedSwaKVPageManager.get(), request, context, decodingStrategy.isSpeculative(), kvHeadroom,
+            tokenStateContract, contextCacheCommitPolicy, mediaTokenIds);
         if (!admitted.has_value())
         {
             return false;

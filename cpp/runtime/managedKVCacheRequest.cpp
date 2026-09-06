@@ -47,14 +47,15 @@ bool swaOperationSucceeded(SwaKVCacheStatus status, char const* operation)
 std::optional<ManagedKVCacheRequest> ManagedKVCacheRequest::begin(ContextCacheCoordinator* contextCache,
     BoundedSwaKVPageManager* swaPageManager, LLMGenerationRequest const& request,
     DecodingInferenceContext const& context, bool speculativeRequest, DecodingKvHeadroom const& headroom,
+    DecodingTokenStateContract tokenStateContract, ContextCacheCommitPolicy commitPolicy,
     std::vector<int32_t> const& mediaTokenIds)
 {
     ELLM_CHECK((contextCache != nullptr) != (swaPageManager != nullptr),
         "Managed KV cache request requires exactly one lifecycle backend");
     if (contextCache != nullptr)
     {
-        std::optional<ContextCacheRequest> admitted
-            = ContextCacheRequest::begin(*contextCache, request, context, speculativeRequest, headroom, mediaTokenIds);
+        std::optional<ContextCacheRequest> admitted = ContextCacheRequest::begin(*contextCache, request, context,
+            speculativeRequest, headroom, mediaTokenIds, tokenStateContract, commitPolicy);
         if (!admitted.has_value())
         {
             return std::nullopt;
@@ -62,7 +63,8 @@ std::optional<ManagedKVCacheRequest> ManagedKVCacheRequest::begin(ContextCacheCo
         return ManagedKVCacheRequest(std::move(*admitted));
     }
 
-    ELLM_CHECK(!speculativeRequest && headroom.baseExtraTokens == 1 && headroom.draftExtraTokens == 0,
+    ELLM_CHECK(!speculativeRequest && tokenStateContract == DecodingTokenStateContract::kCommittedPlusLookahead
+            && headroom.baseExtraTokens == 1 && headroom.draftExtraTokens == 0,
         "Bounded SWA KV cache supports only vanilla one-token decode");
     ELLM_CHECK(context.activeBatchSize > 0
             && context.rawBatchedInputIds.size() == static_cast<size_t>(context.activeBatchSize),
