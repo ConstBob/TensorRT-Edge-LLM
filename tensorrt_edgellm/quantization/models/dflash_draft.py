@@ -455,13 +455,16 @@ class DFlashCalibDraftModel(nn.Module):
         if hasattr(config, "text_config"):
             config = config.text_config
 
-        # Attach dflash_config to the config object. DSpark drafts share the
-        # DFlash backbone; their raw checkpoints (and some raw DFlash ones)
-        # publish target_layer_ids/block_size/mask_token_id at the top level.
+        # Attach dflash_config to the config object. JetSpec and DSpark drafts
+        # share the DFlash backbone; their raw checkpoints (and some raw
+        # DFlash ones) publish target_layer_ids/block_size/mask_token_id at
+        # the top level.
         cfg_path = os.path.join(draft_model_dir, "config.json")
         with open(cfg_path) as f:
             cfg_dict = json.load(f)
         raw_spec_cfg = cfg_dict.get("dflash_config")
+        if raw_spec_cfg is None:
+            raw_spec_cfg = cfg_dict.get("jetspec_config")
         if raw_spec_cfg is None:
             raw_spec_cfg = cfg_dict.get("dspark_config")
         spec_cfg = dict(raw_spec_cfg or {})
