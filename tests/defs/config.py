@@ -2284,6 +2284,8 @@ class TestConfig:
             "tests/test_cases/asr_basic.json",
             "librispeech_clean_test":
             f"{self.edgellm_data_dir}/updated_datasets/librispeech_clean_test/librispeech_clean_test.json",
+            "librispeech_clean_test_lite":
+            f"{self.edgellm_data_dir}/updated_datasets/librispeech_clean_test-lite/librispeech_clean_test.json",
             "tts_basic":
             "tests/test_cases/tts_basic.json",
             "tts_language":
