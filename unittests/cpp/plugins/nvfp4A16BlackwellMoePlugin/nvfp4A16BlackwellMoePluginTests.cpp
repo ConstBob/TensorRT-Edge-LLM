@@ -108,18 +108,21 @@ protected:
     }
 };
 
-TEST_F(Nvfp4A16BlackwellMoePluginTest, CreatorDeclaresThirteenAttributes)
+TEST_F(Nvfp4A16BlackwellMoePluginTest, CreatorDeclaresThirteenAttributesAndTheJitBundle)
 {
     PluginFieldCollection const* names = getCreator()->getFieldNames();
     ASSERT_NE(names, nullptr);
-    EXPECT_EQ(names->nbFields, 13);
+    // 13 ONNX attributes plus the runtime-only NVRTC bundle of the layer's
+    // CUDA-core kernels (CHAR, never present on the ONNX node).
+    ASSERT_EQ(names->nbFields, 14);
     std::vector<std::string> expected{"num_experts", "top_k", "hidden_size", "moe_inter_size", "activation_type",
         "n_group", "topk_group", "norm_topk_prob", "routed_scaling_factor", "routing_mode", "max_routed_rows", "layout",
-        "backend"};
+        "backend", "moe_jit_bundle"};
     for (int32_t i = 0; i < names->nbFields; ++i)
     {
         EXPECT_EQ(std::string(names->fields[i].name), expected[i]) << i;
     }
+    EXPECT_EQ(names->fields[13].type, PluginFieldType::kCHAR);
 }
 
 TEST_F(Nvfp4A16BlackwellMoePluginTest, CreatesNemotronContractAndSerializesAllAttributes)
@@ -135,10 +138,12 @@ TEST_F(Nvfp4A16BlackwellMoePluginTest, CreatesNemotronContractAndSerializesAllAt
     ASSERT_NE(runtime, nullptr);
     PluginFieldCollection const* serialized = runtime->getFieldsToSerialize();
     ASSERT_NE(serialized, nullptr);
+    // Before configurePlugin there is no JIT bundle yet: only the 13 attributes.
     EXPECT_EQ(serialized->nbFields, 13);
     for (int32_t i = 0; i < serialized->nbFields; ++i)
     {
         std::string const name(serialized->fields[i].name);
+        EXPECT_NE(name, "moe_jit_bundle");
         if (name == "layout")
         {
             EXPECT_EQ(*static_cast<int32_t const*>(serialized->fields[i].data), 1);

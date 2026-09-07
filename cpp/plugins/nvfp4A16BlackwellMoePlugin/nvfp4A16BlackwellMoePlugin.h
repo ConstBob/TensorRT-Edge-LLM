@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "kernels/moe/nvfp4A16BlackwellMoe/nvfp4A16BlackwellMoeJitRunner.h"
+
 #include <NvInferRuntime.h>
 
 #include <cstdint>
@@ -94,6 +96,11 @@ public:
 
     void setPluginNamespace(char const* pluginNamespace) noexcept;
 
+    //! Serialized-bundle state used by the creator: the build phase must not
+    //! receive a bundle, the runtime phase must load one.
+    bool hasSerializedJitBundle() const noexcept;
+    void loadSerializedJitBundle();
+
 private:
     void validateAttributes() const;
     bool validateTensorDesc(int32_t pos, nvinfer1::PluginTensorDesc const& desc) const noexcept;
@@ -114,6 +121,15 @@ private:
     int32_t mMaxRoutedRows{}; //!< Padded permuted-row capacity (0 == auto from the profile).
     int32_t mLayout{};
     int32_t mBackend{};
+
+    //! NVRTC bundle of this layer's CUDA-core kernels: compiled (and loaded) in
+    //! configurePlugin, serialized as the ``moe_jit_bundle`` field, loaded into the
+    //! context-keyed module registry at deserialization / clone.
+    void compileJitBundle();
+
+    Nvfp4A16BlackwellMoeJitKernel mJitKernel;
+    std::vector<uint8_t> mJitBundle;
+    Nvfp4A16BlackwellMoeJitRunner mJitRunner;
 
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFCToSerialize{};

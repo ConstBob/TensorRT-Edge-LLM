@@ -382,11 +382,13 @@ def test_create_plugin_accepts_nemotron_contract():
                                                     _PLUGIN_VERSION, "")
     assert creator is not None
     names = [f.name for f in creator.field_names]
+    # 13 ONNX attributes plus the runtime-only NVRTC bundle of the layer's
+    # CUDA-core kernels (compiled at engine build, never set on the ONNX node).
     assert names == [
         "num_experts", "top_k", "hidden_size", "moe_inter_size",
         "activation_type", "n_group", "topk_group", "norm_topk_prob",
         "routed_scaling_factor", "routing_mode", "max_routed_rows", "layout",
-        "backend"
+        "backend", "moe_jit_bundle"
     ]
     fields = _plugin_fields(
         replace(_SMALL_CASE, hidden_size=2688, moe_inter_size=1856))

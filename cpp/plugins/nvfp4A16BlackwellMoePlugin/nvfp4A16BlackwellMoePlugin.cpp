@@ -35,6 +35,7 @@
 #include <cstring>
 #include <cuda_runtime.h>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -91,6 +92,9 @@ constexpr int32_t kFieldMaxRoutedRows{10};
 constexpr int32_t kFieldLayout{11};
 constexpr int32_t kFieldBackend{12};
 constexpr int32_t kNbPluginFields{13};
+//! Optional (runtime-phase) field carrying the serialized NVRTC bundle of the
+//! layer's CUDA-core kernels; never part of the ONNX node.
+constexpr char const* kFieldJitBundle{"moe_jit_bundle"};
 
 int32_t padTo(int32_t const value, int32_t const multiple) noexcept
 {
@@ -232,6 +236,19 @@ Nvfp4A16BlackwellMoePlugin::Nvfp4A16BlackwellMoePlugin(std::string const& name, 
         {
             mBackend = readIntField(field, kFieldBackend);
         }
+        else if (fieldName == kFieldJitBundle)
+        {
+            if (!mJitBundle.empty())
+            {
+                throw std::invalid_argument("Nvfp4A16BlackwellMoePlugin: duplicate moe_jit_bundle attribute");
+            }
+            if (field.type != PluginFieldType::kCHAR || field.length <= 0 || field.data == nullptr)
+            {
+                throw std::invalid_argument("Nvfp4A16BlackwellMoePlugin: moe_jit_bundle must be a nonempty CHAR field");
+            }
+            auto const* bytes = static_cast<uint8_t const*>(field.data);
+            mJitBundle.assign(bytes, bytes + field.length);
+        }
         else
         {
             throw std::invalid_argument("Nvfp4A16BlackwellMoePlugin: unknown plugin attribute " + fieldName);
@@ -241,6 +258,10 @@ Nvfp4A16BlackwellMoePlugin::Nvfp4A16BlackwellMoePlugin(std::string const& name, 
     if (std::any_of(fieldsSeen.begin(), fieldsSeen.end(), [](bool seen) { return !seen; }))
     {
         throw std::invalid_argument("Nvfp4A16BlackwellMoePlugin: all 13 plugin attributes are required");
+    }
+    if (!mJitBundle.empty())
+    {
+        mJitKernel = deserializeNvfp4A16BlackwellMoeJitKernel(mJitBundle.data(), mJitBundle.size());
     }
     validateAttributes();
 }
@@ -334,11 +355,20 @@ IPluginV3* Nvfp4A16BlackwellMoePlugin::clone() noexcept
 {
     try
     {
-        auto* plugin = new Nvfp4A16BlackwellMoePlugin(mLayerName, mNumExperts, mTopK, mHiddenSize, mMoeInterSize,
-            mActivationType, mNGroup, mTopkGroup, mNormTopkProb, mRoutedScalingFactor, mRoutingMode, mMaxRoutedRows,
-            mLayout, mBackend);
+        auto plugin = std::make_unique<Nvfp4A16BlackwellMoePlugin>(mLayerName, mNumExperts, mTopK, mHiddenSize,
+            mMoeInterSize, mActivationType, mNGroup, mTopkGroup, mNormTopkProb, mRoutedScalingFactor, mRoutingMode,
+            mMaxRoutedRows, mLayout, mBackend);
+        plugin->mJitKernel = mJitKernel;
+        plugin->mJitBundle = mJitBundle;
+        if (!plugin->mJitBundle.empty())
+        {
+            // configurePlugin() compiles and serializes the bundle but does not
+            // load it; attachToContext() clones a build-phase or a runtime plugin,
+            // and either way the clone loads through the context-keyed registry.
+            plugin->loadSerializedJitBundle();
+        }
         plugin->setPluginNamespace(mNamespace.c_str());
-        return plugin;
+        return plugin.release();
     }
     catch (std::exception const& e)
     {
@@ -581,6 +611,7 @@ int32_t Nvfp4A16BlackwellMoePlugin::configurePlugin(
                 mMaxRoutedRows, static_cast<long long>(requiredRows));
             return -1;
         }
+        compileJitBundle();
         return 0;
     }
     catch (std::exception const& e)
@@ -660,6 +691,12 @@ int32_t Nvfp4A16BlackwellMoePlugin::enqueue(PluginTensorDesc const* inputDesc, P
         params.fc2GlobalScales = static_cast<float const*>(inputs[kInFc2GlobalScales]);
         params.output = outputs[0];
         params.enablePdl = requestPdl();
+        if (!mJitRunner.isLoaded())
+        {
+            LOG_ERROR("Nvfp4A16BlackwellMoePlugin: the layer's JIT bundle is not loaded (enqueue before configure/clone)");
+            return -1;
+        }
+        params.jit = &mJitRunner;
 
         // The workspace was sized for the profile maximum; the runner re-derives
         // the layout for this token count and checks it fits.
@@ -753,6 +790,18 @@ PluginFieldCollection const* Nvfp4A16BlackwellMoePlugin::getFieldsToSerialize() 
         mDataToSerialize.emplace_back("max_routed_rows", &mMaxRoutedRows, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("layout", &mLayout, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("backend", &mBackend, PluginFieldType::kINT32, 1);
+        // The bundle exists once configurePlugin has run (compileJitBundle throws
+        // otherwise); the runtime creator refuses a plugin without it.
+        if (mJitBundle.size() > static_cast<size_t>(std::numeric_limits<int32_t>::max()))
+        {
+            LOG_ERROR("Nvfp4A16BlackwellMoePlugin: JIT bundle too large to serialize");
+            return nullptr;
+        }
+        if (!mJitBundle.empty())
+        {
+            mDataToSerialize.emplace_back(
+                kFieldJitBundle, mJitBundle.data(), PluginFieldType::kCHAR, static_cast<int32_t>(mJitBundle.size()));
+        }
         mFCToSerialize.nbFields = static_cast<int32_t>(mDataToSerialize.size());
         mFCToSerialize.fields = mDataToSerialize.data();
         return &mFCToSerialize;
@@ -762,6 +811,59 @@ PluginFieldCollection const* Nvfp4A16BlackwellMoePlugin::getFieldsToSerialize() 
         LOG_ERROR("Failed to serialize Nvfp4A16BlackwellMoePlugin fields: %s", e.what());
         return nullptr;
     }
+}
+
+void Nvfp4A16BlackwellMoePlugin::compileJitBundle()
+{
+    kernel::Nvfp4A16BlackwellMoeParams const shape = makeShape(1, mNumExperts, mTopK, mHiddenSize, mMoeInterSize,
+        interSizePadded(), mNGroup, mTopkGroup, mNormTopkProb, mRoutedScalingFactor, mBackend);
+    Nvfp4A16BlackwellMoeJitKey const key = kernel::makeNvfp4A16BlackwellMoeJitKey(shape);
+    if (char const* problem = describeNvfp4A16BlackwellMoeJitKeyProblem(key); problem != nullptr)
+    {
+        throw std::invalid_argument(std::string("Nvfp4A16BlackwellMoePlugin: CUDA-core kernels cannot be built: ") + problem);
+    }
+    if (!mJitBundle.empty())
+    {
+        if (!(mJitKernel.key == key))
+        {
+            throw std::invalid_argument(
+                "Nvfp4A16BlackwellMoePlugin: one plugin instance cannot use multiple JIT semantic keys");
+        }
+    }
+    else
+    {
+        mJitKernel = compileNvfp4A16BlackwellMoeJitKernel(key);
+        mJitBundle = serializeNvfp4A16BlackwellMoeJitKernel(mJitKernel);
+    }
+    // TensorRT executes the build-phase instance (or its clone) for auto-tuning
+    // and harnesses drive it directly, so the module is loaded here as well.
+    if (!mJitRunner.isLoaded() || !(mJitRunner.getKey() == key))
+    {
+        mJitRunner.load(mJitKernel);
+    }
+}
+
+bool Nvfp4A16BlackwellMoePlugin::hasSerializedJitBundle() const noexcept
+{
+    return !mJitBundle.empty();
+}
+
+void Nvfp4A16BlackwellMoePlugin::loadSerializedJitBundle()
+{
+    if (mJitBundle.empty() || mJitKernel.cubin.empty())
+    {
+        throw std::invalid_argument(
+            "Nvfp4A16BlackwellMoePlugin: runtime requires the moe_jit_bundle serialized at engine build");
+    }
+    Nvfp4A16BlackwellMoeJitKey const& key = mJitKernel.key;
+    if (key.numExperts != mNumExperts || key.topK != mTopK || key.hiddenSize != mHiddenSize
+        || key.interSize != mMoeInterSize || key.interSizePadded != interSizePadded()
+        || key.layout != kNVFP4_A16_BLACKWELL_MOE_LAYOUT_ABI)
+    {
+        throw std::invalid_argument(
+            "Nvfp4A16BlackwellMoePlugin: serialized JIT key does not match the plugin's shape");
+    }
+    mJitRunner.load(mJitKernel);
 }
 
 Nvfp4A16BlackwellMoePluginCreator::Nvfp4A16BlackwellMoePluginCreator()
@@ -783,6 +885,7 @@ Nvfp4A16BlackwellMoePluginCreator::Nvfp4A16BlackwellMoePluginCreator()
     mPluginAttributes.emplace_back("max_routed_rows", nullptr, PluginFieldType::kINT32, 1);
     mPluginAttributes.emplace_back("layout", nullptr, PluginFieldType::kINT32, 1);
     mPluginAttributes.emplace_back("backend", nullptr, PluginFieldType::kINT32, 1);
+    mPluginAttributes.emplace_back(kFieldJitBundle, nullptr, PluginFieldType::kCHAR, 0);
 
     mFieldCollection.nbFields = static_cast<int32_t>(mPluginAttributes.size());
     mFieldCollection.fields = mPluginAttributes.data();
@@ -816,12 +919,24 @@ void Nvfp4A16BlackwellMoePluginCreator::setPluginNamespace(char const* pluginNam
 IPluginV3* Nvfp4A16BlackwellMoePluginCreator::createPlugin(
     char const* name, PluginFieldCollection const* fc, TensorRTPhase phase) noexcept
 {
-    (void) phase;
     try
     {
-        auto* plugin = new Nvfp4A16BlackwellMoePlugin(name == nullptr ? kPluginName : name, fc);
+        auto plugin = std::make_unique<Nvfp4A16BlackwellMoePlugin>(name == nullptr ? kPluginName : name, fc);
+        if (phase == TensorRTPhase::kBUILD)
+        {
+            if (plugin->hasSerializedJitBundle())
+            {
+                throw std::invalid_argument("Nvfp4A16BlackwellMoePlugin: BUILD phase must not receive moe_jit_bundle");
+            }
+        }
+        else
+        {
+            // Runtime deserialization: the engine must carry the bundle compiled
+            // at build time; the runtime never compiles.
+            plugin->loadSerializedJitBundle();
+        }
         plugin->setPluginNamespace(mNamespace.c_str());
-        return plugin;
+        return plugin.release();
     }
     catch (std::exception const& e)
     {

@@ -8,8 +8,8 @@ are the B/N operand).
 
 ## Weight layout (`BLACKWELL_MOE_N128_K64_V1`)
 
-One buffer per projection serves this kernel **and** the CUDA-core decode kernels
-in `cpp/kernels/moe/nvfp4A16BlackwellMoe/`:
+One buffer per projection serves this kernel **and** the NVRTC-compiled CUDA-core
+decode kernels in `kernelSrcs/nvfp4A16BlackwellMoe/`:
 
 ```
 qweight      int8 [E, N_pad/128, K/64, 128, 32]   64 E2M1 codes per row tile, low nibble = even k

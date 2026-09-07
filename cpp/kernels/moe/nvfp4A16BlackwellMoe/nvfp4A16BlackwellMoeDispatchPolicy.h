@@ -115,6 +115,15 @@ inline constexpr int32_t kMaxTokenTiles{1024};
 // independently.
 // ---------------------------------------------------------------------------
 inline constexpr int32_t kDecodeMaxTokens{1};
+//! Activation dtypes the CUDA-core kernels are compiled for (baked into the JIT
+//! key, like every other constant below: the benchmark-only EDGELLM_MOE_DECODE_*
+//! overrides are read when the plugin compiles its bundle at engine build).
+enum class DecodeDtype : int32_t
+{
+    kFP16 = 0,
+    kBF16 = 1,
+};
+
 //! Decode FC1 split-K: FC1 has only N1_pad/128 * topK = 90 row tiles at T=1
 //! (2.25 waves of 40 resident CTAs on 20 SMs); split-K 2 doubles the CTA count
 //! and was the best of {1,2,4,8} in the engine (decode step 11.57 / 11.41 /

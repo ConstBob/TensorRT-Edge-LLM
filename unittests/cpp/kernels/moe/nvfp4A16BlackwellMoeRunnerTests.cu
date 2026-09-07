@@ -21,6 +21,8 @@
 
 #include "common/cudaUtils.h"
 #include "kernels/moe/nvfp4A16BlackwellMoe/nvfp4A16BlackwellMoeDispatchPolicy.h"
+#include "kernels/moe/nvfp4A16BlackwellMoe/nvfp4A16BlackwellMoeJitCompiler.h"
+#include "kernels/moe/nvfp4A16BlackwellMoe/nvfp4A16BlackwellMoeJitRunner.h"
 #include "kernels/moe/nvfp4A16BlackwellMoe/nvfp4A16BlackwellMoeRunner.h"
 
 #include <cuda_fp16.h>
@@ -31,6 +33,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <memory>
 #include <random>
 #include <vector>
 
@@ -267,7 +270,26 @@ public:
         params.fc2BlockScales = dS2_.ptr;
         params.fc2GlobalScales = dG2_.as<float>();
         params.output = dOut_.ptr;
+        params.jit = &jitFor(params);
         return params;
+    }
+
+    //! The NVRTC bundle of this shape and knob combination, exactly as the plugin
+    //! compiles it at engine build (one compile and one module per distinct key).
+    Nvfp4A16BlackwellMoeJitRunner const& jitFor(Nvfp4A16BlackwellMoeParams const& params) const
+    {
+        Nvfp4A16BlackwellMoeJitKey const key = makeNvfp4A16BlackwellMoeJitKey(params);
+        for (auto const& runner : jitRunners_)
+        {
+            if (runner->getKey() == key)
+            {
+                return *runner;
+            }
+        }
+        auto runner = std::make_unique<Nvfp4A16BlackwellMoeJitRunner>();
+        runner->load(compileNvfp4A16BlackwellMoeJitKernel(key));
+        jitRunners_.push_back(std::move(runner));
+        return *jitRunners_.back();
     }
 
     void zeroOutput()
@@ -373,6 +395,7 @@ private:
 
     Problem p_;
     int32_t numTokens_;
+    mutable std::vector<std::unique_ptr<Nvfp4A16BlackwellMoeJitRunner>> jitRunners_;
     std::vector<ExpertWeights> w1_, w2_;
     std::vector<float> logits_, bias_, hiddenF_, reference_;
     std::vector<half> hidden_;

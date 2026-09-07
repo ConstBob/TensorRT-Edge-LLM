@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include "nvfp4A16BlackwellMoeDecodeKernels.h"
+#include "nvfp4A16BlackwellMoeJitRunner.h"
 #include "nvfp4A16BlackwellMoeDispatchPolicy.h"
 
 #include <cuda_runtime.h>
@@ -52,8 +52,12 @@ struct Nvfp4A16BlackwellMoeParams
     //! Decode FC2 slots staged into shared memory before its PDL wait: -1 takes
     //! the sealed policy value (or the EDGELLM_MOE_DECODE_FC2_PREFETCH override),
     //! 0..kDecodeFc2MaxPrefetchSlots forces it (tests).  Clamped to topK and to
-    //! the 48 KB default dynamic shared memory.
+    //! the 48 KB static shared-memory limit of the baked kernels.
     int32_t fc2PrefetchSlots{-1};
+    //! The NVRTC-compiled CUDA-core kernels of this layer (routing, layout,
+    //! gather, decode FC1/FC2 and reduces), loaded from the bundle compiled for
+    //! makeNvfp4A16BlackwellMoeJitKey(*this).  Required by run().
+    Nvfp4A16BlackwellMoeJitRunner const* jit{nullptr};
     int32_t numTokens{0};
     int32_t numExperts{0};
     int32_t topK{0};
@@ -82,6 +86,12 @@ struct Nvfp4A16BlackwellMoeParams
 //! otherwise, over ONE weight layout.  Mirrors Nvfp4A16BlackwellGemmRunner:
 //! prepare() from onShapeChange loads exactly the AOT variants the profile can
 //! dispatch, enqueue() never loads modules or queries the device.
+//! The JIT key of a layer contract: the shape, the sealed decode split-K /
+//! pre-wait prefetch policy (with their benchmark env overrides, clamped to the
+//! shape and to the static shared-memory limit) and the dtype.  Plugin, runner
+//! and tests derive it from the same params so bundle and launch always agree.
+Nvfp4A16BlackwellMoeJitKey makeNvfp4A16BlackwellMoeJitKey(Nvfp4A16BlackwellMoeParams const& params) noexcept;
+
 class Nvfp4A16BlackwellMoeRunner
 {
 public:

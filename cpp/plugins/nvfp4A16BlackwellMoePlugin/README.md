@@ -74,15 +74,32 @@ weight layouts and distinct ONNX identities: an engine never carries both.
   to 32, tn32 up to 256, tn64 up to 2048, tn128 above. Contracts
   with `n_group > 1` fall back to the shared `moeSigmoidGroupTopk` +
   `buildLayoutGpu` pair for the first two ops.
-* Modules are loaded in `onShapeChange` (`Nvfp4A16BlackwellMoeRunner::prepare`);
+* **CUDA-core kernels are NVRTC bundles** (the same plugin-JIT path as the XQA
+  attention kernels and the dense `Nvfp4A16BlackwellGemmPlugin` GEMV): routing,
+  tile layout, gather, decode FC1/FC2 and their split-K reduces live in
+  `kernelSrcs/nvfp4A16BlackwellMoe/nvfp4A16BlackwellMoeKernels.cu`, embedded
+  into the plugin library at build time and compiled once per layer in
+  `configurePlugin` with every shape parameter (`E`, `top_k`, `H`, `I`, split-K,
+  prefetch slots, dtype) baked in as `-D` macros. The cubin is serialized as the
+  runtime-only `moe_jit_bundle` attribute, so deserialization never needs NVRTC;
+  `clone()` (build-phase execution) and the runtime creator load it into a
+  context-keyed module registry, and the kernels are launched through the driver
+  API (`cuLaunchKernelEx` with the PDL attribute). The benchmark-only
+  `EDGELLM_MOE_DECODE_*` overrides are therefore read at engine build and travel
+  with the engine. Only the grouped tcgen05 GEMMs stay CuTe DSL AOT.
+* AOT modules are loaded in `onShapeChange` (`Nvfp4A16BlackwellMoeRunner::prepare`);
   `enqueue` never loads modules or queries the device, so CUDA-graph capture is
   safe after one uncaptured warmup.
 
 ## Files
 
 * `cpp/plugins/nvfp4A16BlackwellMoePlugin/nvfp4A16BlackwellMoePlugin.{h,cpp}`
-* `cpp/kernels/moe/nvfp4A16BlackwellMoe/` — runner, dispatch policy, decode
-  kernels, routing / layout / gather support kernels, device routing math
+* `cpp/kernels/moe/nvfp4A16BlackwellMoe/` — runner, dispatch policy, NVRTC
+  compiler (`...JitCompiler`) and driver-API launcher (`...JitRunner`) of the
+  CUDA-core kernels
+* `kernelSrcs/nvfp4A16BlackwellMoe/nvfp4A16BlackwellMoeKernels.cu` — the
+  CUDA-core kernels (routing, tile layout, gather, decode FC1/FC2, reduces),
+  embedded for NVRTC
 * `kernelSrcs/nvfp4_a16_blackwell_moe/` — CuTe DSL grouped GEMM (AOT group
   `nvfp4_a16_blackwell_moe`) and the on-board oracle
 * `tensorrt_edgellm/checkpoint/repacking.py` — `repack_nvfp4_a16_blackwell_moe_experts`
@@ -94,6 +111,9 @@ weight layouts and distinct ONNX identities: an engine never carries both.
   serialization round-trip, decode/prefill numerics (SM110) and rejections.
 * `unittests/cpp/kernels/moe/nvfp4A16BlackwellMoeRunnerTests.cu` — runner vs
   double-precision reference, CUDA-graph replay, dispatch policy.
+* `unittests/cpp/kernels/moe/nvfp4A16BlackwellMoeJitTests.cpp` — JIT key
+  validation, shared-memory budget, compile / bundle round trip (any CUDA 13
+  host), module loading (SM110).
 * `unittests/cpp/plugins/nvfp4A16BlackwellMoePlugin/` — creator contract.
 
 ## Thor sign-off checklist

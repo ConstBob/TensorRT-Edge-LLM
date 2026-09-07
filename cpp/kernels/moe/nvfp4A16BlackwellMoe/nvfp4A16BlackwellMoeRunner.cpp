@@ -23,7 +23,7 @@
 #include "kernels/moe/fp4SupportKernels/buildLayout.h"
 #include "kernels/moe/moeSigmoidGroupTopkKernels.h"
 #include "kernels/nvfp4A16BlackwellSupport.h"
-#include "nvfp4A16BlackwellMoeSupportKernels.h"
+#include "nvfp4A16BlackwellMoeJitCompiler.h"
 
 #if defined(CUTE_DSL_NVFP4_A16_BLACKWELL_MOE_ENABLED)
 #include "kernels/cuteDslModuleLoader.h"
@@ -84,36 +84,6 @@ int32_t decodeFc1SplitK(Nvfp4A16BlackwellMoeParams const& p) noexcept
     return std::max<int32_t>(1, std::min<int32_t>(requested, p.hiddenSize / nvfp4_a16_blackwell::kKTile));
 }
 
-//! Decode FC2 pre-wait prefetch slots: the sealed policy value or the
-//! benchmark-only override EDGELLM_MOE_DECODE_FC2_PREFETCH=0..kDecodeFc2MaxPrefetchSlots
-//! (read once), clamped to topK.  Only the launch (dynamic shared memory) depends on it.
-int32_t decodeFc2PrefetchSlots(Nvfp4A16BlackwellMoeParams const& p) noexcept
-{
-    static int32_t const requested = []() {
-        char const* const env = std::getenv("EDGELLM_MOE_DECODE_FC2_PREFETCH");
-        if (env != nullptr)
-        {
-            int32_t const v = std::atoi(env);
-            if (v >= 0 && v <= moe::kDecodeFc2MaxPrefetchSlots)
-            {
-                return v;
-            }
-        }
-        return moe::kDecodeFc2PrefetchSlots;
-    }();
-    // Keep FC2 under the default 48 KB dynamic shared memory so it needs no
-    // opt-in and keeps its three CTAs per SM for every supported shape.
-    int32_t slots = std::min<int32_t>(p.fc2PrefetchSlots >= 0 ? p.fc2PrefetchSlots : requested, p.topK);
-    slots = std::min<int32_t>(slots, moe::kDecodeFc2MaxPrefetchSlots);
-    int32_t const kBlocks = p.interSize / nvfp4_a16_blackwell::kKTile;
-    int32_t const fc2SplitK = std::min<int32_t>(moe::kDecodeFc2SplitK, kBlocks);
-    while (slots > 0 && moe::decodeFc2SharedBytes(p.topK, kBlocks, fc2SplitK, slots) > 48 * 1024)
-    {
-        --slots;
-    }
-    return slots;
-}
-
 //! Effective PDL mode: the request from the plugin (EDGELLM_ENABLE_PDL) gated by
 //! toolchain support.  The kernels are SM110-only, so no SM gate is needed.
 constexpr bool usePdl(Nvfp4A16BlackwellMoeParams const& p) noexcept
@@ -128,13 +98,14 @@ constexpr bool usePdl(Nvfp4A16BlackwellMoeParams const& p) noexcept
 cudaError_t launchRouting(Nvfp4A16BlackwellMoeParams const& p, int32_t* const topkIndices, float* const topkWeights,
     cudaStream_t const stream) noexcept
 {
-    if (p.nGroup == 1 && p.numExperts <= 512)
-    {
-        return moe::launchSigmoidTopkRoute(p.routerLogits, p.correctionBias, p.numTokens, p.numExperts, p.topK,
-            p.normTopkProb, p.routedScalingFactor, topkIndices, topkWeights, usePdl(p), stream);
-    }
     try
     {
+        if (p.nGroup == 1 && p.numExperts <= 512)
+        {
+            p.jit->launchRoute(p.routerLogits, p.correctionBias, p.numTokens, p.normTopkProb, p.routedScalingFactor,
+                topkIndices, topkWeights, usePdl(p), stream);
+            return cudaSuccess;
+        }
         rt::Tensor const logits(const_cast<float*>(p.routerLogits), {p.numTokens, p.numExperts}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kFLOAT);
         rt::Tensor weights(topkWeights, {p.numTokens, p.topK}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
@@ -431,14 +402,9 @@ cudaError_t runPrefill(
             // Ungrouped contract (Nemotron): the parallel single-CTA layout
             // builder (~10 us with the warp-per-token routing at T=256 versus
             // ~75 us for the generic pair).
-            err = moe::launchBuildTileLayout(reinterpret_cast<int32_t const*>(ws + l.topkIndices), slots, p.numExperts,
-                l.tokenTile, reinterpret_cast<int32_t*>(ws + l.permutedIdx),
-                reinterpret_cast<int32_t*>(ws + l.tileGroupIdx), reinterpret_cast<int32_t*>(ws + l.numValidTiles),
-                usePdl(p), stream);
-            if (err != cudaSuccess)
-            {
-                return err;
-            }
+            p.jit->launchLayout(reinterpret_cast<int32_t const*>(ws + l.topkIndices), slots, l.tokenTile,
+                reinterpret_cast<int32_t*>(ws + l.permutedIdx), reinterpret_cast<int32_t*>(ws + l.tileGroupIdx),
+                reinterpret_cast<int32_t*>(ws + l.numValidTiles), usePdl(p), stream);
         }
         else
         {
@@ -455,14 +421,9 @@ cudaError_t runPrefill(
                 p.numExperts, l.tokenTile, stream);
         }
 
-        err = moe::launchGatherPermutedRows(p.dtype, p.hiddenStates,
-            reinterpret_cast<int32_t const*>(ws + l.permutedIdx),
-            reinterpret_cast<int32_t const*>(ws + l.numValidTiles), l.tokenTile, p.topK, p.hiddenSize, p.numTokens,
-            l.maxRowsPadded, ws + l.permutedActivations, p.output, usePdl(p), stream);
-        if (err != cudaSuccess)
-        {
-            return err;
-        }
+        p.jit->launchGather(p.hiddenStates, reinterpret_cast<int32_t const*>(ws + l.permutedIdx),
+            reinterpret_cast<int32_t const*>(ws + l.numValidTiles), l.tokenTile, p.numTokens, l.maxRowsPadded,
+            ws + l.permutedActivations, p.output, usePdl(p), stream);
 
         moe::TokenTile const tile = static_cast<moe::TokenTile>(l.tokenTile);
         GroupedArgs fc1{};
@@ -511,51 +472,96 @@ cudaError_t runPrefill(
 cudaError_t runDecode(
     Nvfp4A16BlackwellMoeParams const& p, unsigned char* ws, WorkspaceLayout const& l, cudaStream_t stream) noexcept
 {
-    moe::DecodeMoeParams d{};
-    d.numExperts = p.numExperts;
-    d.topK = p.topK;
-    d.topkIndices = reinterpret_cast<int32_t*>(ws + l.topkIndices);
-    d.topkWeights = reinterpret_cast<float*>(ws + l.topkWeights);
-    d.numTokens = p.numTokens;
-    d.hiddenSize = p.hiddenSize;
-    d.interSize = p.interSize;
-    d.interSizePadded = p.interSizePadded;
-    d.hiddenStates = p.hiddenStates;
-    d.fc1Output = ws + l.fc1Output;
-    d.output = p.output;
-    d.fc1QWeights = p.fc1QWeights;
-    d.fc1BlockScales = p.fc1BlockScales;
-    d.fc1GlobalScales = p.fc1GlobalScales;
-    d.fc2QWeights = p.fc2QWeights;
-    d.fc2BlockScales = p.fc2BlockScales;
-    d.fc2GlobalScales = p.fc2GlobalScales;
-    d.fc1SplitK = decodeFc1SplitK(p);
-    d.fc2SplitK = std::min<int32_t>(moe::kDecodeFc2SplitK, p.interSize / nvfp4_a16_blackwell::kKTile);
-    d.fc1Partials = d.fc1SplitK > 1 ? reinterpret_cast<float*>(ws + l.fc1Partials) : nullptr;
-    d.fc2Partials = d.fc2SplitK > 1 ? reinterpret_cast<float*>(ws + l.fc2Partials) : nullptr;
-    d.enablePdl = usePdl(p);
-    d.fc2PrefetchSlots = decodeFc2PrefetchSlots(p);
-    // Routing runs as its own (tiny) kernel: fusing it into every FC1 CTA cost
-    // 131 registers, one CTA per SM and ~40% of FC1's streaming bandwidth.
-    cudaError_t err = launchRouting(p, d.topkIndices, d.topkWeights, stream);
-    if (err != cudaSuccess)
+    try
     {
-        return err;
+        int32_t* const topkIndices = reinterpret_cast<int32_t*>(ws + l.topkIndices);
+        float* const topkWeights = reinterpret_cast<float*>(ws + l.topkWeights);
+        // Routing runs as its own (tiny) kernel: fusing it into every FC1 CTA cost
+        // 131 registers, one CTA per SM and ~40% of FC1's streaming bandwidth.
+        cudaError_t const err = launchRouting(p, topkIndices, topkWeights, stream);
+        if (err != cudaSuccess)
+        {
+            return err;
+        }
+        Nvfp4A16BlackwellMoeJitKey const& key = p.jit->getKey();
+        bool const pdl = usePdl(p);
+        p.jit->launchFc1(p.hiddenStates, topkIndices, p.fc1QWeights, p.fc1BlockScales, p.fc1GlobalScales,
+            ws + l.fc1Output, key.fc1SplitK > 1 ? reinterpret_cast<float*>(ws + l.fc1Partials) : nullptr, p.numTokens,
+            pdl, stream);
+        p.jit->launchFc2(ws + l.fc1Output, topkIndices, topkWeights, p.fc2QWeights, p.fc2BlockScales,
+            p.fc2GlobalScales, p.output, key.fc2SplitK > 1 ? reinterpret_cast<float*>(ws + l.fc2Partials) : nullptr,
+            p.numTokens, pdl, stream);
+        return cudaSuccess;
     }
-    err = moe::launchDecodeFc1(d, p.dtype, stream);
-    if (err != cudaSuccess)
+    catch (...)
     {
-        return err;
+        return cudaErrorUnknown;
     }
-    return moe::launchDecodeFc2(d, p.dtype, stream);
+}
+
+//! The JIT runner attached to the params must hold the bundle compiled for this
+//! layer's shape and dtype (split-K / prefetch come from the bundle itself).
+bool jitMatchesShape(Nvfp4A16BlackwellMoeParams const& p) noexcept
+{
+    if (p.jit == nullptr || !p.jit->isLoaded())
+    {
+        return false;
+    }
+    Nvfp4A16BlackwellMoeJitKey const& key = p.jit->getKey();
+    return key.sm == nvfp4_a16_blackwell::kTargetSm && key.layout == kNVFP4_A16_BLACKWELL_MOE_LAYOUT_ABI
+        && key.numExperts == p.numExperts && key.topK == p.topK && key.hiddenSize == p.hiddenSize
+        && key.interSize == p.interSize && key.interSizePadded == p.interSizePadded
+        && key.dataType
+        == (p.dtype == moe::DecodeDtype::kBF16 ? Nvfp4A16BlackwellMoeDataType::kBF16
+                                                : Nvfp4A16BlackwellMoeDataType::kHALF);
 }
 
 } // namespace
 
+Nvfp4A16BlackwellMoeJitKey makeNvfp4A16BlackwellMoeJitKey(Nvfp4A16BlackwellMoeParams const& p) noexcept
+{
+    Nvfp4A16BlackwellMoeJitKey key{};
+    key.numExperts = p.numExperts;
+    key.topK = p.topK;
+    key.hiddenSize = p.hiddenSize;
+    key.interSize = p.interSize;
+    key.interSizePadded = p.interSizePadded;
+    key.dataType = p.dtype == moe::DecodeDtype::kBF16 ? Nvfp4A16BlackwellMoeDataType::kBF16
+                                                       : Nvfp4A16BlackwellMoeDataType::kHALF;
+    key.fc1SplitK = decodeFc1SplitK(p);
+    key.fc2SplitK = std::max<int32_t>(
+        1, std::min<int32_t>(moe::kDecodeFc2SplitK, p.interSize / nvfp4_a16_blackwell::kKTile));
+    // Decode FC2 pre-wait prefetch slots: the explicit request (tests), else the
+    // benchmark-only override EDGELLM_MOE_DECODE_FC2_PREFETCH (read once), else the
+    // sealed policy value; clamped to topK, the policy maximum and the 48 KB static
+    // shared-memory limit of the baked FC2 kernel.
+    static int32_t const requested = []() {
+        char const* const env = std::getenv("EDGELLM_MOE_DECODE_FC2_PREFETCH");
+        if (env != nullptr)
+        {
+            int32_t const v = std::atoi(env);
+            if (v >= 0 && v <= moe::kDecodeFc2MaxPrefetchSlots)
+            {
+                return v;
+            }
+        }
+        return moe::kDecodeFc2PrefetchSlots;
+    }();
+    int32_t slots = std::min<int32_t>(p.fc2PrefetchSlots >= 0 ? p.fc2PrefetchSlots : requested, p.topK);
+    slots = std::max<int32_t>(0, std::min<int32_t>(slots, moe::kDecodeFc2MaxPrefetchSlots));
+    key.fc2PrefetchSlots = slots;
+    while (key.fc2PrefetchSlots > 0 && getNvfp4A16BlackwellMoeFc2SharedBytes(key) > 48 * 1024)
+    {
+        --key.fc2PrefetchSlots;
+    }
+    return key;
+}
+
 bool Nvfp4A16BlackwellMoeRunner::isSupported(int32_t const smVersion, Nvfp4A16BlackwellMoeParams const& shape) noexcept
 {
 #if defined(CUTE_DSL_NVFP4_A16_BLACKWELL_MOE_ENABLED)
-    return smVersion == nvfp4_a16_blackwell::kTargetSm && validShape(shape);
+    return smVersion == nvfp4_a16_blackwell::kTargetSm && validShape(shape)
+        && canCompileNvfp4A16BlackwellMoeJitKernel(makeNvfp4A16BlackwellMoeJitKey(shape));
 #else
     (void) smVersion;
     (void) shape;
@@ -621,9 +627,9 @@ int32_t Nvfp4A16BlackwellMoeRunner::numGpuOps(Nvfp4A16BlackwellMoeParams const& 
     moe::Backend const backend = moe::resolveBackend(params.backend, params.numTokens);
     if (backend == moe::Backend::kDecode)
     {
-        int32_t const fc2SplitK
-            = std::min<int32_t>(moe::kDecodeFc2SplitK, params.interSize / nvfp4_a16_blackwell::kKTile);
-        return 3 + (decodeFc1SplitK(params) > 1 ? 1 : 0) + (fc2SplitK > 1 ? 1 : 0); // routing, FC1, FC2 (+ reduces)
+        Nvfp4A16BlackwellMoeJitKey const key
+            = params.jit != nullptr && params.jit->isLoaded() ? params.jit->getKey() : makeNvfp4A16BlackwellMoeJitKey(params);
+        return 3 + (key.fc1SplitK > 1 ? 1 : 0) + (key.fc2SplitK > 1 ? 1 : 0); // routing, FC1, FC2 (+ reduces)
     }
     return 5; // routing, tile layout, gather, FC1, FC2
 }
@@ -638,6 +644,10 @@ cudaError_t Nvfp4A16BlackwellMoeRunner::run(Nvfp4A16BlackwellMoeParams const& p,
         || p.fc2GlobalScales == nullptr)
     {
         return cudaErrorInvalidValue;
+    }
+    if (!jitMatchesShape(p))
+    {
+        return cudaErrorInvalidValue; // the JIT bundle of this layer must be loaded (plugin clone / prepare)
     }
     moe::Backend const backend = moe::resolveBackend(p.backend, p.numTokens);
     int32_t const tokenTile = backend == moe::Backend::kDecode ? moe::kLargestTokenTile : prefillTokenTile(p);
