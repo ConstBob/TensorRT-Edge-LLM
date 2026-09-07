@@ -52,8 +52,7 @@ Thor with a tensor-map dump). The producer therefore streams each 4 KB row tile
 as one TMA box of 2 x 2 KB uint64 rows straight into the K_SW32 shared-memory
 image; 32-byte TMA box rows measured 230 GB/s on Thor against 258-270 GB/s for
 2 KB rows or 4 KB bulk copies
-(`tma_bw_probe.cu` and `tma_swizzle_dump.cu` next to this file are the standalone
-evidence tools). Block scales stay a 512-byte TMA transfer per tile.
+(both facts were measured with standalone TMA probe tools kept outside the repository). Block scales stay a 512-byte TMA transfer per tile.
 
 Grouping: `tile_group_idx[n_tile]` selects the expert as the L coordinate of the
 weight **and** block-scale TMA descriptors (one base pointer, no tensormap

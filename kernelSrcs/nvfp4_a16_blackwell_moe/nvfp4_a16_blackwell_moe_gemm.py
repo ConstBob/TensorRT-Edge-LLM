@@ -366,7 +366,7 @@ class Nvfp4A16BlackwellMoeGemm:
         # Weight row tiles are streamed as (256 x 2) uint64 words (2 KB rows):
         # the gmem layout already carries the K_SW32 smem image, so the TMA box
         # is a linear 4 KB copy.  128 x 32-byte box rows cap at ~230 GB/s on
-        # Thor; 2 KB rows reach ~260 GB/s (tma_bw_probe.cu).
+        # Thor; 2 KB rows reach ~260 GB/s (standalone TMA probe measurement).
         self.a_words_shape = (256, 2)
         self.smem_layout_a_words_per_stage = cute.make_composed_layout(
             cute.make_swizzle(0, 4, 3), 0,

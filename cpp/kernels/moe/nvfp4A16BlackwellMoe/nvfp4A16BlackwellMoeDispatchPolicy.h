@@ -108,7 +108,7 @@ inline constexpr int32_t kMaxTokenTiles{1024};
 //     the original 128 x 32-byte box rows the GEMM streamed ~230 GB/s against
 //     Marlin's ~243 GB/s and trailed it by 1-7% at T=2..128; Thor caps
 //     32-byte TMA rows at ~230 GB/s regardless of in-flight depth while 64 B+
-//     rows reach 258-270 GB/s (kernelSrcs/nvfp4_a16_blackwell_moe/tma_bw_probe.cu).
+//     rows reach 258-270 GB/s (measured with a standalone TMA streaming probe).
 //     Residual after the change: uniform T=64 1.01x (tn32; tn16 would trade it
 //     for skewed 1.03x), everything else at or below Marlin.
 // Values are policy hints, not support gates; the runner validates shapes
