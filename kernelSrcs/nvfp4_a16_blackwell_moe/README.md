@@ -47,12 +47,11 @@ own wait orders the data, and its prologue overlaps this kernel's tail.
 launch; the wait/trigger are no-ops without it.
 
 Weight bytes: every 32-byte code row inside a `[128, 32]` tile stores the TMA
-SWIZZLE_32B image (rows 4-7 of every 8 swap their 16-byte halves, measured on
-Thor with a tensor-map dump). The producer therefore streams each 4 KB row tile
-as one TMA box of 2 x 2 KB uint64 rows straight into the K_SW32 shared-memory
-image; 32-byte TMA box rows measured 230 GB/s on Thor against 258-270 GB/s for
-2 KB rows or 4 KB bulk copies
-(both facts were measured with standalone TMA probe tools kept outside the repository). Block scales stay a 512-byte TMA transfer per tile.
+SWIZZLE_32B image (rows 4-7 of every 8 swap their 16-byte halves), so the
+producer streams each 4 KB row tile as one TMA box of 2 x 2 KB uint64 rows
+straight into the K_SW32 shared-memory image. On Thor, 32-byte TMA box rows top
+out at about 230 GB/s, while 2 KB rows or 4 KB bulk copies reach 258-270 GB/s.
+Block scales stay a 512-byte TMA transfer per tile.
 
 Grouping: `tile_group_idx[n_tile]` selects the expert as the L coordinate of the
 weight **and** block-scale TMA descriptors (one base pointer, no tensormap
