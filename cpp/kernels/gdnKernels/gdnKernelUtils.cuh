@@ -29,8 +29,18 @@ void launchGdnCalCuSeqLens(void const* context_lengths, // [N] int32
 
 /** L2-normalize Q and K in-place along the head dimension.
  *  Q, K: (N, seqLen, H, headDim) float16 — each token-head vector is divided by its L2 norm.
- *  Required preprocessing for the Blackwell GDN prefill kernel. */
+ *  Required preprocessing for the SM100/101/110 Blackwell GDN prefill kernel. */
 void launchGdnL2NormQK(void* q, void* k, int32_t n, int32_t seqLen, int32_t h, int32_t headDim, cudaStream_t stream);
+
+/** L2-normalize Q and K in-place in one SM12x kernel launch.
+ *  Q, K: (N, seqLen, H, headDim) float16 — each token-head vector is divided by its L2 norm.
+ *  One warp normalizes the same row of both buffers in a single kernel launch.
+ *  When enablePdl is true, the combined grid is launched with programmatic
+ *  stream serialization, waits for its PDL prerequisite before reading Q/K,
+ *  and triggers its PDL-dependent consumer before the final normalized values
+ *  are stored. */
+cudaError_t launchGdnL2NormQKFusedSm12x(
+    void* q, void* k, int32_t n, int32_t seqLen, int32_t h, int32_t headDim, bool enablePdl, cudaStream_t stream);
 
 /** Transpose the last two dimensions of the GDN state tensor (out-of-place).
  *  The Blackwell GDN prefill MMA produces state in V-major (d_v, d_k) order,

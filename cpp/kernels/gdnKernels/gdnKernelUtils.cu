@@ -17,7 +17,11 @@
 
 #include "gdnKernelUtils.cuh"
 
+#include "common/cudaMacros.h"
+#include "common/logger.h"
+
 #include <cuda_fp16.h>
+#include <type_traits>
 
 namespace trt_edgellm
 {
@@ -89,6 +93,85 @@ __global__ void gdnL2NormQKKernel(half* data, // [numRows, headDim]
     }
 }
 
+__device__ __forceinline__ float computeGdnL2InvNormSm12x(half const* rowPtr, int32_t lane, int32_t headDim)
+{
+    float sumSq = 0.0f;
+    for (int32_t d = lane; d < headDim; d += 32)
+    {
+        float const val = __half2float(rowPtr[d]);
+        sumSq += val * val;
+    }
+    for (int32_t offset = 16; offset > 0; offset >>= 1)
+    {
+        sumSq += __shfl_xor_sync(0xFFFFFFFF, sumSq, offset);
+    }
+    return rsqrtf(sumSq + 1e-6f);
+}
+
+__device__ __forceinline__ void applyGdnL2NormSm12x(half* rowPtr, int32_t lane, int32_t headDim, float invNorm)
+{
+    for (int32_t d = lane; d < headDim; d += 32)
+    {
+        float const val = __half2float(rowPtr[d]);
+        rowPtr[d] = __float2half(val * invNorm);
+    }
+}
+
+/**
+ * SM12x fused Q/K L2 normalization and PDL consumer/producer.
+ *
+ * Q and K have the same layout and shape. Each warp handles the same row in
+ * both buffers while preserving the legacy unary path's FP32 accumulation,
+ * shuffle-reduction, and store order for each tensor.
+ */
+template <bool EnablePdl>
+__global__ void gdnL2NormQKFusedSm12xKernel(half* q, // [numRows, headDim]
+    half* k,                                         // [numRows, headDim]
+    int32_t numRows, int32_t headDim)
+{
+    int32_t const row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+    int32_t const lane = threadIdx.x % 32;
+    if (row >= numRows)
+    {
+        return;
+    }
+
+    int64_t const rowOffset = static_cast<int64_t>(row) * headDim;
+    half* qRowPtr = q + rowOffset;
+    half* kRowPtr = k + rowOffset;
+
+#if SUPPORTS_PROGRAMMATIC_DEPENDENT_LAUNCH && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if constexpr (EnablePdl)
+    {
+        // Q and K are TensorRT plugin inputs and may be produced by the
+        // prerequisite grid. Keep only dependency-independent index and
+        // pointer setup above this wait; the memory clobber prevents either
+        // input load from moving across the visibility boundary.
+        asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    }
+#endif
+
+    float const invNormQ = computeGdnL2InvNormSm12x(qRowPtr, lane, headDim);
+    float const invNormK = computeGdnL2InvNormSm12x(kRowPtr, lane, headDim);
+
+#if SUPPORTS_PROGRAMMATIC_DEPENDENT_LAUNCH && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if constexpr (EnablePdl)
+    {
+        // Every CTA's thread 0 reaches this point after its warp computes both
+        // inverse norms and before any pass-2 store in that warp. The dependent
+        // consumer's griddepcontrol.wait is the grid completion and
+        // memory-visibility boundary, so no CTA barrier is required here.
+        if (threadIdx.x == 0)
+        {
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
+    }
+#endif
+
+    applyGdnL2NormSm12x(qRowPtr, lane, headDim, invNormQ);
+    applyGdnL2NormSm12x(kRowPtr, lane, headDim, invNormK);
+}
+
 void launchGdnL2NormQK(void* q, void* k, int32_t n, int32_t seqLen, int32_t h, int32_t headDim, cudaStream_t stream)
 {
     int32_t const numRowsQ = n * seqLen * h;
@@ -99,6 +182,55 @@ void launchGdnL2NormQK(void* q, void* k, int32_t n, int32_t seqLen, int32_t h, i
 
     gdnL2NormQKKernel<<<numBlocksQ, threadsPerBlock, 0, stream>>>(static_cast<half*>(q), numRowsQ, headDim);
     gdnL2NormQKKernel<<<numBlocksK, threadsPerBlock, 0, stream>>>(static_cast<half*>(k), numRowsQ, headDim);
+}
+
+cudaError_t launchGdnL2NormQKFusedSm12x(
+    void* q, void* k, int32_t n, int32_t seqLen, int32_t h, int32_t headDim, bool enablePdl, cudaStream_t stream)
+{
+    int32_t const numRows = n * seqLen * h;
+    int32_t const warpsPerBlock = 8;
+    int32_t const threadsPerBlock = warpsPerBlock * 32;
+    int32_t const numBlocks = (numRows + warpsPerBlock - 1) / warpsPerBlock;
+
+    auto const launchKernel = [&](auto pdlTag) {
+        constexpr bool kEnablePdl = decltype(pdlTag)::value;
+#if SUPPORTS_PROGRAMMATIC_DEPENDENT_LAUNCH
+        cudaLaunchAttribute pdlAttribute{};
+        cudaLaunchConfig_t launchConfig{};
+        launchConfig.gridDim = dim3(numBlocks);
+        launchConfig.blockDim = dim3(threadsPerBlock);
+        launchConfig.dynamicSmemBytes = 0;
+        launchConfig.stream = stream;
+        launchConfig.attrs = kEnablePdl ? &pdlAttribute : nullptr;
+        launchConfig.numAttrs = kEnablePdl ? 1U : 0U;
+
+        if constexpr (kEnablePdl)
+        {
+            pdlAttribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            pdlAttribute.val.programmaticStreamSerializationAllowed = 1;
+        }
+
+        return cudaLaunchKernelEx(&launchConfig, gdnL2NormQKFusedSm12xKernel<kEnablePdl>, static_cast<half*>(q),
+            static_cast<half*>(k), numRows, headDim);
+#else
+        gdnL2NormQKFusedSm12xKernel<kEnablePdl>
+            <<<numBlocks, threadsPerBlock, 0, stream>>>(static_cast<half*>(q), static_cast<half*>(k), numRows, headDim);
+        return cudaPeekAtLastError();
+#endif // SUPPORTS_PROGRAMMATIC_DEPENDENT_LAUNCH
+    };
+
+#if SUPPORTS_PROGRAMMATIC_DEPENDENT_LAUNCH
+    if (enablePdl)
+    {
+        return launchKernel(std::true_type{});
+    }
+#else
+    if (enablePdl)
+    {
+        LOG_DEBUG("GDN fused Q/K normalization: PDL requested but unavailable in this build; launching without PDL.");
+    }
+#endif
+    return launchKernel(std::false_type{});
 }
 
 /**

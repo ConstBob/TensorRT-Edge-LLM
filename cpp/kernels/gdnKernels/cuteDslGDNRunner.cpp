@@ -19,6 +19,7 @@
 
 #include "cuteDslGDNRunner.h"
 #include "gdnKernelUtils.cuh"
+#include "gdnPdlConfig.h"
 
 #include "common/cudaUtils.h"
 #include "common/logger.h"
@@ -383,8 +384,16 @@ int CuteDslGDNRunner::runPrefillBlackwellGeforce(GDNParams const& params, cudaSt
     }
 
     // Match the existing optimized Blackwell path: all consumers must observe
-    // the same normalized Q/K values.
-    launchGdnL2NormQK(params.q, params.k, n, seqLen, h, k, stream);
+    // the same normalized Q/K values. The effective PDL value is shared by the
+    // dual-role combined Q/K and generated fused GDN launches.
+    int32_t const enablePdl = useGdnPdl(params.enablePdl, seqLen, params.smVersion) ? 1 : 0;
+    cudaError_t const qkNormResult
+        = launchGdnL2NormQKFusedSm12x(params.q, params.k, n, seqLen, h, k, enablePdl != 0, stream);
+    if (qkNormResult != cudaSuccess)
+    {
+        LOG_ERROR("GDN Blackwell GeForce Q/K normalization launch failed: %s", cudaGetErrorString(qkNormResult));
+        return -1;
+    }
 
     gdn_prefill_blackwell_geforce_Tensor_q_t qTensor{};
     SET_4D_TENSOR(qTensor, params.q, n, seqLen, h, k);
@@ -428,7 +437,7 @@ int CuteDslGDNRunner::runPrefillBlackwellGeforce(GDNParams const& params, cudaSt
 
     return cute_dsl_gdn_prefill_blackwell_geforce_wrapper(&sBlackwellGeforcePrefillModule.module, &qTensor, &kTensor,
         &vTensor, &aTensor, &bTensor, &ALogTensor, &dtBiasTensor, &h0InTensor, &h0OutTensor, &contextLengthsTensor,
-        &oTensor, &tensormapScratchTensor, stream);
+        &oTensor, &tensormapScratchTensor, enablePdl, stream);
 #else
     LOG_ERROR("Blackwell GeForce GDN prefill not compiled in this build.");
     return -1;
