@@ -476,6 +476,32 @@ Thinker interleaving — only chunked vocoding, configured via CLI
 }
 ```
 
+### CodePredictor speculative decoding
+
+The CodePredictor loop dominates audio decode time. It speculates with no draft
+model: the checkpoint already carries one `lm_head` per RVQ depth over a shared
+residual stream, so `lm_heads[s+1]` applied to the hidden state at depth `s` is a
+one-step-ahead proposal costing a single GEMV. Verification is standard
+speculative sampling (`min(1, p/q)` accept, `norm(p-q)+` residual resample), so the
+sampled distribution is unchanged.
+
+Off by default; enable per run with `--cpSpecVerifySize N` (one committed position
+plus `N-1` drafted depths, valid range 2-8). Acceptance saturates past four depths.
+Applies to every variant — dense, MoE and Next — and to both `llm_inference
+--enableAudioOutput` and `qwen3_tts_inference`.
+
+No extra build step: the builder recognises a CodePredictor from the `model` field
+in its engine config and widens only that engine's generation profile.
+
+Degrades to the autoregressive loop, with a warning, when the codebook exceeds the
+small-vocabulary kernels, when the engine predates the wider generation profile, or
+when the model has fewer than two RVQ depths — it never silently mis-decodes.
+
+Under greedy decoding the output differs from the autoregressive path: verification
+needs a different `lm_head` per position, which the engine's single `lm_head_idx`
+gather cannot express, so the runtime applies the heads itself and the two
+computations round differently. Under sampling the distribution is unchanged.
+
 ---
 
 ## Qwen3-Omni Next specifics (internal)
@@ -854,6 +880,7 @@ speech on this arch.
 | Next dense 3B | CP FP8 | PTQ (16 samples) + Talker-root ckpt + ONNX QDQ validated on B100; engine E2E pending |
 | Next MoE 23A2.6B | CP FP8 | PTQ (~21 min B100) + ONNX QDQ + fp16 projection sidecar validated; engine E2E validated — WER parity with fp16 CP within run noise, SIM 0.510 vs 0.507 |
 | Next MoE 23A2.6B | ViT/AuT FP8 | B100 E2E validated. Visual (111 FP8 layers) + audio (199 FP8 layers) towers quantized in the joint calib pass, ONNX carries FP8 QDQ, engines build clean. Audio: LibriSpeech-20 WER 3.29% (FP8) vs 3.05% (FP16), Δ within noise, matches 3.30% FP16 baseline. Visual: shape/color description byte-identical to FP16. Validated against a paged-KV FP16 Thinker rebuilt from the BF16 root on the current branch. |
+| All | CP speculative decoding | A100 A/B against the autoregressive loop on the standalone TTS path; kernel-level tests cover sampling/verify equivalence with the DSpark reference |
 
 ## Notes
 

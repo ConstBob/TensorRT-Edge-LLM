@@ -68,6 +68,14 @@ bool isSpecDecodeDraft(Json const& config, char const* type)
     return specDecodeType(config) == type && engineRole(config) == "draft";
 }
 
+//! The CodePredictor exports one model name per Qwen3-Omni variant, all sharing this suffix.
+bool isCodePredictor(Json const& config)
+{
+    constexpr std::string_view suffix = "_code_predictor";
+    auto const model = config.value("model", std::string{});
+    return model.size() >= suffix.size() && model.compare(model.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 bool isValidSpecDecodeType(std::string const& type)
 {
     return type == "none" || type == "mtp" || type == "eagle3" || type == "dflash" || type == "dflash2"
@@ -1018,18 +1026,29 @@ bool LLMBuilder::setupDiffusionBackboneProfiles(nvinfer1::IOptimizationProfile& 
     return result;
 }
 
+//! Widest verify window the CodePredictor runtime can request; must stay >= kCpSpecMaxK.
+constexpr int64_t kCodePredictorMaxVerifyWindow = 8;
+
 bool LLMBuilder::setupVanillaProfiles(
     nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
 {
     bool result = true;
 
+    // A CodePredictor verifies several RVQ depths in one generation-profile call, so its
+    // generation profile has to accept more than one position. The width covers the runtime's
+    // whole speculative range; no other engine decodes more than one position at a time.
+    int64_t const genSeq = isCodePredictor(mModelConfig) ? kCodePredictorMaxVerifyWindow : 1;
+
     // Input embeddings - always dynamic
     result &= setOptimizationProfile(&contextProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
         createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
         createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
+    // Only the upper bound widens: a verify pass must fit, but tuning tactics for the widest
+    // window is slower than tuning for one position on both the autoregressive and the
+    // speculative path, so opt stays at the single-token decode shape.
     result &= setOptimizationProfile(&generationProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
         createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}),
-        createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}));
+        createDims({mBuilderConfig.maxBatchSize, genSeq, mHiddenSize}));
 
     if (mModelConfig.value("use_vision_bidirectional_attention", false))
     {

@@ -18,6 +18,7 @@
 #include "common/checkMacros.h"
 #include "common/cudaMacros.h"
 #include "kernels/speculative/dsparkKernels.h"
+#include "kernels/speculative/speculativeKernelsUtils.h"
 
 #include <cfloat>
 #include <cub/cub.cuh>
@@ -83,11 +84,6 @@ __device__ __forceinline__ float dsparkInvTemperature(float temperature)
     return (temperature < 1e-3F) ? 1.0F : 1.0F / temperature;
 }
 
-__device__ __forceinline__ float dsparkClampUniform(float uniform)
-{
-    return fminf(fmaxf(uniform, 0.0F), 0.99999994F);
-}
-
 __device__ __forceinline__ uint64_t dsparkSplitMix64(uint64_t value)
 {
     value += 0x9E3779B97F4A7C15ULL;
@@ -100,12 +96,12 @@ __device__ __forceinline__ float dsparkUniformFromCounter(uint64_t seed, uint64_
 {
     uint64_t const mixed = dsparkSplitMix64(seed ^ (offset + 0xD1B54A32D192ED03ULL * (counter + 1ULL)));
     uint32_t const mantissa = static_cast<uint32_t>(mixed >> 40);
-    return dsparkClampUniform(static_cast<float>(mantissa) * (1.0F / 16777216.0F));
+    return clampUniform(static_cast<float>(mantissa) * (1.0F / 16777216.0F));
 }
 
 __device__ int32_t dsparkSampleFromProbs(float const* probs, int32_t vocabSize, float uniform)
 {
-    float const target = dsparkClampUniform(uniform);
+    float const target = clampUniform(uniform);
     float cumulative = 0.0F;
     int32_t fallback = 0;
     for (int32_t vocabIdx = 0; vocabIdx < vocabSize; ++vocabIdx)
@@ -138,7 +134,7 @@ __device__ int32_t dsparkSampleFromResidual(
         return dsparkSampleFromProbs(targetProbs, vocabSize, uniform);
     }
 
-    float const target = dsparkClampUniform(uniform) * residualSum;
+    float const target = clampUniform(uniform) * residualSum;
     float cumulative = 0.0F;
     int32_t fallback = 0;
     for (int32_t vocabIdx = 0; vocabIdx < vocabSize; ++vocabIdx)
@@ -1162,7 +1158,7 @@ __global__ void dsparkProbabilisticAcceptKernel(float const* __restrict__ target
 
 __device__ int32_t dsparkSampleFromSparseProbs(float const* probs, int32_t const* indices, int32_t topK, float uniform)
 {
-    float const target = dsparkClampUniform(uniform);
+    float const target = clampUniform(uniform);
     float cumulative = 0.0F;
     int32_t fallback = topK > 0 ? indices[0] : 0;
     for (int32_t k = 0; k < topK; ++k)
