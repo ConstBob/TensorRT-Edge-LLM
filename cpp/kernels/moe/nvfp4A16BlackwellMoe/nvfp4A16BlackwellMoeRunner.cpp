@@ -85,6 +85,7 @@ int32_t decodeFc1SplitK(Nvfp4A16BlackwellMoeParams const& p) noexcept
     return std::max<int32_t>(1, std::min<int32_t>(requested, p.hiddenSize / nvfp4_a16_blackwell::kKTile));
 }
 
+#if defined(CUTE_DSL_NVFP4_A16_BLACKWELL_MOE_ENABLED)
 //! Effective PDL mode: the request from the plugin (EDGELLM_ENABLE_PDL) gated by
 //! toolchain support.  The kernels are SM110-only, so no SM gate is needed.
 constexpr bool usePdl(Nvfp4A16BlackwellMoeParams const& p) noexcept
@@ -127,6 +128,7 @@ cudaError_t launchRouting(Nvfp4A16BlackwellMoeParams const& p, int32_t* const to
         return cudaErrorUnknown;
     }
 }
+#endif // CUTE_DSL_NVFP4_A16_BLACKWELL_MOE_ENABLED
 
 //! Single source of truth for the workspace carve-out (sizing and run use it).
 struct WorkspaceLayout
@@ -470,7 +472,6 @@ cudaError_t runPrefill(
         return cudaErrorUnknown;
     }
 }
-#endif // CUTE_DSL_NVFP4_A16_BLACKWELL_MOE_ENABLED
 
 cudaError_t runDecode(
     Nvfp4A16BlackwellMoeParams const& p, unsigned char* ws, WorkspaceLayout const& l, cudaStream_t stream) noexcept
@@ -518,6 +519,7 @@ bool jitMatchesShape(Nvfp4A16BlackwellMoeParams const& p) noexcept
         == (p.dtype == moe::DecodeDtype::kBF16 ? Nvfp4A16BlackwellMoeDataType::kBF16
                                                : Nvfp4A16BlackwellMoeDataType::kHALF);
 }
+#endif // CUTE_DSL_NVFP4_A16_BLACKWELL_MOE_ENABLED
 
 } // namespace
 
