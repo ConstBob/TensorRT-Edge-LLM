@@ -62,6 +62,14 @@ constexpr int32_t kPrefetchTiles{4};
 //! spills, so the bound is binding by a few registers (-warn-spills guards it).
 constexpr int32_t kDecodeFc1CtasPerSm{2};
 constexpr int32_t kDecodeFc2CtasPerSm{3};
+//! FC2 may copy the weight tiles (this CTA's K range, codes + scales) of its
+//! first params.fc2PrefetchSlots slots into shared memory with cp.async BEFORE
+//! griddepcontrol.wait: their expert ids are routing results, complete and
+//! visible when FC2 starts because FC1 (and its reduce) wait before they
+//! trigger, so the copies overlap the predecessor's tail instead of trailing
+//! the wait.  Nemotron: 6.4 KB activations + 18 KB per staged slot.
+constexpr int32_t kCodeBytesPerTile{kNTile * kPackedBytesPerRowTile};
+constexpr int32_t kScaleBytesPerTile{kNTile * kScalesPerRowTile};
 constexpr int32_t kSmemBytesPerStagedTile{kSmemRowStride * static_cast<int32_t>(sizeof(float))};
 
 struct __align__(16) Uint4
@@ -192,6 +200,21 @@ __device__ __forceinline__ RowTileHalf loadRowTileHalf(unsigned char const* __re
     return tile;
 }
 
+//! Same row tile half read from the shared-memory staging of one slot's K range
+//! (kCodeBytesPerTile / kScaleBytesPerTile per tile, tiles consecutive).  The
+//! swizzle bit of the row tile index is bit 2 of the row inside the tile.
+__device__ __forceinline__ RowTileHalf loadRowTileHalfSmem(unsigned char const* const sCodes,
+    unsigned char const* const sScales, int32_t const tile, int32_t const rowInTile, int32_t const kHalf)
+{
+    RowTileHalf value{};
+    int32_t const storedHalf = kHalf ^ ((rowInTile >> 2) & 1);
+    value.codes = *reinterpret_cast<Uint4 const*>(
+        sCodes + tile * kCodeBytesPerTile + rowInTile * kPackedBytesPerRowTile + storedHalf * kPackedBytesPerThread);
+    value.scales = *reinterpret_cast<unsigned short const*>(
+        sScales + tile * kScaleBytesPerTile + rowInTile * kScalesPerRowTile + kHalf * 2);
+    return value;
+}
+
 //! Dot product of a lane's 32 dequantized weights with the matching staged
 //! activation half (``stagedHalf`` already offset by tile and K half).
 __device__ __forceinline__ float dotRowTileHalf(RowTileHalf const& tile, float const* const stagedHalf)
@@ -213,6 +236,22 @@ __device__ __forceinline__ float dotRowTileHalf(RowTileHalf const& tile, float c
             float const dot = fmaf(values.x, weights.x, values.y * weights.y);
             acc = fmaf(dot, scale, acc);
         }
+    }
+    return acc;
+}
+
+//! Dot of one weight row (this lane's half) over the numTiles tiles staged in
+//! shared memory by the pre-wait cp.async prefetch.
+__device__ __forceinline__ float dotStagedRowRange(unsigned char const* const sCodes,
+    unsigned char const* const sScales, int32_t const numTiles, int32_t const rowInTile, int32_t const kHalf,
+    float const* const stagedRange)
+{
+    float acc = 0.0f;
+    float const* const stagedHalf = stagedRange + kHalf * kSmemHalfStride;
+    for (int32_t tile = 0; tile < numTiles; ++tile)
+    {
+        acc += dotRowTileHalf(
+            loadRowTileHalfSmem(sCodes, sScales, tile, rowInTile, kHalf), stagedHalf + tile * kSmemRowStride);
     }
     return acc;
 }
@@ -263,9 +302,10 @@ __host__ __device__ __forceinline__ int32_t fc1SharedBytes(int32_t const kBlocks
 }
 
 __host__ __device__ __forceinline__ int32_t fc2SharedBytes(
-    int32_t const topK, int32_t const kBlocks, int32_t const splitK)
+    int32_t const topK, int32_t const kBlocks, int32_t const splitK, int32_t const prefetchSlots)
 {
-    return topK * maxTilesPerSplit(kBlocks, splitK) * kSmemBytesPerStagedTile;
+    int32_t const tiles = maxTilesPerSplit(kBlocks, splitK);
+    return topK * tiles * kSmemBytesPerStagedTile + prefetchSlots * tiles * (kCodeBytesPerTile + kScaleBytesPerTile);
 }
 
 //! FC1: grid (N1_pad/128, numTokens*topK, fc1SplitK), 256 threads.  The routing
@@ -292,12 +332,14 @@ __global__ __launch_bounds__(kThreadsPerBlock, kDecodeFc1CtasPerSm) void decodeF
     int32_t const kBlockEnd = kBlocks * (split + 1) / params.fc1SplitK;
     T const* const activationRow
         = static_cast<T const*>(params.hiddenStates) + static_cast<long long>(token) * kFeatures;
-    // topkIndices comes from the routing kernel and the activation row from the
-    // previous layer; the (dependent) expert lookup is issued before the staging
-    // loop so its latency overlaps it.
-    pdlWait();
-    int32_t const expert = params.topkIndices[slot];
+    // The activation row belongs to the previous layer, which had completed
+    // before the routing kernel passed its own wait (routing triggers only
+    // after that wait), so it is staged before this kernel's wait; only the
+    // expert id (routing output) has to wait (trigger placement: see Pdl.cuh).
     stageActivationRange<T>(activationRow, kBlockBegin, kBlockEnd, sharedActivation);
+    pdlWait();
+    pdlTrigger();
+    int32_t const expert = params.topkIndices[slot];
     __syncthreads();
 
     int32_t const lane = static_cast<int32_t>(threadIdx.x) & (kWarpSize - 1);
@@ -331,7 +373,6 @@ __global__ __launch_bounds__(kThreadsPerBlock, kDecodeFc1CtasPerSm) void decodeF
                 = acc;
         }
     }
-    pdlTrigger();
 }
 
 //! FC1 split-K finalize: sum partials, apply alpha[expert], relu^2, narrow.
@@ -342,13 +383,20 @@ __global__ void decodeFc1ReduceKernel(DecodeMoeParams const params)
     int32_t const nFeatures = params.interSizePadded;
     long long const numSlots = static_cast<long long>(params.numTokens) * params.topK;
     long long const numPairs = numSlots * nFeatures / 2;
-    pdlWait(); // partials from FC1, topkIndices from the routing kernel
-    if (pairIndex < numPairs)
+    bool const active = pairIndex < numPairs;
+    long long const elementIndex = pairIndex * 2;
+    // Routing results are complete and visible (FC1 waited before it triggered);
+    // only the partials need this kernel's wait.
+    float alpha = 0.0f;
+    if (active)
     {
-        long long const elementIndex = pairIndex * 2;
         int32_t const slot = static_cast<int32_t>(elementIndex / nFeatures);
-        int32_t const expert = params.topkIndices[slot];
-        float const alpha = params.fc1GlobalScales[expert];
+        alpha = params.fc1GlobalScales[params.topkIndices[slot]];
+    }
+    pdlWait();
+    pdlTrigger();
+    if (active)
+    {
         float2 sum{0.0f, 0.0f};
         for (int32_t split = 0; split < params.fc1SplitK; ++split)
         {
@@ -361,7 +409,6 @@ __global__ void decodeFc1ReduceKernel(DecodeMoeParams const params)
         float const b = fmaxf(sum.y * alpha, 0.0f);
         ActTraits<T>::storePair(static_cast<T*>(params.fc1Output) + elementIndex, make_float2(a * a, b * b));
     }
-    pdlTrigger();
 }
 
 //! FC2: grid (H/128, numTokens, fc2SplitK), 256 threads.  Each CTA loops over the
@@ -388,9 +435,42 @@ __global__ __launch_bounds__(kThreadsPerBlock, kDecodeFc2CtasPerSm) void decodeF
     int32_t const kBlockEnd = kBlocks * (split + 1) / params.fc2SplitK;
     long long const expertPlaneCodes = static_cast<long long>(nFeatures) * kFeatures / 2;
     int32_t const stagedTilesPerSlot = maxTilesPerSplit(kBlocks, params.fc2SplitK);
+    int32_t const numTiles = kBlockEnd - kBlockBegin;
+    int32_t const numPrefetchSlots = params.fc2PrefetchSlots;
+    int32_t const tid = static_cast<int32_t>(threadIdx.x);
+    unsigned char* const sCodes = dynamicSmem + params.topK * stagedTilesPerSlot * kSmemBytesPerStagedTile;
+    unsigned char* const sScales = sCodes + numPrefetchSlots * stagedTilesPerSlot * kCodeBytesPerTile;
+    unsigned char const* const codesBase = static_cast<unsigned char const*>(params.fc2QWeights);
+    unsigned char const* const scalesBase = static_cast<unsigned char const*>(params.fc2BlockScales);
+    // This CTA's K range of one expert is contiguous in the layout: row tiles
+    // (nBlock * kBlocks + kBlock) * 128 .. for kBlock in [begin, end).
+    long long const rangeTileBase = (static_cast<long long>(nBlock) * kBlocks + kBlockBegin) * kNTile;
 
-    // fc1Output, topkIndices and topkWeights are produced by the earlier kernels.
+    // Before the wait: topkIndices / topkWeights / global scales are routing
+    // results, complete and visible because FC1 (and its reduce) waited before
+    // they triggered.  Copy the first slots' weight tiles into shared memory so
+    // the traffic overlaps the predecessor's tail; fc1Output must wait.
+    for (int32_t slotInToken = 0; slotInToken < numPrefetchSlots; ++slotInToken)
+    {
+        int32_t const expert = params.topkIndices[static_cast<long long>(token) * params.topK + slotInToken];
+        unsigned char const* const codes
+            = codesBase + static_cast<long long>(expert) * expertPlaneCodes + rangeTileBase * kPackedBytesPerRowTile;
+        unsigned char const* const scales
+            = scalesBase + static_cast<long long>(expert) * (expertPlaneCodes / 8) + rangeTileBase * kScalesPerRowTile;
+        unsigned char* const dstCodes = sCodes + slotInToken * stagedTilesPerSlot * kCodeBytesPerTile;
+        unsigned char* const dstScales = sScales + slotInToken * stagedTilesPerSlot * kScaleBytesPerTile;
+        for (int32_t v = tid; v < numTiles * (kCodeBytesPerTile / 16); v += kThreadsPerBlock)
+        {
+            cpAsync16(dstCodes + v * 16, codes + v * 16);
+        }
+        for (int32_t v = tid; v < numTiles * (kScaleBytesPerTile / 16); v += kThreadsPerBlock)
+        {
+            cpAsync16(dstScales + v * 16, scales + v * 16);
+        }
+    }
+    cpAsyncCommit();
     pdlWait();
+    pdlTrigger();
     for (int32_t slotInToken = 0; slotInToken < params.topK; ++slotInToken)
     {
         long long const slot = static_cast<long long>(token) * params.topK + slotInToken;
@@ -398,6 +478,7 @@ __global__ __launch_bounds__(kThreadsPerBlock, kDecodeFc2CtasPerSm) void decodeF
         stageActivationRange<T>(activationRow, kBlockBegin, kBlockEnd,
             sharedActivation + slotInToken * stagedTilesPerSlot * kSmemRowStride);
     }
+    cpAsyncWaitAll();
     __syncthreads();
 
     long long const rowTileBase = static_cast<long long>(nBlock) * kBlocks * kNTile + rowInTile;
@@ -407,12 +488,21 @@ __global__ __launch_bounds__(kThreadsPerBlock, kDecodeFc2CtasPerSm) void decodeF
         long long const slot = static_cast<long long>(token) * params.topK + slotInToken;
         int32_t const expert = params.topkIndices[slot];
         float const weight = params.topkWeights[slot] * params.fc2GlobalScales[expert];
-        unsigned char const* const qweights
-            = static_cast<unsigned char const*>(params.fc2QWeights) + static_cast<long long>(expert) * expertPlaneCodes;
-        unsigned char const* const blockScales = static_cast<unsigned char const*>(params.fc2BlockScales)
-            + static_cast<long long>(expert) * (expertPlaneCodes / 8);
-        float const acc = streamRowRange(qweights, blockScales, rowTileBase, kBlockBegin, kBlockEnd, kHalf,
-            sharedActivation + slotInToken * stagedTilesPerSlot * kSmemRowStride);
+        float const* const stagedRange = sharedActivation + slotInToken * stagedTilesPerSlot * kSmemRowStride;
+        float acc = 0.0f;
+        if (slotInToken < numPrefetchSlots)
+        {
+            acc = dotStagedRowRange(sCodes + slotInToken * stagedTilesPerSlot * kCodeBytesPerTile,
+                sScales + slotInToken * stagedTilesPerSlot * kScaleBytesPerTile, numTiles, rowInTile, kHalf,
+                stagedRange);
+        }
+        else
+        {
+            unsigned char const* const qweights = codesBase + static_cast<long long>(expert) * expertPlaneCodes;
+            unsigned char const* const blockScales
+                = scalesBase + static_cast<long long>(expert) * (expertPlaneCodes / 8);
+            acc = streamRowRange(qweights, blockScales, rowTileBase, kBlockBegin, kBlockEnd, kHalf, stagedRange);
+        }
         total = fmaf(weight, acc, total);
     }
     total += __shfl_xor_sync(0xFFFFFFFFU, total, 1, kWarpSize);
@@ -429,7 +519,6 @@ __global__ __launch_bounds__(kThreadsPerBlock, kDecodeFc2CtasPerSm) void decodeF
             params.fc2Partials[(static_cast<long long>(split) * params.numTokens + token) * nFeatures + n] = total;
         }
     }
-    pdlTrigger();
 }
 
 //! FC2 split-K finalize: sum partials, narrow.
@@ -438,7 +527,8 @@ __global__ void decodeFc2ReduceKernel(DecodeMoeParams const params)
 {
     long long const pairIndex = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     long long const numElements = static_cast<long long>(params.numTokens) * params.hiddenSize;
-    pdlWait(); // partials from FC2
+    pdlWait(); // partials from FC2 (nothing of this kernel's inputs predates them)
+    pdlTrigger();
     if (pairIndex * 2 < numElements)
     {
         long long const elementIndex = pairIndex * 2;
@@ -452,7 +542,6 @@ __global__ void decodeFc2ReduceKernel(DecodeMoeParams const params)
         }
         ActTraits<T>::storePair(static_cast<T*>(params.output) + elementIndex, sum);
     }
-    pdlTrigger();
 }
 
 constexpr int32_t kDefaultMaxDynamicSmemBytes{48 * 1024};
@@ -493,7 +582,8 @@ template <typename T>
 cudaError_t launchFc2Typed(DecodeMoeParams const& params, cudaStream_t const stream)
 {
     dim3 const grid(params.hiddenSize / kNTile, params.numTokens, params.fc2SplitK);
-    int32_t const smemBytes = fc2SharedBytes(params.topK, params.interSize / kKTile, params.fc2SplitK);
+    int32_t const smemBytes
+        = fc2SharedBytes(params.topK, params.interSize / kKTile, params.fc2SplitK, params.fc2PrefetchSlots);
     cudaError_t const attr = optInDynamicSmem(decodeFc2Kernel<T>, smemBytes);
     if (attr != cudaSuccess)
     {
@@ -550,6 +640,10 @@ char const* validateDecodeParams(DecodeMoeParams const& p, DecodeDtype const dty
     {
         return "hiddenSize must be a positive multiple of 128";
     }
+    if (p.fc2PrefetchSlots < 0 || p.fc2PrefetchSlots > p.topK)
+    {
+        return "fc2PrefetchSlots must be in [0, topK]";
+    }
     if (p.interSize <= 0 || p.interSize % kKTile != 0)
     {
         return "interSize must be a positive multiple of 64";
@@ -578,11 +672,18 @@ char const* validateDecodeParams(DecodeMoeParams const& p, DecodeDtype const dty
         return "split-K requires a partials buffer";
     }
     auto const aligned16 = [](void const* ptr) { return (reinterpret_cast<uintptr_t>(ptr) & 15U) == 0; };
-    if (!aligned16(p.hiddenStates) || !aligned16(p.fc1Output) || !aligned16(p.fc1QWeights) || !aligned16(p.fc2QWeights))
+    if (!aligned16(p.hiddenStates) || !aligned16(p.fc1Output) || !aligned16(p.fc1QWeights) || !aligned16(p.fc2QWeights)
+        || !aligned16(p.fc2BlockScales))
     {
-        return "activations and weights must be 16-byte aligned";
+        return "activations, weights and FC2 block scales must be 16-byte aligned";
     }
     return nullptr;
+}
+
+int32_t decodeFc2SharedBytes(
+    int32_t const topK, int32_t const kBlocks, int32_t const splitK, int32_t const prefetchSlots)
+{
+    return fc2SharedBytes(topK, kBlocks, splitK, prefetchSlots);
 }
 
 cudaError_t launchDecodeFc1(DecodeMoeParams const& params, DecodeDtype const dtype, cudaStream_t const stream)

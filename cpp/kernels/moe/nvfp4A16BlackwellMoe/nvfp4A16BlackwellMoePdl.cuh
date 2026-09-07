@@ -18,14 +18,17 @@
 
 //! Programmatic Dependent Launch (PDL) helpers for the Thor W4A16 MoE kernels.
 //!
-//! Every kernel of the plugin calls pdlWait() before its first read of data a
-//! previous kernel (or the preceding TensorRT layer) produced, and pdlTrigger()
-//! once its own outputs are written, so the next kernel in the stream can be
-//! launched with cudaLaunchAttributeProgrammaticStreamSerialization and start
-//! its prologue while this one drains.  Both instructions are no-ops when the
-//! grid was launched without the attribute, so the kernels carry them
-//! unconditionally and the runner gates PDL at the launch (toolchain macro,
-//! EDGELLM_ENABLE_PDL, benchmark A/B).
+//! Every kernel of the plugin calls pdlWait() before its first read of data its
+//! immediate predecessor produced and before its first global write, and
+//! pdlTrigger() right after that wait: a dependent grid is scheduled only once
+//! every CTA of this grid has triggered or exited, i.e. during this grid's last
+//! wave, and the dependent's own wait orders the data.  Inputs produced two or
+//! more launches earlier are already complete and visible when a kernel starts
+//! (its predecessor passed its own wait before triggering), so kernels stage or
+//! prefetch those before waiting.  Both instructions are no-ops when the grid
+//! was launched without the attribute, so the kernels carry them unconditionally
+//! and the runner gates PDL at the launch (toolchain macro, EDGELLM_ENABLE_PDL,
+//! benchmark A/B).
 
 #include "common/cudaMacros.h"
 
@@ -54,6 +57,35 @@ __device__ __forceinline__ void pdlTrigger()
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
 #endif
+}
+
+//! Pre-wait helpers: work that does not depend on the immediate predecessor
+//! (constant weights, results of earlier launches) can be moved before pdlWait().
+
+//! 16-byte global -> shared asynchronous copy (cp.async.cg, L2 only).
+__device__ __forceinline__ void cpAsync16(void* const smemDst, void const* const gmemSrc)
+{
+    unsigned int const dst = static_cast<unsigned int>(__cvta_generic_to_shared(smemDst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(gmemSrc) : "memory");
+}
+
+__device__ __forceinline__ void cpAsyncCommit()
+{
+    asm volatile("cp.async.commit_group;" ::: "memory");
+}
+
+__device__ __forceinline__ void cpAsyncWaitAll()
+{
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+}
+
+//! Prefetch [pointer, pointer + bytes) into L2 (one line per lane per step).
+__device__ __forceinline__ void prefetchL2(void const* const pointer, int32_t const bytes, int32_t const lane)
+{
+    for (int32_t offset = lane * 128; offset < bytes; offset += 32 * 128)
+    {
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(static_cast<unsigned char const*>(pointer) + offset));
+    }
 }
 
 //! Launch @p kernel with the programmatic-stream-serialization attribute when

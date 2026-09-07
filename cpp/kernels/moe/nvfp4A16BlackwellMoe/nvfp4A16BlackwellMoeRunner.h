@@ -49,6 +49,11 @@ struct Nvfp4A16BlackwellMoeParams
     //! still requires toolchain support; shared grouped-routing kernels launch
     //! without the attribute and simply serialize).
     bool enablePdl{false};
+    //! Decode FC2 slots staged into shared memory before its PDL wait: -1 takes
+    //! the sealed policy value (or the EDGELLM_MOE_DECODE_FC2_PREFETCH override),
+    //! 0..kDecodeFc2MaxPrefetchSlots forces it (tests).  Clamped to topK and to
+    //! the 48 KB default dynamic shared memory.
+    int32_t fc2PrefetchSlots{-1};
     int32_t numTokens{0};
     int32_t numExperts{0};
     int32_t topK{0};

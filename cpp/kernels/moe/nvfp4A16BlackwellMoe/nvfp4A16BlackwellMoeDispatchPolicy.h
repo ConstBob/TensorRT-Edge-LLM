@@ -129,6 +129,20 @@ inline constexpr int32_t kDecodeFc1SplitK{2};
 inline constexpr int32_t kDecodeFc1MaxSplitK{8};
 static_assert(kDecodeFc1SplitK >= 1 && kDecodeFc1SplitK <= kDecodeFc1MaxSplitK, "sealed FC1 split-K out of range");
 inline constexpr int32_t kDecodeFc2SplitK{8};
+//! Decode FC2 slots whose weight tiles are copied into shared memory with
+//! cp.async before the kernel's griddepcontrol.wait (their experts are routing
+//! results, complete when FC2 starts).  Sealed to 0: each staged slot costs
+//! stagedTiles x 4.5 KB of shared memory per CTA (Nemotron 18 KB), and the
+//! larger carve-out keeps FC2 CTAs from co-residing with the shared-expert
+//! GEMV that TensorRT runs on its auxiliary stream (kernels with different
+//! shared-memory configurations wait for the SM to drain), so FC2 started
+//! ~10 us later and the layer got slower: decode step 11.44 / 11.51 / 11.52 ms
+//! for 0 / 1 / 2 slots at pastKV 128 (three interleaved rounds, PDL on; 11.42
+//! with PDL off), 11.54 / 11.58 / 11.58 at pastKV 2048.  The path stays
+//! available for other shapes (EDGELLM_MOE_DECODE_FC2_PREFETCH=1|2 or the
+//! runner parameter) and is exercised by the unit tests.
+inline constexpr int32_t kDecodeFc2PrefetchSlots{0};
+inline constexpr int32_t kDecodeFc2MaxPrefetchSlots{2};
 
 constexpr Backend resolveBackend(Backend const requested, int32_t const numTokens) noexcept
 {

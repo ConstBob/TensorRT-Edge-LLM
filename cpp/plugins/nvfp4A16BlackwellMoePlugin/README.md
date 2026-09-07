@@ -35,24 +35,36 @@ weight layouts and distinct ONNX identities: an engine never carries both.
   (`EDGELLM_MOE_DECODE_FC1_SPLITK`) can select, so the size TensorRT records at
   build time never depends on the environment.
 * **Programmatic Dependent Launch**: every kernel above issues `griddepcontrol.wait`
-  before its first read of data a previous kernel (or the preceding TensorRT
-  layer) produced and `griddepcontrol.launch_dependents` once its outputs are
-  written; the runner launches them with
+  before its first read of data its immediate predecessor produced (and before
+  its first global write), immediately followed by
+  `griddepcontrol.launch_dependents`; the runner launches them with
   `cudaLaunchAttributeProgrammaticStreamSerialization` (CUDA kernels through
   `cudaLaunchKernelEx`, the grouped GEMMs through the AOT wrapper's `enable_pdl`
   argument) so each kernel's prologue overlaps the previous kernel's tail. On by
   default; `EDGELLM_ENABLE_PDL=0` (read once, before the first enqueue) disables
   it for an A/B, the same knob as `Nvfp4MoePlugin`. The shared grouped-routing
   kernels used for `n_group > 1` carry no wait and are launched without the
-  attribute, so that contract simply serializes. Measured on Thor (CUDA-graph
-  decode step, Nemotron 3.5 Lightning): consecutive plugin kernels now start
-  0.5-5.6 us before their predecessor ends (nsys), which is worth about 1% of
-  the prefill step at ISL 2048 and is within noise at decode, because the
-  dependent kernels' pre-wait prologue is short. The follow-up that would turn
-  the overlap into bandwidth is a pre-wait weight prefetch in `decodeFc2Kernel`
-  (its routing inputs are already complete and visible when it starts, because
-  FC1 triggers only after its own wait); FC1 cannot do the same, its expert
-  index is the immediate predecessor's output.
+  attribute, so that contract simply serializes. Every kernel triggers right
+  after its wait (dependents are scheduled once all CTAs of the primary have
+  started, i.e. during its last wave) and does the work that does not depend
+  on its immediate predecessor before the wait: a kernel's inputs that were
+  produced two or more launches earlier are complete and visible when it
+  starts, because its predecessor passed its own wait before triggering. So
+  `decodeFc1Kernel` stages the activation row (previous layer) before the wait
+  and looks the expert up after; `decodeFc1ReduceKernel` reads the routing
+  results first; the routing kernel pulls the bias into L2; the grouped GEMMs
+  run their barrier/TMEM prologue before the wait. Nothing is written before a
+  wait (TensorRT may still hand that memory to the running predecessor).
+  `decodeFc2Kernel` can also look up its first slots' experts and `cp.async`
+  their weight tiles for its K range into shared memory before waiting for
+  FC1's output (`kDecodeFc2PrefetchSlots`, `EDGELLM_MOE_DECODE_FC2_PREFETCH`);
+  it is sealed to 0 because the larger shared-memory carve-out stops FC2 CTAs
+  from co-residing with the shared-expert GEMV TensorRT runs on its auxiliary
+  stream, which cost more than the staging saved (decode step 11.44 / 11.51 /
+  11.52 ms for 0 / 1 / 2 slots). Measured effect of PDL on Thor (CUDA-graph
+  decode step, Nemotron 3.5 Lightning): consecutive plugin kernels start
+  0.5-5.6 us before their predecessor ends (nsys), about 1% of the prefill step
+  at ISL 2048 and within noise at decode.
 * `T >= 2` (prefill and batched decode): warp-per-token sigmoid top-k routing -> single-CTA
   expert-contiguous tile layout (`permuted_idx`, `tile_group_idx`,
   `num_valid_tiles`) -> permuted-row gather (routed rows only; pad rows are

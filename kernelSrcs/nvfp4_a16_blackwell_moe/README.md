@@ -35,15 +35,16 @@ are runtime arguments. The token tile is also the per-expert padding
 granularity of the permuted activation buffer; the runner selects it by token
 count (`nvfp4A16BlackwellMoeDispatchPolicy.h`).
 
-Programmatic Dependent Launch: the kernel issues `griddepcontrol.wait` right
-after the shared-memory carve-out, before it reads `num_valid_tiles` /
-`tile_group_idx` (layout kernel output) or issues any TMA of the B operand
-(gather or FC1 output), and `griddepcontrol.launch_dependents` at kernel scope
-after the warp-role branches. The idle warp reaches that trigger right after
-the prologue, so each persistent CTA signals early; that is intended (the
-dependent kernel's own wait orders the data, and its prologue overlaps this
-kernel's tail). `enable_pdl != 0` adds the programmatic-stream-serialization
-attribute to the launch; the wait/trigger are no-ops without it.
+Programmatic Dependent Launch: the kernel runs its whole dependency-free
+prologue (TMA descriptor prefetch, shared-memory carve-out, pipeline barrier
+init, TMEM allocation) first, then issues `griddepcontrol.wait` immediately
+followed by `griddepcontrol.launch_dependents`, right before the first read
+of `num_valid_tiles` / `tile_group_idx` (layout kernel output) and the first
+TMA of the B operand (gather or FC1 output). The early trigger is intended:
+the dependent grid is scheduled once every persistent CTA has started, its
+own wait orders the data, and its prologue overlaps this kernel's tail.
+`enable_pdl != 0` adds the programmatic-stream-serialization attribute to the
+launch; the wait/trigger are no-ops without it.
 
 Weight bytes: every 32-byte code row inside a `[128, 32]` tile stores the TMA
 SWIZZLE_32B image (rows 4-7 of every 8 swap their 16-byte halves, measured on

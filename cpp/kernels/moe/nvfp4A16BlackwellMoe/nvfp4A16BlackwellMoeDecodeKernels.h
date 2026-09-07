@@ -70,6 +70,7 @@ struct DecodeMoeParams
     // Split-K
     int32_t fc1SplitK{1};
     int32_t fc2SplitK{1};
+    int32_t fc2PrefetchSlots{0}; //!< FC2 slots staged into shared memory before the PDL wait (<= topK)
     float* fc1Partials{nullptr}; //!< [fc1SplitK, numTokens*topK, interSizePadded] fp32
     float* fc2Partials{nullptr}; //!< [fc2SplitK, numTokens, H] fp32
     //! Launch every kernel with programmatic stream serialization (the kernels
@@ -90,6 +91,10 @@ size_t getDecodeFc2PartialBytes(DecodeMoeParams const& params);
 
 //! Host-side validation; returns nullptr on success or a static reason string.
 char const* validateDecodeParams(DecodeMoeParams const& params, DecodeDtype dtype);
+
+//! Dynamic shared memory of decodeFc2Kernel for the given contract (activation
+//! staging plus the pre-wait weight staging of prefetchSlots slots).
+int32_t decodeFc2SharedBytes(int32_t topK, int32_t kBlocks, int32_t splitK, int32_t prefetchSlots);
 
 //! Launch FC1 (+ reduce when fc1SplitK > 1); topkIndices must already hold the
 //! routing (launchSigmoidTopkRoute / moeSigmoidGroupTopk). Returns cudaGetLastError().

@@ -533,9 +533,10 @@ class Nvfp4A16BlackwellMoeGemm:
         :param topk_weights: ``[num_tokens, topK]`` fp32 router weights; scatter_add only.
         :param out: ``[num_tokens, N]`` FP16/BF16 token output; scatter_add only.
         :param enable_pdl: non-zero launches with programmatic stream
-            serialization; the kernel always issues griddepcontrol.wait before
-            reading ``tile_group_idx`` / ``num_valid_tiles`` / activations and
-            griddepcontrol.launch_dependents when it is done.
+            serialization; the kernel always issues griddepcontrol.wait (after
+            its dependency-free prologue, before reading ``tile_group_idx`` /
+            ``num_valid_tiles`` / activations) immediately followed by
+            griddepcontrol.launch_dependents.
 
         This method sets up the kernel parameters, computes the grid size,
         defines the shared storage, and launches the kernel.
@@ -889,25 +890,6 @@ class Nvfp4A16BlackwellMoeGemm:
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        # PDL: num_valid_tiles / tile_group_idx come from the layout kernel and
-        # the B operand from the gather (FC1) or from FC1 (FC2); only descriptor
-        # prefetch and shared-memory carving run before this wait.
-        griddepcontrol_wait()
-        # Device count of non-empty token tiles (written by the layout builder).
-        # The host launches a conservative grid; every scheduler-owning warp
-        # skips tiles at or beyond this count in lockstep.
-        num_valid_tiles_value = cutlass.Int32(mNumValidTiles[0])
-        # Stage tile_group_idx into SMEM: the TMA producer otherwise stalls on a
-        # ~1 us global load before the first TMA of every tile.
-        sTileExpert = storage.tile_expert.get_tensor(
-            cute.make_layout((MAX_TOKEN_TILES, ), stride=(1, )))
-        num_staged_tiles = cutlass.min(num_valid_tiles_value, MAX_TOKEN_TILES)
-        for tile_i in cutlass.range(tidx,
-                                    num_staged_tiles,
-                                    self.threads_per_cta,
-                                    unroll=1):
-            sTileExpert[tile_i] = mTileExpert[tile_i]
-        cute.arch.sync_threads()
 
         # Initialize load2transform pipeline, which tracks the dependencies between TMA's loading
         # of A and B, and the transformation of A and MMA's consumption
@@ -1173,6 +1155,32 @@ class Nvfp4A16BlackwellMoeGemm:
             )
         else:
             tCrA = tiled_mma.make_fragment_A(sA_transform)
+
+        # PDL: everything above (descriptor prefetch, shared-memory carving,
+        # pipeline barriers, TMEM allocation) is independent of the predecessor
+        # and runs while it drains.  num_valid_tiles / tile_group_idx come from
+        # the layout kernel and the B operand from the gather (FC1) or FC1
+        # (FC2), so the wait sits right before the first of those reads.  The
+        # trigger follows immediately: dependents are scheduled once every CTA
+        # of this persistent grid has started, and their own wait orders the
+        # data, so they only overlap this kernel's tail with their prologue.
+        griddepcontrol_wait()
+        griddepcontrol_launch_dependents()
+        # Device count of non-empty token tiles (written by the layout builder).
+        # The host launches a conservative grid; every scheduler-owning warp
+        # skips tiles at or beyond this count in lockstep.
+        num_valid_tiles_value = cutlass.Int32(mNumValidTiles[0])
+        # Stage tile_group_idx into SMEM: the TMA producer otherwise stalls on a
+        # ~1 us global load before the first TMA of every tile.
+        sTileExpert = storage.tile_expert.get_tensor(
+            cute.make_layout((MAX_TOKEN_TILES, ), stride=(1, )))
+        num_staged_tiles = cutlass.min(num_valid_tiles_value, MAX_TOKEN_TILES)
+        for tile_i in cutlass.range(tidx,
+                                    num_staged_tiles,
+                                    self.threads_per_cta,
+                                    unroll=1):
+            sTileExpert[tile_i] = mTileExpert[tile_i]
+        cute.arch.sync_threads()
 
         # Specialized TMA load warp for A/B tensor
         if warp_idx == self.tma_warp_id:
@@ -1860,13 +1868,6 @@ class Nvfp4A16BlackwellMoeGemm:
         # Idle warp
         if warp_idx == self.idle_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_idle_warp)
-
-        # PDL trigger. A CTA counts as triggered when its first thread executes
-        # this, and the idle warp gets here right after the prologue, so every
-        # persistent CTA signals early: the dependent grid is scheduled once all
-        # CTAs have started and overlaps this kernel's tail with its prologue.
-        # Its own griddepcontrol.wait still orders the data.
-        griddepcontrol_launch_dependents()
 
     @cute.jit
     def scatter_add_subtile(

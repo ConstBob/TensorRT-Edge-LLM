@@ -239,12 +239,14 @@ public:
         computeReference();
     }
 
-    Nvfp4A16BlackwellMoeParams params(moe::Backend const backend, bool const enablePdl = false) const
+    Nvfp4A16BlackwellMoeParams params(
+        moe::Backend const backend, bool const enablePdl = false, int32_t const fc2PrefetchSlots = -1) const
     {
         Nvfp4A16BlackwellMoeParams params{};
         params.dtype = moe::DecodeDtype::kFP16;
         params.backend = backend;
         params.enablePdl = enablePdl;
+        params.fc2PrefetchSlots = fc2PrefetchSlots;
         params.numTokens = numTokens_;
         params.numExperts = p_.numExperts;
         params.topK = p_.topK;
@@ -381,6 +383,13 @@ private:
 constexpr Problem kSmall{128, 6, 256, 192, 256};
 //! Nemotron 3.5 Lightning routed-MoE shape.
 constexpr Problem kNemotron{128, 6, 2688, 1856, 1920};
+//! Single routed slot: FC2's pre-wait weight staging clamps to one slot and the
+//! FC2 loop has no global-streamed slot left.
+constexpr Problem kSmallTopK1{128, 1, 256, 192, 256};
+//! Wide intermediate: FC2 stages 8 K tiles per slot, so one pre-wait weight slot
+//! (6 * 8 * 272 + 8 * 4608 B) already exceeds the 48 KB budget and the runner
+//! falls back to 0 staged slots.
+constexpr Problem kSmallWideInter{128, 6, 256, 4096, 4096};
 
 class Nvfp4A16BlackwellMoeRunnerTest : public ::testing::Test
 {
@@ -405,10 +414,10 @@ protected:
         }
     }
 
-    void runOnce(
-        MoeFixture& fixture, moe::Backend const backend, cudaStream_t const stream, bool const enablePdl = false)
+    void runOnce(MoeFixture& fixture, moe::Backend const backend, cudaStream_t const stream,
+        bool const enablePdl = false, int32_t const fc2PrefetchSlots = -1)
     {
-        Nvfp4A16BlackwellMoeParams const params = fixture.params(backend, enablePdl);
+        Nvfp4A16BlackwellMoeParams const params = fixture.params(backend, enablePdl, fc2PrefetchSlots);
         size_t const workspaceBytes = Nvfp4A16BlackwellMoeRunner::getWorkspaceSize(params);
         ASSERT_GT(workspaceBytes, 0U);
         DeviceBuffer workspace(workspaceBytes);
@@ -465,12 +474,13 @@ TEST_F(Nvfp4A16BlackwellMoeRunnerTest, PdlMatchesReferenceBothBackends)
     // griddepcontrol waits must still order routing -> layout/gather -> FC1 ->
     // FC2 (and the reduces) on both paths and shapes.
     {
-        // Decode is deterministic, so PDL off and on must agree bit for bit.
+        // Decode is deterministic, so PDL off (no pre-wait staging) and PDL on
+        // with FC2's two-slot shared-memory weight staging must agree bit for bit.
         MoeFixture fixture(kSmall, 1, 41);
-        runOnce(fixture, moe::Backend::kAuto, nullptr, /*enablePdl=*/false);
+        runOnce(fixture, moe::Backend::kAuto, nullptr, /*enablePdl=*/false, /*fc2PrefetchSlots=*/0);
         std::vector<half> const withoutPdl = fixture.downloadOutput();
-        runOnce(fixture, moe::Backend::kAuto, nullptr, /*enablePdl=*/true);
-        fixture.expectMatchesReference("pdl decode T=1 small");
+        runOnce(fixture, moe::Backend::kAuto, nullptr, /*enablePdl=*/true, /*fc2PrefetchSlots=*/2);
+        fixture.expectMatchesReference("pdl decode T=1 small, 2 staged slots");
         std::vector<half> const withPdl = fixture.downloadOutput();
         ASSERT_EQ(withoutPdl.size(), withPdl.size());
         for (size_t i = 0; i < withPdl.size(); ++i)
@@ -485,13 +495,41 @@ TEST_F(Nvfp4A16BlackwellMoeRunnerTest, PdlMatchesReferenceBothBackends)
     }
     {
         MoeFixture fixture(kNemotron, 1, 43);
-        runOnce(fixture, moe::Backend::kAuto, nullptr, /*enablePdl=*/true);
-        fixture.expectMatchesReference("pdl decode T=1 nemotron");
+        runOnce(fixture, moe::Backend::kAuto, nullptr, /*enablePdl=*/false, /*fc2PrefetchSlots=*/0);
+        std::vector<half> const withoutPdl = fixture.downloadOutput();
+        runOnce(fixture, moe::Backend::kAuto, nullptr, /*enablePdl=*/true, /*fc2PrefetchSlots=*/2);
+        fixture.expectMatchesReference("pdl decode T=1 nemotron, 2 staged slots");
+        std::vector<half> const withPdl = fixture.downloadOutput();
+        ASSERT_EQ(withoutPdl.size(), withPdl.size());
+        for (size_t i = 0; i < withPdl.size(); ++i)
+        {
+            ASSERT_EQ(__half_as_ushort(withoutPdl[i]), __half_as_ushort(withPdl[i])) << "element " << i;
+        }
+    }
+    {
+        // The 48 KB clamp drops the staging entirely for this shape.
+        MoeFixture fixture(kSmallWideInter, 1, 47);
+        runOnce(fixture, moe::Backend::kAuto, nullptr, /*enablePdl=*/true, /*fc2PrefetchSlots=*/2);
+        fixture.expectMatchesReference("pdl decode T=1 wide intermediate (staging clamped to 0)");
     }
     {
         MoeFixture fixture(kNemotron, 20, 44);
         runOnce(fixture, moe::Backend::kAuto, nullptr, /*enablePdl=*/true);
         fixture.expectMatchesReference("pdl prefill T=20 nemotron");
+    }
+}
+
+TEST_F(Nvfp4A16BlackwellMoeRunnerTest, TopK1MatchesReferenceDecodeAndForcedDecode)
+{
+    {
+        MoeFixture fixture(kSmallTopK1, 1, 45);
+        runOnce(fixture, moe::Backend::kAuto, nullptr, /*enablePdl=*/true, /*fc2PrefetchSlots=*/2);
+        fixture.expectMatchesReference("pdl decode T=1 topK=1 (staging clamps to 1 slot)");
+    }
+    {
+        MoeFixture fixture(kSmallTopK1, 5, 46);
+        runOnce(fixture, moe::Backend::kDecode, nullptr, /*enablePdl=*/true, /*fc2PrefetchSlots=*/1);
+        fixture.expectMatchesReference("pdl forced decode T=5 topK=1");
     }
 }
 

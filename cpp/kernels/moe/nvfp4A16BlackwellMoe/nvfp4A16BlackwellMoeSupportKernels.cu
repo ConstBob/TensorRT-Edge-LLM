@@ -47,9 +47,11 @@ __global__ __launch_bounds__(kThreads) void gatherPermutedRowsKernel(T const* __
     int32_t const vectorsPerRow = hiddenSize / kElementsPerVector;
     int64_t const block = static_cast<int64_t>(blockIdx.x);
     uint4 const zero{0U, 0U, 0U, 0U};
-    // permutedIdx / numValidTiles come from the layout kernel and hidden from the
-    // previous layer: nothing below may be read before the grid dependency resolves.
+    // permutedIdx / numValidTiles come from the layout kernel and the output rows
+    // may still alias memory the predecessor uses: nothing may be read or written
+    // before the grid dependency resolves (trigger placement: see Pdl.cuh).
     pdlWait();
+    pdlTrigger();
     if (block < maxRowsPadded)
     {
         int64_t const validRows = static_cast<int64_t>(numValidTiles[0]) * tokenTile;
@@ -80,7 +82,6 @@ __global__ __launch_bounds__(kThreads) void gatherPermutedRowsKernel(T const* __
             }
         }
     }
-    pdlTrigger();
 }
 
 //! Warp-per-token sigmoid top-k routing for the ungrouped contract (nGroup == 1).
@@ -95,8 +96,15 @@ __global__ __launch_bounds__(kThreads) void sigmoidTopkRouteKernel(float const* 
     int32_t const warp = static_cast<int32_t>(threadIdx.x) / 32;
     int32_t const lane = static_cast<int32_t>(threadIdx.x) & 31;
     int32_t const token = static_cast<int32_t>(blockIdx.x) * (kThreads / 32) + warp;
-    // The router logits are written by the preceding layer.
+    // The router logits are written by the preceding layer; the correction bias
+    // is a constant weight and is the only input that can be touched before the
+    // wait (pulled into L2 so the routing warps find it there).
+    if (correctionBias != nullptr)
+    {
+        prefetchL2(correctionBias, numExperts * static_cast<int32_t>(sizeof(float)), lane);
+    }
     pdlWait();
+    pdlTrigger();
     if (token < numTokens)
     {
         int32_t const wordsPerWarp = numExperts + 2 * topK;
@@ -111,7 +119,6 @@ __global__ __launch_bounds__(kThreads) void sigmoidTopkRouteKernel(float const* 
             topkWeights[static_cast<int64_t>(token) * topK + lane] = sWeight[lane];
         }
     }
-    pdlTrigger();
 }
 
 //! Single-CTA expert-contiguous, tile-padded layout (same contract as buildLayoutGpu
@@ -138,8 +145,10 @@ __global__ __launch_bounds__(kLayoutThreads) void buildTileLayoutKernel(int32_t 
         cursor[e] = 0;
     }
     __syncthreads();
-    // topkIndices is written by the routing kernel.
+    // topkIndices is written by the routing kernel; the shared-memory counters
+    // above are the only work that can precede the wait.
     pdlWait();
+    pdlTrigger();
     for (int32_t i = tid; i < numSlots; i += kLayoutThreads)
     {
         int32_t const expert = topkIndices[i];
@@ -222,7 +231,6 @@ __global__ __launch_bounds__(kLayoutThreads) void buildTileLayoutKernel(int32_t 
             permutedIdx[rowOffset[expert] + pos] = i;
         }
     }
-    pdlTrigger();
 }
 
 } // namespace
