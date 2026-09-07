@@ -69,6 +69,7 @@ struct GDNParams
     void* intermediate_states{}; ///< [N, seq_len, HV, K, V] FP32 — per-step h cache for rollback.
                                  ///<   Must be non-null when use_mtp == true.
     bool use_mtp{false};         ///< true → MTP decode path (any seq_len).
+    bool enablePdl{false};       ///< Request PDL for the SM120/121 prefill path; the runner applies final gates.
 
     int32_t n{};
     int32_t seq_len{};

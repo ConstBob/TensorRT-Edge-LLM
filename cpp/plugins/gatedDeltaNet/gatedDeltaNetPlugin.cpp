@@ -33,6 +33,8 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <stdexcept>
 
@@ -68,6 +70,21 @@ constexpr int32_t kNUM_SPEC_VERIFY_OPTIONAL_INPUTS{1};
 constexpr int32_t kNUM_DDTREE_OPTIONAL_INPUTS{2};
 constexpr int32_t kNUM_REQUIRED_OUTPUTS{2};
 constexpr int32_t kNUM_SPEC_VERIFY_OPTIONAL_OUTPUTS{1};
+
+#ifdef CUTE_DSL_GDN_ENABLED
+//! PDL is enabled by default for the SM12x GDN prefill path. This intentionally
+//! shares EDGELLM_ENABLE_PDL with the existing NVFP4 MoE implementation so one
+//! production recovery switch disables both paths. Only the literal value "0"
+//! disables PDL; the runner applies the final toolchain, sequence, and SM gates.
+bool requestGdnPdl()
+{
+    static bool const enabled = []() {
+        char const* const value = std::getenv("EDGELLM_ENABLE_PDL");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+#endif
 
 } // namespace
 
@@ -544,6 +561,7 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
     params.k_dim = k_dim;
     params.v_dim = v_dim;
     params.smVersion = mSMVersion;
+    params.enablePdl = requestGdnPdl();
 
     if (mtpActive)
     {

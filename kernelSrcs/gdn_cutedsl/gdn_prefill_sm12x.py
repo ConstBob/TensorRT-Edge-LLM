@@ -1444,6 +1444,7 @@ class FullyFusedGdnPrefillBlackwellGeforce:
         num_v_heads: cutlass.Int32,
         num_sab_heads: cutlass.Int32,
         num_seqs: cutlass.Int32,
+        enable_pdl: cutlass.Int32,
         grid_x: int,
         stream,
     ):
@@ -1600,12 +1601,14 @@ class FullyFusedGdnPrefillBlackwellGeforce:
             num_v_heads,
             num_sab_heads,
             num_seqs,
+            enable_pdl,
         ).launch(
             grid=(grid_x, 1, 1),
             block=(384, 1, 1),
             max_number_threads=(384, 1, 1),
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=enable_pdl,
         )
 
     @cute.kernel
@@ -1634,6 +1637,7 @@ class FullyFusedGdnPrefillBlackwellGeforce:
         num_v_heads: cutlass.Int32,
         num_sab_heads: cutlass.Int32,
         num_seqs: cutlass.Int32,
+        enable_pdl: cutlass.Int32,
     ):
         NUM_LOAD_WARP_GROUPS = 1
         NUM_MMA_WARP_GROUPS = 2
@@ -1808,6 +1812,12 @@ class FullyFusedGdnPrefillBlackwellGeforce:
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
 
+        # The Q/K descriptors, work selection, and shared-memory pipelines are
+        # independent of the preceding L2-normalization kernel. Defer only the
+        # first payload access until every producer CTA has completed its stores.
+        if enable_pdl:
+            cute.arch.griddepcontrol_wait()
+
         if (
             work_desc.seq_len != cutlass.Int32(0)
             and warp_group_idx == WarpGroupRole.LDST
@@ -1853,6 +1863,10 @@ class FullyFusedGdnPrefillBlackwellGeforce:
                     num_q_heads,
                     num_v_heads,
                 )
+                if enable_pdl:
+                    # Release after output TMA while the state-store tail drains.
+                    with cute.arch.elect_one():
+                        cute.arch.griddepcontrol_launch_dependents()
             elif ldst_warp_role == LoadStoreWarpRole.LOAD_BETA:
                 self.run_load_beta_role(
                     sBeta,
@@ -1938,6 +1952,7 @@ def run_gdn_prefill_blackwell_geforce(
     context_lengths: cute.Tensor,
     o: cute.Tensor,
     tensormap_scratch: cute.Tensor,
+    enable_pdl: cutlass.Int32,
     stream: cuda.CUstream,
 ):
     n = q.layout.shape[0]
@@ -1998,6 +2013,7 @@ def run_gdn_prefill_blackwell_geforce(
         cutlass.Int32(num_v_heads),
         cutlass.Int32(num_v_heads),
         cutlass.Int32(n),
+        enable_pdl,
         n * num_v_heads,
         stream,
     )
@@ -2093,7 +2109,7 @@ def compile_gdn_prefill_blackwell_geforce(gpu_arch=""):
         tensors["A_log"], tensors["dt_bias"],
         tensors["h0_in"], tensors["h0_out"],
         tensors["context_lengths"], tensors["o"],
-        tensors["tensormap_scratch"], stream,
+        tensors["tensormap_scratch"], cutlass.Int32(1), stream,
     )
     return cute.compile(
         run_gdn_prefill_blackwell_geforce,
@@ -2202,7 +2218,7 @@ def run_accuracy_test(n, h, hv, k, v, seq_len, tolerance, gpu_arch=""):
         tensors["A_log"], tensors["dt_bias"],
         tensors["h0_in"], tensors["h0_out"],
         tensors["context_lengths"], tensors["o"],
-        tensors["tensormap_scratch"], stream,
+        tensors["tensormap_scratch"], cutlass.Int32(0), stream,
     )
     cp.cuda.get_current_stream().synchronize()
 
