@@ -289,7 +289,7 @@ def test_real_checkpoint_layer1_expert0_spot_check():
     index_path = os.path.join(snapshot, "model.safetensors.index.json")
     if not os.path.isfile(index_path):
         pytest.skip("Nemotron 3.5 Lightning NVFP4 snapshot not available")
-    safetensors = pytest.importorskip("safetensors")
+    pytest.importorskip("safetensors")
     from safetensors import safe_open  # noqa: F401
     weight_map = json.load(open(index_path))["weight_map"]
     prefix = "backbone.layers.1.mixer.experts.0."

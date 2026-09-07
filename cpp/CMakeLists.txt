@@ -129,8 +129,8 @@ add_custom_command(
     ${CMAKE_SOURCE_DIR}/kernelSrcs/xqa --gemv_dir
     ${CMAKE_SOURCE_DIR}/kernelSrcs/nvfp4A16BlackwellGemv --qsa_indexer_dir
     ${CMAKE_SOURCE_DIR}/kernelSrcs/qsaIndexer --moe_dir
-    ${CMAKE_SOURCE_DIR}/kernelSrcs/nvfp4A16BlackwellMoe --cpp_dir ${CMAKE_SOURCE_DIR}/cpp
-    --cuda_include_dir ${CUDA_RUNTIME_API_INCLUDE_DIR}
+    ${CMAKE_SOURCE_DIR}/kernelSrcs/nvfp4A16BlackwellMoe --cpp_dir
+    ${CMAKE_SOURCE_DIR}/cpp --cuda_include_dir ${CUDA_RUNTIME_API_INCLUDE_DIR}
   DEPENDS
     ${XQA_SOURCE_FILES}
     ${NVFP4_A16_BLACKWELL_GEMV_JIT_SOURCE_FILES}
@@ -282,8 +282,8 @@ set_target_properties(NvInfer_edgellm_plugin PROPERTIES LIBRARY_OUTPUT_DIRECTORY
                                                         ${CMAKE_BINARY_DIR})
 target_include_directories(NvInfer_edgellm_plugin
                            PRIVATE ${COMMON_INCLUDE_DIRS})
-# edgellmPluginJit precedes edgellmKernels: the Thor W4A16 MoE runner in the
-# JIT archive calls the shared grouped-routing / tile-layout kernels.
+# edgellmPluginJit precedes edgellmKernels: the Thor W4A16 MoE runner in the JIT
+# archive calls the shared grouped-routing / tile-layout kernels.
 target_link_libraries(
   NvInfer_edgellm_plugin
   PRIVATE commonLibraryExt edgellmPluginJit edgellmKernels

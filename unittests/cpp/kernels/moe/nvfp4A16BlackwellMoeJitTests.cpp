@@ -183,8 +183,7 @@ TEST(Nvfp4A16BlackwellMoeJitTest, CompilesAndRoundTripsTheBundle)
     Nvfp4A16BlackwellMoeJitKernel const kernel = compileNvfp4A16BlackwellMoeJitKernel(key);
     EXPECT_TRUE(kernel.key == key);
     ASSERT_FALSE(kernel.cubin.empty());
-    EXPECT_TRUE(
-        computeNvfp4A16BlackwellMoeJitDigest(key, kernel.cubin.data(), kernel.cubin.size()) == kernel.digest);
+    EXPECT_TRUE(computeNvfp4A16BlackwellMoeJitDigest(key, kernel.cubin.data(), kernel.cubin.size()) == kernel.digest);
     // Second request of the same key is served by the compile cache.
     Nvfp4A16BlackwellMoeJitKernel const again = compileNvfp4A16BlackwellMoeJitKernel(key);
     EXPECT_EQ(again.cubin, kernel.cubin);
@@ -223,10 +222,10 @@ TEST(Nvfp4A16BlackwellMoeJitTest, UnloadedRunnerRejectsLaunches)
     int32_t indices{};
     float weights{};
     float logits{};
-    EXPECT_THROW(runner.launchRoute(&logits, nullptr, 1, true, 1.0F, &indices, &weights, false, nullptr),
-        std::runtime_error);
-    EXPECT_THROW(runner.launchFc2(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 1, false,
-                     nullptr),
+    EXPECT_THROW(
+        runner.launchRoute(&logits, nullptr, 1, true, 1.0F, &indices, &weights, false, nullptr), std::runtime_error);
+    EXPECT_THROW(
+        runner.launchFc2(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 1, false, nullptr),
         std::runtime_error);
 }
 

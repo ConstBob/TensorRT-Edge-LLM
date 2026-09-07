@@ -17,8 +17,8 @@
 
 #pragma once
 
-#include "nvfp4A16BlackwellMoeJitRunner.h"
 #include "nvfp4A16BlackwellMoeDispatchPolicy.h"
+#include "nvfp4A16BlackwellMoeJitRunner.h"
 
 #include <cuda_runtime.h>
 

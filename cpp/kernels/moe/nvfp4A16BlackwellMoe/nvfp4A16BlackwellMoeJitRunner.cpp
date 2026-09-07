@@ -248,7 +248,8 @@ void Nvfp4A16BlackwellMoeJitRunner::launchRoute(float const* const logits, float
     int32_t* indicesArg = topkIndices;
     float* weightsArg = topkWeights;
     void* params[]{&logitsArg, &biasArg, &tokensArg, &normArg, &scaleArg, &indicesArg, &weightsArg};
-    uint32_t const grid = checkedGrid((static_cast<int64_t>(numTokens) + kWARPS_PER_BLOCK - 1) / kWARPS_PER_BLOCK, "routing");
+    uint32_t const grid
+        = checkedGrid((static_cast<int64_t>(numTokens) + kWARPS_PER_BLOCK - 1) / kWARPS_PER_BLOCK, "routing");
     launchKernel(mLoadedModule->route, grid, 1U, 1U, kTHREADS_PER_BLOCK, params, enablePdl, stream);
 }
 
@@ -314,8 +315,7 @@ void Nvfp4A16BlackwellMoeJitRunner::launchFc1(void const* const hiddenStates, in
     void* outputArg = fc1Output;
     float* partialsArg = partials;
     int32_t tokensArg = numTokens;
-    void* params[]{
-        &hiddenArg, &indicesArg, &qweightsArg, &scalesArg, &globalArg, &outputArg, &partialsArg, &tokensArg};
+    void* params[]{&hiddenArg, &indicesArg, &qweightsArg, &scalesArg, &globalArg, &outputArg, &partialsArg, &tokensArg};
     uint32_t const gridX = checkedGrid(mKey.interSizePadded / kN_TILE, "FC1");
     uint32_t const gridY = checkedGrid(static_cast<int64_t>(numTokens) * mKey.topK, "FC1 slots");
     launchKernel(mLoadedModule->fc1, gridX, gridY, static_cast<uint32_t>(mKey.fc1SplitK), kTHREADS_PER_BLOCK, params,
@@ -323,8 +323,7 @@ void Nvfp4A16BlackwellMoeJitRunner::launchFc1(void const* const hiddenStates, in
     if (mKey.fc1SplitK > 1)
     {
         void* reduceParams[]{&indicesArg, &globalArg, &partialsArg, &outputArg, &tokensArg};
-        uint32_t const blocks
-            = pairBlocks(static_cast<int64_t>(numTokens) * mKey.topK * mKey.interSizePadded);
+        uint32_t const blocks = pairBlocks(static_cast<int64_t>(numTokens) * mKey.topK * mKey.interSizePadded);
         launchKernel(mLoadedModule->fc1Reduce, blocks, 1U, 1U, kTHREADS_PER_BLOCK, reduceParams, enablePdl, stream);
     }
 }

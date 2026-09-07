@@ -693,7 +693,8 @@ int32_t Nvfp4A16BlackwellMoePlugin::enqueue(PluginTensorDesc const* inputDesc, P
         params.enablePdl = requestPdl();
         if (!mJitRunner.isLoaded())
         {
-            LOG_ERROR("Nvfp4A16BlackwellMoePlugin: the layer's JIT bundle is not loaded (enqueue before configure/clone)");
+            LOG_ERROR(
+                "Nvfp4A16BlackwellMoePlugin: the layer's JIT bundle is not loaded (enqueue before configure/clone)");
             return -1;
         }
         params.jit = &mJitRunner;
@@ -820,7 +821,8 @@ void Nvfp4A16BlackwellMoePlugin::compileJitBundle()
     Nvfp4A16BlackwellMoeJitKey const key = kernel::makeNvfp4A16BlackwellMoeJitKey(shape);
     if (char const* problem = describeNvfp4A16BlackwellMoeJitKeyProblem(key); problem != nullptr)
     {
-        throw std::invalid_argument(std::string("Nvfp4A16BlackwellMoePlugin: CUDA-core kernels cannot be built: ") + problem);
+        throw std::invalid_argument(
+            std::string("Nvfp4A16BlackwellMoePlugin: CUDA-core kernels cannot be built: ") + problem);
     }
     if (!mJitBundle.empty())
     {
@@ -860,8 +862,7 @@ void Nvfp4A16BlackwellMoePlugin::loadSerializedJitBundle()
         || key.interSize != mMoeInterSize || key.interSizePadded != interSizePadded()
         || key.layout != kNVFP4_A16_BLACKWELL_MOE_LAYOUT_ABI)
     {
-        throw std::invalid_argument(
-            "Nvfp4A16BlackwellMoePlugin: serialized JIT key does not match the plugin's shape");
+        throw std::invalid_argument("Nvfp4A16BlackwellMoePlugin: serialized JIT key does not match the plugin's shape");
     }
     mJitRunner.load(mJitKernel);
 }

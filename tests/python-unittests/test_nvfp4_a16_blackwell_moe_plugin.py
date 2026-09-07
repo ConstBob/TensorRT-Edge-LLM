@@ -30,7 +30,6 @@ import sys
 from dataclasses import dataclass, replace
 from typing import Dict
 
-import numpy as np
 import pytest
 from test_plugin_base import (DEPENDENCIES_AVAILABLE, IMPORT_ERROR,
                               PluginRunner, assert_close, pf_float32, pf_int32)
@@ -329,7 +328,9 @@ def test_grouped_routing_decode_and_prefill_dynamic_engine():
     # n_group > 1 takes the shared moeSigmoidGroupTopk routing in both the
     # decode path (S=1) and the grouped-GEMM path (S=9 / S=64).
     _execute_case(
-        replace(_SMALL_CASE, name="small_relu2_grouped", n_group=2,
+        replace(_SMALL_CASE,
+                name="small_relu2_grouped",
+                n_group=2,
                 topk_group=1))
 
 

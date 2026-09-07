@@ -52,8 +52,7 @@ public:
 
     //! Warp-per-token sigmoid top-k routing (ungrouped contract).
     void launchRoute(float const* logits, float const* correctionBias, int32_t numTokens, bool normTopkProb,
-        float routedScalingFactor, int32_t* topkIndices, float* topkWeights, bool enablePdl,
-        cudaStream_t stream) const;
+        float routedScalingFactor, int32_t* topkIndices, float* topkWeights, bool enablePdl, cudaStream_t stream) const;
 
     //! Single-CTA expert-contiguous tile layout of the numSlots routed rows.
     void launchLayout(int32_t const* topkIndices, int32_t numSlots, int32_t tokenTile, int32_t* permutedIdx,

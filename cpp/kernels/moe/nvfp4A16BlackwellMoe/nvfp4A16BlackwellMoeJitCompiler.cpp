@@ -95,10 +95,11 @@ void validateKey(Nvfp4A16BlackwellMoeJitKey const& key)
 
 std::string keyToString(Nvfp4A16BlackwellMoeJitKey const& key)
 {
-    return format::fmtstr("SM%d, layout=%u, E=%d, topK=%d, H=%d, I=%d, I_pad=%d, fc1SplitK=%d, fc2SplitK=%d, "
-                          "fc2PrefetchSlots=%d, dtype=%u, source ABI=%u",
-        key.sm, key.layout, key.numExperts, key.topK, key.hiddenSize, key.interSize, key.interSizePadded,
-        key.fc1SplitK, key.fc2SplitK, key.fc2PrefetchSlots, static_cast<uint32_t>(key.dataType), key.sourceAbi);
+    return format::fmtstr(
+        "SM%d, layout=%u, E=%d, topK=%d, H=%d, I=%d, I_pad=%d, fc1SplitK=%d, fc2SplitK=%d, "
+        "fc2PrefetchSlots=%d, dtype=%u, source ABI=%u",
+        key.sm, key.layout, key.numExperts, key.topK, key.hiddenSize, key.interSize, key.interSizePadded, key.fc1SplitK,
+        key.fc2SplitK, key.fc2PrefetchSlots, static_cast<uint32_t>(key.dataType), key.sourceAbi);
 }
 
 std::vector<std::string> buildNvrtcOptions(Nvfp4A16BlackwellMoeJitKey const& key)
@@ -106,8 +107,8 @@ std::vector<std::string> buildNvrtcOptions(Nvfp4A16BlackwellMoeJitKey const& key
     return {"--std=c++17", "--use_fast_math", "--device-as-default-execution-space", "--gpu-architecture=sm_110a",
         "-DNDEBUG", "-DMOE_NUM_EXPERTS=" + std::to_string(key.numExperts), "-DMOE_TOP_K=" + std::to_string(key.topK),
         "-DMOE_HIDDEN=" + std::to_string(key.hiddenSize), "-DMOE_INTER=" + std::to_string(key.interSize),
-        "-DMOE_INTER_PAD=" + std::to_string(key.interSizePadded),
-        "-DMOE_FC1_SPLIT_K=" + std::to_string(key.fc1SplitK), "-DMOE_FC2_SPLIT_K=" + std::to_string(key.fc2SplitK),
+        "-DMOE_INTER_PAD=" + std::to_string(key.interSizePadded), "-DMOE_FC1_SPLIT_K=" + std::to_string(key.fc1SplitK),
+        "-DMOE_FC2_SPLIT_K=" + std::to_string(key.fc2SplitK),
         "-DMOE_FC2_PREFETCH_SLOTS=" + std::to_string(key.fc2PrefetchSlots),
         "-DMOE_DATA_TYPE=" + std::to_string(static_cast<uint32_t>(key.dataType)),
         "-DMOE_LAYOUT_ABI=" + std::to_string(key.layout), "-DMOE_SOURCE_ABI=" + std::to_string(key.sourceAbi)};
