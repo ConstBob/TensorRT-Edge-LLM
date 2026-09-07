@@ -81,16 +81,6 @@ flowchart LR
 | Decode-sized batches (`numTokens <= 16`) use router + W4A16 GEMV kernels.
   Prefill-sized batches build a GPU layout, `fp4Quantize` activations, gather,
   run FC1 grouped GEMM, quantize again, run FC2 grouped GEMM, and scatter-reduce.
-
-| NVFP4-A16 Nemotron 3.5 Lightning MoE (Thor)
-| FP16 activations, NVFP4 expert weights with raw E4M3 block scales and fp32
-  per-expert `weight_scale_2`, no activation quantization. `Nvfp4A16BlackwellMoePlugin`
-  is SM110-only; other platforms keep the Marlin-based `Nvfp4A16MoePlugin`.
-| One `BLACKWELL_MOE_N128_K64_V1` weight buffer feeds both backends. `T = 1`: fused CUDA-core FC1 (routing + dequant GEMV + ReLU2) and FC2 (per-slot
-  router weight, split-K, deterministic). `T >= 2`: warp-per-token sigmoid
-  top-k routing, single-CTA expert-contiguous tile layout, permuted-row gather,
-  tcgen05 grouped FC1 (ReLU2 fused) and FC2 (router-weighted `red.global`
-  scatter fused).
 |===
 
 === INT4 Qwen3 MoE Flow
@@ -172,18 +162,6 @@ separate shared expert's dense ReLU-squared MLP output.
 | `cpp/plugins/nvfp4MoePluginGeforce/`
 | CuTeDSL fused NVFP4 MoE plugin for SM120/SM121.
 
-| `cpp/plugins/nvfp4A16BlackwellMoePlugin/`
-| Thor SM110 NVFP4-A16 MoE plugin (`layout`/`backend` attributes, fp32 per-expert
-  scales, rank-5 weight tensors).
-
-| `cpp/kernels/moe/nvfp4A16BlackwellMoe/`
-| Nvfp4A16BlackwellMoeRunner: workspace layout, decode/prefill dispatch policy,
-  fused CUDA-core decode kernels, permuted-row gather, AOT grouped-GEMM launch.
-
-| `kernelSrcs/nvfp4_a16_blackwell_moe/`
-| CuTe DSL tcgen05 grouped W4A16 MoE GEMM (FC1 relu2-store, FC2 scatter-add) and
-  its on-board oracle.
-
 | `cpp/kernels/moe/`
 | Top-k routing, sigmoid grouped top-k, slot alignment, activation, Marlin,
   NVFP4 decode, quantization, grouped GEMM, and scatter/finalize kernels.
@@ -201,12 +179,3 @@ separate shared expert's dense ReLU-squared MLP output.
   softmax routing.
 * `unittests/cpp/kernels/moe/moeSigmoidGroupTopkKernelTests.cpp` validates the
   sigmoid grouped-top-k routing kernel used by Nemotron-H-style routing.
-* `unittests/cpp/kernels/moe/nvfp4A16BlackwellMoeRunnerTests.cu` validates the
-  Thor SM110 NVFP4-A16 MoE runner (decode and grouped prefill vs a double
-  reference, CUDA-graph replay, dispatch policy).
-* `unittests/cpp/plugins/nvfp4A16BlackwellMoePlugin/` validates the
-  `Nvfp4A16BlackwellMoePlugin` creator contract and hosts the Marlin-vs-Blackwell
-  plugin benchmark.
-* `tests/python-unittests/test_nvfp4_a16_blackwell_moe_layout.py` and
-  `tests/python-unittests/test_nvfp4_a16_blackwell_moe_plugin.py` pin the
-  `BLACKWELL_MOE_N128_K64_V1` layout and the plugin engine build/numerics.
