@@ -37,6 +37,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <exception>
 
@@ -337,9 +338,11 @@ cudaError_t currentDeviceInfo(int32_t& smVersion, int32_t& maxActiveClusters) no
     return (smVersion > 0 && maxActiveClusters > 0) ? cudaSuccess : cudaErrorInvalidDevice;
 }
 
-// The wrapper receives the SM count as max_active_clusters; cache it once at
-// prepare() so enqueue never queries the device (CUDA-graph safe).
-int32_t gMaxActiveClusters{0};
+// The wrapper receives the SM count as max_active_clusters; cache it at
+// prepare() so enqueue never queries the device (CUDA-graph safe). Atomic
+// because TensorRT may configure several layers from different threads; the
+// value is a property of the single device, identical for every instance.
+std::atomic<int32_t> gMaxActiveClusters{0};
 
 //! Benchmark-only override of the token tile (EDGELLM_MOE_FORCE_TILE=8|16|32|64|128),
 //! read once; used by the committed Marlin-vs-Blackwell benchmark to sweep tiles
@@ -443,7 +446,7 @@ cudaError_t runPrefill(
         fc1.numExperts = p.numExperts;
         fc1.numTokens = p.numTokens;
         fc1.topK = p.topK;
-        fc1.maxActiveClusters = gMaxActiveClusters;
+        fc1.maxActiveClusters = gMaxActiveClusters.load(std::memory_order_relaxed);
         fc1.enablePdl = usePdl(p) ? 1 : 0;
         err = launchFc1(tile, fc1, stream);
         if (err != cudaSuccess)
@@ -584,7 +587,7 @@ cudaError_t Nvfp4A16BlackwellMoeRunner::prepare(
     {
         return cudaErrorNotSupported;
     }
-    gMaxActiveClusters = maxActiveClusters;
+    gMaxActiveClusters.store(maxActiveClusters, std::memory_order_relaxed);
     GroupedArgs const loadOnly{};
     for (moe::TokenTile const tile : {moe::TokenTile::kTn8, moe::TokenTile::kTn16, moe::TokenTile::kTn32,
              moe::TokenTile::kTn64, moe::TokenTile::kTn128})
@@ -661,7 +664,7 @@ cudaError_t Nvfp4A16BlackwellMoeRunner::run(Nvfp4A16BlackwellMoeParams const& p,
     {
         return runDecode(p, ws, layout, stream);
     }
-    if (gMaxActiveClusters <= 0)
+    if (gMaxActiveClusters.load(std::memory_order_relaxed) <= 0)
     {
         return cudaErrorNotReady; // prepare() must run before the first enqueue
     }
