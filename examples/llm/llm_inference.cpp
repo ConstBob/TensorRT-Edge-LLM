@@ -110,7 +110,8 @@ enum LLMInferenceOptionId : int
     DART_PIVOT_IMAGE_TOKENS = 937,
     DART_PIVOT_TEXT_TOKENS = 938,
     VISUAL_PRUNE_ALGO = 939,
-    ENCODER_CACHE_BUDGET_BYTES = 940
+    ENCODER_CACHE_BUDGET_BYTES = 940,
+    CP_SPEC_VERIFY_SIZE = 941
 };
 
 // Struct to hold speculative decoding arguments (used by both EAGLE and MTP)
@@ -162,6 +163,7 @@ struct LLMInferenceArgs
     int64_t maxGenerateLength{-1}; // -1 means use value from input file
     int32_t numLogprobs{-1};       // -1 means use value from input file
     SpecDecodeArgs specDecodeArgs;
+    int32_t cpSpecVerifySize{0};
     rt::ContextCacheConfig contextCacheConfig;
 
     // Qwen3-Omni audio output options
@@ -424,6 +426,9 @@ void printUsage(char const* programName)
     std::cerr << "  --talkerEngineDir         Path to Talker engine directory" << std::endl;
     std::cerr << "  --code2wavEngineDir       Path to Code2Wav engine directory (optional)" << std::endl;
     std::cerr << "  --outputAudioDir          Directory to save generated audio (.wav) files" << std::endl;
+    std::cerr << "  --cpSpecVerifySize        CodePredictor speculative decoding verify window: 1 committed"
+              << std::endl;
+    std::cerr << "                            position plus N-1 drafted RVQ depths. 0 disables (default)." << std::endl;
 }
 
 namespace
@@ -461,6 +466,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"profileOutputFile", required_argument, 0, LLMInferenceOptionId::PROFILE_OUTPUT_FILE},
         {"warmup", required_argument, 0, LLMInferenceOptionId::WARMUP},
         {"dumpOutput", no_argument, 0, LLMInferenceOptionId::DUMP_OUTPUT},
+        {"cpSpecVerifySize", required_argument, 0, LLMInferenceOptionId::CP_SPEC_VERIFY_SIZE},
         {"specDecode", no_argument, 0, LLMInferenceOptionId::SPEC_DECODE},
         {"eagle", no_argument, 0, LLMInferenceOptionId::SPEC_DECODE}, // deprecated alias
         {"specDraftTopK", required_argument, 0, LLMInferenceOptionId::SPEC_DRAFT_TOP_K},
@@ -758,6 +764,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
             break;
         case LLMInferenceOptionId::TALKER_ENGINE_DIR: args.talkerEngineDir = optarg; break;
         case LLMInferenceOptionId::CODE2WAV_ENGINE_DIR: args.code2wavEngineDir = optarg; break;
+        case LLMInferenceOptionId::CP_SPEC_VERIFY_SIZE: args.cpSpecVerifySize = std::stoi(optarg); break;
         case LLMInferenceOptionId::OUTPUT_AUDIO_DIR: args.outputAudioDir = optarg; break;
         case LLMInferenceOptionId::ENABLE_THINKER_TALKER_STREAMING: args.enableThinkerTalkerStreaming = true; break;
         case LLMInferenceOptionId::NUM_LOGPROBS:
@@ -1666,7 +1673,7 @@ int main(int argc, char* argv[])
             std::filesystem::path const codePredictorDir
                 = std::filesystem::path(args.talkerEngineDir).parent_path() / "code_predictor";
             ttsRuntime = std::make_unique<rt::Qwen3OmniTTSRuntime>(args.talkerEngineDir, codePredictorDir.string(),
-                args.engineDir, /*cloneEncoderDir=*/"", stream, args.checkpointDir);
+                args.engineDir, /*cloneEncoderDir=*/"", stream, args.checkpointDir, args.cpSpecVerifySize);
             LOG_INFO("TTS runtime initialized for audio output");
         }
         catch (std::exception const& e)

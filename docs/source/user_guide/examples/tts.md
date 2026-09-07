@@ -348,3 +348,26 @@ instruct / VoiceDesign / clone). Text input is consumed whole per request; strea
 > | What streams | audio output only (chunked vocoding of a fixed text) | the full Thinker→Talker pipeline (speech synthesis starts while the Thinker is still generating text) |
 > | Enabled via | CLI: `--streaming --chunkFrames=<N>` | input JSON: `"streaming": {"enable": true, "codec_chunk_frames": <N>, "talker_prefill_threshold": <M>}` |
 > | Chunk knob | `--chunkFrames` | `codec_chunk_frames` |
+>
+> Unifying the two surfaces (same JSON block / flag names) is tracked as a follow-up.
+## CodePredictor speculative decoding
+
+The CodePredictor loop dominates audio decode time and can speculate with no draft model and no
+retraining, reusing the `lm_head` the checkpoint already carries for each RVQ depth. It is off by
+default; add `--cpSpecVerifySize N` (one committed RVQ depth plus `N-1` drafted depths, valid
+range 2-8) to the command above:
+
+```bash
+./build/examples/omni/qwen3_tts_inference \
+    --talkerEngineDir $ENG/talker \
+    --code2wavEngineDir $ENG/code2wav \
+    --tokenizerDir $ENG/talker \
+    --inputFile $WORKSPACE_DIR/input.json \
+    --outputFile $WORKSPACE_DIR/output.json \
+    --outputAudioDir $WORKSPACE_DIR/audio \
+    --cpSpecVerifySize 3
+```
+
+Engines need no special build step, and the sampled output distribution is unchanged. See
+[CodePredictor Speculative Decoding](../features/codepredictor-speculative-decoding.md) for the
+design, the acceptance behaviour, and the limitations.

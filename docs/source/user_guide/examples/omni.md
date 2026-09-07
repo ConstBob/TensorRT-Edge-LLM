@@ -377,3 +377,26 @@ CLI flag remains for ad-hoc runs and takes precedence for `enable`):
   state through a `text_projection` MLP sidecar. Build C++ with
   `-DENABLE_CUTE_DSL=gemm` — without it this MLP silently returns zeros on
   Ampere/Blackwell, producing garbled or empty Talker audio.
+## CodePredictor speculative decoding
+
+The CodePredictor loop dominates audio decode time and can speculate with no draft model and no
+retraining, reusing the `lm_head` the checkpoint already carries for each RVQ depth. It is off by
+default; add `--cpSpecVerifySize N` (one committed RVQ depth plus `N-1` drafted depths, valid
+range 2-8) to the command above:
+
+```bash
+./build/examples/llm/llm_inference \
+    --engineDir $ENG/thinker \
+    --multimodalEngineDir $ENG/multimodal \
+    --enableAudioOutput \
+    --talkerEngineDir $ENG/talker \
+    --code2wavEngineDir $ENG/multimodal/code2wav \
+    --inputFile $WORKSPACE_DIR/input.json \
+    --outputFile $WORKSPACE_DIR/output.json \
+    --outputAudioDir $WORKSPACE_DIR/audio \
+    --cpSpecVerifySize 3
+```
+
+Engines need no special build step, and the sampled output distribution is unchanged. See
+[CodePredictor Speculative Decoding](../features/codepredictor-speculative-decoding.md) for the
+design, the acceptance behaviour, and the limitations.
