@@ -57,9 +57,8 @@ __device__ __forceinline__ void pdlTrigger()
 }
 
 //! Launch @p kernel with the programmatic-stream-serialization attribute when
-//! @p enablePdl is set (and the toolchain supports it).  The actual argument
-//! types must match the kernel's parameter types exactly (cudaLaunchKernelEx
-//! passes their addresses without conversion).
+//! @p enablePdl is set (and the toolchain supports it).  cudaLaunchKernelEx
+//! coerces the actual arguments to the kernel's parameter types.
 template <typename... KernelArgs, typename... ActualArgs>
 inline cudaError_t launchKernelPdl(void (*kernel)(KernelArgs...), dim3 const grid, dim3 const block,
     size_t const smemBytes, cudaStream_t const stream, bool const enablePdl, ActualArgs&&... args)

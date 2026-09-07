@@ -48,9 +48,11 @@ weight layouts and distinct ONNX identities: an engine never carries both.
   decode step, Nemotron 3.5 Lightning): consecutive plugin kernels now start
   0.5-5.6 us before their predecessor ends (nsys), which is worth about 1% of
   the prefill step at ISL 2048 and is within noise at decode, because the
-  dependent kernels' pre-wait prologue is short; a pre-wait weight prefetch in
-  the decode kernels is the follow-up that would turn the overlap into
-  bandwidth.
+  dependent kernels' pre-wait prologue is short. The follow-up that would turn
+  the overlap into bandwidth is a pre-wait weight prefetch in `decodeFc2Kernel`
+  (its routing inputs are already complete and visible when it starts, because
+  FC1 triggers only after its own wait); FC1 cannot do the same, its expert
+  index is the immediate predecessor's output.
 * `T >= 2` (prefill and batched decode): warp-per-token sigmoid top-k routing -> single-CTA
   expert-contiguous tile layout (`permuted_idx`, `tile_group_idx`,
   `num_valid_tiles`) -> permuted-row gather (routed rows only; pad rows are

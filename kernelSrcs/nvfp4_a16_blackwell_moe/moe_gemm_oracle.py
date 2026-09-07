@@ -207,6 +207,9 @@ def main():
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--skip_check", action="store_true")
+    ap.add_argument("--pdl", type=int, choices=(0, 1), default=0,
+                    help="launch with programmatic stream serialization "
+                    "(the kernels always carry the griddepcontrol wait/trigger)")
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed)
@@ -290,8 +293,8 @@ def main():
         common["permuted_idx"],
         common["topk_w"],
     )
-    #        rows, act_ld, out_features, in_features, E, T, topk, max_active_clusters
-    fc1_ints = (max_rows, K1, n1_pad, K1, E, T, topk, sm_count)
+    #        rows, act_ld, out_features, in_features, E, T, topk, max_active_clusters, enable_pdl
+    fc1_ints = (max_rows, K1, n1_pad, K1, E, T, topk, sm_count, args.pdl)
     fc2_tensors = (
         dptr(d["fc1_out"], io_dtype),
         dptr(d["fc2_q"], cutlass.Float4E2M1FN),
@@ -303,7 +306,7 @@ def main():
         common["permuted_idx"],
         common["topk_w"],
     )
-    fc2_ints = (max_rows, n1_pad, K1, I, E, T, topk, sm_count)
+    fc2_ints = (max_rows, n1_pad, K1, I, E, T, topk, sm_count, args.pdl)
 
     fc1, fc1_args = compile_variant(io_dtype, tile, FUSION_RELU2_STORE,
                                     fc1_tensors, fc1_ints, stream)

@@ -1861,8 +1861,11 @@ class Nvfp4A16BlackwellMoeGemm:
         if warp_idx == self.idle_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_idle_warp)
 
-        # PDL: every warp has finished its role (TMA stores / red.global issued
-        # and waited); let the next kernel in the stream start its prologue.
+        # PDL trigger. A CTA counts as triggered when its first thread executes
+        # this, and the idle warp gets here right after the prologue, so every
+        # persistent CTA signals early: the dependent grid is scheduled once all
+        # CTAs have started and overlaps this kernel's tail with its prologue.
+        # Its own griddepcontrol.wait still orders the data.
         griddepcontrol_launch_dependents()
 
     @cute.jit

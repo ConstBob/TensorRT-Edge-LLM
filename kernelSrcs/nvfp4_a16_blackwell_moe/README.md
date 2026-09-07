@@ -26,13 +26,24 @@ pure byte permutation of the checkpoint. For Nemotron 3.5 Lightning: FC1
 
 | Variant | Fusion | Token tile |
 |---|---|---|
-| `nvfp4_a16_blackwell_moe_fc1_relu2_fp16_tm128_tn{32,64,128}_tk64` | `relu(alpha*acc)^2`, TMA store to the permuted `[R_pad, N]` intermediate | 32 / 64 / 128 |
-| `nvfp4_a16_blackwell_moe_fc2_scatter_fp16_tm128_tn{32,64,128}_tk64` | `alpha * topk_weight * acc`, `red.global.v4.f16x2.add` scatter into `[T, N]` | 32 / 64 / 128 |
+| `nvfp4_a16_blackwell_moe_fc1_relu2_fp16_tm128_tn{8,16,32,64,128}_tk64` | `relu(alpha*acc)^2`, TMA store to the permuted `[R_pad, N]` intermediate | 8 / 16 / 32 / 64 / 128 |
+| `nvfp4_a16_blackwell_moe_fc2_scatter_fp16_tm128_tn{8,16,32,64,128}_tk64` | `alpha * topk_weight * acc`, `red.global.v4.f16x2.add` scatter into `[T, N]` | 8 / 16 / 32 / 64 / 128 |
 
 Only FP16 is baked (the plugin rejects BF16). E, N, K, the padded row count,
-the token count and `top_k` are runtime arguments. The token tile is also the
-per-expert padding granularity of the permuted activation buffer; the runner
-selects it by token count (`nvfp4A16BlackwellMoeDispatchPolicy.h`).
+the token count, `top_k`, the SM count (`max_active_clusters`) and `enable_pdl`
+are runtime arguments. The token tile is also the per-expert padding
+granularity of the permuted activation buffer; the runner selects it by token
+count (`nvfp4A16BlackwellMoeDispatchPolicy.h`).
+
+Programmatic Dependent Launch: the kernel issues `griddepcontrol.wait` right
+after the shared-memory carve-out, before it reads `num_valid_tiles` /
+`tile_group_idx` (layout kernel output) or issues any TMA of the B operand
+(gather or FC1 output), and `griddepcontrol.launch_dependents` at kernel scope
+after the warp-role branches. The idle warp reaches that trigger right after
+the prologue, so each persistent CTA signals early; that is intended (the
+dependent kernel's own wait orders the data, and its prologue overlaps this
+kernel's tail). `enable_pdl != 0` adds the programmatic-stream-serialization
+attribute to the launch; the wait/trigger are no-ops without it.
 
 Weight bytes: every 32-byte code row inside a `[128, 32]` tile stores the TMA
 SWIZZLE_32B image (rows 4-7 of every 8 swap their 16-byte halves, measured on
@@ -74,6 +85,7 @@ thresholds are the best worst case over uniform and skewed routing.
 ```bash
 python kernelSrcs/nvfp4_a16_blackwell_moe/moe_gemm_oracle.py --tokens 128 --token_tile 32
 python kernelSrcs/nvfp4_a16_blackwell_moe/moe_gemm_oracle.py --tokens 2048 --token_tile 64 --bench --iters 30
+python kernelSrcs/nvfp4_a16_blackwell_moe/moe_gemm_oracle.py --tokens 128 --token_tile 32 --pdl 1
 ```
 
 Needs `numpy`, `cupy` and `nvidia-cutlass-dsl` (no torch). The oracle builds the
@@ -86,6 +98,6 @@ dequantized weights and checks both fusions (`ORACLE PASS`).
 python kernelSrcs/build_cutedsl.py --kernels nvfp4_a16_blackwell_moe --gpu_arch sm_110 --arch aarch64
 ```
 
-`cmake/CuteDsl.cmake` fails the configure when any of the six variants is
+`cmake/CuteDsl.cmake` fails the configure when any of the ten variants is
 missing from the artifact; the runner is compiled only when
 `CUTE_DSL_NVFP4_A16_BLACKWELL_MOE_ENABLED` is set.
