@@ -126,6 +126,10 @@ class Gemma4TextAttention(Module):
             sliding_window_size=sliding_window,
             enable_fp8_kv_cache=cfg.kv_cache_quant == "fp8",
             attention_scale=cfg.attention_scaling,
+            # Sliding layers have no skippable long-range tiles.
+            skip_softmax_scale_factor=(cfg.skip_softmax_scale_factor
+                                       if self.attention_type
+                                       == "full_attention" else 0.0),
             enable_kv_shared=self.is_kv_shared,
             qkv_scales=self.weights.qkv_scales(self.prefix),
             attention_mask=attention_mask,

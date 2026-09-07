@@ -227,7 +227,7 @@ protected:
     bool mSupportsBoundedKVCache{false};
 
     //! Skip-softmax (BLASST) calibrated scale factor S (0 = disabled); see
-    //! computeSkipSoftmaxThreshold.
+    //! resolveSkipSoftmaxScaleFactor — the kernel derives per-seq log2(S / seqlen_kv).
     float mSkipSoftmaxScaleFactor{};
 
     ContextFMHABackend mContextFMHABackend{ContextFMHABackend::kNONE};

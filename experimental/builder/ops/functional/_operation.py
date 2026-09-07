@@ -45,6 +45,11 @@ def parameter(name: str, value, consumer: str, *, recipe=None) -> Tensor:
     return Tensor(current_net().parameter(name, value, consumer, recipe))
 
 
+def network_input(name: str, dtype, shape: Sequence[int]) -> Tensor:
+    """Return the network input ``name``, declaring it on first use."""
+    return Tensor(current_net().add_input(name, dtype, shape))
+
+
 def operation(name: str,
               inputs: Sequence[Tensor],
               *,

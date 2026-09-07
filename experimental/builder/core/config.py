@@ -106,6 +106,7 @@ class DeviceConfig:
     tie_word_embeddings: bool = False
     sliding_window_size: int = -1
     final_logit_softcapping: Optional[float] = None
+    skip_softmax_scale_factor: float = 0.0
 
     # quantization
     quant: quantization.QuantConfig = field(
@@ -407,6 +408,8 @@ class DeviceConfig:
             attention_k_eq_v=bool(llm.get("attention_k_eq_v", False)),
             tie_word_embeddings=bool(llm.get("tie_word_embeddings", False)),
             sliding_window_size=_get_sliding_window(llm),
+            skip_softmax_scale_factor=_get_skip_softmax_scale_factor(
+                llm, root),
             final_logit_softcapping=(float(llm["final_logit_softcapping"])
                                      if llm.get("final_logit_softcapping")
                                      is not None else None),
@@ -740,6 +743,31 @@ def _get_sliding_window(llm: Dict[str, Any]) -> int:
     if sw is not None and llm.get("use_bidirectional_attention") == "all":
         sw = int(sw) // 2 + 1
     return int(sw) if sw is not None else -1
+
+
+def _get_skip_softmax_scale_factor(llm: Dict[str, Any],
+                                   root: Dict[str, Any]) -> float:
+    """Return the calibrated skip-softmax S (0 = disabled).
+
+    An explicit ``skip_softmax_scale_factor`` wins; otherwise
+    ``skip_softmax_target_sparsity`` converts through the recorded
+    ``skip_softmax_calibration`` formula ``S = a * exp(b * target_sparsity)``.
+    """
+    for cfg in (llm, root):
+        value = cfg.get("skip_softmax_scale_factor")
+        if value is not None:
+            return float(value)
+    for cfg in (llm, root):
+        sparsity = cfg.get("skip_softmax_target_sparsity")
+        calibration = cfg.get("skip_softmax_calibration")
+        if sparsity is None:
+            continue
+        if not isinstance(calibration, dict):
+            raise ValueError("skip_softmax_target_sparsity requires "
+                             "skip_softmax_calibration {a, b} in config.json")
+        return float(calibration["a"]) * math.exp(
+            float(calibration["b"]) * float(sparsity))
+    return 0.0
 
 
 def _parse_raw_layer_types(llm: Dict[str, Any]) -> List[str]:

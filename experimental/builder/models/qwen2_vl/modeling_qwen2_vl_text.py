@@ -93,6 +93,7 @@ class Qwen2VLAttention(Module):
             sliding_window_size=sliding_window,
             enable_fp8_kv_cache=self.cfg.kv_cache_quant == "fp8",
             qkv_scales=self.weights.qkv_scales(self.prefix),
+            skip_softmax_scale_factor=self.cfg.skip_softmax_scale_factor,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
         )

@@ -372,6 +372,8 @@ class GatedAttention(nn.Module):
         self.attention_scale = config.attention_scaling
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
         self.sliding_window_size = -1
+        # Skip-softmax (BLASST) calibrated scale factor S (0.0 = disabled).
+        self.skip_softmax_scale_factor = config.skip_softmax_scale_factor
         module_prefix = f"layers.{layer_idx}.self_attn"
 
         # q_proj output is doubled: query + gate
@@ -422,6 +424,7 @@ class GatedAttention(nn.Module):
         kv_page_table: torch.Tensor,
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
+        skip_softmax_scale: "torch.Tensor | None" = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -465,8 +468,11 @@ class GatedAttention(nn.Module):
             "attention_scale": self.attention_scale,
             "enable_context_mask_selector": False,
             "enable_vision_block_attention": False,
-            "skip_softmax_scale_factor": 0.0,
+            "skip_softmax_scale_factor": self.skip_softmax_scale_factor,
         }
+        # The plugin requires the override input exactly when the attribute is non-zero.
+        if skip_softmax_scale is not None and self.skip_softmax_scale_factor > 0.0:
+            kwargs["skip_softmax_scale"] = skip_softmax_scale
         if enable_tree:
             kwargs["attention_mask"] = attention_mask
             kwargs["attention_pos_id"] = attention_pos_id
@@ -529,6 +535,7 @@ class Qwen3_5DecoderLayer(nn.Module):
         kv_page_table: "torch.Tensor | None" = None,
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
+        skip_softmax_scale: "torch.Tensor | None" = None,
         # GDN-specific (ignored by attention layers)
         conv_state: "torch.Tensor | None" = None,
         recurrent_state: "torch.Tensor | None" = None,
@@ -559,9 +566,15 @@ class Qwen3_5DecoderLayer(nn.Module):
                     intermediate_conv_out, intermediate_rec_out)
         else:
             attn_out, present_kv = self.self_attn(
-                normed, past_key_value, rope_rotary_cos_sin, context_lengths,
-                kvcache_start_index, kv_page_table, attention_mask,
-                attention_pos_id)
+                normed,
+                past_key_value,
+                rope_rotary_cos_sin,
+                context_lengths,
+                kvcache_start_index,
+                kv_page_table,
+                attention_mask,
+                attention_pos_id,
+                skip_softmax_scale=skip_softmax_scale)
             hidden_states = residual + attn_out
             residual = hidden_states
             hidden_states = residual + self.mlp(
@@ -607,6 +620,7 @@ class Qwen3_5Backbone(nn.Module):
         recurrent_states: Tuple[torch.Tensor, ...] = (),
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
+        skip_softmax_scale: "torch.Tensor | None" = None,
         spec_verify_phase_marker: "torch.Tensor | None" = None,
         tree_parent_ids: "torch.Tensor | None" = None,
         tree_depths: "torch.Tensor | None" = None,
@@ -655,6 +669,7 @@ class Qwen3_5Backbone(nn.Module):
                     kv_page_table=kv_page_table,
                     attention_mask=attention_mask,
                     attention_pos_id=attention_pos_id,
+                    skip_softmax_scale=skip_softmax_scale,
                 )
                 present_key_values_list.append(present_kv)
                 attn_idx += 1
@@ -742,6 +757,9 @@ def _make_flat_wrapper_hybrid(model: nn.Module,
         ]
     if dflash_tree_base:
         param_names += ["tree_parent_ids", "tree_depths"]
+    # Always in the traced signature; export.py drops the dangling graph
+    # input when no AttentionPlugin consumes it.
+    param_names += ["skip_softmax_scale"]
 
     past_kv_tuple = "({},)".format(", ".join(
         f"past_key_values_{i}" for i in range(Na))) if Na else "()"
@@ -757,6 +775,7 @@ def _make_flat_wrapper_hybrid(model: nn.Module,
     if dflash_tree_base:
         mtp_kwargs += (", tree_parent_ids=tree_parent_ids"
                        ", tree_depths=tree_depths")
+    skip_kwarg = ", skip_softmax_scale=skip_softmax_scale"
 
     if spec_base:
         body = (
@@ -766,7 +785,7 @@ def _make_flat_wrapper_hybrid(model: nn.Module,
             f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
             f"context_lengths, kvcache_start_index, kv_page_table, "
             f"last_token_ids,\n"
-            f"        {conv_tuple}, {rec_tuple}{mtp_kwargs})\n"
+            f"        {conv_tuple}, {rec_tuple}{mtp_kwargs}{skip_kwarg})\n"
             f"    return ((logits, hidden_states) + tuple(present_key_values)\n"
             f"            + tuple(present_conv_states)"
             f" + tuple(present_recurrent_states)"
@@ -779,7 +798,7 @@ def _make_flat_wrapper_hybrid(model: nn.Module,
             f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
             f"context_lengths, kvcache_start_index, kv_page_table, "
             f"last_token_ids,\n"
-            f"        {conv_tuple}, {rec_tuple})\n"
+            f"        {conv_tuple}, {rec_tuple}{skip_kwarg})\n"
             f"    return ((logits,) + tuple(present_key_values)\n"
             f"            + tuple(present_conv_states)"
             f" + tuple(present_recurrent_states))\n")
@@ -1182,6 +1201,16 @@ class Qwen3_5CausalLM(nn.Module):
                 all_shapes.append({0: batch, 1: verify_seq})  # tree_parent_ids
                 all_shapes.append({0: batch, 1: verify_seq})  # tree_depths
 
+        # Trailing runtime skip-softmax override input (mirrors
+        # modeling_default.py: int8 shape-only carrier, dynamic length).
+        skip_softmax_scale = torch.zeros(1, dtype=torch.int8, device=device)
+        skip_dim = torch.export.Dim("skip_softmax_scale_len",
+                                    min=0,
+                                    max=1048576)
+        args = args + (skip_softmax_scale, )
+        input_names = input_names + ["skip_softmax_scale"]
+        all_shapes.append({0: skip_dim})  # skip_softmax_scale
+
         wrapped = _make_flat_wrapper_hybrid(self,
                                             Na,
                                             Ng,
@@ -1209,6 +1238,7 @@ class Qwen3_5CausalLM(nn.Module):
         recurrent_states: Tuple[torch.Tensor, ...] = (),
         attention_pos_id: "torch.Tensor | None" = None,
         attention_mask: "torch.Tensor | None" = None,
+        skip_softmax_scale: "torch.Tensor | None" = None,
         spec_verify_phase_marker: "torch.Tensor | None" = None,
         tree_parent_ids: "torch.Tensor | None" = None,
         tree_depths: "torch.Tensor | None" = None,
@@ -1233,6 +1263,7 @@ class Qwen3_5CausalLM(nn.Module):
              recurrent_states,
              attention_mask=attention_mask,
              attention_pos_id=attention_pos_id,
+             skip_softmax_scale=skip_softmax_scale,
              spec_verify_phase_marker=spec_verify_phase_marker,
              tree_parent_ids=tree_parent_ids,
              tree_depths=tree_depths,
