@@ -9,7 +9,7 @@
 // STAGES loads (STAGES * 4 KB) are in flight per SM. Nothing consumes the data:
 // the measurement is the memory system alone.
 //
-// Standalone evidence tool for issue #944 (not built by CMake).
+// Standalone evidence tool for the Thor W4A16 MoE TMA streaming rate (not built by CMake).
 // Build (board): nvcc -O3 -std=c++17 -arch=sm_110a tma_bw_probe.cu -o tma_bw_probe
 // Run:           ./tma_bw_probe [bytes_mb=512] [reps=5]
 // Thor 2026-09-05: 32 B rows 228-236 GB/s at every depth; 64 B+ rows, 2 KB rows and 1-D bulk 256-270 GB/s.

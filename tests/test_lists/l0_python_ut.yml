@@ -142,7 +142,6 @@ tests:
   - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_build_rejects_unsupported_num_experts
   - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_create_plugin_accepts_256_experts
 
-  # Thor SM110 Blackwell W4A16 MoE plugin and layout tests (issue #944)
   - tests/python-unittests/test_nvfp4_a16_blackwell_moe_layout.py::test_offsets_match_repack
   - tests/python-unittests/test_nvfp4_a16_blackwell_moe_layout.py::test_roundtrip_dequant_is_bit_exact
   - tests/python-unittests/test_nvfp4_a16_blackwell_moe_layout.py::test_repack_is_pure_byte_permutation

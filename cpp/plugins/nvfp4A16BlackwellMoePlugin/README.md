@@ -1,6 +1,6 @@
 # Nvfp4A16BlackwellMoePlugin
 
-Thor (SM110) plugin for NVFP4-weight / FP16-activation routed MoE (issue #944).
+Thor (SM110) plugin for NVFP4-weight / FP16-activation routed MoE.
 It replaces `Nvfp4A16MoePlugin` (Marlin) for Thor exports only; every other
 platform keeps the Marlin plugin unchanged. The two plugins have different
 weight layouts and distinct ONNX identities: an engine never carries both.
@@ -94,8 +94,7 @@ weight layouts and distinct ONNX identities: an engine never carries both.
   serialization round-trip, decode/prefill numerics (SM110) and rejections.
 * `unittests/cpp/kernels/moe/nvfp4A16BlackwellMoeRunnerTests.cu` — runner vs
   double-precision reference, CUDA-graph replay, dispatch policy.
-* `unittests/cpp/plugins/nvfp4A16BlackwellMoePlugin/` — creator contract and the
-  Marlin-vs-Blackwell plugin benchmark (`EDGELLM_MOE_BENCH_DIR`).
+* `unittests/cpp/plugins/nvfp4A16BlackwellMoePlugin/` — creator contract.
 
 ## Thor sign-off checklist
 

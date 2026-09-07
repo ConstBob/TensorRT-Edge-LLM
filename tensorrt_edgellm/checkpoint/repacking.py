@@ -1230,8 +1230,8 @@ _E2M1_BOUNDS = np.array([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
 # BLACKWELL_MOE_N128_K64_V1 -- Thor (SM110) routed-MoE NVFP4 W4A16 layout
 #
 # One weight buffer per projection serves both the tcgen05 grouped prefill GEMM
-# and the CUDA-core decode kernels of ``Nvfp4A16BlackwellMoePlugin`` (issue
-# #944); there is never a second copy of the MoE weights.  Per expert it is the
+# and the CUDA-core decode kernels of ``Nvfp4A16BlackwellMoePlugin``; there is
+# never a second copy of the MoE weights.  Per expert it is the
 # dense ``BLACKWELL_N128_K64_V1`` tile layout produced by
 # :func:`repack_nvfp4_a16_blackwell_linear`; the expert index is a leading mode
 # so one TMA descriptor with L = num_experts addresses every expert without

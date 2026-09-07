@@ -1778,7 +1778,7 @@ for _io_dtype in _NVFP4_A16_BLACKWELL_DTYPES:
 
 # ---------------------------------------------------------------------------
 # nvfp4_a16_blackwell_moe group — grouped (routed-MoE) W4A16 TCGen5 GEMM for
-# SM110 (Nvfp4A16BlackwellMoePlugin prefill path, issue #944).
+# SM110 (Nvfp4A16BlackwellMoePlugin prefill path).
 #
 # Same mainloop and opaque weight tile as nvfp4_a16_blackwell_gemm, with the
 # expert as the L mode of the weight/scale TMA descriptors:

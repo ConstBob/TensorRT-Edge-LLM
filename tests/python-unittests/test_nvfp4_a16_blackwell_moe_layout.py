@@ -15,7 +15,7 @@
 """CPU pin of the ``BLACKWELL_MOE_N128_K64_V1`` routed-MoE W4A16 weight layout.
 
 The layout is the single weight buffer shared by the tcgen05 grouped prefill
-GEMM and the decode kernels of ``Nvfp4A16BlackwellMoePlugin`` (issue #944).
+GEMM and the decode kernels of ``Nvfp4A16BlackwellMoePlugin``.
 These tests pin the executable specification
 (:func:`nvfp4_a16_blackwell_moe_offsets`) against the repacker, check that the
 repack is a pure byte permutation with an fp32 verbatim global scale, and pin

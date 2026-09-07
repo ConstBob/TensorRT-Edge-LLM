@@ -1,6 +1,6 @@
 # `nvfp4_a16_blackwell_moe` — Thor (SM110) grouped W4A16 MoE GEMM
 
-Prefill kernels of `Nvfp4A16BlackwellMoePlugin` (issue #944): a tcgen05
+Prefill kernels of `Nvfp4A16BlackwellMoePlugin`: a tcgen05
 `kind::f16` mixed-input grouped GEMM for NVFP4 routed-expert weights with
 FP16 activations, sharing the SM110 mainloop of `nvfp4_a16_blackwell_gemm`
 (weights are the A/M operand, K-major, dequantized straight into TMEM; tokens

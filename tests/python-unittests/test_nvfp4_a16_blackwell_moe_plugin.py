@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""``Nvfp4A16BlackwellMoePlugin`` (Thor SM110 W4A16 routed MoE, issue #944).
+"""``Nvfp4A16BlackwellMoePlugin`` (Thor SM110 W4A16 routed MoE).
 
 The positive tests build one dynamic-profile engine, round-trip its
 serialization and execute decode (S=1), the smallest grouped-GEMM prefill

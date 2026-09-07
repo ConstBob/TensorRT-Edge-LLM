@@ -14,7 +14,7 @@
 # limitations under the License.
 """SM110 grouped (routed-MoE) NVFP4-weight FP16/BF16 GEMM, RMEM-to-TMEM transform.
 
-Prefill kernel of ``Nvfp4A16BlackwellMoePlugin`` (issue #944).  The tcgen05
+Prefill kernel of ``Nvfp4A16BlackwellMoePlugin``.  The tcgen05
 ``kind::f16`` mixed-input mainloop is the one shipped for the dense SM110
 NVFP4-A16 GEMM (``kernelSrcs/nvfp4_a16_blackwell_gemm``): the NVFP4 weights are
 the A/M operand (K-major, dequantized straight into TMEM) and the FP16/BF16

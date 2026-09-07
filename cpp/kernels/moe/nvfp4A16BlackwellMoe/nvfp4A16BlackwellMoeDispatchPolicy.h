@@ -56,10 +56,10 @@ inline constexpr int32_t kMaxTokenTiles{1024};
 
 // ---------------------------------------------------------------------------
 // Fixed production policy for Thor SM110, Nemotron 3.5 Lightning shape
-// (E=128, topK=6, H=2688, I=1856, FP16). Sealed on 2026-09-05 from the
-// committed plugin benchmark (unittests/cpp/plugins/nvfp4A16BlackwellMoePlugin/
-// nvfp4A16MoePluginBenchTests.cpp, genMoeBenchData.py inputs) on Jetson AGX
-// Thor (MAXN, GPU 1575 MHz, 20 SMs): CUDA-graph replay, cold L2 (256 MB flush
+// (E=128, topK=6, H=2688, I=1856, FP16). Sealed on 2026-09-05 from a
+// Marlin-vs-Blackwell plugin benchmark (a gtest harness kept outside the
+// repository; random codes, real shapes) on Jetson AGX Thor (MAXN, GPU
+// 1575 MHz, 20 SMs): CUDA-graph replay, cold L2 (256 MB flush
 // before every layer, flush cost subtracted), median of 7 batches of 50
 // layers, both plugins driven through the same enqueue path.
 //

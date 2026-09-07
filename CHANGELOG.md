@@ -15,7 +15,6 @@
 - Added NVFP4 W4A16 export for official LM heads and Qwen3 A16 MoE
 - Added NVFP4 MoE build and runtime support for NVIDIA Nemotron 3 Super 120B-A12B checkpoints with 512 routed experts and top-32 routing
 - Added Blackwell SM110 dense NVFP4-A16 GEMM and GEMV kernels
-- Added a Thor SM110 NVFP4-A16 routed-MoE plugin (`Nvfp4A16BlackwellMoePlugin`: tcgen05 grouped GEMM prefill, CUDA-core decode, one `BLACKWELL_MOE_N128_K64_V1` weight layout, Programmatic Dependent Launch on every kernel) and routed `--target-sm 110` Nemotron-H exports to it
 - Improved Blackwell performance with single-launch D80 SSD prefill, faster SM12x fused MoE, fused GDN projections, and one less per-layer KV copy
 - Added a CuTe DSL RMSNorm plugin and upgraded CuTe DSL to 4.7.0
 - Enabled FMHA-v2 and XQA on Hopper SM90 with JIT-compiled XQA kernels

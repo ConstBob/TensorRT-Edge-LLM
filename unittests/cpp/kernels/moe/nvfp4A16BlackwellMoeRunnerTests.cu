@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-//! Nvfp4A16BlackwellMoeRunner (Thor SM110 W4A16 routed MoE, issue #944):
+//! Nvfp4A16BlackwellMoeRunner (Thor SM110 W4A16 routed MoE):
 //! decode and grouped-GEMM prefill against an FP4-exact double-precision
 //! reference, CUDA-graph replay, dispatch policy and shape gating.
 

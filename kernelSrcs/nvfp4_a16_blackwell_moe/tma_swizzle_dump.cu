@@ -1,4 +1,4 @@
-// Standalone evidence tool for issue #944 (not built by CMake): nvcc -O2 -std=c++17 -arch=sm_110a tma_swizzle_dump.cu
+// Standalone evidence tool for the TMA swizzle image of the Thor W4A16 MoE layout (not built by CMake): nvcc -O2 -std=c++17 -arch=sm_110a tma_swizzle_dump.cu
 // Thor 2026-09-05: SWIZZLE_32B == CuTe Swizzle<1,4,3> (rows 4-7 of every 8 swap 16-byte halves), 64B == <2,4,3>, 128B
 // == <3,4,3>. Dump the byte permutation TMA applies for a (32 B x 128 rows) box with SWIZZLE_32B (and 64B/128B) on this
 // GPU: gmem tile holds byte value = (index & 0xFF) pattern via 16-bit chunk ids; we load one tile into SMEM and write
