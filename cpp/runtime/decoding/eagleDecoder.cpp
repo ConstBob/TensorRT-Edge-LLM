@@ -31,6 +31,7 @@
 #include "profiling/timer.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/decoding/decoderUtils.h"
+#include "runtime/decoding/guidedDecoder.h"
 #include "runtime/decoding/logitBias.h"
 #include "runtime/preprocess/embeddingPreprocessor.h"
 #include "sampler/sampling.h"
@@ -78,6 +79,8 @@ EagleDecoder::EagleDecoder(DecodingRuntimeContext& runtime, std::filesystem::pat
         = Tensor({maxRuntimeBatchSize}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "SpecDecode::draftProposalSize");
     mDraftAttentionMask = Tensor({maxRuntimeBatchSize, effectiveMaxDraftProposalSize, effectiveMaxDraftProposalSize},
         DeviceType::kGPU, nvinfer1::DataType::kINT8, "SpecDecode::draftAttentionMask");
+    mVerifyParentIds = Tensor({maxRuntimeBatchSize, mRuntime.deployment.specConfig->verifySize}, DeviceType::kGPU,
+        nvinfer1::DataType::kINT32, "SpecDecode::verifyParentIds");
 
     buildTensorMapForSpecDecodeDraft(
         mDraftTensorMap, mRuntime.base.pipelineIO, mRuntime.base.sharedResources, *mRuntime.deployment.draft);
@@ -516,8 +519,18 @@ bool EagleDecoder::constructDraftProposal(DecodingInferenceContext& context)
                      {activeBatchSize, mRuntime.deployment.specConfig->verifySize,
                          static_cast<int64_t>(divUp(mRuntime.deployment.specConfig->verifySize, 32))}),
         "Tensor reshape failed");
+    check::check(mVerifyParentIds.reshape({activeBatchSize, mRuntime.deployment.specConfig->verifySize}),
+        "Tensor reshape failed");
     kernel::constructVerificationDraftTree(mDraftTokenIdsFullTable, mDraftTokenPredecessorFullTable,
-        mRuntime.sampling.indices, mRuntime.preprocess.idsInput, mDraftAttentionMask, context.stream);
+        mRuntime.sampling.indices, mRuntime.preprocess.idsInput, mDraftAttentionMask, std::ref(mVerifyParentIds),
+        context.stream);
+
+    if (context.hasGuidedDecoding)
+    {
+        // No valid-node count: the selection always fills the whole verify tree.
+        mRuntime.guidedDecoder.captureDraftTree(mRuntime.preprocess.idsInput, mVerifyParentIds, std::nullopt,
+            activeBatchSize, mRuntime.deployment.specConfig->verifySize, context.stream);
+    }
 
     return true;
 }
@@ -598,6 +611,12 @@ bool EagleDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     }
     // GCOVR_EXCL_STOP
 
+    if (context.hasGuidedDecoding)
+    {
+        applyGuidedDecodingMaskForDraftTree(mRuntime.guidedDecoder, context, mRuntime.base.pipelineIO.outputLogits,
+            activeBatchSize, mRuntime.deployment.specConfig->verifySize, context.stream);
+    }
+
     int32_t const maxAcceptDepth = mRuntime.deployment.specConfig->draftingStep + 1;
     check::check(mAcceptedTokenIds.reshape({activeBatchSize, maxAcceptDepth}), "Tensor reshape failed");
     check::check(mAcceptedTokenIndices.reshape({activeBatchSize, maxAcceptDepth}), "Tensor reshape failed");
@@ -662,6 +681,12 @@ bool EagleDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     decoder_utils::appendAcceptedTokens(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
         mAcceptedTokenIds, maxAcceptDepth, mRuntime.tokenizer, context.stream,
         mRuntime.deployment.specConfig->verifySize - 1);
+
+    if (context.hasGuidedDecoding)
+    {
+        advanceGuidedDecodingForCommitted(mRuntime.guidedDecoder, context, mHostAcceptedTokenIds.dataPointer<int32_t>(),
+            mHostAcceptLengths.dataPointer<int32_t>(), maxAcceptDepth, activeBatchSize);
+    }
     int32_t const* const hostAcceptLengths = mHostAcceptLengths.dataPointer<int32_t>();
     mCommonStateTracker.recordAccepted(hostAcceptLengths, activeBatchSize);
 

@@ -1140,7 +1140,9 @@ __global__ void dsparkProbabilisticAcceptKernel(float const* __restrict__ target
         float const draftProb = draftRow[draftToken];
         float const acceptProb = draftProb <= 1e-20F ? 1.0F : fminf(1.0F, targetProb / draftProb);
         float const acceptUniform = acceptUniforms[batchIdx * uniformStride + step];
-        if (acceptUniform <= acceptProb)
+        // p == 0 must reject: the guard above reads a vanishing draft probability as p/q -> inf,
+        // the right limit only while p > 0.
+        if (targetProb > 0.0F && acceptUniform <= acceptProb)
         {
             batchAccepted[acceptedDraft] = draftToken;
             ++acceptedDraft;

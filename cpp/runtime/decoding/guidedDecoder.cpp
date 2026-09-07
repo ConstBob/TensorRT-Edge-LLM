@@ -16,6 +16,7 @@
  */
 
 #include "runtime/decoding/guidedDecoder.h"
+#include "profiling/nvtx_wrapper.h"
 
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
@@ -80,8 +81,27 @@ void failSlot(DecodingInferenceContext& context, int32_t slot, char const* what)
 
 } // namespace
 
+std::vector<int32_t> reasoningStartMarkers(Tokenizer const& tokenizer)
+{
+    return {static_cast<int32_t>(tokenizer.getTokenId("<|channel>")),
+        static_cast<int32_t>(tokenizer.getTokenId("<think>"))};
+}
+
+std::vector<int32_t> reasoningEndMarkers(Tokenizer const& tokenizer)
+{
+    return {static_cast<int32_t>(tokenizer.getTokenId("<channel|>")),
+        static_cast<int32_t>(tokenizer.getTokenId("</think>"))};
+}
+
+bool reasoningBlockOpenedByTemplate(Tokenizer const& tokenizer)
+{
+    auto const& thinkingPrompt = tokenizer.getGenerationPromptThinking();
+    return thinkingPrompt.find("<|channel>") != std::string::npos
+        || thinkingPrompt.find("<think>") != std::string::npos;
+}
+
 bool reasoningClosedInPrompt(std::vector<int32_t> const& promptTokens, std::vector<int32_t> const& startMarkers,
-    std::vector<int32_t> const& endMarkers) noexcept
+    std::vector<int32_t> const& endMarkers, bool templateOpensBlock) noexcept
 {
     auto const present = [](std::vector<int32_t> const& markers) {
         return std::any_of(markers.begin(), markers.end(), [](int32_t id) { return id >= 0; });
@@ -105,8 +125,9 @@ bool reasoningClosedInPrompt(std::vector<int32_t> const& promptTokens, std::vect
             return false;
         }
     }
-    // No marker at all: the block has not been opened, and the model may still open one.
-    return false;
+    // No marker at all: a template that writes the opening one leaves none behind only when the
+    // block was never opened; where the model writes it instead, absence proves nothing.
+    return templateOpensBlock;
 }
 
 void applyGuidedDecodingMask(GuidedDecoder& decoder, DecodingInferenceContext& context, Tensor& logits,
@@ -137,6 +158,10 @@ void advanceGuidedDecoding(
         return;
     }
 
+    // Deliberately not routed through advanceCommitted: this path carries *output*-space IDs
+    // (captured before the reduced-vocabulary remap) while that one takes full-space IDs. The
+    // reasoning flag is latched for this path by the runtime's updateThinkingDone, which is
+    // correct as long as a step commits exactly one token -- which is what vanilla decode means.
     buildSlotSuppression(context, activeBatchSize, context.guidedMaskSuppressedPerSlot);
     for (int32_t slot = 0; slot < activeBatchSize; ++slot)
     {
@@ -148,6 +173,80 @@ void advanceGuidedDecoding(
         if (!decoder.advance(slot, outputSpaceIds[slot]))
         {
             // The mask should have made this impossible.
+            failSlot(context, slot, "the grammar rejected a token the mask should have forbidden");
+        }
+    }
+}
+
+void applyGuidedDecodingMaskForDraftTree(GuidedDecoder& decoder, DecodingInferenceContext& context, Tensor& logits,
+    int32_t activeBatchSize, int32_t rowsPerSlot, cudaStream_t stream)
+{
+    if (!context.hasGuidedDecoding || activeBatchSize <= 0)
+    {
+        return;
+    }
+    // Waiting here, rather than next to the copy, is the point: the verify forward is already
+    // enqueued, so the grammar walk below runs while the GPU is busy with it. A long wait is
+    // normal and healthy -- it spans the drafting forwards. What matters on a profile is whether
+    // the walk that follows stays inside the verify forward's span; if it sticks out, the GPU is
+    // waiting on us and the overlap is gone. Hence two ranges rather than one.
+    {
+        NVTX_SCOPED_RANGE(nvtxWait, "GUIDED_WAIT_DRAFT_TREE", nvtx_colors::PALE_ORANGE);
+        decoder.waitForDraftTopology();
+    }
+    int32_t const* const draftTokens = decoder.hostDraftTokens();
+    if (draftTokens == nullptr)
+    {
+        return;
+    }
+
+    NVTX_SCOPED_RANGE(nvtxFill,
+        ("GUIDED_FILL_MASK[R" + std::to_string(context.generationRound) + "," + std::to_string(activeBatchSize) + "]")
+            .c_str(),
+        nvtx_colors::SKY_BLUE);
+
+    // Only the finished gate is slot-level here. Whether the reasoning block is still open is a
+    // per-path property once a branch can cross the closing marker, so the walk decides it.
+    context.guidedMaskSuppressedPerSlot.assign(static_cast<size_t>(activeBatchSize), 0);
+    for (int32_t slot = 0; slot < activeBatchSize; ++slot)
+    {
+        bool const finished
+            = slot < static_cast<int32_t>(context.finishedStates.size()) && context.finishedStates[slot] != 0;
+        context.guidedMaskSuppressedPerSlot[static_cast<size_t>(slot)] = finished ? 1 : 0;
+    }
+
+    decoder.fillMasksForDraftTree(activeBatchSize, rowsPerSlot, draftTokens, decoder.hostDraftParentIds(),
+        decoder.hostDraftValidCounts(), context.guidedMaskSuppressedPerSlot, context.guidedReasoningEnded,
+        context.guidedUnsatisfiableSlots, stream);
+
+    for (auto const slot : context.guidedUnsatisfiableSlots)
+    {
+        failSlot(context, slot, "the grammar admits no token in this engine's output vocabulary");
+    }
+
+    decoder.applyMask(logits, activeBatchSize, rowsPerSlot, stream);
+}
+
+void advanceGuidedDecodingForCommitted(GuidedDecoder& decoder, DecodingInferenceContext& context,
+    int32_t const* hostAcceptedTokenIds, int32_t const* hostAcceptLengths, int32_t maxAcceptDepth,
+    int32_t activeBatchSize)
+{
+    if (!context.hasGuidedDecoding)
+    {
+        return;
+    }
+    for (int32_t slot = 0; slot < activeBatchSize; ++slot)
+    {
+        if (!decoder.hasGrammar(slot) || context.finishedStates[slot] != 0)
+        {
+            continue;
+        }
+        int32_t const count = hostAcceptLengths[slot];
+        // advanceCommitted latches the reasoning flag off the separator, so the grammar and the
+        // runtime's thinking bookkeeping cannot drift apart.
+        if (!decoder.advanceCommitted(slot, hostAcceptedTokenIds + static_cast<size_t>(slot) * maxAcceptDepth, count,
+                context.guidedReasoningEnded[static_cast<size_t>(slot)]))
+        {
             failSlot(context, slot, "the grammar rejected a token the mask should have forbidden");
         }
     }
@@ -395,17 +494,78 @@ struct GuidedDecoder::Impl
     Tensor outputToFullVocab;
     bool hasReducedVocab{false};
 
+    //! Full tokenizer ID -> output-space index, or -1 for a token this engine cannot emit.
+    //! Only built when the engine prunes; the speculative path needs this direction because the
+    //! verify tree carries full-vocabulary IDs and the matchers live in output space.
+    int32_t fullVocabSize{0};
+    std::vector<int32_t> fullToOutput;
+
+    //! Reasoning-end markers in the full vocabulary; -1 entries never match.
+    std::vector<int32_t> reasoningEnd;
+
+    //! One warning per request when a draft token has no output-space image, which means the
+    //! engine's reduced vocabulary is not a superset of the draft's. Silently dropping every
+    //! draft node instead would look like an unexplained acceptance-rate collapse.
+    std::vector<int8_t> warnedUnmappable;
+
+    //! Full ID -> output-space index. Identity, plus a bounds check, when the engine does not
+    //! prune; the caller therefore has a single code path.
+    int32_t toOutputSpace(int32_t fullId) const
+    {
+        if (fullId < 0 || fullId >= fullVocabSize)
+        {
+            return -1;
+        }
+        return hasReducedVocab ? fullToOutput[static_cast<size_t>(fullId)] : fullId;
+    }
+
+    bool isReasoningEnd(int32_t fullId) const
+    {
+        return fullId >= 0 && std::find(reasoningEnd.begin(), reasoningEnd.end(), fullId) != reasoningEnd.end();
+    }
+
+    //! True when the row's mask admits at least one token.
+    bool rowHasAnyToken(int32_t rowId) const
+    {
+        int32_t const* const row = hostBitmask.dataPointer<int32_t>() + static_cast<size_t>(rowId) * bitmaskSize;
+        int32_t acc = 0;
+        for (int32_t w = 0; w < bitmaskSize; ++w)
+        {
+            acc |= row[w];
+        }
+        return acc != 0;
+    }
+
+    bool rowAllows(int32_t rowId, int32_t outputToken) const
+    {
+        int32_t const* const row = hostBitmask.dataPointer<int32_t>() + static_cast<size_t>(rowId) * bitmaskSize;
+        return ((static_cast<uint32_t>(row[outputToken >> 5]) >> (outputToken & 31)) & 1U) != 0U;
+    }
+
     //! Built on first use: one idToPiece call per output-vocabulary entry is too
     //! expensive to pay for runs that never use guided decoding.
     std::optional<xgrammar::TokenizerInfo> tokenizerInfo;
     std::optional<xgrammar::GrammarCompiler> compiler;
-
     std::vector<std::optional<xgrammar::GrammarMatcher>> matchers;
 
-    Tensor deviceBitmask;
-    Tensor deviceRowNeedsMask;
-    Tensor hostBitmask;
-    Tensor hostRowNeedsMask;
+    Tensor deviceBitmask;      //!< [maxRows, bitmaskSize] the mask the apply kernel reads
+    Tensor deviceRowNeedsMask; //!< [maxRows] per-row flag; the kernel leaves a zeroed row alone
+    Tensor hostBitmask;        //!< [maxRows, bitmaskSize] where XGrammar fills; only flags are cleared per step
+    Tensor hostRowNeedsMask;   //!< [maxRows] staging for the flags above
+
+    //! Speculative decoding only, allocated when a slot owns more than one verify row. Holds this
+    //! step's draft geometry: the matchers live on the host, so the walk waits for this copy, and
+    //! the event is blocking-sync because that wait spans the drafting forwards.
+    Tensor hostDraftTokens;              //!< [batch, rowsPerSlot] node tokens, full vocabulary
+    Tensor hostDraftParentIds;           //!< Tree only: [batch, rowsPerSlot] parent index; -1 at root/padding
+    Tensor hostDraftValidCounts;         //!< Tree only: [batch] nodes actually built; later rows are padding
+    bool draftIsTree{false};             //!< Whether this step's draft geometry is a tree
+    bool draftHasValidCounts{false};     //!< Whether the tree builder reports a node count at all
+    cudaEvent_t draftCopyReady{nullptr}; //!< Signals that the copy has landed
+    bool draftCopyPending{false};        //!< A copy is in flight; guards against a stale event
+
+    std::vector<int32_t> firstChild;  //!< [rowsPerSlot] lowest-numbered child, or -1 for a leaf
+    std::vector<int32_t> nextSibling; //!< [rowsPerSlot] next child of the same parent, or -1
 
     void ensureCompiler();
     xgrammar::CompiledGrammar compile(GuidedDecodingParams const& params);
@@ -501,12 +661,20 @@ GuidedDecoder::GuidedDecoder()
 {
 }
 
-GuidedDecoder::~GuidedDecoder() = default;
+GuidedDecoder::~GuidedDecoder()
+{
+    if (mImpl->draftCopyReady != nullptr)
+    {
+        cudaEventDestroy(mImpl->draftCopyReady);
+    }
+}
 
-void GuidedDecoder::initialize(int32_t maxBatchSize, int32_t outputVocabSize, Tokenizer const* tokenizer,
-    Tensor const& reducedToFullVocabMap, cudaStream_t stream)
+void GuidedDecoder::initialize(int32_t maxBatchSize, int32_t maxRowsPerSlot, int32_t outputVocabSize,
+    int32_t fullVocabSize, Tokenizer const* tokenizer, Tensor const& reducedToFullVocabMap, cudaStream_t stream)
 {
     ELLM_CHECK(maxBatchSize > 0, "GuidedDecoder requires a positive max batch size");
+    ELLM_CHECK(maxRowsPerSlot > 0, "GuidedDecoder requires a positive max rows per slot");
+    ELLM_CHECK(fullVocabSize >= outputVocabSize, "Full vocabulary is smaller than the engine output vocabulary");
     ELLM_CHECK(outputVocabSize > 0, "GuidedDecoder requires a positive output vocabulary size");
     ELLM_CHECK(tokenizer != nullptr, "GuidedDecoder requires a tokenizer");
 
@@ -514,7 +682,10 @@ void GuidedDecoder::initialize(int32_t maxBatchSize, int32_t outputVocabSize, To
     mImpl->maxBatchSize = maxBatchSize;
     mImpl->outputVocabSize = outputVocabSize;
     mImpl->bitmaskSize = xgrammar::GetBitmaskSize(outputVocabSize);
+    mImpl->fullVocabSize = fullVocabSize;
     mImpl->matchers.assign(static_cast<size_t>(maxBatchSize), std::nullopt);
+    mImpl->warnedUnmappable.assign(static_cast<size_t>(maxBatchSize), 0);
+    mImpl->reasoningEnd = reasoningEndMarkers(*tokenizer);
 
     mImpl->hasReducedVocab = false;
     if (!reducedToFullVocabMap.isEmpty())
@@ -528,11 +699,25 @@ void GuidedDecoder::initialize(int32_t maxBatchSize, int32_t outputVocabSize, To
             static_cast<size_t>(outputVocabSize) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         mImpl->hasReducedVocab = true;
+
+        // Reverse of the map above. The verify tree carries full-vocabulary IDs and the
+        // matchers live in output space, and unlike vanilla decode there is no point in the
+        // speculative path where the runtime still holds the pre-remap index.
+        int32_t const* const outputToFull = mImpl->outputToFullVocab.dataPointer<int32_t>();
+        mImpl->fullToOutput.assign(static_cast<size_t>(fullVocabSize), -1);
+        for (int32_t outputId = 0; outputId < outputVocabSize; ++outputId)
+        {
+            int32_t const fullId = outputToFull[outputId];
+            if (fullId >= 0 && fullId < fullVocabSize)
+            {
+                mImpl->fullToOutput[static_cast<size_t>(fullId)] = outputId;
+            }
+        }
     }
 
-    // Vanilla decode emits one logits row per slot; speculative verification will need
-    // maxBatchSize * rowsPerSlot here.
-    int32_t const maxRows = maxBatchSize;
+    // Vanilla decode emits one logits row per slot; speculative verification emits one per
+    // verify node, so the buffers are sized by the deployment's verify size.
+    int32_t const maxRows = maxBatchSize * maxRowsPerSlot;
     mImpl->maxRows = maxRows;
     mImpl->deviceBitmask
         = Tensor({maxRows, mImpl->bitmaskSize}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "GuidedDecoder::bitmask");
@@ -546,8 +731,24 @@ void GuidedDecoder::initialize(int32_t maxBatchSize, int32_t outputVocabSize, To
         static_cast<size_t>(maxRows) * static_cast<size_t>(mImpl->bitmaskSize) * sizeof(int32_t));
     std::memset(mImpl->hostRowNeedsMask.rawPointer(), 0, static_cast<size_t>(maxRows) * sizeof(int32_t));
 
-    LOG_DEBUG("GuidedDecoder initialized: maxBatchSize=%d outputVocabSize=%d bitmaskSize=%d reducedVocab=%s",
-        maxBatchSize, outputVocabSize, mImpl->bitmaskSize, mImpl->hasReducedVocab ? "yes" : "no");
+    if (maxRowsPerSlot > 1)
+    {
+        mImpl->hostDraftTokens = Tensor({maxBatchSize, maxRowsPerSlot}, DeviceType::kCPU, nvinfer1::DataType::kINT32,
+            "GuidedDecoder::hostDraftTokens");
+        mImpl->hostDraftParentIds = Tensor({maxBatchSize, maxRowsPerSlot}, DeviceType::kCPU, nvinfer1::DataType::kINT32,
+            "GuidedDecoder::hostDraftParentIds");
+        mImpl->hostDraftValidCounts = Tensor(
+            {maxBatchSize}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "GuidedDecoder::hostDraftValidCounts");
+        mImpl->firstChild.resize(static_cast<size_t>(maxRowsPerSlot));
+        mImpl->nextSibling.resize(static_cast<size_t>(maxRowsPerSlot));
+        CUDA_CHECK(cudaEventCreateWithFlags(&mImpl->draftCopyReady, cudaEventDisableTiming | cudaEventBlockingSync));
+    }
+
+    LOG_INFO(
+        "GuidedDecoder initialized: maxBatchSize=%d maxRowsPerSlot=%d outputVocabSize=%d bitmaskSize=%d "
+        "reducedVocab=%s bitmaskBuffers=%.2f MB",
+        maxBatchSize, maxRowsPerSlot, outputVocabSize, mImpl->bitmaskSize, mImpl->hasReducedVocab ? "yes" : "no",
+        2.0 * static_cast<double>(maxRows) * mImpl->bitmaskSize * sizeof(int32_t) / (1024.0 * 1024.0));
 }
 
 bool GuidedDecoder::prepareSlot(int32_t slot, GuidedDecodingParams const& params, std::string& failReason)
@@ -569,6 +770,7 @@ bool GuidedDecoder::prepareSlot(int32_t slot, GuidedDecodingParams const& params
         int64_t const cacheAfter = mImpl->compiler->GetCacheSizeBytes();
 
         mImpl->matchers[static_cast<size_t>(slot)].emplace(compiledGrammar);
+        mImpl->warnedUnmappable[static_cast<size_t>(slot)] = 0;
 
         LOG_INFO("Guided decoding: compiled %s for slot %d in %.2f ms (cache %s, now %.1f KB)",
             guideTypeName(params.type), slot, elapsedMs, cacheAfter == cacheBefore ? "hit" : "miss",
@@ -647,6 +849,9 @@ void GuidedDecoder::fillMasks(int32_t activeBatchSize, int32_t rowsPerSlot,
     {
         return;
     }
+    ELLM_CHECK(rowsPerSlot == 1,
+        "GuidedDecoder::fillMasks fills one row per slot from an un-advanced matcher, so it only means "
+        "anything for vanilla decode; speculative verification must use fillMasksForDraftTree");
     int32_t const totalRows = activeBatchSize * rowsPerSlot;
     ELLM_CHECK(totalRows <= mImpl->maxRows, "GuidedDecoder::fillMasks row count exceeds the allocated buffer");
 
@@ -728,6 +933,303 @@ void GuidedDecoder::fillMasks(int32_t activeBatchSize, int32_t rowsPerSlot,
     CUDA_CHECK(cudaMemcpyAsync(mImpl->deviceBitmask.rawPointer(), mImpl->hostBitmask.rawPointer(),
         static_cast<size_t>(totalRows) * static_cast<size_t>(mImpl->bitmaskSize) * sizeof(int32_t),
         cudaMemcpyHostToDevice, stream));
+}
+
+void GuidedDecoder::captureDraftChains(
+    Tensor const& draftChainIds, int32_t activeBatchSize, int32_t rowsPerSlot, cudaStream_t stream)
+{
+    if (activeBatchSize <= 0 || rowsPerSlot <= 0 || mImpl->hostDraftTokens.isEmpty())
+    {
+        return;
+    }
+    auto const elements = static_cast<size_t>(activeBatchSize) * static_cast<size_t>(rowsPerSlot);
+    ELLM_CHECK(static_cast<size_t>(draftChainIds.getShape().volume()) >= elements,
+        "GuidedDecoder::captureDraftChains was given fewer chain entries than the batch needs");
+    CUDA_CHECK(cudaMemcpyAsync(mImpl->hostDraftTokens.rawPointer(), draftChainIds.rawPointer(),
+        elements * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    mImpl->draftIsTree = false;
+    CUDA_CHECK(cudaEventRecord(mImpl->draftCopyReady, stream));
+    mImpl->draftCopyPending = true;
+}
+
+void GuidedDecoder::captureDraftTree(Tensor const& nodeTokenIds, Tensor const& parentIds,
+    OptionalInputTensor const& validCounts, int32_t activeBatchSize, int32_t rowsPerSlot, cudaStream_t stream)
+{
+    if (activeBatchSize <= 0 || rowsPerSlot <= 0 || mImpl->hostDraftTokens.isEmpty())
+    {
+        return;
+    }
+    auto const elements = static_cast<size_t>(activeBatchSize) * static_cast<size_t>(rowsPerSlot);
+    ELLM_CHECK(static_cast<size_t>(nodeTokenIds.getShape().volume()) >= elements
+            && static_cast<size_t>(parentIds.getShape().volume()) >= elements
+            && (!validCounts.has_value()
+                || static_cast<size_t>(validCounts->get().getShape().volume()) >= static_cast<size_t>(activeBatchSize)),
+        "GuidedDecoder::captureDraftTree was given fewer tree entries than the batch needs");
+    CUDA_CHECK(cudaMemcpyAsync(mImpl->hostDraftTokens.rawPointer(), nodeTokenIds.rawPointer(),
+        elements * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(mImpl->hostDraftParentIds.rawPointer(), parentIds.rawPointer(),
+        elements * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    mImpl->draftHasValidCounts = validCounts.has_value();
+    if (validCounts.has_value())
+    {
+        CUDA_CHECK(cudaMemcpyAsync(mImpl->hostDraftValidCounts.rawPointer(), validCounts->get().rawPointer(),
+            static_cast<size_t>(activeBatchSize) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    }
+    mImpl->draftIsTree = true;
+    CUDA_CHECK(cudaEventRecord(mImpl->draftCopyReady, stream));
+    mImpl->draftCopyPending = true;
+}
+
+int32_t const* GuidedDecoder::hostDraftTokens() const
+{
+    return mImpl->hostDraftTokens.isEmpty() ? nullptr : mImpl->hostDraftTokens.dataPointer<int32_t>();
+}
+
+int32_t const* GuidedDecoder::hostDraftParentIds() const
+{
+    return mImpl->draftIsTree ? mImpl->hostDraftParentIds.dataPointer<int32_t>() : nullptr;
+}
+
+int32_t const* GuidedDecoder::hostDraftValidCounts() const
+{
+    return mImpl->draftIsTree && mImpl->draftHasValidCounts ? mImpl->hostDraftValidCounts.dataPointer<int32_t>()
+                                                            : nullptr;
+}
+
+void GuidedDecoder::waitForDraftTopology()
+{
+    if (!mImpl->draftCopyPending)
+    {
+        return;
+    }
+    CUDA_CHECK(cudaEventSynchronize(mImpl->draftCopyReady));
+    mImpl->draftCopyPending = false;
+}
+
+void GuidedDecoder::fillMasksForDraftTree(int32_t activeBatchSize, int32_t rowsPerSlot,
+    int32_t const* draftTokensFullSpace, int32_t const* parentIds, int32_t const* validCounts,
+    std::vector<int8_t> const& slotSuppressed, std::vector<int8_t> const& reasoningEndedPerSlot,
+    std::vector<int32_t>& unsatisfiableSlots, cudaStream_t stream)
+{
+    unsatisfiableSlots.clear();
+    if (activeBatchSize <= 0 || rowsPerSlot <= 0)
+    {
+        return;
+    }
+    ELLM_CHECK(draftTokensFullSpace != nullptr, "GuidedDecoder::fillMasksForDraftTree needs the draft tokens");
+    int32_t const totalRows = activeBatchSize * rowsPerSlot;
+    ELLM_CHECK(totalRows <= mImpl->maxRows, "GuidedDecoder::fillMasksForDraftTree exceeds the allocated buffer");
+
+    // XGrammar writes straight into row `index` of the host buffer, so the whole slot block is
+    // addressed by absolute row number and no sub-view is needed.
+    std::array<int64_t, 2> shape{static_cast<int64_t>(mImpl->maxRows), static_cast<int64_t>(mImpl->bitmaskSize)};
+    DLTensor bitmaskTensor{};
+    bitmaskTensor.data = mImpl->hostBitmask.rawPointer();
+    bitmaskTensor.device = DLDevice{kDLCPU, 0};
+    bitmaskTensor.ndim = 2;
+    bitmaskTensor.dtype = xgrammar::GetBitmaskDLType();
+    bitmaskTensor.shape = shape.data();
+
+    int32_t* const rowNeedsMask = mImpl->hostRowNeedsMask.dataPointer<int32_t>();
+    int32_t* const firstChild = mImpl->firstChild.data();
+    int32_t* const nextSibling = mImpl->nextSibling.data();
+    bool anyRowNeedsMask = false;
+
+    for (int32_t slot = 0; slot < activeBatchSize; ++slot)
+    {
+        int32_t const base = slot * rowsPerSlot;
+        // Clearing the flags is what makes an unvisited row harmless: the kernel skips it and
+        // never reads the stale mask left there by an earlier step. Clearing the rows
+        // themselves would cost `bitmaskSize` bytes each instead of four.
+        for (int32_t row = 0; row < rowsPerSlot; ++row)
+        {
+            rowNeedsMask[base + row] = 0;
+        }
+
+        bool const suppressed
+            = slot < static_cast<int32_t>(slotSuppressed.size()) && slotSuppressed[static_cast<size_t>(slot)] != 0;
+        // Both gates are independent, and filling past termination aborts inside XGrammar.
+        if (!hasGrammar(slot) || suppressed || mImpl->matchers[static_cast<size_t>(slot)]->IsTerminated())
+        {
+            continue;
+        }
+        auto& matcher = *mImpl->matchers[static_cast<size_t>(slot)];
+
+        // A chain is the tree with `parent[i] == i - 1` and no padding, so one walk covers both
+        // geometries and the chain path cannot drift away from the tree path.
+        int32_t nodeCount = rowsPerSlot;
+        if (validCounts != nullptr)
+        {
+            nodeCount = std::min(validCounts[slot], rowsPerSlot);
+        }
+        if (nodeCount <= 0)
+        {
+            continue;
+        }
+
+        // One descending pass suffices because the tree builder appends a node only after its
+        // parent, so `parent[node] < node` holds; prepending therefore also leaves siblings in
+        // ascending, i.e. score-prioritized, order.
+        std::fill(firstChild, firstChild + nodeCount, -1);
+        for (int32_t node = nodeCount - 1; node >= 1; --node)
+        {
+            int32_t const parent = parentIds != nullptr ? parentIds[base + node] : node - 1;
+            if (parent < 0)
+            {
+                // A node whose parent missed the selection hangs off nothing, so the accept walk
+                // can never reach it. Selecting by score alone can produce these.
+                continue;
+            }
+            ELLM_CHECK(parent < node,
+                "GuidedDecoder::fillMasksForDraftTree got a draft tree whose nodes do not follow their parents");
+            nextSibling[node] = firstChild[parent];
+            firstChild[parent] = node;
+        }
+
+        // Reasoning state is per path, not per slot: one branch can leave the thinking block
+        // while its sibling is still inside it, and carrying a single flag across the walk
+        // would constrain the sibling from a marker it never saw.
+        bool const rootReasoningEnded = slot < static_cast<int32_t>(reasoningEndedPerSlot.size())
+            && reasoningEndedPerSlot[static_cast<size_t>(slot)] != 0;
+
+        // Node 0 is the token the previous step committed; the matcher already consumed it.
+        if (rootReasoningEnded)
+        {
+            matcher.FillNextTokenBitmask(&bitmaskTensor, base);
+            if (!mImpl->rowHasAnyToken(base))
+            {
+                // Only row 0 can make the request fail: its token is always committed. A later
+                // row admitting nothing just means that draft node is unreachable.
+                unsatisfiableSlots.push_back(slot);
+                continue;
+            }
+            rowNeedsMask[base] = 1;
+            anyRowNeedsMask = true;
+        }
+
+        // Entered with the matcher standing where this node's parent left it, and left with it
+        // standing there again, so a rejected branch costs its siblings nothing.
+        auto visit = [&](auto&& self, int32_t node, bool reasoningEnded) -> void {
+            int32_t const row = base + node;
+            int32_t const fullId = draftTokensFullSpace[row];
+
+            if (!reasoningEnded)
+            {
+                if (mImpl->isReasoningEnd(fullId))
+                {
+                    // The separator itself is not constrained output and is not fed to the
+                    // matcher, but the row it owns is the first one the grammar governs: it
+                    // masks the token that follows the block, with the grammar still at its
+                    // start state.
+                    reasoningEnded = true;
+                    matcher.FillNextTokenBitmask(&bitmaskTensor, row);
+                    if (mImpl->rowHasAnyToken(row))
+                    {
+                        rowNeedsMask[row] = 1;
+                        anyRowNeedsMask = true;
+                    }
+                }
+                for (int32_t child = firstChild[node]; child >= 0; child = nextSibling[child])
+                {
+                    self(self, child, reasoningEnded);
+                }
+                return;
+            }
+
+            int32_t const outputId = mImpl->toOutputSpace(fullId);
+            if (outputId < 0)
+            {
+                // The engine cannot emit this token, so the base model can never sample it and
+                // the node is dead anyway. Reachable only when the reduced vocabulary is not a
+                // superset of the draft's, e.g. an EAGLE export without --d2t_path.
+                if (mImpl->warnedUnmappable[static_cast<size_t>(slot)] == 0)
+                {
+                    mImpl->warnedUnmappable[static_cast<size_t>(slot)] = 1;
+                    LOG_WARNING(
+                        "Request %d: draft token %d has no image in the engine's reduced vocabulary; every draft "
+                        "node below it is rejected. Check that the vocabulary reduction kept the draft's tokens.",
+                        slot, fullId);
+                }
+                return;
+            }
+            // The parent's row is always filled and never negative: the walk starts at node 0 or
+            // a separator, both of which fill their own row, and a parentless node is never linked.
+            int32_t const parentRow = base + (parentIds != nullptr ? parentIds[row] : node - 1);
+            if (!mImpl->rowAllows(parentRow, outputId))
+            {
+                return; // Grammar refuses this node: it and its subtree stay unmasked.
+            }
+            if (!matcher.AcceptToken(outputId))
+            {
+                return;
+            }
+            if (!matcher.IsTerminated()) // Filling a mask past termination is a hard error, not a no-op.
+            {
+                matcher.FillNextTokenBitmask(&bitmaskTensor, row);
+                rowNeedsMask[row] = 1;
+                anyRowNeedsMask = true;
+                for (int32_t child = firstChild[node]; child >= 0; child = nextSibling[child])
+                {
+                    self(self, child, true);
+                }
+            }
+            matcher.Rollback(1);
+        };
+
+        for (int32_t child = firstChild[0]; child >= 0; child = nextSibling[child])
+        {
+            visit(visit, child, rootReasoningEnded);
+        }
+
+        // The walk is speculative: the grammar advances only once the step's tokens are known
+        // to be committed, in advanceCommitted.
+    }
+
+    CUDA_CHECK(cudaMemcpyAsync(mImpl->deviceRowNeedsMask.rawPointer(), mImpl->hostRowNeedsMask.rawPointer(),
+        static_cast<size_t>(totalRows) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    if (!anyRowNeedsMask)
+    {
+        return;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(mImpl->deviceBitmask.rawPointer(), mImpl->hostBitmask.rawPointer(),
+        static_cast<size_t>(totalRows) * static_cast<size_t>(mImpl->bitmaskSize) * sizeof(int32_t),
+        cudaMemcpyHostToDevice, stream));
+}
+
+bool GuidedDecoder::advanceCommitted(
+    int32_t slot, int32_t const* committedFullSpace, int32_t count, int8_t& reasoningEnded)
+{
+    if (!hasGrammar(slot) || count <= 0)
+    {
+        return true;
+    }
+    auto& matcher = *mImpl->matchers[static_cast<size_t>(slot)];
+    for (int32_t i = 0; i < count; ++i)
+    {
+        int32_t const fullId = committedFullSpace[i];
+        if (reasoningEnded == 0)
+        {
+            if (mImpl->isReasoningEnd(fullId))
+            {
+                reasoningEnded = 1; // The separator is consumed here, never fed to the matcher.
+            }
+            continue;
+        }
+        if (matcher.IsTerminated())
+        {
+            return true; // Everything after the stop token belongs to a finished request.
+        }
+        int32_t const outputId = mImpl->toOutputSpace(fullId);
+        if (outputId < 0)
+        {
+            return false; // Committed tokens come from the engine's own vocabulary: internal bug.
+        }
+        if (!matcher.AcceptToken(outputId))
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 void GuidedDecoder::applyMask(Tensor& logits, int32_t activeBatchSize, int32_t rowsPerSlot, cudaStream_t stream)

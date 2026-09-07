@@ -89,6 +89,8 @@ private:
 
     Tensor mDraftProposalSize;
     Tensor mDraftAttentionMask;
+    //! [maxBatch, verifySize] parent row of each verify node, for the guided-decoding mask walk.
+    Tensor mVerifyParentIds;
     Tensor mDraftTokenIdsFullTable;
     Tensor mDraftTokenScoreFullTable;
     Tensor mDraftTokenPredecessorFullTable;

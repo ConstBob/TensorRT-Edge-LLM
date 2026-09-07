@@ -367,6 +367,15 @@ public:
         return mChatTemplate.defaultSystemPrompt;
     }
 
+    /**
+     * @brief Get the generation prompt the template appends when thinking is enabled
+     * @return Thinking generation prompt, empty when the template has no thinking variant
+     */
+    std::string const& getGenerationPromptThinking() const noexcept
+    {
+        return mChatTemplate.generationPromptThinking;
+    }
+
 protected:
     /**
      * @brief Parse tokenizer.json to extract configuration

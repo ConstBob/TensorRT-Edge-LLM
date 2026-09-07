@@ -38,6 +38,7 @@
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/decoding/decoderUtils.h"
 #include "runtime/decoding/dflashDecodeUtils.h"
+#include "runtime/decoding/guidedDecoder.h"
 #include "runtime/decoding/logitBias.h"
 #include "runtime/decoding/requestStableRng.h"
 #include "sampler/sampling.h"
@@ -541,6 +542,18 @@ bool DFlashDecoder::prepareBlockDraftVerifyInputs(DecodingInferenceContext& cont
     }
 
     copyVerifyTokenIdsToBaseInput(activeBatchSize, verifySize, context.stream);
+    if (context.hasGuidedDecoding)
+    {
+        if (useTreeVerification())
+        {
+            mRuntime.guidedDecoder.captureDraftTree(mTreeTokenIds, mRuntime.base.pipelineIO.specTreeParentIds,
+                std::ref(mValidCounts), activeBatchSize, verifySize, context.stream);
+        }
+        else
+        {
+            mRuntime.guidedDecoder.captureDraftChains(mVerifyTokenIds, activeBatchSize, verifySize, context.stream);
+        }
+    }
     if (!checkCudaLastError("prepare DFlash verify inputs"))
     {
         return false;
@@ -703,6 +716,12 @@ bool DFlashDecoder::runBaseVerification(DecodingInferenceContext& context)
     }
     // GCOVR_EXCL_STOP
 
+    if (context.hasGuidedDecoding)
+    {
+        applyGuidedDecodingMaskForDraftTree(mRuntime.guidedDecoder, context, mRuntime.base.pipelineIO.outputLogits,
+            activeBatchSize, verifySize, context.stream);
+    }
+
     if (isV2())
     {
         if (!runV2Acceptance(context, verifySize, maxAcceptLength))
@@ -757,6 +776,12 @@ bool DFlashDecoder::runBaseVerification(DecodingInferenceContext& context)
     // Step 8: Append accepted tokens to context (includes the round's D2H sync)
     decoder_utils::appendAcceptedTokens(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
         mAcceptedTokenIds, maxAcceptLength, mRuntime.tokenizer, context.stream, verifySize - 1);
+
+    if (context.hasGuidedDecoding)
+    {
+        advanceGuidedDecodingForCommitted(mRuntime.guidedDecoder, context, mHostAcceptedTokenIds.dataPointer<int32_t>(),
+            mHostAcceptLengths.dataPointer<int32_t>(), maxAcceptLength, activeBatchSize);
+    }
 
     if (context.numLogprobs > 0)
     {

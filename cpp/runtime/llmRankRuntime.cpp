@@ -573,8 +573,9 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
     // -----------------------------------------------------------------------
     // 12. Guided decoding. Needs the tokenizer and the reduced-vocab map above.
     // -----------------------------------------------------------------------
-    mGuidedDecoder.initialize(
-        mMaxRuntimeBatchSize, mDeployment.base.outputVocabSize, mTokenizer, mBaseVocabMappingTable, stream);
+    int32_t const guidedMaxRowsPerSlot = mDeployment.specConfig.has_value() ? mDeployment.specConfig->verifySize : 1;
+    mGuidedDecoder.initialize(mMaxRuntimeBatchSize, guidedMaxRowsPerSlot, mDeployment.base.outputVocabSize,
+        mDeployment.base.vocabSize, mTokenizer, mBaseVocabMappingTable, stream);
 
     // -----------------------------------------------------------------------
     // 13. Decoding strategies.
@@ -1109,13 +1110,14 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
     context.onTokenGenerated = request.onTokenGenerated;
     context.enableThinking = request.enableThinking;
 
-    // Reasoning markers, looked up once: -1 when the tokenizer has no such token.
-    int32_t const endOfChannelId = static_cast<int32_t>(mTokenizer->getTokenId("<channel|>"));
-    int32_t const endOfThinkId = static_cast<int32_t>(mTokenizer->getTokenId("</think>"));
-    int32_t const startOfChannelId = static_cast<int32_t>(mTokenizer->getTokenId("<|channel>"));
-    int32_t const startOfThinkId = static_cast<int32_t>(mTokenizer->getTokenId("<think>"));
-    std::vector<int32_t> const reasoningStartMarkers{startOfChannelId, startOfThinkId};
-    std::vector<int32_t> const reasoningEndMarkers{endOfChannelId, endOfThinkId};
+    // Reasoning markers, looked up once: -1 when the tokenizer has no such token. Shared with
+    // the grammar gate, which must agree on which token ends the block.
+    std::vector<int32_t> const reasoningStartIds = reasoningStartMarkers(*mTokenizer);
+    std::vector<int32_t> const reasoningEndIds = reasoningEndMarkers(*mTokenizer);
+    int32_t const endOfChannelId = reasoningEndIds[0];
+    int32_t const endOfThinkId = reasoningEndIds[1];
+    int32_t const startOfChannelId = reasoningStartIds[0];
+    int32_t const startOfThinkId = reasoningStartIds[1];
 
     prepareLogitBias(mLogitBias, request, context);
 
@@ -1125,12 +1127,12 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
     {
         // Seeded from the prompt rather than from `enableThinking`: the chat template decides
         // whether the block is open, already closed, or absent, and only the prompt shows which.
+        bool const templateOpensBlock = reasoningBlockOpenedByTemplate(*mTokenizer);
         context.guidedReasoningEnded.assign(static_cast<size_t>(activeBatchSize), 0);
         for (int32_t i = 0; i < activeBatchSize; ++i)
         {
-            context.guidedReasoningEnded[i] = static_cast<int8_t>(
-                reasoningClosedInPrompt(context.rawBatchedInputIds[i], reasoningStartMarkers, reasoningEndMarkers) ? 1
-                                                                                                                   : 0);
+            context.guidedReasoningEnded[i] = static_cast<int8_t>(reasoningClosedInPrompt(
+                context.rawBatchedInputIds[i], reasoningStartIds, reasoningEndIds, templateOpensBlock));
         }
 
         mGuidedDecoder.reset();
@@ -1843,15 +1845,6 @@ bool LLMRankRuntime::validateRequestConfig(LLMGenerationRequest const& request)
     }
     if (hasGuidedDecoding(request))
     {
-        // Constraining spec decode means masking every draft-verification row from its own
-        // grammar state, which is not implemented yet.
-        if (mDeployment.specDecodeMode() != SpecDecodeMode::kNONE && !request.disableSpecDecode)
-        {
-            LOG_ERROR(
-                "guided_decoding is not supported together with speculative decoding yet. Set "
-                "disable_spec_decode on the request, or use a non-speculative engine.");
-            return false;
-        }
         // Block diffusion denoises a whole canvas per step rather than appending one token, so
         // it carries neither of the mask hooks. Rejecting beats accepting and ignoring the guide.
         if (mDeployment.base.isDiffusionBackbone)
