@@ -32,7 +32,8 @@ from typing import Dict
 
 import pytest
 from test_plugin_base import (DEPENDENCIES_AVAILABLE, IMPORT_ERROR,
-                              PluginRunner, assert_close, pf_float32, pf_int32)
+                              PluginRunner, PluginUnsupportedError,
+                              assert_close, pf_float32, pf_int32)
 
 _REPO_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
@@ -247,7 +248,9 @@ def _profiles(case: MoeCase, input_specs):
     return profiles
 
 
-def _build_runner(case: MoeCase, **io_kwargs) -> PluginRunner:
+def _build_runner(case: MoeCase,
+                  expect_unsupported: bool = False,
+                  **io_kwargs) -> PluginRunner:
     runner = PluginRunner()
     input_specs = _io_specs(case, **io_kwargs)
     runner.build(input_specs=input_specs,
@@ -255,7 +258,8 @@ def _build_runner(case: MoeCase, **io_kwargs) -> PluginRunner:
                  plugin_name=_PLUGIN_NAME,
                  plugin_version=_PLUGIN_VERSION,
                  plugin_fields=_plugin_fields(case),
-                 profiles=_profiles(case, input_specs))
+                 profiles=_profiles(case, input_specs),
+                 expect_unsupported=expect_unsupported)
     return runner
 
 
@@ -348,13 +352,17 @@ def test_nemotron_shape_decode_and_prefill_dynamic_engine():
 def test_build_on_non_thor_gpu_is_rejected():
     if _is_thor():
         pytest.skip("negative SM gate only applies away from SM110")
-    with pytest.raises(Exception):
-        _build_runner(_SMALL_CASE)
+    # configurePlugin refuses every other SM; the graceful build-time rejection
+    # surfaces as PluginUnsupportedError through expect_unsupported.
+    with pytest.raises(PluginUnsupportedError):
+        _build_runner(_SMALL_CASE, expect_unsupported=True)
 
 
 def _expect_build_rejected(case: MoeCase, **io_kwargs):
-    with pytest.raises(Exception):
-        _build_runner(case, **io_kwargs)
+    """The creator (attribute validation) or the builder (dtype / SM gates)
+    must refuse the contract cleanly on every device."""
+    with pytest.raises(PluginUnsupportedError):
+        _build_runner(case, expect_unsupported=True, **io_kwargs)
 
 
 def test_build_rejects_marlin_layout_and_unknown_backend():
