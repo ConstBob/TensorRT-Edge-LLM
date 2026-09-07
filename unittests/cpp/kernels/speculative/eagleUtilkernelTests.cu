@@ -887,11 +887,33 @@ TEST(EagleKernels, ConstructVerificationDraftTree)
     copyHostToDevice<int32_t>(draftParentFullTableDevice, inputDraftParentFullTable);
     copyHostToDevice<int32_t>(selectedIndicesDevice, inputSelectedIndices);
 
+    auto parentIdsDevice = rt::Tensor({batchSize, verifyTreeSize}, rt::DeviceType::kGPU, DataType::kINT32);
     constructVerificationDraftTree(draftIdFullTableDevice, draftParentFullTableDevice, selectedIndicesDevice,
-        inputIdsDevice, draftTreeMaskDevice, stream);
+        inputIdsDevice, draftTreeMaskDevice, std::ref(parentIdsDevice), stream);
 
     auto const actualIds = copyDeviceToHost<int32_t>(inputIdsDevice);
     auto const actualMask = copyDeviceToHost<int8_t>(draftTreeMaskDevice);
+    auto const actualParents = copyDeviceToHost<int32_t>(parentIdsDevice);
+
+    // The mask carries every ancestor plus the node itself. Nodes precede their descendants, so
+    // the immediate parent is the highest-numbered ancestor below the node -- derived here rather
+    // than hard-coded, which is what makes this fail if the kernel reports a different ancestor.
+    for (int b = 0; b < batchSize; b++)
+    {
+        for (int i = 0; i < verifyTreeSize; i++)
+        {
+            int expectedParent = -1;
+            for (int j = 0; j < i; j++)
+            {
+                if (actualMask[b * verifyTreeSize * verifyTreeSize + i * verifyTreeSize + j] != 0)
+                {
+                    expectedParent = j;
+                }
+            }
+            EXPECT_EQ(actualParents[b * verifyTreeSize + i], expectedParent)
+                << "Batch " << b << " parent mismatch at position " << i;
+        }
+    }
 
     // ========== Comprehensive verification for Batch 0 ==========
     // Verify token IDs for batch 0

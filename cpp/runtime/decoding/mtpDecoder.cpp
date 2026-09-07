@@ -33,6 +33,7 @@
 #include "profiling/timer.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/decoding/decoderUtils.h"
+#include "runtime/decoding/guidedDecoder.h"
 #include "runtime/decoding/logitBias.h"
 #include "runtime/preprocess/embeddingPreprocessor.h"
 #include "sampler/sampling.h"
@@ -507,7 +508,19 @@ bool MTPDecoder::constructDraftProposal(DecodingInferenceContext& context)
         // Tree mode: the tree builder consumes the stacked per-depth logits and
         // emits all base-verify inputs directly; the EAGLE full-table selection below
         // is chain-only.
-        return buildTreeVerifyInputs(activeBatchSize, context.stream);
+        if (!buildTreeVerifyInputs(activeBatchSize, context.stream))
+        {
+            return false;
+        }
+        if (context.hasGuidedDecoding)
+        {
+            // Outside buildTreeVerifyInputs on purpose: graph capture calls that function with
+            // an unpopulated tree, and copying it would leave the host buffer holding garbage
+            // for the first real step.
+            mRuntime.guidedDecoder.captureDraftTree(mTreeTokenIds, mRuntime.base.pipelineIO.specTreeParentIds,
+                std::ref(mValidCounts), activeBatchSize, mRuntime.deployment.specConfig->verifySize, context.stream);
+        }
+        return true;
     }
 
     check::check(mRuntime.sampling.indices.reshape({activeBatchSize, mRuntime.deployment.specConfig->verifySize}),
@@ -525,7 +538,15 @@ bool MTPDecoder::constructDraftProposal(DecodingInferenceContext& context)
                          static_cast<int64_t>(divUp(mRuntime.deployment.specConfig->verifySize, 32))}),
         "Tensor reshape failed");
     kernel::constructVerificationDraftTree(mDraftTokenIdsFullTable, mDraftTokenPredecessorFullTable,
-        mRuntime.sampling.indices, mRuntime.preprocess.idsInput, mDraftAttentionMask, context.stream);
+        mRuntime.sampling.indices, mRuntime.preprocess.idsInput, mDraftAttentionMask, std::nullopt, context.stream);
+
+    if (context.hasGuidedDecoding)
+    {
+        // Copy the chain out while the stream still holds only drafting work, so the mask fill
+        // can wait on just this copy instead of on the verify forward enqueued after it.
+        mRuntime.guidedDecoder.captureDraftChains(
+            mRuntime.preprocess.idsInput, activeBatchSize, mRuntime.deployment.specConfig->verifySize, context.stream);
+    }
 
     return true;
 }
@@ -666,6 +687,15 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     }
     // GCOVR_EXCL_STOP
 
+    if (context.hasGuidedDecoding)
+    {
+        // After the logit bias, as in vanilla decode: the grammar is a hard constraint and has to
+        // land last. eagleAccept below takes the base's top-1 per row, so masking here is what
+        // makes every accepted token grammar-legal.
+        applyGuidedDecodingMaskForDraftTree(mRuntime.guidedDecoder, context, mRuntime.base.pipelineIO.outputLogits,
+            activeBatchSize, mRuntime.deployment.specConfig->verifySize, context.stream);
+    }
+
     // A tree with fewer verify nodes than the full chain depth caps the acceptable
     // path length at verifySize.
     int32_t const chainAcceptDepth = mRuntime.deployment.specConfig->draftingStep + 1;
@@ -759,6 +789,14 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     decoder_utils::appendAcceptedTokens(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
         mAcceptedTokenIds, maxAcceptDepth, mRuntime.tokenizer, context.stream,
         mRuntime.deployment.specConfig->verifySize - 1);
+
+    if (context.hasGuidedDecoding)
+    {
+        // Uses the accept lengths appendAcceptedTokens just rewrote, so the grammar advances over
+        // exactly the tokens that reached the output and stops where EOS or max length did.
+        advanceGuidedDecodingForCommitted(mRuntime.guidedDecoder, context, mHostAcceptedTokenIds.dataPointer<int32_t>(),
+            mHostAcceptLengths.dataPointer<int32_t>(), maxAcceptDepth, activeBatchSize);
+    }
 
     // Few-layer-validation dump (no-op unless EDGELLM_DUMP_LOGITS_KVCACHE_* are set).
     decoder_utils::dumpSpecRound(context, mRuntime.base.cacheManager, *mRuntime.base.sharedResources.kvPageTables[0],

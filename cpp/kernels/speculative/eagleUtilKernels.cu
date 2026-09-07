@@ -429,7 +429,7 @@ __global__ void updateDraftTreeFullTablesKernel(int32_t const* draftIdTable, flo
 
 __global__ void constructVerificationDraftTreeKernel(int32_t const* draftIdFullTable,
     int32_t const* draftParentFullTable, int32_t const* selectedIndices, int32_t* inputIds, int8_t* draftTreeMask,
-    int32_t const fullTableLength, int32_t const verifyTreeSize)
+    int32_t* parentIds, int32_t const fullTableLength, int32_t const verifyTreeSize)
 {
     int32_t const batchIdx = blockIdx.x;
     int32_t const tIdx = threadIdx.x;
@@ -497,6 +497,13 @@ __global__ void constructVerificationDraftTreeKernel(int32_t const* draftIdFullT
     for (int32_t i = 0; i < attendIter; i++)
     {
         draftTreeMask[verifyTreeOffset + attendedIndices[i]] = 1;
+    }
+
+    if (parentIds != nullptr)
+    {
+        // The walk above matches the immediate predecessor first, so attendedIndices[1] is the
+        // parent's row. The root, and a node whose parent missed the selection, report -1.
+        parentIds[verifyTreeCTAOffset + tIdx] = attendIter >= 2 ? attendedIndices[1] : -1;
     }
 }
 
@@ -1235,7 +1242,8 @@ void updateDraftTreeFullTables(rt::Tensor const& draftIdTable, rt::Tensor const&
 }
 
 void constructVerificationDraftTree(rt::Tensor const& draftIdFullTable, rt::Tensor const& draftParentFullTable,
-    rt::Tensor const& selectedIndices, rt::Tensor& inputIds, rt::Tensor& draftTreeMask, cudaStream_t stream)
+    rt::Tensor const& selectedIndices, rt::Tensor& inputIds, rt::Tensor& draftTreeMask,
+    rt::OptionalOutputTensor const& parentIds, cudaStream_t stream)
 {
     check::check(draftIdFullTable.getDeviceType() == rt::DeviceType::kGPU
             && draftParentFullTable.getDeviceType() == rt::DeviceType::kGPU
@@ -1259,7 +1267,8 @@ void constructVerificationDraftTree(rt::Tensor const& draftIdFullTable, rt::Tens
     dim3 gridDim{static_cast<uint32_t>(batchSize)};
     constructVerificationDraftTreeKernel<<<gridDim, blockDim, 0, stream>>>(draftIdFullTable.dataPointer<int32_t>(),
         draftParentFullTable.dataPointer<int32_t>(), selectedIndices.dataPointer<int32_t>(),
-        inputIds.dataPointer<int32_t>(), draftTreeMask.dataPointer<int8_t>(), fullTableLength, verifyTreeSize);
+        inputIds.dataPointer<int32_t>(), draftTreeMask.dataPointer<int8_t>(),
+        parentIds.has_value() ? parentIds->get().dataPointer<int32_t>() : nullptr, fullTableLength, verifyTreeSize);
 }
 
 } // namespace kernel

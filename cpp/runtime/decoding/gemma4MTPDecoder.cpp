@@ -30,6 +30,7 @@
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
 #include "runtime/decoding/decoderUtils.h"
+#include "runtime/decoding/guidedDecoder.h"
 #include "runtime/state/pipelineIO.h"
 #include "sampler/sampling.h"
 
@@ -495,6 +496,11 @@ bool Gemma4MTPDecoder::runBaseVerification(DecodingInferenceContext& context)
     CUDA_CHECK(cudaMemcpyAsync(mRuntime.preprocess.idsInput.rawPointer(), mVerifyTokenIds.rawPointer(),
         activeBatchSize * verifySize * sizeof(int32_t), cudaMemcpyDeviceToDevice, context.stream));
 
+    if (context.hasGuidedDecoding)
+    {
+        mRuntime.guidedDecoder.captureDraftChains(mVerifyTokenIds, activeBatchSize, verifySize, context.stream);
+    }
+
     check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape(
                      {activeBatchSize, verifySize, mRuntime.deployment.base.hiddenSize}),
         "Tensor reshape failed");
@@ -561,6 +567,12 @@ bool Gemma4MTPDecoder::acceptAndCommit(DecodingInferenceContext& context)
     check::check(mAcceptLength.reshape({activeBatchSize}), "Tensor reshape failed");
     check::check(mArgmaxScratch.reshape({activeBatchSize * verifySize}), "Tensor reshape failed");
 
+    if (context.hasGuidedDecoding)
+    {
+        applyGuidedDecodingMaskForDraftTree(mRuntime.guidedDecoder, context, mRuntime.base.pipelineIO.outputLogits,
+            activeBatchSize, verifySize, context.stream);
+    }
+
     kernel::sequentialAccept(mRuntime.base.pipelineIO.outputLogits, mVerifyTokenIds, mAcceptedTokenIds, mAcceptLength,
         mArgmaxScratch, activeBatchSize, verifySize, mRuntime.deployment.base.outputVocabSize, context.stream);
 
@@ -603,6 +615,12 @@ bool Gemma4MTPDecoder::acceptAndCommit(DecodingInferenceContext& context)
 
     decoder_utils::appendAcceptedTokens(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
         mAcceptedTokenIds, verifySize, mRuntime.tokenizer, context.stream, verifySize - 1);
+
+    if (context.hasGuidedDecoding)
+    {
+        advanceGuidedDecodingForCommitted(mRuntime.guidedDecoder, context, mHostAcceptedTokenIds.dataPointer<int32_t>(),
+            mHostAcceptLengths.dataPointer<int32_t>(), verifySize, activeBatchSize);
+    }
 
     if (context.numLogprobs > 0)
     {

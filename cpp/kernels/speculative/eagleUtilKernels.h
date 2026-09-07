@@ -279,10 +279,15 @@ void updateDraftTreeFullTables(rt::Tensor const& draftIdTable, rt::Tensor const&
 //! Outputs:
 //!     inputIds [GPU, Int32]: Input ids to the base model. shape [batch, verify-tree-size]
 //!     draftTreeMask [GPU, Int8]: Draft tree mask. shape [batch, verify-tree-size, verify-tree-size]
+//!     parentIds [GPU, Int32, optional]: Parent's row within the verify tree, shape [batch, verify-tree-size].
+//!         The root, and any node whose parent missed the selection, report -1. The mask already carries the
+//!         full ancestor set; this is the immediate predecessor, which reading the mask alone cannot give
+//!         without a scan.
 //!
 //! @throws std::runtime_error if tensors not located on GPU, or tensor datatype or shape is invalid
 void constructVerificationDraftTree(rt::Tensor const& draftIdFullTable, rt::Tensor const& draftParentFullTable,
-    rt::Tensor const& selectedIndices, rt::Tensor& inputIds, rt::Tensor& draftTreeMask, cudaStream_t stream);
+    rt::Tensor const& selectedIndices, rt::Tensor& inputIds, rt::Tensor& draftTreeMask,
+    rt::OptionalOutputTensor const& parentIds, cudaStream_t stream);
 
 // clang-format on
 

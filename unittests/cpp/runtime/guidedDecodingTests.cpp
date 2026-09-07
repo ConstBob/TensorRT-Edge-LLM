@@ -399,21 +399,33 @@ TEST(GuidedDecodingReasoningGateTest, SeedsFromThePromptRatherThanARequestFlag)
 
     // Template opened and closed the block: constrain from the first generated token. The end
     // marker is never generated, so a gate waiting for one would never open.
-    EXPECT_TRUE(rt::reasoningClosedInPrompt({kTEXT, kSTART_THINK, kEND_THINK}, starts, ends));
+    EXPECT_TRUE(
+        rt::reasoningClosedInPrompt({kTEXT, kSTART_THINK, kEND_THINK}, starts, ends, /*templateOpensBlock=*/false));
 
     // Template left the block open: the model is mid-reasoning.
-    EXPECT_FALSE(rt::reasoningClosedInPrompt({kTEXT, kSTART_THINK}, starts, ends));
-    EXPECT_FALSE(rt::reasoningClosedInPrompt({kTEXT, kSTART_CHANNEL}, starts, ends));
+    EXPECT_FALSE(rt::reasoningClosedInPrompt({kTEXT, kSTART_THINK}, starts, ends, /*templateOpensBlock=*/false));
+    EXPECT_FALSE(rt::reasoningClosedInPrompt({kTEXT, kSTART_CHANNEL}, starts, ends, /*templateOpensBlock=*/false));
 
-    // Template omitted the block: the model may still open one itself.
-    EXPECT_FALSE(rt::reasoningClosedInPrompt({kTEXT, kTEXT}, starts, ends));
+    // Template omitted the block. What that means depends on who writes the opening marker:
+    // where the model does, absence proves nothing and the block must be treated as open; where
+    // the template does, absence proves the block was never opened. Reading the second case as
+    // open leaves such a model permanently mid-thought and silently unconstrained.
+    EXPECT_FALSE(rt::reasoningClosedInPrompt({kTEXT, kTEXT}, starts, ends, /*templateOpensBlock=*/false));
+    EXPECT_TRUE(rt::reasoningClosedInPrompt({kTEXT, kTEXT}, starts, ends, /*templateOpensBlock=*/true));
+
+    // A template that opens the block still yields to what the prompt actually shows.
+    EXPECT_FALSE(rt::reasoningClosedInPrompt({kTEXT, kSTART_CHANNEL}, starts, ends, /*templateOpensBlock=*/true));
+    EXPECT_TRUE(rt::reasoningClosedInPrompt({kSTART_CHANNEL, kEND_CHANNEL}, starts, ends, /*templateOpensBlock=*/true));
 
     // Only the most recent marker counts; an earlier turn's block must not leak.
-    EXPECT_TRUE(rt::reasoningClosedInPrompt({kSTART_THINK, kEND_THINK, kTEXT, kSTART_THINK, kEND_THINK}, starts, ends));
-    EXPECT_FALSE(rt::reasoningClosedInPrompt({kSTART_THINK, kEND_THINK, kTEXT, kSTART_THINK}, starts, ends));
+    EXPECT_TRUE(rt::reasoningClosedInPrompt(
+        {kSTART_THINK, kEND_THINK, kTEXT, kSTART_THINK, kEND_THINK}, starts, ends, /*templateOpensBlock=*/false));
+    EXPECT_FALSE(rt::reasoningClosedInPrompt(
+        {kSTART_THINK, kEND_THINK, kTEXT, kSTART_THINK}, starts, ends, /*templateOpensBlock=*/false));
 
     // Marker families are independent: a channel block closes on the channel end marker.
-    EXPECT_TRUE(rt::reasoningClosedInPrompt({kSTART_CHANNEL, kEND_CHANNEL}, starts, ends));
+    EXPECT_TRUE(
+        rt::reasoningClosedInPrompt({kSTART_CHANNEL, kEND_CHANNEL}, starts, ends, /*templateOpensBlock=*/false));
 }
 
 //! A model with no reasoning markers has no reasoning phase, so it must not sit behind a gate
@@ -421,12 +433,12 @@ TEST(GuidedDecodingReasoningGateTest, SeedsFromThePromptRatherThanARequestFlag)
 TEST(GuidedDecodingReasoningGateTest, ModelWithoutMarkersIsNeverGated)
 {
     std::vector<int32_t> const absent{-1, -1};
-    EXPECT_TRUE(rt::reasoningClosedInPrompt({7, 8, 9}, absent, absent));
-    EXPECT_TRUE(rt::reasoningClosedInPrompt({}, absent, absent));
+    EXPECT_TRUE(rt::reasoningClosedInPrompt({7, 8, 9}, absent, absent, /*templateOpensBlock=*/false));
+    EXPECT_TRUE(rt::reasoningClosedInPrompt({}, absent, absent, /*templateOpensBlock=*/false));
 
     // -1 must not match a padding or placeholder id that happens to be negative.
-    EXPECT_TRUE(rt::reasoningClosedInPrompt({-1, 7}, absent, absent));
-    EXPECT_FALSE(rt::reasoningClosedInPrompt({-1, 7}, {-1, 100}, {-1, 101}));
+    EXPECT_TRUE(rt::reasoningClosedInPrompt({-1, 7}, absent, absent, /*templateOpensBlock=*/false));
+    EXPECT_FALSE(rt::reasoningClosedInPrompt({-1, 7}, {-1, 100}, {-1, 101}, /*templateOpensBlock=*/false));
 }
 
 // ---------------------------------------------------------------- GuidedDecoder lifecycle
@@ -446,9 +458,10 @@ protected:
         // IDs 0..9 spell the JSON we need; 10 is EOS.
         std::ofstream(mDir / "tokenizer.json") << R"JSON({
   "model": {"type": "BPE", "vocab": {
-    "{": 0, "}": 1, "\"": 2, ":": 3, "a": 4, "1": 5, "2": 6, ",": 7, "b": 8, " ": 9, "<eos>": 10
+    "{": 0, "}": 1, "\"": 2, ":": 3, "a": 4, "1": 5, "2": 6, ",": 7, "b": 8, " ": 9, "<eos>": 10,
+    "</think>": 11
   }, "merges": []},
-  "added_tokens": [{"id": 10, "content": "<eos>"}],
+  "added_tokens": [{"id": 10, "content": "<eos>"}, {"id": 11, "content": "</think>"}],
   "pre_tokenizer": {"type": "Split", "pattern": {"String": ""}}
 })JSON";
         std::ofstream(mDir / "tokenizer_config.json") << R"JSON({"eos_token": {"content": "<eos>"}})JSON";
@@ -468,14 +481,15 @@ protected:
     }
 
     //! No reduced-vocabulary map: output space is the identity over the full vocabulary.
-    void initDecoder(rt::GuidedDecoder& decoder, int32_t maxBatchSize)
+    void initDecoder(rt::GuidedDecoder& decoder, int32_t maxBatchSize, int32_t maxRowsPerSlot = 1)
     {
         rt::Tensor emptyMap;
-        decoder.initialize(maxBatchSize, kVOCAB_SIZE, &mTokenizer, emptyMap, mStream);
+        decoder.initialize(maxBatchSize, maxRowsPerSlot, kVOCAB_SIZE, kVOCAB_SIZE, &mTokenizer, emptyMap, mStream);
     }
 
-    static constexpr int32_t kVOCAB_SIZE = 11;
+    static constexpr int32_t kVOCAB_SIZE = 12;
     static constexpr int32_t kEOS_ID = 10;
+    static constexpr int32_t kTHINK_END_ID = 11;
 
     std::filesystem::path mDir;
     tokenizer::Tokenizer mTokenizer;
@@ -667,6 +681,255 @@ TEST_F(GuidedDecoderTest, FillMasksMarksOnlyLegalTokens)
     }
 }
 
+//! ---------------------------------------------------------------------------------------------
+//! Speculative verification: one mask per draft-chain node (#677).
+//! ---------------------------------------------------------------------------------------------
+
+//! The schema `{"a": <integer>}` walks through four distinct grammar states, so the four verify
+//! rows must carry four distinct masks. Filling them from one un-advanced matcher would repeat
+//! the same mask, which is the whole failure mode this path exists to avoid.
+TEST_F(GuidedDecoderTest, DraftChainGivesEachRowItsOwnMask)
+{
+    constexpr int32_t kRows = 4;
+    rt::GuidedDecoder decoder;
+    initDecoder(decoder, /*maxBatchSize=*/1, kRows);
+
+    std::string failReason;
+    ASSERT_TRUE(decoder.prepareSlot(0,
+        makeGuide(
+            rt::GuideType::kJsonSchema, R"({"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]})"),
+        failReason))
+        << failReason;
+
+    // Node 0 is the already-committed token; nodes 1..3 spell `{`, `"`, `a`.
+    std::vector<int32_t> const chain{/*root*/ 0, 0, 2, 4};
+    std::vector<int8_t> const notSuppressed{0};
+    std::vector<int8_t> const reasoningEnded{1};
+    std::vector<int32_t> unsatisfiable;
+    decoder.fillMasksForDraftTree(/*activeBatchSize=*/1, kRows, chain.data(), /*parentIds=*/nullptr,
+        /*validCounts=*/nullptr, notSuppressed, reasoningEnded, unsatisfiable, mStream);
+    EXPECT_TRUE(unsatisfiable.empty());
+
+    rt::Tensor logits({1, kRows, kVOCAB_SIZE}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "logits");
+    copyHostToDevice<float>(logits, std::vector<float>(kRows * kVOCAB_SIZE, 1.0F));
+    decoder.applyMask(logits, /*activeBatchSize=*/1, kRows, mStream);
+    CUDA_CHECK(cudaStreamSynchronize(mStream));
+
+    std::vector<float> out(kRows * kVOCAB_SIZE);
+    CUDA_CHECK(cudaMemcpy(out.data(), logits.rawPointer(), out.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    auto allowed = [&](int32_t row, int32_t token) { return out[row * kVOCAB_SIZE + token] == 1.0F; };
+
+    EXPECT_TRUE(allowed(0, 0)) << "row 0 is the object start, so '{' must survive";
+    EXPECT_FALSE(allowed(0, 4)) << "'a' cannot start the object";
+    EXPECT_TRUE(allowed(1, 2)) << "after '{' a key must open with '\"'";
+    EXPECT_FALSE(allowed(1, 0)) << "a second '{' is not a key";
+    EXPECT_TRUE(allowed(2, 4)) << "the only declared property is 'a'";
+    EXPECT_FALSE(allowed(2, 2)) << "the key name has to start before it can close";
+    EXPECT_TRUE(allowed(3, 2)) << "after 'a' the key closes";
+    EXPECT_FALSE(allowed(3, 4)) << "'aa' is not a declared property";
+
+    // The point of the test: no two rows may be identical.
+    for (int32_t lhs = 0; lhs < kRows; ++lhs)
+    {
+        for (int32_t rhs = lhs + 1; rhs < kRows; ++rhs)
+        {
+            bool same = true;
+            for (int32_t token = 0; token < kVOCAB_SIZE && same; ++token)
+            {
+                same = allowed(lhs, token) == allowed(rhs, token);
+            }
+            EXPECT_FALSE(same) << "rows " << lhs << " and " << rhs << " carry the same mask";
+        }
+    }
+}
+
+//! A draft token the grammar refuses ends the walk. That node and every node under it are
+//! unreachable, so their rows stay unmasked rather than being driven to the sentinel.
+TEST_F(GuidedDecoderTest, DraftChainStopsAtTheFirstIllegalNode)
+{
+    constexpr int32_t kRows = 4;
+    rt::GuidedDecoder decoder;
+    initDecoder(decoder, /*maxBatchSize=*/1, kRows);
+
+    std::string failReason;
+    ASSERT_TRUE(decoder.prepareSlot(0,
+        makeGuide(
+            rt::GuideType::kJsonSchema, R"({"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]})"),
+        failReason))
+        << failReason;
+
+    // `{` is legal, then `a` is not a key opener, so nodes 2 and 3 are dead.
+    std::vector<int32_t> const chain{0, 0, 4, 0};
+    std::vector<int8_t> const notSuppressed{0};
+    std::vector<int8_t> const reasoningEnded{1};
+    std::vector<int32_t> unsatisfiable;
+    decoder.fillMasksForDraftTree(/*activeBatchSize=*/1, kRows, chain.data(), /*parentIds=*/nullptr,
+        /*validCounts=*/nullptr, notSuppressed, reasoningEnded, unsatisfiable, mStream);
+    EXPECT_TRUE(unsatisfiable.empty()) << "a dead draft node is normal, not a failed request";
+
+    rt::Tensor logits({1, kRows, kVOCAB_SIZE}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "logits");
+    copyHostToDevice<float>(logits, std::vector<float>(kRows * kVOCAB_SIZE, 1.0F));
+    decoder.applyMask(logits, /*activeBatchSize=*/1, kRows, mStream);
+    CUDA_CHECK(cudaStreamSynchronize(mStream));
+
+    std::vector<float> out(kRows * kVOCAB_SIZE);
+    CUDA_CHECK(cudaMemcpy(out.data(), logits.rawPointer(), out.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    EXPECT_FLOAT_EQ(out[0 * kVOCAB_SIZE + 1], kMaskedLogitValue) << "row 0 is masked";
+    EXPECT_FLOAT_EQ(out[1 * kVOCAB_SIZE + 0], kMaskedLogitValue) << "row 1 is masked";
+    for (int32_t row = 2; row < kRows; ++row)
+    {
+        for (int32_t token = 0; token < kVOCAB_SIZE; ++token)
+        {
+            EXPECT_FLOAT_EQ(out[row * kVOCAB_SIZE + token], 1.0F)
+                << "row " << row << " is unreachable and must be left alone";
+        }
+    }
+}
+
+//! The walk is speculative: it must leave the matcher exactly where it found it, or the next
+//! step starts from a grammar state the model never actually reached.
+TEST_F(GuidedDecoderTest, DraftChainLeavesTheMatcherWhereItFoundIt)
+{
+    constexpr int32_t kRows = 4;
+    rt::GuidedDecoder decoder;
+    initDecoder(decoder, /*maxBatchSize=*/1, kRows);
+
+    std::string failReason;
+    ASSERT_TRUE(decoder.prepareSlot(0,
+        makeGuide(
+            rt::GuideType::kJsonSchema, R"({"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]})"),
+        failReason))
+        << failReason;
+
+    std::vector<int32_t> const chain{0, 0, 2, 4};
+    std::vector<int8_t> const notSuppressed{0};
+    std::vector<int8_t> const reasoningEnded{1};
+    std::vector<int32_t> unsatisfiable;
+
+    auto maskAfterOneWalk = [&]() {
+        decoder.fillMasksForDraftTree(/*activeBatchSize=*/1, kRows, chain.data(), /*parentIds=*/nullptr,
+            /*validCounts=*/nullptr, notSuppressed, reasoningEnded, unsatisfiable, mStream);
+        rt::Tensor logits({1, kRows, kVOCAB_SIZE}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "logits");
+        copyHostToDevice<float>(logits, std::vector<float>(kRows * kVOCAB_SIZE, 1.0F));
+        decoder.applyMask(logits, /*activeBatchSize=*/1, kRows, mStream);
+        CUDA_CHECK(cudaStreamSynchronize(mStream));
+        std::vector<float> out(kRows * kVOCAB_SIZE);
+        CUDA_CHECK(cudaMemcpy(out.data(), logits.rawPointer(), out.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        return out;
+    };
+
+    EXPECT_EQ(maskAfterOneWalk(), maskAfterOneWalk()) << "the second walk saw a different grammar state";
+}
+
+//! Speculative decoding commits a variable number of tokens per step, so the grammar advances
+//! by that many at once and must land exactly where the committed text left it.
+TEST_F(GuidedDecoderTest, AdvanceCommittedWalksEveryCommittedToken)
+{
+    rt::GuidedDecoder decoder;
+    initDecoder(decoder, /*maxBatchSize=*/1, /*maxRowsPerSlot=*/4);
+
+    std::string failReason;
+    ASSERT_TRUE(decoder.prepareSlot(0,
+        makeGuide(
+            rt::GuideType::kJsonSchema, R"({"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]})"),
+        failReason))
+        << failReason;
+
+    std::vector<int32_t> const committed{0, 2, 4}; // `{`, `"`, `a`
+    int8_t reasoningEnded = 1;
+    ASSERT_TRUE(decoder.advanceCommitted(0, committed.data(), static_cast<int32_t>(committed.size()), reasoningEnded));
+
+    // After `{"a` the key can only close, so a second 'a' must be refused and '"' accepted.
+    EXPECT_FALSE(decoder.advance(0, 4)) << "'aa' is not a declared property";
+}
+
+//! A token the grammar forbids mid-run fails the request rather than being skipped: the mask
+//! should have made it impossible, so reaching it means the two sides disagree.
+TEST_F(GuidedDecoderTest, AdvanceCommittedReportsARejectedToken)
+{
+    rt::GuidedDecoder decoder;
+    initDecoder(decoder, /*maxBatchSize=*/1, /*maxRowsPerSlot=*/4);
+
+    std::string failReason;
+    ASSERT_TRUE(decoder.prepareSlot(0,
+        makeGuide(
+            rt::GuideType::kJsonSchema, R"({"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]})"),
+        failReason))
+        << failReason;
+
+    std::vector<int32_t> const committed{0, 4}; // `{` then 'a', which cannot open a key
+    int8_t reasoningEnded = 1;
+    EXPECT_FALSE(decoder.advanceCommitted(0, committed.data(), static_cast<int32_t>(committed.size()), reasoningEnded));
+}
+
+//! Reasoning gate, the case a per-slot flag cannot express: the block closes partway through a
+//! verify chain, so the rows before the separator are free and the rows after it are governed.
+TEST_F(GuidedDecoderTest, ReasoningGateStartsAtTheSeparatorInsideAChain)
+{
+    constexpr int32_t kRows = 4;
+    rt::GuidedDecoder decoder;
+    initDecoder(decoder, /*maxBatchSize=*/1, kRows);
+
+    std::string failReason;
+    ASSERT_TRUE(decoder.prepareSlot(0,
+        makeGuide(
+            rt::GuideType::kJsonSchema, R"({"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]})"),
+        failReason))
+        << failReason;
+
+    // Still reasoning on entry; node 2 closes the block, so row 2 is the first governed row.
+    std::vector<int32_t> const chain{4, 4, kTHINK_END_ID, 0};
+    std::vector<int8_t> const notSuppressed{0};
+    std::vector<int8_t> const stillReasoning{0};
+    std::vector<int32_t> unsatisfiable;
+    decoder.fillMasksForDraftTree(/*activeBatchSize=*/1, kRows, chain.data(), /*parentIds=*/nullptr,
+        /*validCounts=*/nullptr, notSuppressed, stillReasoning, unsatisfiable, mStream);
+    EXPECT_TRUE(unsatisfiable.empty());
+
+    rt::Tensor logits({1, kRows, kVOCAB_SIZE}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "logits");
+    copyHostToDevice<float>(logits, std::vector<float>(kRows * kVOCAB_SIZE, 1.0F));
+    decoder.applyMask(logits, /*activeBatchSize=*/1, kRows, mStream);
+    CUDA_CHECK(cudaStreamSynchronize(mStream));
+
+    std::vector<float> out(kRows * kVOCAB_SIZE);
+    CUDA_CHECK(cudaMemcpy(out.data(), logits.rawPointer(), out.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    for (int32_t row = 0; row < 2; ++row)
+    {
+        for (int32_t token = 0; token < kVOCAB_SIZE; ++token)
+        {
+            EXPECT_FLOAT_EQ(out[row * kVOCAB_SIZE + token], 1.0F)
+                << "row " << row << " is inside the reasoning block and must stay free";
+        }
+    }
+    EXPECT_FLOAT_EQ(out[2 * kVOCAB_SIZE + 0], 1.0F) << "the separator's row opens the object";
+    EXPECT_FLOAT_EQ(out[2 * kVOCAB_SIZE + 4], kMaskedLogitValue) << "'a' cannot start the object";
+    EXPECT_FLOAT_EQ(out[3 * kVOCAB_SIZE + 2], 1.0F) << "after '{' a key opens";
+    EXPECT_FLOAT_EQ(out[3 * kVOCAB_SIZE + 0], kMaskedLogitValue) << "a second '{' is not a key";
+}
+
+//! The separator is a delimiter, not constrained output: consuming it flips the flag but must
+//! not advance the grammar, or the schema would have to start with `</think>`.
+TEST_F(GuidedDecoderTest, AdvanceCommittedConsumesTheSeparatorWithoutFeedingIt)
+{
+    rt::GuidedDecoder decoder;
+    initDecoder(decoder, /*maxBatchSize=*/1, /*maxRowsPerSlot=*/4);
+
+    std::string failReason;
+    ASSERT_TRUE(decoder.prepareSlot(0,
+        makeGuide(
+            rt::GuideType::kJsonSchema, R"({"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]})"),
+        failReason))
+        << failReason;
+
+    std::vector<int32_t> const committed{4, 4, kTHINK_END_ID, 0}; // free text, separator, then `{`
+    int8_t reasoningEnded = 0;
+    ASSERT_TRUE(decoder.advanceCommitted(0, committed.data(), static_cast<int32_t>(committed.size()), reasoningEnded));
+    EXPECT_EQ(reasoningEnded, 1) << "the separator must latch the flag";
+
+    // Only `{` reached the grammar, so a key must open next.
+    EXPECT_TRUE(decoder.advance(0, 2)) << "after '{' the key opens with '\"'";
+}
+
 //! choice has no XGrammar primitive behind it: it is lowered to an EBNF alternation, so the
 //! test that matters is that only the first character of some alternative is legal at step 0.
 TEST_F(GuidedDecoderTest, ChoiceAllowsOnlyTheFirstCharacterOfAnAlternative)
@@ -849,6 +1112,316 @@ TEST_F(GuidedDecoderTest, ReportsUnsatisfiableGrammarAsAnAllZeroRow)
 
     ASSERT_EQ(unsatisfiable.size(), 1U);
     EXPECT_EQ(unsatisfiable[0], 0);
+}
+
+//! ---------------------------------------------------------------------------------------------
+//! Speculative verification over a branching draft tree (#677 phase 2).
+//! ---------------------------------------------------------------------------------------------
+
+//! `root ::= "a" ("1" "b" | "2" ",") "a"` forks after `a`, so nodes 2 and 3 are siblings standing
+//! at the same grammar state but leading to different ones. Walking rows in index order instead
+//! of depth-first would evaluate node 3 with node 2 still accepted, and `2` would be refused.
+TEST_F(GuidedDecoderTest, DraftTreeGivesSiblingBranchesIndependentMasks)
+{
+    constexpr int32_t kRows = 6;
+    rt::GuidedDecoder decoder;
+    initDecoder(decoder, /*maxBatchSize=*/1, kRows);
+
+    std::string failReason;
+    ASSERT_TRUE(
+        decoder.prepareSlot(0, makeGuide(rt::GuideType::kEbnf, R"(root ::= "a" ("1" "b" | "2" ",") "a")"), failReason))
+        << failReason;
+
+    //  node:    0       1      2      3      4      5
+    //  parent: -1       0      1      1      2      3
+    //  token:  root    'a'    '1'    '2'    'b'    ','
+    std::vector<int32_t> const tokens{0, 4, 5, 6, 8, 7};
+    std::vector<int32_t> const parents{-1, 0, 1, 1, 2, 3};
+    std::vector<int32_t> const counts{kRows};
+    std::vector<int8_t> const notSuppressed{0};
+    std::vector<int8_t> const reasoningEnded{1};
+    std::vector<int32_t> unsatisfiable;
+    decoder.fillMasksForDraftTree(
+        /*activeBatchSize=*/1, kRows, tokens.data(), parents.data(), counts.data(), notSuppressed, reasoningEnded,
+        unsatisfiable, mStream);
+    EXPECT_TRUE(unsatisfiable.empty());
+
+    rt::Tensor logits({1, kRows, kVOCAB_SIZE}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "logits");
+    copyHostToDevice<float>(logits, std::vector<float>(kRows * kVOCAB_SIZE, 1.0F));
+    decoder.applyMask(logits, /*activeBatchSize=*/1, kRows, mStream);
+    CUDA_CHECK(cudaStreamSynchronize(mStream));
+
+    std::vector<float> out(kRows * kVOCAB_SIZE);
+    CUDA_CHECK(cudaMemcpy(out.data(), logits.rawPointer(), out.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    auto allowed = [&](int32_t row, int32_t token) { return out[row * kVOCAB_SIZE + token] == 1.0F; };
+
+    EXPECT_TRUE(allowed(0, 4)) << "the grammar starts with 'a'";
+    EXPECT_TRUE(allowed(1, 5)) << "after 'a' the fork admits '1'";
+    EXPECT_TRUE(allowed(1, 6)) << "after 'a' the fork admits '2'";
+
+    // The two forks must disagree. Sharing a mask here is what a sweep in row order produces.
+    EXPECT_TRUE(allowed(2, 8)) << "the '1' branch continues with 'b'";
+    EXPECT_FALSE(allowed(2, 7)) << "the '1' branch does not admit ','";
+    EXPECT_TRUE(allowed(3, 7)) << "the '2' branch continues with ','";
+    EXPECT_FALSE(allowed(3, 8)) << "the '2' branch does not admit 'b'";
+
+    EXPECT_TRUE(allowed(4, 4)) << "both branches close on a trailing 'a'";
+    EXPECT_TRUE(allowed(5, 4)) << "the sibling branch reached its own trailing 'a'";
+}
+
+//! A branch the grammar refuses takes its own subtree down and nothing else. Pruning by row
+//! index instead of by subtree would silently kill the sibling that is still legal.
+TEST_F(GuidedDecoderTest, DraftTreeDeadBranchLeavesItsSiblingAlone)
+{
+    constexpr int32_t kRows = 6;
+    rt::GuidedDecoder decoder;
+    initDecoder(decoder, /*maxBatchSize=*/1, kRows);
+
+    std::string failReason;
+    ASSERT_TRUE(
+        decoder.prepareSlot(0, makeGuide(rt::GuideType::kEbnf, R"(root ::= "a" ("1" "b" | "2" ",") "a")"), failReason))
+        << failReason;
+
+    // Node 2 drafts 'b', which cannot follow 'a'. Node 3 is its sibling and stays legal.
+    std::vector<int32_t> const tokens{0, 4, 8, 6, 8, 7};
+    std::vector<int32_t> const parents{-1, 0, 1, 1, 2, 3};
+    std::vector<int32_t> const counts{kRows};
+    std::vector<int8_t> const notSuppressed{0};
+    std::vector<int8_t> const reasoningEnded{1};
+    std::vector<int32_t> unsatisfiable;
+    decoder.fillMasksForDraftTree(
+        /*activeBatchSize=*/1, kRows, tokens.data(), parents.data(), counts.data(), notSuppressed, reasoningEnded,
+        unsatisfiable, mStream);
+    EXPECT_TRUE(unsatisfiable.empty()) << "a dead draft node is normal output, not a failed request";
+
+    rt::Tensor logits({1, kRows, kVOCAB_SIZE}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "logits");
+    copyHostToDevice<float>(logits, std::vector<float>(kRows * kVOCAB_SIZE, 1.0F));
+    decoder.applyMask(logits, /*activeBatchSize=*/1, kRows, mStream);
+    CUDA_CHECK(cudaStreamSynchronize(mStream));
+
+    std::vector<float> out(kRows * kVOCAB_SIZE);
+    CUDA_CHECK(cudaMemcpy(out.data(), logits.rawPointer(), out.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    auto rowUntouched = [&](int32_t row) {
+        for (int32_t token = 0; token < kVOCAB_SIZE; ++token)
+        {
+            if (out[row * kVOCAB_SIZE + token] != 1.0F)
+            {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    EXPECT_TRUE(rowUntouched(2)) << "the refused node is unreachable and must stay unmasked";
+    EXPECT_TRUE(rowUntouched(4)) << "the refused node's child is unreachable too";
+    EXPECT_FALSE(rowUntouched(3)) << "the sibling branch is still alive and must be masked";
+    EXPECT_FLOAT_EQ(out[3 * kVOCAB_SIZE + 7], 1.0F) << "the sibling continues with ','";
+    EXPECT_FLOAT_EQ(out[3 * kVOCAB_SIZE + 8], kMaskedLogitValue) << "the sibling does not admit 'b'";
+    EXPECT_FALSE(rowUntouched(5)) << "the sibling's child is reachable and must be masked";
+}
+
+//! Every accepted node has to be rewound on the way back up, or the next sibling -- and the next
+//! decode step -- start from a grammar state the model never reached.
+TEST_F(GuidedDecoderTest, DraftTreeLeavesTheMatcherWhereItFoundIt)
+{
+    constexpr int32_t kRows = 6;
+    rt::GuidedDecoder decoder;
+    initDecoder(decoder, /*maxBatchSize=*/1, kRows);
+
+    std::string failReason;
+    ASSERT_TRUE(
+        decoder.prepareSlot(0, makeGuide(rt::GuideType::kEbnf, R"(root ::= "a" ("1" "b" | "2" ",") "a")"), failReason))
+        << failReason;
+
+    std::vector<int32_t> const tokens{0, 4, 5, 6, 8, 7};
+    std::vector<int32_t> const parents{-1, 0, 1, 1, 2, 3};
+    std::vector<int32_t> const counts{kRows};
+    std::vector<int8_t> const notSuppressed{0};
+    std::vector<int8_t> const reasoningEnded{1};
+    std::vector<int32_t> unsatisfiable;
+
+    auto maskAfterOneWalk = [&]() {
+        decoder.fillMasksForDraftTree(/*activeBatchSize=*/1, kRows, tokens.data(), parents.data(), counts.data(),
+            notSuppressed, reasoningEnded, unsatisfiable, mStream);
+        rt::Tensor logits({1, kRows, kVOCAB_SIZE}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "logits");
+        copyHostToDevice<float>(logits, std::vector<float>(kRows * kVOCAB_SIZE, 1.0F));
+        decoder.applyMask(logits, /*activeBatchSize=*/1, kRows, mStream);
+        CUDA_CHECK(cudaStreamSynchronize(mStream));
+        std::vector<float> out(kRows * kVOCAB_SIZE);
+        CUDA_CHECK(cudaMemcpy(out.data(), logits.rawPointer(), out.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        return out;
+    };
+
+    EXPECT_EQ(maskAfterOneWalk(), maskAfterOneWalk()) << "the second walk saw a different grammar state";
+}
+
+//! The builder pads the block out to verifySize when it runs out of candidates. Padding carries
+//! parent -1 and a stale token, so treating it as a node would both corrupt the walk and mask
+//! rows the base model is not going to read.
+TEST_F(GuidedDecoderTest, DraftTreeStopsAtTheValidNodeCount)
+{
+    constexpr int32_t kRows = 6;
+    rt::GuidedDecoder decoder;
+    initDecoder(decoder, /*maxBatchSize=*/1, kRows);
+
+    std::string failReason;
+    ASSERT_TRUE(
+        decoder.prepareSlot(0, makeGuide(rt::GuideType::kEbnf, R"(root ::= "a" ("1" "b" | "2" ",") "a")"), failReason))
+        << failReason;
+
+    // Only nodes 0..2 are real; 3..5 are padding whose parent is -1 and whose token is stale.
+    std::vector<int32_t> const tokens{0, 4, 5, 4, 4, 4};
+    std::vector<int32_t> const parents{-1, 0, 1, -1, -1, -1};
+    std::vector<int32_t> const counts{3};
+    std::vector<int8_t> const notSuppressed{0};
+    std::vector<int8_t> const reasoningEnded{1};
+    std::vector<int32_t> unsatisfiable;
+    decoder.fillMasksForDraftTree(
+        /*activeBatchSize=*/1, kRows, tokens.data(), parents.data(), counts.data(), notSuppressed, reasoningEnded,
+        unsatisfiable, mStream);
+    EXPECT_TRUE(unsatisfiable.empty());
+
+    rt::Tensor logits({1, kRows, kVOCAB_SIZE}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "logits");
+    copyHostToDevice<float>(logits, std::vector<float>(kRows * kVOCAB_SIZE, 1.0F));
+    decoder.applyMask(logits, /*activeBatchSize=*/1, kRows, mStream);
+    CUDA_CHECK(cudaStreamSynchronize(mStream));
+
+    std::vector<float> out(kRows * kVOCAB_SIZE);
+    CUDA_CHECK(cudaMemcpy(out.data(), logits.rawPointer(), out.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    EXPECT_FLOAT_EQ(out[0 * kVOCAB_SIZE + 8], kMaskedLogitValue) << "row 0 is a real node and is masked";
+    EXPECT_FLOAT_EQ(out[2 * kVOCAB_SIZE + 8], 1.0F) << "row 2 is a real node continuing with 'b'";
+    for (int32_t row = 3; row < kRows; ++row)
+    {
+        for (int32_t token = 0; token < kVOCAB_SIZE; ++token)
+        {
+            EXPECT_FLOAT_EQ(out[row * kVOCAB_SIZE + token], 1.0F)
+                << "row " << row << " is padding and must be left alone";
+        }
+    }
+}
+
+//! D6 under a tree: reasoning state belongs to the path, not the slot. One branch crossing
+//! `</think>` must not constrain a sibling that is still inside the thinking block -- which is
+//! exactly what a single flag carried across the walk in node order would do.
+TEST_F(GuidedDecoderTest, ReasoningGateDoesNotLeakAcrossSiblingBranches)
+{
+    constexpr int32_t kRows = 5;
+    rt::GuidedDecoder decoder;
+    initDecoder(decoder, /*maxBatchSize=*/1, kRows);
+
+    std::string failReason;
+    ASSERT_TRUE(
+        decoder.prepareSlot(0, makeGuide(rt::GuideType::kEbnf, R"(root ::= "a" ("1" "b" | "2" ",") "a")"), failReason))
+        << failReason;
+
+    //  node:    0       1          2      3      4
+    //  parent: -1       0          0      1      2
+    //  token:  root  '</think>'   'a'    'a'    'b'
+    // Node 1 closes the block; node 2 is its sibling and is still inside it.
+    std::vector<int32_t> const tokens{0, kTHINK_END_ID, 4, 4, 8};
+    std::vector<int32_t> const parents{-1, 0, 0, 1, 2};
+    std::vector<int32_t> const counts{kRows};
+    std::vector<int8_t> const notSuppressed{0};
+    std::vector<int32_t> unsatisfiable;
+
+    // Leave a mask behind in row 0 first. Rows are reused across steps and only their flags are
+    // cleared, so a walk that consults a row it did not fill this step reads whatever the last
+    // step wrote. Against a freshly zeroed buffer such a read denies every token and hides the
+    // bug; against a dirty one it admits the sibling and constrains it.
+    std::vector<int8_t> const reasoningEnded{1};
+    decoder.fillMasksForDraftTree(/*activeBatchSize=*/1, kRows, tokens.data(), parents.data(), counts.data(),
+        notSuppressed, reasoningEnded, unsatisfiable, mStream);
+    ASSERT_TRUE(unsatisfiable.empty());
+
+    std::vector<int8_t> const stillReasoning{0};
+    decoder.fillMasksForDraftTree(
+        /*activeBatchSize=*/1, kRows, tokens.data(), parents.data(), counts.data(), notSuppressed, stillReasoning,
+        unsatisfiable, mStream);
+    EXPECT_TRUE(unsatisfiable.empty());
+
+    rt::Tensor logits({1, kRows, kVOCAB_SIZE}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "logits");
+    copyHostToDevice<float>(logits, std::vector<float>(kRows * kVOCAB_SIZE, 1.0F));
+    decoder.applyMask(logits, /*activeBatchSize=*/1, kRows, mStream);
+    CUDA_CHECK(cudaStreamSynchronize(mStream));
+
+    std::vector<float> out(kRows * kVOCAB_SIZE);
+    CUDA_CHECK(cudaMemcpy(out.data(), logits.rawPointer(), out.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    auto rowUntouched = [&](int32_t row) {
+        for (int32_t token = 0; token < kVOCAB_SIZE; ++token)
+        {
+            if (out[row * kVOCAB_SIZE + token] != 1.0F)
+            {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    EXPECT_TRUE(rowUntouched(0)) << "the block is still open at the root, so nothing is constrained";
+    EXPECT_FALSE(rowUntouched(1)) << "the separator owns the first row the grammar governs";
+    EXPECT_FLOAT_EQ(out[1 * kVOCAB_SIZE + 4], 1.0F) << "the grammar is still at its start state there";
+    EXPECT_FALSE(rowUntouched(3)) << "past the separator the branch is governed by the grammar";
+    EXPECT_FLOAT_EQ(out[3 * kVOCAB_SIZE + 5], 1.0F) << "after 'a' the fork admits '1'";
+    EXPECT_FLOAT_EQ(out[3 * kVOCAB_SIZE + 4], kMaskedLogitValue) << "a second 'a' is not in the grammar";
+
+    // The assertion this test exists for.
+    EXPECT_TRUE(rowUntouched(2)) << "the sibling never saw the separator and must stay unconstrained";
+    EXPECT_TRUE(rowUntouched(4)) << "the sibling's child is inside the thinking block as well";
+}
+
+//! EAGLE selects verify nodes by score alone, so a node can end up in the tree while its parent
+//! did not. Such a node hangs off nothing: acceptance walks down from the root, so it is
+//! unreachable and must be left unmasked rather than aborting the walk or attaching to the root.
+TEST_F(GuidedDecoderTest, DraftTreeSkipsNodesWhoseParentMissedTheSelection)
+{
+    constexpr int32_t kRows = 4;
+    rt::GuidedDecoder decoder;
+    initDecoder(decoder, /*maxBatchSize=*/1, kRows);
+
+    std::string failReason;
+    ASSERT_TRUE(
+        decoder.prepareSlot(0, makeGuide(rt::GuideType::kEbnf, R"(root ::= "a" ("1" "b" | "2" ",") "a")"), failReason))
+        << failReason;
+
+    //  node:    0      1      2      3
+    //  parent: -1      0     -1      1     <- node 2 is an orphan
+    //  token:  root   'a'    'a'    '1'
+    // The orphan carries a token the root's mask does admit, so attaching it to the root instead
+    // of skipping it would mask its row -- without that, the grammar would reject it anyway and
+    // the two behaviours would be indistinguishable.
+    std::vector<int32_t> const tokens{0, 4, 4, 5};
+    std::vector<int32_t> const parents{-1, 0, -1, 1};
+    std::vector<int32_t> const counts{kRows};
+    std::vector<int8_t> const notSuppressed{0};
+    std::vector<int8_t> const reasoningEnded{1};
+    std::vector<int32_t> unsatisfiable;
+    decoder.fillMasksForDraftTree(
+        /*activeBatchSize=*/1, kRows, tokens.data(), parents.data(), counts.data(), notSuppressed, reasoningEnded,
+        unsatisfiable, mStream);
+    EXPECT_TRUE(unsatisfiable.empty());
+
+    rt::Tensor logits({1, kRows, kVOCAB_SIZE}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "logits");
+    copyHostToDevice<float>(logits, std::vector<float>(kRows * kVOCAB_SIZE, 1.0F));
+    decoder.applyMask(logits, /*activeBatchSize=*/1, kRows, mStream);
+    CUDA_CHECK(cudaStreamSynchronize(mStream));
+
+    std::vector<float> out(kRows * kVOCAB_SIZE);
+    CUDA_CHECK(cudaMemcpy(out.data(), logits.rawPointer(), out.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    auto rowUntouched = [&](int32_t row) {
+        for (int32_t token = 0; token < kVOCAB_SIZE; ++token)
+        {
+            if (out[row * kVOCAB_SIZE + token] != 1.0F)
+            {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    EXPECT_FALSE(rowUntouched(0)) << "the root is masked as usual";
+    EXPECT_FALSE(rowUntouched(1)) << "a node with a real parent is masked as usual";
+    EXPECT_TRUE(rowUntouched(2)) << "the orphan is unreachable and must stay unmasked";
+    EXPECT_FALSE(rowUntouched(3)) << "the orphan must not take its sibling down with it";
 }
 
 } // namespace

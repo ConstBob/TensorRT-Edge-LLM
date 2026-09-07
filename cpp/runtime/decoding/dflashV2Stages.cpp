@@ -38,6 +38,7 @@
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/decoding/decoderUtils.h"
 #include "runtime/decoding/dflashDecodeUtils.h"
+#include "runtime/decoding/guidedDecoder.h"
 #include "runtime/decoding/logitBias.h"
 #include "runtime/decoding/requestStableRng.h"
 #include "sampler/sampling.h"
@@ -262,6 +263,10 @@ bool DFlashDecoder::prepareV2Proposal(DecodingInferenceContext& context)
     prepareLinearTreeBaseVerificationMetadata(activeBatchSize, verifySize, context.stream);
 
     copyVerifyTokenIdsToBaseInput(activeBatchSize, verifySize, context.stream);
+    if (context.hasGuidedDecoding)
+    {
+        mRuntime.guidedDecoder.captureDraftChains(mVerifyTokenIds, activeBatchSize, verifySize, context.stream);
+    }
     if (!checkCudaLastError("prepare DFlash verify inputs"))
     {
         return false;

@@ -752,3 +752,39 @@ TEST(DSparkKernels, FusedGreedyStepFp8MatchesFp16Closely)
         EXPECT_NEAR(rowsFp8[i], rowsFp16[i], bound) << "i=" << i;
     }
 }
+
+//! Guided decoding drives every grammar-illegal token's target probability to exactly zero, which
+//! makes the vanishing-draft-probability guard reachable with p == 0 as well as q == 0. The guard
+//! reads that as p/q -> inf and would accept, emitting a token the target says cannot occur. The
+//! uniform draw is 0.0 here because the clamp admits it and it is the one value that would also
+//! slip past an `acceptProb == 0` comparison.
+TEST(DSparkKernels, ProbabilisticAcceptRejectsTokenTheTargetGivesNoMass)
+{
+    cudaStream_t stream = nullptr;
+    constexpr int32_t batchSize = 1;
+    constexpr int32_t proposalLen = 1;
+    constexpr int32_t verifyLen = proposalLen + 1;
+    constexpr int32_t vocabSize = 4;
+
+    auto targetProbabilities = rt::Tensor({batchSize, verifyLen, vocabSize}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    auto draftProbabilities = rt::Tensor({batchSize, proposalLen, vocabSize}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    auto draftTokenIds = rt::Tensor({batchSize, proposalLen}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto uniforms = rt::Tensor({batchSize, 2 * proposalLen + 1}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    auto proposalLengths = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto acceptedTokenIds = rt::Tensor({batchSize, verifyLen}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto acceptLength = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+
+    // Token 2 is masked away in both verify rows; the residual leaves only token 0.
+    copyHostToDevice<float>(targetProbabilities, {0.70F, 0.30F, 0.00F, 0.00F, 0.60F, 0.40F, 0.00F, 0.00F});
+    copyHostToDevice<float>(draftProbabilities, {0.20F, 0.80F, 0.00F, 0.00F});
+    copyHostToDevice<int32_t>(draftTokenIds, {2});
+    copyHostToDevice<float>(uniforms, {0.0F, 0.5F, 0.5F});
+    copyHostToDevice<int32_t>(proposalLengths, {proposalLen});
+
+    dsparkProbabilisticAccept(targetProbabilities, draftProbabilities, draftTokenIds, proposalLengths, uniforms,
+        acceptedTokenIds, acceptLength, batchSize, proposalLen, proposalLen, vocabSize, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    EXPECT_EQ(copyDeviceToHost<int32_t>(acceptLength), (std::vector<int32_t>{1}));
+    EXPECT_EQ(copyDeviceToHost<int32_t>(acceptedTokenIds)[0], 0) << "the masked token must not be emitted";
+}

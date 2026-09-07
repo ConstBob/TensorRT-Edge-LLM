@@ -155,11 +155,45 @@ The check only inspects schema keywords, so a property genuinely *named* `contai
 
 ---
 
+## Speculative decoding
+
+Every speculative decoding mode is supported, with no request-side configuration.
+
+| Mode | Geometry |
+|---|---|
+| MTP | chain and tree |
+| EAGLE3 | tree |
+| DFlash | linear and DDTree |
+| DFlash2 | chain |
+| JetSpec | DDTree |
+| DSpark | chain and tree, greedy or sampled |
+| Gemma4 MTP | chain |
+
+A speculative step verifies several candidate tokens at once, and each verification row sits at a
+different point in the grammar, so the mask is built per row rather than per request: the decoder
+hands the shape of its draft tree to the guided decoder, which walks the grammar down the tree and
+masks every row from the state its own path reaches. A candidate the grammar refuses takes its
+subtree with it, leaving those rows unmasked; they are unreachable anyway, because acceptance
+follows a root-to-node path.
+
+Constrained output stays valid whether or not drafting is on, but it is not always *identical*.
+Tree geometries verify each node under an attention mask covering only its own path, which differs
+numerically from the vanilla forward, so a near-tie can resolve differently and long unconstrained
+stretches may diverge. Chain geometries do not have this effect.
+
 ## Limitations
 
-- **Not supported with speculative decoding** (EAGLE, MTP, DSpark, DFlash). Set `disable_spec_decode` on the request or use a non-speculative engine. Tracked as a follow-up.
 - **Not supported on block-diffusion engines**, which denoise a whole canvas per step instead of appending one token at a time. Such requests are rejected rather than silently left unconstrained.
-- **Thinking models**: the constraint starts once the reasoning-end marker (`</think>`) has been seen, so the reasoning block itself is unconstrained. A request whose reasoning never ends is therefore never constrained.
+- **Thinking models**: the constraint starts at the token *immediately after* the reasoning-end
+  marker (`</think>` or `<channel|>`), including when speculative decoding commits the marker and
+  the tokens following it in the same step. The reasoning block itself is unconstrained. A request
+  whose reasoning never ends is therefore never constrained.
+
+  Whether a request starts inside a reasoning block is read from the rendered prompt, not from
+  `enable_thinking`. Where the prompt carries no marker at all, the chat template decides: a
+  template that writes the opening marker itself (Gemma's thinking prompt ends in
+  `<|channel>thought`) means the block was never opened, while one that leaves the model to emit
+  it (Qwen3's thinking prompt stops at `assistant`) means the model may still open one.
 - **Regex dialect**: XGrammar's regex, not PCRE. No lookaround and no backreferences.
 - **EBNF entry rule** must be named `root`.
 - **Guide size** is capped at 128 KB. Compilation is superlinear in guide size and runs before any GPU work.

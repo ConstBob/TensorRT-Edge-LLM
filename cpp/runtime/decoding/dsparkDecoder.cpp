@@ -35,6 +35,7 @@
 #include "profiling/timer.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/decoding/decoderUtils.h"
+#include "runtime/decoding/guidedDecoder.h"
 #include "runtime/decoding/logitBias.h"
 #include "sampler/sampling.h"
 
@@ -831,13 +832,31 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
                 mLastAcceptedTokens, mDraftTokenIds, mConfidenceScores, activeBatchSize, proposalLen, mDraftHiddenSize,
                 mMarkovRank, mConfidenceHeadWithMarkov, context.stream, mDraftBlockLen, mDraftSlotOffset);
         }
-        return buildTreeVerifyInputs(activeBatchSize, context.stream, mUseTreeScheduler);
+        if (!buildTreeVerifyInputs(activeBatchSize, context.stream, mUseTreeScheduler))
+        {
+            return false;
+        }
+        if (context.hasGuidedDecoding)
+        {
+            // Outside buildTreeVerifyInputs on purpose: graph capture calls that function with an
+            // unpopulated tree, and copying it would leave the host buffer holding garbage.
+            mRuntime.guidedDecoder.captureDraftTree(mTreeTokenIds, mTreeParentIds, std::ref(mValidCounts),
+                activeBatchSize, mCurrentVerifyLen, context.stream);
+        }
+        return true;
     }
     mCurrentVerifyLen = mCurrentProposalLen + 1;
 
     check::check(mVerifyTokenIds.reshape({activeBatchSize, mCurrentVerifyLen}), "Tensor reshape failed");
     kernel::dsparkBuildVerifyTokens(mLastAcceptedTokens, mDraftTokenIds, mVerifyTokenIds, activeBatchSize, mProposalLen,
         mCurrentProposalLen, context.stream);
+
+    if (context.hasGuidedDecoding)
+    {
+        // The chain scheduler can shorten the proposal, so the row count is this step's verify
+        // length rather than the deployment's verify size.
+        mRuntime.guidedDecoder.captureDraftChains(mVerifyTokenIds, activeBatchSize, mCurrentVerifyLen, context.stream);
+    }
 
     return true;
 }
@@ -967,6 +986,13 @@ bool DSparkDecoder::runBaseVerification(DecodingInferenceContext& context)
     }
     // GCOVR_EXCL_STOP
 
+    if (context.hasGuidedDecoding)
+    {
+        // One hook covers all three accept paths below: each of them reads outputLogits.
+        applyGuidedDecodingMaskForDraftTree(mRuntime.guidedDecoder, context, mRuntime.base.pipelineIO.outputLogits,
+            activeBatchSize, verifyLen, context.stream);
+    }
+
     if (mUseTree)
     {
         int32_t const maxAcceptLength = std::min(mProposalLen + 1, verifyLen);
@@ -987,6 +1013,13 @@ bool DSparkDecoder::runBaseVerification(DecodingInferenceContext& context)
         // Tree convention: every non-root node in the verify tree is a proposal, matching DFlash DDTree.
         decoder_utils::appendAcceptedTokens(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
             mAcceptedTokenIds, maxAcceptLength, mRuntime.tokenizer, context.stream, verifyLen - 1);
+
+        if (context.hasGuidedDecoding)
+        {
+            advanceGuidedDecodingForCommitted(mRuntime.guidedDecoder, context,
+                mHostAcceptedTokenIds.dataPointer<int32_t>(), mHostAcceptLengths.dataPointer<int32_t>(),
+                maxAcceptLength, activeBatchSize);
+        }
         return true;
     }
 
@@ -1061,6 +1094,12 @@ bool DSparkDecoder::runBaseVerification(DecodingInferenceContext& context)
     decoder_utils::appendAcceptedTokens(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
         mAcceptedTokenIds, verifyLen, mRuntime.tokenizer, context.stream, mCurrentProposalLen,
         mScheduledProposalLengths.empty() ? nullptr : mScheduledProposalLengths.data());
+
+    if (context.hasGuidedDecoding)
+    {
+        advanceGuidedDecodingForCommitted(mRuntime.guidedDecoder, context, mHostAcceptedTokenIds.dataPointer<int32_t>(),
+            mHostAcceptLengths.dataPointer<int32_t>(), verifyLen, activeBatchSize);
+    }
 
     return true;
 }
