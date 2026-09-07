@@ -244,23 +244,19 @@ AttentionExecutionMode deduceModeVanilla(rt::Tensor const& packedQKVTensor, rt::
 }
 
 #ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
-//! Skip-softmax (BLASST): derive the runtime threshold from the calibrated scale
-//! factor S as lambda = S / L, passed to the kernel as log2(lambda). Returns a
-//! finite negative log2(lambda) when skip applies, or 0.0 — the runner's disable
-//! sentinel (log2 of the degenerate lambda = 1) — when it does not.
-float computeSkipSoftmaxThreshold(float scaleFactor, int32_t slidingWindowSize, int32_t kvCacheCapacity)
+//! Skip-softmax (BLASST): resolve the effective calibrated scale factor S to hand
+//! to the kernel, which derives the per-sequence threshold log2(S / seqlen_kv)
+//! itself (trtllm-gen parity — replaces the old host-side S / kvCacheCapacity
+//! division and its lambda >= 1 dense clamp; short sequences are protected
+//! structurally by the never-skip block-0 / diagonal tiles). Returns 0.0 — the
+//! runner's disable sentinel — for non-positive S or sliding-window layers.
+float resolveSkipSoftmaxScaleFactor(float scaleFactor, int32_t slidingWindowSize)
 {
     if (scaleFactor <= 0.F || slidingWindowSize > 0)
     {
         return 0.F;
     }
-    float const lambda = scaleFactor / static_cast<float>(std::max(kvCacheCapacity, 1));
-    if (lambda >= 1.F)
-    {
-        // Degenerate threshold (would mark every tile skippable) — run dense instead.
-        return 0.F;
-    }
-    return std::log2(lambda);
+    return scaleFactor;
 }
 #endif // CUTE_DSL_FMHA_BLACKWELL_ENABLED
 
@@ -1525,8 +1521,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
             skipSoftmaxScaleFactor = static_cast<float>(overrideS);
         }
     }
-    float const skipSoftmaxThresholdLog2
-        = computeSkipSoftmaxThreshold(skipSoftmaxScaleFactor, mSlidingWindowSize, kvCacheCapacity);
+    float const skipSoftmaxScaleFactorEff = resolveSkipSoftmaxScaleFactor(skipSoftmaxScaleFactor, mSlidingWindowSize);
 #endif // CUTE_DSL_FMHA_BLACKWELL_ENABLED
 
     // Optional inputs use the same compact dynamic ordering as supportsFormatCombination().
@@ -1674,7 +1669,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                 CuteDslFMHARunner runner(
                     mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, kvCacheCapacity);
                 if (!runner.preflightPaged(stream, slidingWindow, /*fp8Input=*/false, /*isCausal=*/true,
-                        /*skipSoftmaxThresholdLog2=*/0.0F, /*useBidirectional=*/true))
+                        /*skipSoftmaxScaleFactor=*/0.0F, /*useBidirectional=*/true))
                 {
                     return -1;
                 }
@@ -1799,7 +1794,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                         attentionOutputTensor.dataPointer<half>(), paddedCuKVSeqLensTensor.dataPointer<int32_t>(),
                         2 * numPages, maxPagesPerSeq, rt::kTOKENS_PER_PAGE, kvCacheTensor.getDataType(), stream,
                         mAttentionScale, slidingWindow, /*fp8Input=*/false, 1.0F, 1.0F, 1.0F,
-                        /*isCausal=*/true, /*skipSoftmaxThresholdLog2=*/0.0F, blockBeginTensor.dataPointer<int32_t>(),
+                        /*isCausal=*/true, /*skipSoftmaxScaleFactor=*/0.0F, blockBeginTensor.dataPointer<int32_t>(),
                         blockEndTensor.dataPointer<int32_t>()))
                 {
                     return -1;
@@ -1846,11 +1841,11 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
             int32_t const slidingWindow
                 = (mSlidingWindowSize > 0 && !usePaddingContextMask) ? mSlidingWindowSize - 1 : INT_MAX;
             bool const fp8Input = !sharedKV && mEnableFp8KVCache;
-            float const preflightSkipSoftmaxThresholdLog2 = fp8Input ? 0.0F : skipSoftmaxThresholdLog2;
+            float const preflightSkipSoftmaxScaleFactor = fp8Input ? 0.0F : skipSoftmaxScaleFactorEff;
             CuteDslFMHARunner runner(
                 mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, kvCacheCapacity);
             if (!runner.preflightPaged(stream, slidingWindow, fp8Input, !usePaddingContextMask,
-                    preflightSkipSoftmaxThresholdLog2, /*useBidirectional=*/false))
+                    preflightSkipSoftmaxScaleFactor, /*useBidirectional=*/false))
             {
                 return -1;
             }
@@ -2017,7 +2012,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                         attentionOutputTensor.dataPointer<half>(), // O  [b, s_q, h_q, d]
                         fmhaCuKVSeqLens, 2 * numPages, maxPagesPerSeq, rt::kTOKENS_PER_PAGE,
                         kvCacheTensor.getDataType(), stream, mAttentionScale, slidingWindow, /*fp8Input=*/false, 1.0F,
-                        kScale, vScale, !usePaddingContextMask, skipSoftmaxThresholdLog2))
+                        kScale, vScale, !usePaddingContextMask, skipSoftmaxScaleFactorEff))
                 {
                     return -1;
                 }
@@ -2186,7 +2181,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, PluginTe
                         attentionOutputTensor.dataPointer<half>(),     // O  [b, s_q, h_q, d]
                         fmhaCuKVSeqLens, 2 * numPages, maxPagesPerSeq, rt::kTOKENS_PER_PAGE,
                         kvCacheTensor.getDataType(), stream, mAttentionScale, slidingWindow, /*fp8Input=*/false, 1.0F,
-                        1.0F, 1.0F, !usePaddingContextMask, skipSoftmaxThresholdLog2))
+                        1.0F, 1.0F, !usePaddingContextMask, skipSoftmaxScaleFactorEff))
                 {
                     return -1;
                 }

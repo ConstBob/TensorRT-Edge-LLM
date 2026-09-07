@@ -16,8 +16,10 @@
 
 from typing import Optional, Sequence, Tuple
 
+import tensorrt as trt
+
 from ..tensor import Tensor
-from ._operation import operation
+from ._operation import network_input, operation
 
 KV_PAGE_SIZE = 128
 
@@ -41,6 +43,7 @@ def attention(
     k_norm_gamma: Optional[Tensor] = None,
     rms_norm_eps: float = 1e-6,
     attention_scale: Optional[float] = None,
+    skip_softmax_scale_factor: float = 0.0,
     enable_kv_shared: bool = False,
     context_mask_selector: Optional[Tensor] = None,
     vision_block_ids: Optional[Tensor] = None,
@@ -78,6 +81,7 @@ def attention(
         "enable_vision_block_attention": int(vision_block_ids is not None),
         "sliding_window_size": sliding_window_size,
         "qkv_scales": qkv_scales,
+        "skip_softmax_scale_factor": skip_softmax_scale_factor,
     }
     if attention_scale is not None:
         attributes["attention_scale"] = attention_scale
@@ -95,6 +99,11 @@ def attention(
         inputs.extend((attention_mask, attention_pos_id))
     if vision_block_ids is not None:
         inputs.append(vision_block_ids)
+    if skip_softmax_scale_factor > 0.0:
+        # Shape-only INT8 carrier shared by every attention op: dim0 is the
+        # runtime S override (0 = keep the baked scale factor). The plugin
+        # requires it whenever skip-softmax is enabled.
+        inputs.append(network_input("skip_softmax_scale", trt.int8, (-1, )))
     attn_4d, present_kv = operation("attention",
                                     inputs,
                                     output_count=2,

@@ -496,6 +496,12 @@ class Gemma4Attention(Attention):
                                     if self.attention_type
                                     == "sliding_attention" else -1)
         self.use_swa_pool = _gemma4_uses_swa_pool(config, layer_idx)
+        # Skip-softmax (BLASST) calibrated scale factor S (0.0 = disabled);
+        # mirrors modeling_default.py. Only meaningful on full-attention
+        # (d512 global) layers — sliding layers have no skippable tiles.
+        self.skip_softmax_scale_factor = (config.skip_softmax_scale_factor
+                                          if self.attention_type
+                                          != "sliding_attention" else 0.0)
 
     def forward(
         self,
@@ -580,7 +586,7 @@ class Gemma4Attention(Attention):
             "attention_scale": self.attention_scale,
             "enable_context_mask_selector": context_mask_selector is not None,
             "enable_vision_block_attention": enable_vision_block,
-            "skip_softmax_scale_factor": 0.0,
+            "skip_softmax_scale_factor": self.skip_softmax_scale_factor,
         }
         if context_mask_selector is not None:
             kwargs["context_mask_selector"] = context_mask_selector

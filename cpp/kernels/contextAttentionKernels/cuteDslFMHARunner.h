@@ -63,11 +63,11 @@ public:
 
     //! Ensures the exact dense LLM variant selected by run() is loaded.
     bool preflightLlm(cudaStream_t stream, int32_t slidingWindowSize = INT_MAX, bool fp8Input = false,
-        float skipSoftmaxThresholdLog2 = 0.0F);
+        float skipSoftmaxScaleFactor = 0.0F);
 
     //! Ensures the exact paged LLM variant selected by runPaged() is loaded.
     bool preflightPaged(cudaStream_t stream, int32_t slidingWindowSize = INT_MAX, bool fp8Input = false,
-        bool isCausal = true, float skipSoftmaxThresholdLog2 = 0.0F, bool useBidirectional = false);
+        bool isCausal = true, float skipSoftmaxScaleFactor = 0.0F, bool useBidirectional = false);
 
     //! Ensures the exact packed ViT variant selected by run() is loaded.
     bool preflightViT(cudaStream_t stream);
@@ -91,15 +91,15 @@ public:
      * @param qScale Q dequant scale (quant→orig), ignored when fp8Input=false
      * @param kScale K dequant scale (quant→orig), ignored when fp8Input=false
      * @param vScale V dequant scale (quant→orig), applied to the attention output and ignored when fp8Input=false
-     * @param skipSoftmaxThresholdLog2 Skip-softmax (BLASST) threshold as log2(lambda). A finite negative value
-     *        (lambda in (0,1)) dispatches the skip-softmax kernel variant, which skips the P*V GEMM of KV
-     *        tiles whose contribution is negligible — approximate, FP16 causal only. 0.0 (the default,
-     *        log2 of the degenerate lambda = 1) disables skip, mirroring the slidingWindowSize = INT_MAX
-     *        sentinel convention.
+     * @param skipSoftmaxScaleFactor Skip-softmax (BLASST) calibrated scale factor S; the kernel derives the
+     * per-sequence threshold log2(S / seqlen_kv) itself (trtllm-gen parity). A finite positive value (lambda in (0,1))
+     * dispatches the skip-softmax kernel variant, which skips the P*V GEMM of KV tiles whose contribution is negligible
+     * — approximate, FP16 causal only. 0.0 (the default, log2 of the degenerate lambda = 1) disables skip, mirroring
+     * the slidingWindowSize = INT_MAX sentinel convention.
      */
     bool run(void const* qPtr, void const* kvPtr, void* oPtr, int32_t const* cuKVSeqLens, cudaStream_t stream,
         float attentionScale, int32_t slidingWindowSize = INT_MAX, bool fp8Input = false, float qScale = 1.0F,
-        float kScale = 1.0F, float vScale = 1.0F, float skipSoftmaxThresholdLog2 = 0.0F);
+        float kScale = 1.0F, float vScale = 1.0F, float skipSoftmaxScaleFactor = 0.0F);
 
     /**
      * @brief LLM FMHA over a paged KV cache.
@@ -130,7 +130,8 @@ public:
      * @param kScale K dequant scale, ignored when fp8Input=false
      * @param vScale V dequant scale, ignored when fp8Input=false
      * @param isCausal Whether to dispatch a causal or dense non-causal variant
-     * @param skipSoftmaxThresholdLog2 Skip-softmax threshold as log2(lambda), or 0 to disable
+     * @param skipSoftmaxScaleFactor Skip-softmax calibrated scale factor S (kernel derives per-seq log2(S/seqlen_kv)),
+     * or 0 to disable
      * @param bidirectionalBlockBegin Optional inclusive bidirectional-block begin positions [B, S_q].
      * Text/padding rows use -1; every row in a disjoint contiguous vision run
      * must repeat that run's begin position.
@@ -142,7 +143,7 @@ public:
         int32_t const* cuKVSeqLens, int32_t numPages, int32_t maxPagesPerSeq, int32_t tokensPerPage,
         nvinfer1::DataType kvDataType, cudaStream_t stream, float attentionScale, int32_t slidingWindowSize = INT_MAX,
         bool fp8Input = false, float qScale = 1.0F, float kScale = 1.0F, float vScale = 1.0F, bool isCausal = true,
-        float skipSoftmaxThresholdLog2 = 0.0F, int32_t const* bidirectionalBlockBegin = nullptr,
+        float skipSoftmaxScaleFactor = 0.0F, int32_t const* bidirectionalBlockBegin = nullptr,
         int32_t const* bidirectionalBlockEnd = nullptr);
 
     /**
@@ -191,6 +192,7 @@ private:
     // LLM skip-softmax (BLASST) kernel modules (FP16, causal, no sliding window)
     static detail::LazyKernelModule<fmha_d64_skipsoftmax_Kernel_Module_t> sLLM_d64_skipsoftmax;
     static detail::LazyKernelModule<fmha_d128_skipsoftmax_Kernel_Module_t> sLLM_d128_skipsoftmax;
+    static detail::LazyKernelModule<fmha_d256_skipsoftmax_Kernel_Module_t> sLLM_d256_skipsoftmax;
 
     // LLM kernel modules (FP8 input, FP16 output)
     static detail::LazyKernelModule<fmha_d64_fp8_Kernel_Module_t> sLLM_d64_fp8;
@@ -205,6 +207,8 @@ private:
     static detail::LazyKernelModule<fmha_d128_paged_Kernel_Module_t> sLLM_d128_paged;
     static detail::LazyKernelModule<fmha_d64_skipsoftmax_paged_Kernel_Module_t> sLLM_d64_skipsoftmax_paged;
     static detail::LazyKernelModule<fmha_d128_skipsoftmax_paged_Kernel_Module_t> sLLM_d128_skipsoftmax_paged;
+    static detail::LazyKernelModule<fmha_d256_skipsoftmax_paged_Kernel_Module_t> sLLM_d256_skipsoftmax_paged;
+    static detail::LazyKernelModule<fmha_d512_skipsoftmax_paged_Kernel_Module_t> sLLM_d512_skipsoftmax_paged;
     static detail::LazyKernelModule<fmha_d256_paged_Kernel_Module_t> sLLM_d256_paged;
     static detail::LazyKernelModule<fmha_d256_dense_paged_Kernel_Module_t> sLLM_d256_dense_paged;
     static detail::LazyKernelModule<fmha_d512_paged_Kernel_Module_t> sLLM_d512_paged;

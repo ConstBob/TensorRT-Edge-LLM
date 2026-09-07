@@ -395,6 +395,17 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
             if init.name in dropped_const_tensors and init.name not in consumed:
                 model.graph.initializer.remove(init)
 
+    # Drop the graph-level skip_softmax_scale input when no node consumes it
+    # any more (skip_softmax_scale_factor == 0 everywhere): a dangling ONNX
+    # graph input still becomes a TRT network input, so the dense engine would
+    # carry the binding it is supposed to be free of.
+    consumed_inputs = {i for n in model.graph.node for i in n.input}
+    for graph_input in list(model.graph.input):
+        if (graph_input.name == "skip_softmax_scale"
+                and graph_input.name not in consumed_inputs):
+            model.graph.input.remove(graph_input)
+            changed += 1
+
     if not changed and not mode_shape_changed:
         return
     logger.info(

@@ -63,8 +63,11 @@ detail::LazyKernelModule<fmha_d256_sw_Kernel_Module_t> CuteDslFMHARunner::sLLM_d
 // LLM skip-softmax (BLASST, FP16 causal)
 detail::LazyKernelModule<fmha_d64_skipsoftmax_Kernel_Module_t> CuteDslFMHARunner::sLLM_d64_skipsoftmax{};
 detail::LazyKernelModule<fmha_d128_skipsoftmax_Kernel_Module_t> CuteDslFMHARunner::sLLM_d128_skipsoftmax{};
+detail::LazyKernelModule<fmha_d256_skipsoftmax_Kernel_Module_t> CuteDslFMHARunner::sLLM_d256_skipsoftmax{};
 detail::LazyKernelModule<fmha_d64_skipsoftmax_paged_Kernel_Module_t> CuteDslFMHARunner::sLLM_d64_skipsoftmax_paged{};
 detail::LazyKernelModule<fmha_d128_skipsoftmax_paged_Kernel_Module_t> CuteDslFMHARunner::sLLM_d128_skipsoftmax_paged{};
+detail::LazyKernelModule<fmha_d256_skipsoftmax_paged_Kernel_Module_t> CuteDslFMHARunner::sLLM_d256_skipsoftmax_paged{};
+detail::LazyKernelModule<fmha_d512_skipsoftmax_paged_Kernel_Module_t> CuteDslFMHARunner::sLLM_d512_skipsoftmax_paged{};
 // LLM (FP8 input, FP16 output)
 detail::LazyKernelModule<fmha_d64_fp8_Kernel_Module_t> CuteDslFMHARunner::sLLM_d64_fp8{};
 detail::LazyKernelModule<fmha_d128_fp8_Kernel_Module_t> CuteDslFMHARunner::sLLM_d128_fp8{};
@@ -121,10 +124,12 @@ bool CuteDslFMHARunner::canImplementViT(int32_t headSize, int32_t smVersion)
 }
 
 bool CuteDslFMHARunner::preflightLlm(
-    cudaStream_t stream, int32_t slidingWindowSize, bool fp8Input, float skipSoftmaxThresholdLog2)
+    cudaStream_t stream, int32_t slidingWindowSize, bool fp8Input, float skipSoftmaxScaleFactor)
 {
     bool const useSlidingWindow = slidingWindowSize < INT_MAX;
-    bool const enableSkipSoftmax = std::isfinite(skipSoftmaxThresholdLog2) && skipSoftmaxThresholdLog2 < 0.0F;
+    // S/L semantics: the carrier is the calibrated scale factor S (finite, > 0 enables);
+    // the kernel derives log2(S / seqlen_kv) per sequence itself.
+    bool const enableSkipSoftmax = std::isfinite(skipSoftmaxScaleFactor) && skipSoftmaxScaleFactor > 0.0F;
 
     if (enableSkipSoftmax)
     {
@@ -142,6 +147,9 @@ bool CuteDslFMHARunner::preflightLlm(
         case 128:
             return preflightVariant<fmha_d128_skipsoftmax_Kernel_Module_Load,
                 fmha_d128_skipsoftmax_Kernel_Module_Unload>(sLLM_d128_skipsoftmax, "fmha_d128_skipsoftmax", stream);
+        case 256:
+            return preflightVariant<fmha_d256_skipsoftmax_Kernel_Module_Load,
+                fmha_d256_skipsoftmax_Kernel_Module_Unload>(sLLM_d256_skipsoftmax, "fmha_d256_skipsoftmax", stream);
         default: LOG_ERROR("CuTe DSL LLM FMHA: unsupported head_dim=%d", mHeadDim); return false;
         }
     }
@@ -194,7 +202,7 @@ bool CuteDslFMHARunner::preflightLlm(
 }
 
 bool CuteDslFMHARunner::preflightPaged(cudaStream_t stream, int32_t slidingWindowSize, bool fp8Input, bool isCausal,
-    float skipSoftmaxThresholdLog2, bool useBidirectional)
+    float skipSoftmaxScaleFactor, bool useBidirectional)
 {
     bool const useSlidingWindow = slidingWindowSize < INT_MAX;
 
@@ -233,16 +241,31 @@ bool CuteDslFMHARunner::preflightPaged(cudaStream_t stream, int32_t slidingWindo
                   sLLM_d512_dense_paged, "fmha_d512_dense_paged", stream);
     }
 
+    // S/L semantics: S > 0 enables; kernel derives per-seq log2(S / seqlen_kv).
     bool const enableSkipSoftmax
-        = std::isfinite(skipSoftmaxThresholdLog2) && skipSoftmaxThresholdLog2 < 0.0F && !fp8Input && !useSlidingWindow;
-    if (enableSkipSoftmax && (mHeadDim == 64 || mHeadDim == 128))
+        = std::isfinite(skipSoftmaxScaleFactor) && skipSoftmaxScaleFactor > 0.0F && !fp8Input && !useSlidingWindow;
+    if (enableSkipSoftmax)
     {
-        return mHeadDim == 64 ? preflightVariant<fmha_d64_skipsoftmax_paged_Kernel_Module_Load,
-                                    fmha_d64_skipsoftmax_paged_Kernel_Module_Unload>(
-                                    sLLM_d64_skipsoftmax_paged, "fmha_d64_skipsoftmax_paged", stream)
-                              : preflightVariant<fmha_d128_skipsoftmax_paged_Kernel_Module_Load,
-                                    fmha_d128_skipsoftmax_paged_Kernel_Module_Unload>(
-                                    sLLM_d128_skipsoftmax_paged, "fmha_d128_skipsoftmax_paged", stream);
+        switch (mHeadDim)
+        {
+        case 64:
+            return preflightVariant<fmha_d64_skipsoftmax_paged_Kernel_Module_Load,
+                fmha_d64_skipsoftmax_paged_Kernel_Module_Unload>(
+                sLLM_d64_skipsoftmax_paged, "fmha_d64_skipsoftmax_paged", stream);
+        case 128:
+            return preflightVariant<fmha_d128_skipsoftmax_paged_Kernel_Module_Load,
+                fmha_d128_skipsoftmax_paged_Kernel_Module_Unload>(
+                sLLM_d128_skipsoftmax_paged, "fmha_d128_skipsoftmax_paged", stream);
+        case 256:
+            return preflightVariant<fmha_d256_skipsoftmax_paged_Kernel_Module_Load,
+                fmha_d256_skipsoftmax_paged_Kernel_Module_Unload>(
+                sLLM_d256_skipsoftmax_paged, "fmha_d256_skipsoftmax_paged", stream);
+        case 512:
+            return preflightVariant<fmha_d512_skipsoftmax_paged_Kernel_Module_Load,
+                fmha_d512_skipsoftmax_paged_Kernel_Module_Unload>(
+                sLLM_d512_skipsoftmax_paged, "fmha_d512_skipsoftmax_paged", stream);
+        default: LOG_ERROR("CuTe DSL paged LLM FMHA: unsupported skip-softmax head_dim=%d", mHeadDim); return false;
+        }
     }
 
     if (fp8Input)
@@ -395,7 +418,7 @@ int32_t callLlmFmha(detail::LazyKernelModule<WrapperArgT<0, decltype(cuteDslKern
     {
         return cuteDslKernelWrapper(&module, &qTensor, &kvTensor, &oTensor, &cumSeqlenK, params.windowSizeLeft,
             params.attentionScale, params.scaleQ, params.scaleK, params.scaleV, params.invScaleO,
-            getDeviceMultiProcessorCount(), params.stream, params.skipSoftmaxThresholdLog2);
+            getDeviceMultiProcessorCount(), params.stream, params.skipSoftmaxScaleFactor);
     }
     else
     {
@@ -466,7 +489,7 @@ int32_t callLlmFmhaPaged(detail::LazyKernelModule<WrapperArgT<0, decltype(cuteDs
     {
         check::check(params.bidirectionalBlockBegin == nullptr && params.bidirectionalBlockEnd == nullptr,
             "Standard paged LLM FMHA does not accept bidirectional block ranges.");
-        auto const args = std::tuple_cat(tensorArgs, runtimeArgs, std::make_tuple(params.skipSoftmaxThresholdLog2));
+        auto const args = std::tuple_cat(tensorArgs, runtimeArgs, std::make_tuple(params.skipSoftmaxScaleFactor));
         return std::apply(cuteDslKernelWrapper, args);
     }
     else
@@ -516,7 +539,7 @@ int32_t callVitFmha(detail::LazyKernelModule<WrapperArgT<0, decltype(cuteDslKern
 
 bool CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int32_t const* cuKVSeqLens,
     cudaStream_t stream, float attentionScale, int32_t slidingWindowSize, bool fp8Input, float qScale, float kScale,
-    float vScale, float skipSoftmaxThresholdLog2)
+    float vScale, float skipSoftmaxScaleFactor)
 {
     validateAttentionScale(attentionScale);
 
@@ -527,13 +550,13 @@ bool CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int
     // Skip-softmax threshold sentinel: a finite negative log2(lambda) enables the
     // skip variant; 0.0 (log2 of the degenerate lambda = 1) means disabled. Any
     // other value is a caller bug — warn and dispatch dense.
-    bool const enableSkipSoftmax = std::isfinite(skipSoftmaxThresholdLog2) && skipSoftmaxThresholdLog2 < 0.0F;
-    if (!enableSkipSoftmax && skipSoftmaxThresholdLog2 != 0.0F)
+    bool const enableSkipSoftmax = std::isfinite(skipSoftmaxScaleFactor) && skipSoftmaxScaleFactor > 0.0F;
+    if (!enableSkipSoftmax && skipSoftmaxScaleFactor != 0.0F)
     {
         LOG_WARNING(
-            "CuTe DSL LLM FMHA: invalid skipSoftmaxThresholdLog2=%f (want finite < 0, or 0 to disable); "
+            "CuTe DSL LLM FMHA: invalid skipSoftmaxScaleFactor=%f (want finite > 0, or 0 to disable); "
             "dispatching dense kernel instead.",
-            skipSoftmaxThresholdLog2);
+            skipSoftmaxScaleFactor);
     }
 
     LlmFmhaParams params{};
@@ -553,7 +576,7 @@ bool CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int
     params.scaleK = kScale;
     params.scaleV = vScale;
     params.invScaleO = 1.0F;
-    params.skipSoftmaxThresholdLog2 = skipSoftmaxThresholdLog2;
+    params.skipSoftmaxScaleFactor = skipSoftmaxScaleFactor;
     params.stream = stream;
 
     int32_t ret = -1;
@@ -575,6 +598,10 @@ bool CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int
         case 128:
             ret = callLlmFmha<cute_dsl_fmha_d128_skipsoftmax_wrapper, fmha_d128_skipsoftmax_Kernel_Module_Load,
                 fmha_d128_skipsoftmax_Kernel_Module_Unload>(sLLM_d128_skipsoftmax, "fmha_d128_skipsoftmax", params);
+            break;
+        case 256:
+            ret = callLlmFmha<cute_dsl_fmha_d256_skipsoftmax_wrapper, fmha_d256_skipsoftmax_Kernel_Module_Load,
+                fmha_d256_skipsoftmax_Kernel_Module_Unload>(sLLM_d256_skipsoftmax, "fmha_d256_skipsoftmax", params);
             break;
         default: LOG_ERROR("CuTe DSL LLM FMHA: unsupported head_dim=%d", headDim); return false;
         }
@@ -647,7 +674,7 @@ bool CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int
 bool CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, int32_t const* kvCachePageList,
     void* oPtr, int32_t const* cuKVSeqLens, int32_t numPages, int32_t maxPagesPerSeq, int32_t tokensPerPage,
     nvinfer1::DataType kvDataType, cudaStream_t stream, float attentionScale, int32_t slidingWindowSize, bool fp8Input,
-    float qScale, float kScale, float vScale, bool isCausal, float skipSoftmaxThresholdLog2,
+    float qScale, float kScale, float vScale, bool isCausal, float skipSoftmaxScaleFactor,
     int32_t const* bidirectionalBlockBegin, int32_t const* bidirectionalBlockEnd)
 {
     check::check(qPtr != nullptr, "CuTe DSL paged FMHA qPtr must not be null.");
@@ -685,15 +712,15 @@ bool CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
     int32_t const headDim = mHeadDim;
     int32_t constexpr kNoLimit = 1 << 30;
 
-    // Skip-softmax threshold sentinel: a finite negative log2(lambda) enables the
-    // skip variant; 0.0 means disabled.
-    bool const thresholdValid = std::isfinite(skipSoftmaxThresholdLog2) && skipSoftmaxThresholdLog2 < 0.0F;
-    if (!thresholdValid && skipSoftmaxThresholdLog2 != 0.0F)
+    // Skip-softmax sentinel: a finite positive scale factor S enables the skip
+    // variant (kernel derives per-seq lambda = S / seqlen_kv); 0.0 means disabled.
+    bool const thresholdValid = std::isfinite(skipSoftmaxScaleFactor) && skipSoftmaxScaleFactor > 0.0F;
+    if (!thresholdValid && skipSoftmaxScaleFactor != 0.0F)
     {
         LOG_WARNING(
-            "CuTe DSL paged LLM FMHA: invalid skipSoftmaxThresholdLog2=%f (want finite < 0, or 0 to disable); "
+            "CuTe DSL paged LLM FMHA: invalid skipSoftmaxScaleFactor=%f (want finite > 0, or 0 to disable); "
             "dispatching dense paged kernel instead.",
-            skipSoftmaxThresholdLog2);
+            skipSoftmaxScaleFactor);
     }
     bool const enableSkipSoftmax = thresholdValid && !fp8Input && isCausal && !useSlidingWindow;
 
@@ -719,7 +746,7 @@ bool CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
     params.scaleK = kScale;
     params.scaleV = vScale;
     params.invScaleO = 1.0F;
-    params.skipSoftmaxThresholdLog2 = skipSoftmaxThresholdLog2;
+    params.skipSoftmaxScaleFactor = skipSoftmaxScaleFactor;
     params.stream = stream;
 
     int32_t ret = -1;
@@ -755,16 +782,32 @@ bool CuteDslFMHARunner::runPaged(void const* qPtr, void const* pagedKVPoolPtr, i
                       sLLM_d512_dense_paged, "fmha_d512_dense_paged", params);
         }
     }
-    else if (enableSkipSoftmax && (headDim == 64 || headDim == 128))
+    else if (enableSkipSoftmax && (headDim == 64 || headDim == 128 || headDim == 256 || headDim == 512))
     {
-        // Skip-softmax paged prefill: causal, FP16, non-sliding, d64/d128 only.
-        ret = headDim == 64
-            ? callLlmFmhaPaged<cute_dsl_fmha_d64_skipsoftmax_paged_wrapper,
-                  fmha_d64_skipsoftmax_paged_Kernel_Module_Load, fmha_d64_skipsoftmax_paged_Kernel_Module_Unload>(
-                  sLLM_d64_skipsoftmax_paged, "fmha_d64_skipsoftmax_paged", params)
-            : callLlmFmhaPaged<cute_dsl_fmha_d128_skipsoftmax_paged_wrapper,
-                  fmha_d128_skipsoftmax_paged_Kernel_Module_Load, fmha_d128_skipsoftmax_paged_Kernel_Module_Unload>(
-                  sLLM_d128_skipsoftmax_paged, "fmha_d128_skipsoftmax_paged", params);
+        // Skip-softmax paged prefill: causal, FP16, non-sliding.
+        switch (headDim)
+        {
+        case 64:
+            ret = callLlmFmhaPaged<cute_dsl_fmha_d64_skipsoftmax_paged_wrapper,
+                fmha_d64_skipsoftmax_paged_Kernel_Module_Load, fmha_d64_skipsoftmax_paged_Kernel_Module_Unload>(
+                sLLM_d64_skipsoftmax_paged, "fmha_d64_skipsoftmax_paged", params);
+            break;
+        case 128:
+            ret = callLlmFmhaPaged<cute_dsl_fmha_d128_skipsoftmax_paged_wrapper,
+                fmha_d128_skipsoftmax_paged_Kernel_Module_Load, fmha_d128_skipsoftmax_paged_Kernel_Module_Unload>(
+                sLLM_d128_skipsoftmax_paged, "fmha_d128_skipsoftmax_paged", params);
+            break;
+        case 256:
+            ret = callLlmFmhaPaged<cute_dsl_fmha_d256_skipsoftmax_paged_wrapper,
+                fmha_d256_skipsoftmax_paged_Kernel_Module_Load, fmha_d256_skipsoftmax_paged_Kernel_Module_Unload>(
+                sLLM_d256_skipsoftmax_paged, "fmha_d256_skipsoftmax_paged", params);
+            break;
+        default:
+            ret = callLlmFmhaPaged<cute_dsl_fmha_d512_skipsoftmax_paged_wrapper,
+                fmha_d512_skipsoftmax_paged_Kernel_Module_Load, fmha_d512_skipsoftmax_paged_Kernel_Module_Unload>(
+                sLLM_d512_skipsoftmax_paged, "fmha_d512_skipsoftmax_paged", params);
+            break;
+        }
     }
     else if (fp8Input)
     {

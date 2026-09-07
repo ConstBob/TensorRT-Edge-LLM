@@ -1199,3 +1199,76 @@ def cvt_f32x4_to_f8x4(fp32x4, fp8x4, *, loc=None, ip=None):
     cute.recast_tensor(fp8x4, cutlass.Int32)[0] = cutlass.Int32(packed)
 
 
+##############################################################################
+# Skip-softmax (BLASST)
+##############################################################################
+# Shared by the d64/d128 kernel (BlackwellFusedMultiHeadAttentionForward) and
+# the d256-per-CTA kernel (…HeadDimPerCta256). Both sides are pure functions of
+# their arguments — the per-kernel wiring (SMEM exchange buffer, pipeline
+# ordering, PV-skip branch) stays in each kernel class.
+
+
+@cute.jit
+def get_skip_softmax_flag(warp_wants_skip_softmax_exchange):
+    """MMA-warp side of skip-softmax: read the 4 per-warp vote bytes the softmax
+    warpgroup published to the SMEM exchange buffer as one Int32 (the
+    softmax->MMA pipeline release/acquire orders the stores) and skip this
+    tile's P*V only when all 4 warps agreed — P is then exactly zeros."""
+    votes_i32 = cute.make_tensor(
+        cute.recast_ptr(
+            warp_wants_skip_softmax_exchange.iterator, dtype=cutlass.Int32
+        ),
+        cute.make_layout((1,)),
+    )
+    votes = cute.arch.make_warp_uniform(votes_i32[0])
+    return cute.arch.popc(votes) == 4
+
+
+@cute.jit
+def calculate_skip_softmax_flag(
+    row_max,
+    tile_row_max,
+    scale_softmax_log2,
+    skip_softmax_threshold_log2,
+    thread_idx,
+    row_is_oob,
+    warp_wants_skip_softmax_exchange,
+    skip_softmax_count,
+    total_softmax_count,
+):
+    """Softmax-warpgroup side of skip-softmax (BLASST). Skip the current KV
+    block when its local row-max is below the running global row-max by more
+    than ln(lambda):  (tile_row_max - row_max) * scale_log2 < threshold_log2.
+    Per-thread predicate reduced to a PER-WARP vote (32 rows); each warp
+    publishes its vote byte to the SMEM exchange buffer. A skipped warp leaves
+    row_max unchanged so O/l need no rescale.
+    :return: (warp_wants_skip, row_max)
+    """
+    thread_wants_skip = (
+        (tile_row_max - row_max) * scale_softmax_log2
+    ) < skip_softmax_threshold_log2
+    # Rows past the end of the query sequence never contribute; treat them as
+    # wanting to skip so they don't veto a warp-level skip. row_is_oob is
+    # KV-tile-invariant (depends only on the query row + seqlen_q) so it is
+    # computed ONCE per work-tile in softmax() and threaded in, removing an
+    # add+compare+OR from every enabled KV tile on the bound softmax warp.
+    thread_wants_skip = thread_wants_skip or row_is_oob
+    warp_wants_skip = cute.arch.vote_all_sync(thread_wants_skip)
+
+    with cute.arch.elect_one():
+        warp_wants_skip_softmax_exchange[cute.arch.warp_idx() % 4] = warp_wants_skip
+
+    if not warp_wants_skip:
+        row_max = cute.arch.fmax(row_max, tile_row_max)
+
+    if cutlass.const_expr(skip_softmax_count is not None):
+        # Exclude fully-OOB row-blocks (phantom stage visits past seqlen_q):
+        # they always vote skip by construction and would inflate the ratio
+        # (e.g. S=128 reads 0.50 instead of the true 0.00).
+        warp_all_oob = cute.arch.vote_all_sync(row_is_oob)
+        if not warp_all_oob:
+            if thread_idx % 32 == 0:
+                if warp_wants_skip:
+                    cute.arch.atomic_add(skip_softmax_count.iterator.llvm_ptr, Int32(1))
+                cute.arch.atomic_add(total_softmax_count.iterator.llvm_ptr, Int32(1))
+    return warp_wants_skip, row_max

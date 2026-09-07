@@ -18,6 +18,7 @@ tests:
 
   # ONNX-less builder checkpoint contracts
   - tests/python-unittests/test_direct_builder_checkpoint_contract.py
+  - tests/python-unittests/test_direct_builder_skip_softmax.py
   - tests/python-unittests/test_checkpoint_loader_shard.py
 
   - tests/python-unittests/test_chat_template_extraction.py::test_direct_process_chat_template_preserves_trim_contract

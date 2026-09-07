@@ -310,6 +310,14 @@ KERNEL_VARIANTS = [
                     + _LLM + ["--skip_softmax_threshold", "1e-6"],
     ),
     KernelVariant(
+        name="fmha_d256_skipsoftmax",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,16,256", "--k_shape", "1,1024,2,256"]
+                    + _LLM + ["--skip_softmax_threshold", "1e-6"],
+    ),
+    KernelVariant(
         name="fmha_d256",
         group="fmha",
         supported_sms=[100, 101, 110],
@@ -472,6 +480,22 @@ KERNEL_VARIANTS = [
         supported_sms=[100, 101, 110],
         script="fmha_cutedsl_blackwell/fmha.py",
         script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,1,128"]
+                    + _LLM_PAGED + ["--skip_softmax_threshold", "1e-6"],
+    ),
+    KernelVariant(
+        name="fmha_d256_skipsoftmax_paged",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,16,256", "--k_shape", "1,1024,2,256"]
+                    + _LLM_PAGED + ["--skip_softmax_threshold", "1e-6"],
+    ),
+    KernelVariant(
+        name="fmha_d512_skipsoftmax_paged",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,8,512", "--k_shape", "1,1024,1,512"]
                     + _LLM_PAGED + ["--skip_softmax_threshold", "1e-6"],
     ),
     KernelVariant(

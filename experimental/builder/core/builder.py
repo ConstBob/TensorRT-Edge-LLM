@@ -763,6 +763,9 @@ def _setup_llm_profiles(builder, config, network, cfg: DeviceConfig,
                        generation_opt=(1, ),
                        generation_max=(1, ))
     set_profile_shapes("dflash_delta_lengths", (1, ), (maxB, ), (maxB, ))
+    # dim0 is the runtime S override; a meaningful S is below the context
+    # length, hence <= maxKV.
+    set_profile_shapes("skip_softmax_scale", (0, ), (0, ), (maxKV, ))
     dflash_width = fixed_dim("dflash_target_hidden_concat", -1, H)
     if (args.resolved_spec_role == contracts.SpecRole.DRAFT
             and args.spec_type in ("dflash", "dspark")):

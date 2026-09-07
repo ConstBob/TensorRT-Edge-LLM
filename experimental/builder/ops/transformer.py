@@ -112,6 +112,7 @@ class DecoderAttention(Module):
             sliding_window_size=self.sliding_window_size,
             enable_fp8_kv_cache=cfg.kv_cache_quant == "fp8",
             qkv_scales=self.weights.qkv_scales(self.prefix),
+            skip_softmax_scale_factor=cfg.skip_softmax_scale_factor,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
             **self.attention_kwargs(),
@@ -203,6 +204,7 @@ class GatedDecoderAttention(Module):
             head_size=cfg.head_dim,
             enable_fp8_kv_cache=cfg.kv_cache_quant == "fp8",
             qkv_scales=self.weights.qkv_scales(self.prefix),
+            skip_softmax_scale_factor=cfg.skip_softmax_scale_factor,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
         )

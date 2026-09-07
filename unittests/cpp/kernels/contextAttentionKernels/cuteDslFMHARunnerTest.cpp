@@ -280,9 +280,10 @@ void runViTAccuracyCase(
 }
 
 void runLlmAccuracyCase(int32_t batchSize, int32_t seqLen, int32_t numQHeads, int32_t numKVHeads, int32_t headDim,
-    float attentionScale, float skipSoftmaxThresholdLog2 = 0.0F)
+    float attentionScale, float skipSoftmaxLambda = 0.0F)
 {
-    bool const enableSkipSoftmax = skipSoftmaxThresholdLog2 < 0.0F;
+    bool const enableSkipSoftmax = skipSoftmaxLambda > 0.0F;
+    float const skipSoftmaxScaleFactor = enableSkipSoftmax ? skipSoftmaxLambda * static_cast<float>(seqLen) : 0.0F;
     size_t const qSize = static_cast<size_t>(batchSize) * seqLen * numQHeads * headDim;
     size_t const kvSize = static_cast<size_t>(batchSize) * seqLen * numKVHeads * headDim;
 
@@ -351,7 +352,7 @@ void runLlmAccuracyCase(int32_t batchSize, int32_t seqLen, int32_t numQHeads, in
     CuteDslFMHARunner runner(numQHeads, numKVHeads, headDim, batchSize, seqLen, seqLen);
     ASSERT_TRUE(runner.run(qCute.dataPointer<half>(), kvCacheCute.dataPointer<half>(),
         outputCuteDsl.dataPointer<half>(), cuKVSeqLens.dataPointer<int32_t>(), stream, attentionScale, INT_MAX, false,
-        1.0F, 1.0F, 1.0F, skipSoftmaxThresholdLog2));
+        1.0F, 1.0F, 1.0F, skipSoftmaxScaleFactor));
 
     rt::launchFmhaReferenceBshd(qReference, kReference, vReference, outputReference, true, attentionScale, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -720,11 +721,15 @@ void runLlmPagedNonCausalAccuracyCase(int32_t physicalSeqLenQ, int32_t numQHeads
 void runLlmD512PagedAccuracyCase(int32_t physicalSeqLen, int32_t numQHeads, int32_t numKVHeads,
     std::vector<int32_t> const& validSeqLens, float attentionScale, int32_t slidingWindowSize = INT_MAX,
     std::vector<int32_t> const* blockBeginHost = nullptr, std::vector<int32_t> const* blockEndHost = nullptr,
-    bool validatePairedBlockPointers = false)
+    bool validatePairedBlockPointers = false, float skipSoftmaxLambda = 0.0F)
 {
     constexpr int32_t kHeadDim = 512;
     constexpr int32_t kTokensPerPage = 128;
     int32_t const batchSize = static_cast<int32_t>(validSeqLens.size());
+    // S = lambda * longest valid seq; the kernel derives per-seq lambda = S / L.
+    float const skipSoftmaxScaleFactor = skipSoftmaxLambda > 0.0F
+        ? skipSoftmaxLambda * static_cast<float>(*std::max_element(validSeqLens.begin(), validSeqLens.end()))
+        : 0.0F;
     int32_t const maxPagesPerSeq = (physicalSeqLen + kTokensPerPage - 1) / kTokensPerPage;
     int32_t const capacity = maxPagesPerSeq * kTokensPerPage;
     bool const useBidirectional = blockBeginHost != nullptr || blockEndHost != nullptr;
@@ -885,19 +890,19 @@ void runLlmD512PagedAccuracyCase(int32_t physicalSeqLen, int32_t numQHeads, int3
             runner.runPaged(qTensor.rawPointer(), kvPagedTensor.rawPointer(), pageListTensor.dataPointer<int32_t>(),
                 outputCuteDsl.rawPointer(), paddedCuKVSeqLens.dataPointer<int32_t>(), numPages, maxPagesPerSeq,
                 kTokensPerPage, DataType::kHALF, stream, attentionScale, slidingWindowSize, false, 1.0F, 1.0F, 1.0F,
-                /*isCausal=*/true, /*skipSoftmaxThresholdLog2=*/0.0F, blockBegin, nullptr),
+                /*isCausal=*/true, /*skipSoftmaxScaleFactor=*/0.0F, blockBegin, nullptr),
             std::runtime_error);
         EXPECT_THROW(
             runner.runPaged(qTensor.rawPointer(), kvPagedTensor.rawPointer(), pageListTensor.dataPointer<int32_t>(),
                 outputCuteDsl.rawPointer(), paddedCuKVSeqLens.dataPointer<int32_t>(), numPages, maxPagesPerSeq,
                 kTokensPerPage, DataType::kHALF, stream, attentionScale, slidingWindowSize, false, 1.0F, 1.0F, 1.0F,
-                /*isCausal=*/true, /*skipSoftmaxThresholdLog2=*/0.0F, nullptr, blockEnd),
+                /*isCausal=*/true, /*skipSoftmaxScaleFactor=*/0.0F, nullptr, blockEnd),
             std::runtime_error);
     }
     ASSERT_TRUE(runner.runPaged(qTensor.rawPointer(), kvPagedTensor.rawPointer(), pageListTensor.dataPointer<int32_t>(),
         outputCuteDsl.rawPointer(), paddedCuKVSeqLens.dataPointer<int32_t>(), numPages, maxPagesPerSeq, kTokensPerPage,
         DataType::kHALF, stream, attentionScale, slidingWindowSize, false, 1.0F, 1.0F, 1.0F,
-        /*isCausal=*/true, /*skipSoftmaxThresholdLog2=*/0.0F, blockBegin, blockEnd));
+        /*isCausal=*/true, skipSoftmaxScaleFactor, blockBegin, blockEnd));
     if (useBidirectional)
     {
         auto const reference
@@ -1015,9 +1020,11 @@ template <typename T>
 void runLlmPagedMatchesContiguousCase(int32_t batchSize, int32_t seqLen, int32_t numQHeads, int32_t numKVHeads,
     int32_t headDim, int32_t tokensPerPage, DataType dataType, int32_t slidingWindowSize = INT_MAX,
     bool fp8Input = false, float qScale = 1.0F, float kScale = 1.0F, float vScale = 1.0F,
-    float skipSoftmaxThresholdLog2 = 0.0F)
+    float skipSoftmaxLambda = 0.0F)
 {
     ASSERT_EQ(seqLen % tokensPerPage, 0);
+    float const skipSoftmaxScaleFactor
+        = skipSoftmaxLambda > 0.0F ? skipSoftmaxLambda * static_cast<float>(seqLen) : 0.0F;
     int32_t const maxPagesPerSeq = seqLen / tokensPerPage;
     int32_t const numPages = batchSize * 2 * maxPagesPerSeq;
 
@@ -1094,11 +1101,11 @@ void runLlmPagedMatchesContiguousCase(int32_t batchSize, int32_t seqLen, int32_t
     CuteDslFMHARunner runner(numQHeads, numKVHeads, headDim, batchSize, seqLen, seqLen);
     ASSERT_TRUE(runner.run(qContiguous.rawPointer(), kvContiguousTensor.rawPointer(),
         outputContiguous.dataPointer<half>(), cuKVSeqLens.dataPointer<int32_t>(), stream, attentionScale,
-        slidingWindowSize, fp8Input, qScale, kScale, vScale, skipSoftmaxThresholdLog2));
+        slidingWindowSize, fp8Input, qScale, kScale, vScale, skipSoftmaxScaleFactor));
     ASSERT_TRUE(runner.runPaged(qPaged.rawPointer(), kvPagedTensor.rawPointer(), pageListTensor.dataPointer<int32_t>(),
         outputPaged.dataPointer<half>(), cuKVSeqLens.dataPointer<int32_t>(), numPages, maxPagesPerSeq, tokensPerPage,
         dataType, stream, attentionScale, slidingWindowSize, fp8Input, qScale, kScale, vScale, /*isCausal=*/true,
-        skipSoftmaxThresholdLog2));
+        skipSoftmaxScaleFactor));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
 
@@ -1267,6 +1274,27 @@ TEST(CuteDslFMHARunnerTest, llmD512PagedAccuracy)
         runLlmD512PagedAccuracyCase(
             testCase.seqLen, testCase.numQHeads, testCase.numKVHeads, {testCase.seqLen}, attentionScale);
     }
+}
+
+TEST(CuteDslFMHARunnerTest, llmD512PagedSkipSoftmaxAccuracy)
+{
+    int32_t const rawSmVersion = getSMVersion();
+    if (!isSupportedCuteDslTestSm(rawSmVersion))
+    {
+        GTEST_SKIP() << "D512 CuTe DSL FMHA unit tests only run on SM100/101/110. Current SM=" << rawSmVersion;
+    }
+
+    // Kernel modules lazy-load on first dispatch (upstream lazy-loading refactor);
+    // no explicit load step needed.
+
+    // Conservative lambda: exercises the d512 skip dispatch/kernel end to end while
+    // staying within the dense reference tolerance (random data rarely skips).
+    float const lambda = 0.001F;
+    runLlmD512PagedAccuracyCase(
+        /*physicalSeqLen=*/257, /*numQHeads=*/8, /*numKVHeads=*/1, {257},
+        /*attentionScale=*/1.0F / std::sqrt(static_cast<float>(512)),
+        /*slidingWindowSize=*/INT_MAX, nullptr, nullptr,
+        /*validatePairedBlockPointers=*/false, lambda);
 }
 
 TEST(CuteDslFMHARunnerTest, llmD512PagedRaggedAccuracy)
@@ -1510,6 +1538,7 @@ TEST(CuteDslFMHARunnerTest, llmSkipSoftmaxAccuracy)
     std::vector<LlmCase> const cases{
         {2, 1024, 14, 2, 64},
         {1, 1024, 16, 8, 128},
+        {1, 1024, 16, 2, 256},
     };
 
     for (auto const& testCase : cases)
@@ -1522,7 +1551,7 @@ TEST(CuteDslFMHARunnerTest, llmSkipSoftmaxAccuracy)
         // silently dispatches dense; pass a real lambda.
         float const lambda = testCase.headDim == 64 ? 0.003F : 0.001F;
         runLlmAccuracyCase(testCase.batchSize, testCase.seqLen, testCase.numQHeads, testCase.numKVHeads,
-            testCase.headDim, attentionScale, std::log2(lambda));
+            testCase.headDim, attentionScale, lambda);
     }
 }
 
@@ -1591,6 +1620,7 @@ TEST(CuteDslFMHARunnerTest, llmPagedKVSkipSoftmaxMatchesContiguous)
     std::vector<LlmPagedSkipCase> const cases{
         {2, 1024, 14, 2, 64},
         {1, 1024, 16, 8, 128},
+        {1, 1024, 16, 2, 256},
     };
 
     for (auto const& testCase : cases)
@@ -1602,7 +1632,7 @@ TEST(CuteDslFMHARunnerTest, llmPagedKVSkipSoftmaxMatchesContiguous)
         runLlmPagedMatchesContiguousCase<half>(testCase.batchSize, testCase.seqLen, testCase.numQHeads,
             testCase.numKVHeads, testCase.headDim, /*tokensPerPage=*/128, DataType::kHALF,
             /*slidingWindowSize=*/INT_MAX,
-            /*fp8Input=*/false, /*qScale=*/1.0F, /*kScale=*/1.0F, /*vScale=*/1.0F, std::log2(lambda));
+            /*fp8Input=*/false, /*qScale=*/1.0F, /*kScale=*/1.0F, /*vScale=*/1.0F, lambda);
     }
 }
 

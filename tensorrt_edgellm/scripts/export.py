@@ -60,6 +60,7 @@ LLM-only:
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 from typing import TYPE_CHECKING, Optional
@@ -1002,6 +1003,8 @@ def _export_llm(model_dir: str,
                 tp_size: int = 1,
                 num_decoder_layers: "int | None" = None,
                 skip_softmax_scale_factor: "float | None" = None,
+                skip_softmax_calibration: "dict | None" = None,
+                skip_softmax_target_sparsity: "float | None" = None,
                 quantization_override: "str | None" = None) -> None:
     """Export LLM backbone via the standard tensorrt_edgellm pipeline.
 
@@ -1179,6 +1182,30 @@ def _export_llm(model_dir: str,
                                 llm_out_dir,
                                 model_type,
                                 config_filename=config_filename)
+
+    # Record the skip-softmax calibration formula in the exported config so
+    # deployments can convert target_sparsity -> S without recalibrating.
+    if skip_softmax_calibration or skip_softmax_target_sparsity is not None:
+        for cfg_name in os.listdir(llm_out_dir):
+            if not (cfg_name == "config.json" or
+                    (cfg_name.startswith("config_tp")
+                     and cfg_name.endswith(".json"))):
+                continue
+            cfg_path = os.path.join(llm_out_dir, cfg_name)
+            with open(cfg_path) as fh:
+                cfg = json.load(fh)
+            if skip_softmax_calibration:
+                cfg["skip_softmax_calibration"] = {
+                    "a": skip_softmax_calibration["a"],
+                    "b": skip_softmax_calibration["b"],
+                    "formula": "a * exp(b * target_sparsity)",
+                }
+            if skip_softmax_target_sparsity is not None:
+                cfg["skip_softmax_target_sparsity"] = skip_softmax_target_sparsity
+            with open(cfg_path, "w") as fh:
+                json.dump(cfg, fh, indent=2)
+            logger.info("[LLM] skip-softmax calibration metadata -> %s",
+                        cfg_path)
 
     # Standalone Talker checkpoints route through ``_export_llm`` (not the
     # qwen3_tts ``_export_talker``) because their model_type isn't in the
@@ -4032,12 +4059,43 @@ def main() -> None:
         metavar="S",
         help=(
             "Skip-softmax (BLASST) calibrated scale factor S (0 = disabled). "
-            "Baked into the AttentionPlugin nodes; at inference the runtime "
-            "derives lambda = S / context_length per request for the prefill "
-            "FMHA. Obtain S from calibrate_skip_softmax.py. Overrides the "
-            "checkpoint config.json key \"skip_softmax_scale_factor\" — an "
-            "explicit 0 disables skip-softmax even if the config enables it; "
-            "omit the flag to keep the config value."),
+            "Baked into the AttentionPlugin nodes; at inference the kernel "
+            "derives lambda = S / seqlen_kv per sequence for the prefill "
+            "FMHA. LONG-CONTEXT ONLY: requests shorter than S run at "
+            "lambda > 1 and degrade sharply (short-prompt tasks such as MMLU "
+            "drop by double digits) — if the deployment traffic contains "
+            "requests with L < S, serve them with a dense engine or pick a "
+            "smaller S. Obtain S from calibrate_skip_softmax.py. Overrides "
+            "the checkpoint config.json key \"skip_softmax_scale_factor\" — "
+            "an explicit 0 disables skip-softmax even if the config enables "
+            "it; omit the flag to keep the config value."),
+    )
+    p.add_argument(
+        "--target-sparsity",
+        "--target_sparsity",
+        dest="target_sparsity",
+        type=float,
+        default=None,
+        metavar="R",
+        help=(
+            "Skip-softmax target sparsity in (0,1). Converted to the scale "
+            "factor via the calibration formula S = a * exp(b * R) taken from "
+            "--skip-softmax-calibration or the checkpoint config.json key "
+            "\"skip_softmax_calibration\". An explicit "
+            "--skip-softmax-scale-factor takes precedence."),
+    )
+    p.add_argument(
+        "--skip-softmax-calibration",
+        "--skip_softmax_calibration",
+        dest="skip_softmax_calibration",
+        type=str,
+        default=None,
+        metavar="JSON",
+        help=(
+            "Path to the calibration json emitted by calibrate_skip_softmax.py "
+            "(keys: a, b). Recorded into the exported config.json as "
+            "\"skip_softmax_calibration\" so deployments can convert "
+            "target_sparsity to S without recalibrating."),
     )
     p.add_argument(
         "--draft-reduced-vocab-dir",
@@ -4625,6 +4683,31 @@ def main() -> None:
     # Each stage is (enabled, component_name, exporter_callable). Exporter
     # receives the computed output dir; the (enabled, component) columns also
     # drive both the pre-run log and the post-run summary below.
+    # Resolve skip-softmax S: an explicit scale factor wins;
+    # otherwise target_sparsity converts via the calibration formula from
+    # --skip-softmax-calibration or the source checkpoint config.json.
+    _skip_calib = None
+    if getattr(args, "skip_softmax_calibration", None):
+        with open(args.skip_softmax_calibration) as _fh:
+            _skip_calib = json.load(_fh)
+    else:
+        _src_cfg_sk = _load_config(model_dir)
+        if isinstance(_src_cfg_sk.get("skip_softmax_calibration"), dict):
+            _skip_calib = _src_cfg_sk["skip_softmax_calibration"]
+    _resolved_skip_s = args.skip_softmax_scale_factor
+    if _resolved_skip_s is None and getattr(args, "target_sparsity",
+                                            None) is not None:
+        if not _skip_calib:
+            raise SystemExit("--target-sparsity requires calibration metadata "
+                             "(--skip-softmax-calibration or checkpoint "
+                             "config.json skip_softmax_calibration)")
+        _resolved_skip_s = float(_skip_calib["a"]) * math.exp(
+            float(_skip_calib["b"]) * args.target_sparsity)
+        logger.info(
+            "skip-softmax: target_sparsity=%.2f -> S=%.4f (a=%.6g b=%.6g)",
+            args.target_sparsity, _resolved_skip_s, float(_skip_calib["a"]),
+            float(_skip_calib["b"]))
+
     stages = [
         (_has_llm_component(model_type, "thinker") and not args.skip_llm
          and not _draft_only
@@ -4650,7 +4733,9 @@ def main() -> None:
              externalize_weights=externalize_weights,
              tp_size=args.tp_size,
              num_decoder_layers=args.num_decoder_layer,
-             skip_softmax_scale_factor=args.skip_softmax_scale_factor,
+             skip_softmax_scale_factor=_resolved_skip_s,
+             skip_softmax_calibration=_skip_calib,
+             skip_softmax_target_sparsity=args.target_sparsity,
              quantization_override=getattr(args, 'quantization', None))),
         (args.mtp and not gemma4_mtp_requested
          and _allow("mtp_draft"), "mtp_draft", lambda out: _export_mtp_draft(
