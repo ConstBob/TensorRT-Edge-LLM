@@ -72,6 +72,9 @@ struct DecodeMoeParams
     int32_t fc2SplitK{1};
     float* fc1Partials{nullptr}; //!< [fc1SplitK, numTokens*topK, interSizePadded] fp32
     float* fc2Partials{nullptr}; //!< [fc2SplitK, numTokens, H] fp32
+    //! Launch every kernel with programmatic stream serialization (the kernels
+    //! always carry the griddepcontrol wait/trigger; this only sets the attribute).
+    bool enablePdl{false};
 };
 
 //! Supported activation dtypes.

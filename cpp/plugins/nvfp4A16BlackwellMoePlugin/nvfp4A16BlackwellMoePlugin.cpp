@@ -31,6 +31,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <cuda_runtime.h>
 #include <limits>
 #include <mutex>
@@ -454,6 +456,18 @@ bool Nvfp4A16BlackwellMoePlugin::supportsFormatCombination(
 namespace
 {
 
+//! PDL is on by default for every kernel of this plugin; EDGELLM_ENABLE_PDL=0
+//! (read once, before the first enqueue) keeps an explicit production A/B and
+//! recovery switch, the same knob as Nvfp4MoePlugin.
+bool requestPdl()
+{
+    static bool const enabled = []() {
+        char const* const value = std::getenv("EDGELLM_ENABLE_PDL");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
 kernel::Nvfp4A16BlackwellMoeParams makeShape(int32_t numTokens, int32_t numExperts, int32_t topK, int32_t hiddenSize,
     int32_t interSize, int32_t interSizePadded, int32_t nGroup, int32_t topkGroup, int32_t normTopkProb,
     float routedScalingFactor, int32_t backend) noexcept
@@ -645,6 +659,7 @@ int32_t Nvfp4A16BlackwellMoePlugin::enqueue(PluginTensorDesc const* inputDesc, P
         params.fc2BlockScales = inputs[kInFc2BlockScales];
         params.fc2GlobalScales = static_cast<float const*>(inputs[kInFc2GlobalScales]);
         params.output = outputs[0];
+        params.enablePdl = requestPdl();
 
         // The workspace was sized for the profile maximum; the runner re-derives
         // the layout for this token count and checks it fits.

@@ -34,6 +34,23 @@ weight layouts and distinct ONNX identities: an engine never carries both.
   workspace is sized for the largest FC1 split-K the benchmark override
   (`EDGELLM_MOE_DECODE_FC1_SPLITK`) can select, so the size TensorRT records at
   build time never depends on the environment.
+* **Programmatic Dependent Launch**: every kernel above issues `griddepcontrol.wait`
+  before its first read of data a previous kernel (or the preceding TensorRT
+  layer) produced and `griddepcontrol.launch_dependents` once its outputs are
+  written; the runner launches them with
+  `cudaLaunchAttributeProgrammaticStreamSerialization` (CUDA kernels through
+  `cudaLaunchKernelEx`, the grouped GEMMs through the AOT wrapper's `enable_pdl`
+  argument) so each kernel's prologue overlaps the previous kernel's tail. On by
+  default; `EDGELLM_ENABLE_PDL=0` (read once, before the first enqueue) disables
+  it for an A/B, the same knob as `Nvfp4MoePlugin`. The shared grouped-routing
+  kernels used for `n_group > 1` carry no wait and are launched without the
+  attribute, so that contract simply serializes. Measured on Thor (CUDA-graph
+  decode step, Nemotron 3.5 Lightning): consecutive plugin kernels now start
+  0.5-5.6 us before their predecessor ends (nsys), which is worth about 1% of
+  the prefill step at ISL 2048 and is within noise at decode, because the
+  dependent kernels' pre-wait prologue is short; a pre-wait weight prefetch in
+  the decode kernels is the follow-up that would turn the overlap into
+  bandwidth.
 * `T >= 2` (prefill and batched decode): warp-per-token sigmoid top-k routing -> single-CTA
   expert-contiguous tile layout (`permuted_idx`, `tile_group_idx`,
   `num_valid_tiles`) -> permuted-row gather (routed rows only; pad rows are

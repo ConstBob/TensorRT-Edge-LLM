@@ -72,6 +72,39 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 
 
 @dsl_user_op
+def griddepcontrol_wait(*, loc=None, ip=None) -> None:
+    """Programmatic Dependent Launch: block until every prerequisite grid has
+    completed and flushed its memory (a no-op when the grid was launched
+    without the PDL attribute)."""
+    llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string="griddepcontrol.wait;",
+        constraints="",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def griddepcontrol_launch_dependents(*, loc=None, ip=None) -> None:
+    """Programmatic Dependent Launch: let the dependent grid be scheduled; its
+    own griddepcontrol.wait still orders the data."""
+    llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string="griddepcontrol.launch_dependents;",
+        constraints="",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def cvt_e2m1x2_to_bf16x2_u32(packed_e2m1, *, loc=None, ip=None):
     """Convert low/high E2M1 nibbles to low/high BF16 halfwords."""
     src_i8 = Uint8(packed_e2m1).ir_value(loc=loc, ip=ip)
@@ -486,6 +519,7 @@ class Nvfp4A16BlackwellMoeGemm:
         topk_weights: cute.Tensor,
         out: cute.Tensor,
         max_active_clusters: cutlass.Int32,
+        enable_pdl: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         """
@@ -498,6 +532,10 @@ class Nvfp4A16BlackwellMoeGemm:
             (``< 0`` for padding rows); scatter_add only.
         :param topk_weights: ``[num_tokens, topK]`` fp32 router weights; scatter_add only.
         :param out: ``[num_tokens, N]`` FP16/BF16 token output; scatter_add only.
+        :param enable_pdl: non-zero launches with programmatic stream
+            serialization; the kernel always issues griddepcontrol.wait before
+            reading ``tile_group_idx`` / ``num_valid_tiles`` / activations and
+            griddepcontrol.launch_dependents when it is done.
 
         This method sets up the kernel parameters, computes the grid size,
         defines the shared storage, and launches the kernel.
@@ -781,6 +819,7 @@ class Nvfp4A16BlackwellMoeGemm:
             cluster=(*self.cluster_shape_mn, 1),
             min_blocks_per_mp=1,
             stream=stream,
+            use_pdl=enable_pdl,
         )
         return
 
@@ -850,6 +889,10 @@ class Nvfp4A16BlackwellMoeGemm:
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
+        # PDL: num_valid_tiles / tile_group_idx come from the layout kernel and
+        # the B operand from the gather (FC1) or from FC1 (FC2); only descriptor
+        # prefetch and shared-memory carving run before this wait.
+        griddepcontrol_wait()
         # Device count of non-empty token tiles (written by the layout builder).
         # The host launches a conservative grid; every scheduler-owning warp
         # skips tiles at or beyond this count in lockstep.
@@ -1818,6 +1861,10 @@ class Nvfp4A16BlackwellMoeGemm:
         if warp_idx == self.idle_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_idle_warp)
 
+        # PDL: every warp has finished its role (TMA stores / red.global issued
+        # and waited); let the next kernel in the stream start its prologue.
+        griddepcontrol_launch_dependents()
+
     @cute.jit
     def scatter_add_subtile(
         self,
@@ -2246,6 +2293,7 @@ class Nvfp4A16BlackwellMoeGemmLaunch:
         num_tokens: cutlass.Int32,
         top_k: cutlass.Int32,
         max_active_clusters: cutlass.Int32,
+        enable_pdl: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         # Keep the public wrapper ABI at int32, but promote every extent and
@@ -2346,6 +2394,7 @@ class Nvfp4A16BlackwellMoeGemmLaunch:
             topk_weights,
             out,
             max_active_clusters,
+            enable_pdl,
             stream,
         )
 
@@ -2422,6 +2471,7 @@ def make_trace_args(io_dtype: type[cutlass.Numeric], token_tile: int):
         cutlass.Int32(1),  # num_tokens
         cutlass.Int32(1),  # top_k
         cutlass.Int32(1),  # max_active_clusters
+        cutlass.Int32(0),  # enable_pdl
         cuda.CUstream(0),
     )
 

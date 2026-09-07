@@ -16,6 +16,7 @@
  */
 
 #include "nvfp4A16BlackwellMoeDecodeKernels.h"
+#include "nvfp4A16BlackwellMoePdl.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -291,7 +292,10 @@ __global__ __launch_bounds__(kThreadsPerBlock, kDecodeFc1CtasPerSm) void decodeF
     int32_t const kBlockEnd = kBlocks * (split + 1) / params.fc1SplitK;
     T const* const activationRow
         = static_cast<T const*>(params.hiddenStates) + static_cast<long long>(token) * kFeatures;
-    // Issue the (dependent) expert lookup before the staging loop so its latency overlaps it.
+    // topkIndices comes from the routing kernel and the activation row from the
+    // previous layer; the (dependent) expert lookup is issued before the staging
+    // loop so its latency overlaps it.
+    pdlWait();
     int32_t const expert = params.topkIndices[slot];
     stageActivationRange<T>(activationRow, kBlockBegin, kBlockEnd, sharedActivation);
     __syncthreads();
@@ -327,6 +331,7 @@ __global__ __launch_bounds__(kThreadsPerBlock, kDecodeFc1CtasPerSm) void decodeF
                 = acc;
         }
     }
+    pdlTrigger();
 }
 
 //! FC1 split-K finalize: sum partials, apply alpha[expert], relu^2, narrow.
@@ -337,25 +342,26 @@ __global__ void decodeFc1ReduceKernel(DecodeMoeParams const params)
     int32_t const nFeatures = params.interSizePadded;
     long long const numSlots = static_cast<long long>(params.numTokens) * params.topK;
     long long const numPairs = numSlots * nFeatures / 2;
-    if (pairIndex >= numPairs)
+    pdlWait(); // partials from FC1, topkIndices from the routing kernel
+    if (pairIndex < numPairs)
     {
-        return;
+        long long const elementIndex = pairIndex * 2;
+        int32_t const slot = static_cast<int32_t>(elementIndex / nFeatures);
+        int32_t const expert = params.topkIndices[slot];
+        float const alpha = params.fc1GlobalScales[expert];
+        float2 sum{0.0f, 0.0f};
+        for (int32_t split = 0; split < params.fc1SplitK; ++split)
+        {
+            float2 const v = *reinterpret_cast<float2 const*>(
+                params.fc1Partials + static_cast<long long>(split) * numSlots * nFeatures + elementIndex);
+            sum.x += v.x;
+            sum.y += v.y;
+        }
+        float const a = fmaxf(sum.x * alpha, 0.0f);
+        float const b = fmaxf(sum.y * alpha, 0.0f);
+        ActTraits<T>::storePair(static_cast<T*>(params.fc1Output) + elementIndex, make_float2(a * a, b * b));
     }
-    long long const elementIndex = pairIndex * 2;
-    int32_t const slot = static_cast<int32_t>(elementIndex / nFeatures);
-    int32_t const expert = params.topkIndices[slot];
-    float const alpha = params.fc1GlobalScales[expert];
-    float2 sum{0.0f, 0.0f};
-    for (int32_t split = 0; split < params.fc1SplitK; ++split)
-    {
-        float2 const v = *reinterpret_cast<float2 const*>(
-            params.fc1Partials + static_cast<long long>(split) * numSlots * nFeatures + elementIndex);
-        sum.x += v.x;
-        sum.y += v.y;
-    }
-    float const a = fmaxf(sum.x * alpha, 0.0f);
-    float const b = fmaxf(sum.y * alpha, 0.0f);
-    ActTraits<T>::storePair(static_cast<T*>(params.fc1Output) + elementIndex, make_float2(a * a, b * b));
+    pdlTrigger();
 }
 
 //! FC2: grid (H/128, numTokens, fc2SplitK), 256 threads.  Each CTA loops over the
@@ -383,6 +389,8 @@ __global__ __launch_bounds__(kThreadsPerBlock, kDecodeFc2CtasPerSm) void decodeF
     long long const expertPlaneCodes = static_cast<long long>(nFeatures) * kFeatures / 2;
     int32_t const stagedTilesPerSlot = maxTilesPerSplit(kBlocks, params.fc2SplitK);
 
+    // fc1Output, topkIndices and topkWeights are produced by the earlier kernels.
+    pdlWait();
     for (int32_t slotInToken = 0; slotInToken < params.topK; ++slotInToken)
     {
         long long const slot = static_cast<long long>(token) * params.topK + slotInToken;
@@ -421,6 +429,7 @@ __global__ __launch_bounds__(kThreadsPerBlock, kDecodeFc2CtasPerSm) void decodeF
             params.fc2Partials[(static_cast<long long>(split) * params.numTokens + token) * nFeatures + n] = total;
         }
     }
+    pdlTrigger();
 }
 
 //! FC2 split-K finalize: sum partials, narrow.
@@ -429,20 +438,21 @@ __global__ void decodeFc2ReduceKernel(DecodeMoeParams const params)
 {
     long long const pairIndex = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     long long const numElements = static_cast<long long>(params.numTokens) * params.hiddenSize;
-    if (pairIndex * 2 >= numElements)
+    pdlWait(); // partials from FC2
+    if (pairIndex * 2 < numElements)
     {
-        return;
+        long long const elementIndex = pairIndex * 2;
+        float2 sum{0.0f, 0.0f};
+        for (int32_t split = 0; split < params.fc2SplitK; ++split)
+        {
+            float2 const v = *reinterpret_cast<float2 const*>(
+                params.fc2Partials + static_cast<long long>(split) * numElements + elementIndex);
+            sum.x += v.x;
+            sum.y += v.y;
+        }
+        ActTraits<T>::storePair(static_cast<T*>(params.output) + elementIndex, sum);
     }
-    long long const elementIndex = pairIndex * 2;
-    float2 sum{0.0f, 0.0f};
-    for (int32_t split = 0; split < params.fc2SplitK; ++split)
-    {
-        float2 const v = *reinterpret_cast<float2 const*>(
-            params.fc2Partials + static_cast<long long>(split) * numElements + elementIndex);
-        sum.x += v.x;
-        sum.y += v.y;
-    }
-    ActTraits<T>::storePair(static_cast<T*>(params.output) + elementIndex, sum);
+    pdlTrigger();
 }
 
 constexpr int32_t kDefaultMaxDynamicSmemBytes{48 * 1024};
@@ -467,14 +477,16 @@ cudaError_t launchFc1Typed(DecodeMoeParams const& params, cudaStream_t const str
     {
         return attr;
     }
-    decodeFc1Kernel<T><<<grid, kThreadsPerBlock, smemBytes, stream>>>(params);
-    if (params.fc1SplitK > 1)
+    cudaError_t const launched = launchKernelPdl(decodeFc1Kernel<T>, grid, dim3(kThreadsPerBlock),
+        static_cast<size_t>(smemBytes), stream, params.enablePdl, params);
+    if (launched != cudaSuccess || params.fc1SplitK == 1)
     {
-        long long const numPairs = static_cast<long long>(params.numTokens) * params.topK * params.interSizePadded / 2;
-        dim3 const reduceGrid(static_cast<unsigned int>((numPairs + kThreadsPerBlock - 1) / kThreadsPerBlock));
-        decodeFc1ReduceKernel<T><<<reduceGrid, kThreadsPerBlock, 0, stream>>>(params);
+        return launched;
     }
-    return cudaGetLastError();
+    long long const numPairs = static_cast<long long>(params.numTokens) * params.topK * params.interSizePadded / 2;
+    dim3 const reduceGrid(static_cast<unsigned int>((numPairs + kThreadsPerBlock - 1) / kThreadsPerBlock));
+    return launchKernelPdl(
+        decodeFc1ReduceKernel<T>, reduceGrid, dim3(kThreadsPerBlock), 0, stream, params.enablePdl, params);
 }
 
 template <typename T>
@@ -487,14 +499,16 @@ cudaError_t launchFc2Typed(DecodeMoeParams const& params, cudaStream_t const str
     {
         return attr;
     }
-    decodeFc2Kernel<T><<<grid, kThreadsPerBlock, smemBytes, stream>>>(params);
-    if (params.fc2SplitK > 1)
+    cudaError_t const launched = launchKernelPdl(decodeFc2Kernel<T>, grid, dim3(kThreadsPerBlock),
+        static_cast<size_t>(smemBytes), stream, params.enablePdl, params);
+    if (launched != cudaSuccess || params.fc2SplitK == 1)
     {
-        long long const numPairs = static_cast<long long>(params.numTokens) * params.hiddenSize / 2;
-        dim3 const reduceGrid(static_cast<unsigned int>((numPairs + kThreadsPerBlock - 1) / kThreadsPerBlock));
-        decodeFc2ReduceKernel<T><<<reduceGrid, kThreadsPerBlock, 0, stream>>>(params);
+        return launched;
     }
-    return cudaGetLastError();
+    long long const numPairs = static_cast<long long>(params.numTokens) * params.hiddenSize / 2;
+    dim3 const reduceGrid(static_cast<unsigned int>((numPairs + kThreadsPerBlock - 1) / kThreadsPerBlock));
+    return launchKernelPdl(
+        decodeFc2ReduceKernel<T>, reduceGrid, dim3(kThreadsPerBlock), 0, stream, params.enablePdl, params);
 }
 
 } // namespace

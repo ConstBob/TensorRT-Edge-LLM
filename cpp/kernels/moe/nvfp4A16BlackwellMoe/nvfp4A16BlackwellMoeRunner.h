@@ -45,6 +45,10 @@ struct Nvfp4A16BlackwellMoeParams
 {
     nvfp4_a16_blackwell_moe::DecodeDtype dtype{nvfp4_a16_blackwell_moe::DecodeDtype::kFP16};
     nvfp4_a16_blackwell_moe::Backend backend{nvfp4_a16_blackwell_moe::Backend::kAuto};
+    //! Programmatic Dependent Launch for every kernel of the layer (the runner
+    //! still requires toolchain support; shared grouped-routing kernels launch
+    //! without the attribute and simply serialize).
+    bool enablePdl{false};
     int32_t numTokens{0};
     int32_t numExperts{0};
     int32_t topK{0};

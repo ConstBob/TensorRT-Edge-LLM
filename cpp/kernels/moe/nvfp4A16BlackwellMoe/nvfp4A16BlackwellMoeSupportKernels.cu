@@ -17,6 +17,8 @@
 
 #include "nvfp4A16BlackwellMoeSupportKernels.h"
 
+#include "nvfp4A16BlackwellMoePdl.cuh"
+
 #include "moeSigmoidGroupTopkDevice.cuh"
 
 #include <cuda_bf16.h>
@@ -45,41 +47,40 @@ __global__ __launch_bounds__(kThreads) void gatherPermutedRowsKernel(T const* __
     int32_t const vectorsPerRow = hiddenSize / kElementsPerVector;
     int64_t const block = static_cast<int64_t>(blockIdx.x);
     uint4 const zero{0U, 0U, 0U, 0U};
+    // permutedIdx / numValidTiles come from the layout kernel and hidden from the
+    // previous layer: nothing below may be read before the grid dependency resolves.
+    pdlWait();
     if (block < maxRowsPadded)
     {
         int64_t const validRows = static_cast<int64_t>(numValidTiles[0]) * tokenTile;
-        if (block >= validRows)
+        // Rows past the valid tiles and padding rows need no fill: FC1 produces a
+        // discarded row from whatever is there and the FC2 epilogue skips it
+        // through permuted_idx.
+        int32_t const expanded = block < validRows ? permutedIdx[block] : -1;
+        if (expanded >= 0)
         {
-            return;
-        }
-        int32_t const expanded = permutedIdx[block];
-        if (expanded < 0)
-        {
-            // Padding row: FC1 produces a discarded row from whatever is here and
-            // the FC2 epilogue skips it through permuted_idx, so no fill is needed.
-            return;
-        }
-        uint4* const dst = reinterpret_cast<uint4*>(permuted + block * hiddenSize);
-        int32_t const token = expanded / topK;
-        uint4 const* const src = reinterpret_cast<uint4 const*>(hidden + static_cast<int64_t>(token) * hiddenSize);
-        for (int32_t v = threadIdx.x; v < vectorsPerRow; v += kThreads)
-        {
-            dst[v] = src[v];
+            uint4* const dst = reinterpret_cast<uint4*>(permuted + block * hiddenSize);
+            int32_t const token = expanded / topK;
+            uint4 const* const src = reinterpret_cast<uint4 const*>(hidden + static_cast<int64_t>(token) * hiddenSize);
+            for (int32_t v = threadIdx.x; v < vectorsPerRow; v += kThreads)
+            {
+                dst[v] = src[v];
+            }
         }
     }
     else
     {
         int64_t const token = block - maxRowsPadded;
-        if (token >= numTokens)
+        if (token < numTokens)
         {
-            return;
-        }
-        uint4* const dst = reinterpret_cast<uint4*>(output + token * hiddenSize);
-        for (int32_t v = threadIdx.x; v < vectorsPerRow; v += kThreads)
-        {
-            dst[v] = zero;
+            uint4* const dst = reinterpret_cast<uint4*>(output + token * hiddenSize);
+            for (int32_t v = threadIdx.x; v < vectorsPerRow; v += kThreads)
+            {
+                dst[v] = zero;
+            }
         }
     }
+    pdlTrigger();
 }
 
 //! Warp-per-token sigmoid top-k routing for the ungrouped contract (nGroup == 1).
@@ -94,21 +95,23 @@ __global__ __launch_bounds__(kThreads) void sigmoidTopkRouteKernel(float const* 
     int32_t const warp = static_cast<int32_t>(threadIdx.x) / 32;
     int32_t const lane = static_cast<int32_t>(threadIdx.x) & 31;
     int32_t const token = static_cast<int32_t>(blockIdx.x) * (kThreads / 32) + warp;
-    if (token >= numTokens)
+    // The router logits are written by the preceding layer.
+    pdlWait();
+    if (token < numTokens)
     {
-        return;
+        int32_t const wordsPerWarp = numExperts + 2 * topK;
+        float* const sSigmoid = routeSmem + warp * wordsPerWarp;
+        float* const sWeight = sSigmoid + numExperts;
+        int32_t* const sIdx = reinterpret_cast<int32_t*>(sWeight + topK);
+        sigmoidTopkWarp<kMaxExpertsPerLane>(logits + static_cast<int64_t>(token) * numExperts, correctionBias,
+            numExperts, topK, normTopkProb, routedScalingFactor, sSigmoid, sIdx, sWeight);
+        if (lane < topK)
+        {
+            topkIndices[static_cast<int64_t>(token) * topK + lane] = sIdx[lane];
+            topkWeights[static_cast<int64_t>(token) * topK + lane] = sWeight[lane];
+        }
     }
-    int32_t const wordsPerWarp = numExperts + 2 * topK;
-    float* const sSigmoid = routeSmem + warp * wordsPerWarp;
-    float* const sWeight = sSigmoid + numExperts;
-    int32_t* const sIdx = reinterpret_cast<int32_t*>(sWeight + topK);
-    sigmoidTopkWarp<kMaxExpertsPerLane>(logits + static_cast<int64_t>(token) * numExperts, correctionBias, numExperts,
-        topK, normTopkProb, routedScalingFactor, sSigmoid, sIdx, sWeight);
-    if (lane < topK)
-    {
-        topkIndices[static_cast<int64_t>(token) * topK + lane] = sIdx[lane];
-        topkWeights[static_cast<int64_t>(token) * topK + lane] = sWeight[lane];
-    }
+    pdlTrigger();
 }
 
 //! Single-CTA expert-contiguous, tile-padded layout (same contract as buildLayoutGpu
@@ -135,6 +138,8 @@ __global__ __launch_bounds__(kLayoutThreads) void buildTileLayoutKernel(int32_t 
         cursor[e] = 0;
     }
     __syncthreads();
+    // topkIndices is written by the routing kernel.
+    pdlWait();
     for (int32_t i = tid; i < numSlots; i += kLayoutThreads)
     {
         int32_t const expert = topkIndices[i];
@@ -217,6 +222,7 @@ __global__ __launch_bounds__(kLayoutThreads) void buildTileLayoutKernel(int32_t 
             permutedIdx[rowOffset[expert] + pos] = i;
         }
     }
+    pdlTrigger();
 }
 
 } // namespace
@@ -224,7 +230,7 @@ __global__ __launch_bounds__(kLayoutThreads) void buildTileLayoutKernel(int32_t 
 cudaError_t launchGatherPermutedRows(DecodeDtype const dtype, void const* const hiddenStates,
     int32_t const* const permutedIdx, int32_t const* const numValidTiles, int32_t const tokenTile, int32_t const topK,
     int32_t const hiddenSize, int32_t const numTokens, int64_t const maxRowsPadded, void* const permutedActivations,
-    void* const output, cudaStream_t const stream)
+    void* const output, bool const enablePdl, cudaStream_t const stream)
 {
     if (hiddenSize % 8 != 0 || topK <= 0 || tokenTile <= 0 || numTokens <= 0 || maxRowsPadded <= 0)
     {
@@ -238,23 +244,19 @@ cudaError_t launchGatherPermutedRows(DecodeDtype const dtype, void const* const 
     dim3 const grid(static_cast<unsigned int>(blocks));
     if (dtype == DecodeDtype::kFP16)
     {
-        gatherPermutedRowsKernel<half><<<grid, kThreads, 0, stream>>>(static_cast<half const*>(hiddenStates),
-            permutedIdx, numValidTiles, tokenTile, topK, hiddenSize, numTokens, maxRowsPadded,
-            static_cast<half*>(permutedActivations), static_cast<half*>(output));
+        return launchKernelPdl(gatherPermutedRowsKernel<half>, grid, dim3(kThreads), 0, stream, enablePdl,
+            static_cast<half const*>(hiddenStates), permutedIdx, numValidTiles, tokenTile, topK, hiddenSize, numTokens,
+            maxRowsPadded, static_cast<half*>(permutedActivations), static_cast<half*>(output));
     }
-    else
-    {
-        gatherPermutedRowsKernel<__nv_bfloat16>
-            <<<grid, kThreads, 0, stream>>>(static_cast<__nv_bfloat16 const*>(hiddenStates), permutedIdx, numValidTiles,
-                tokenTile, topK, hiddenSize, numTokens, maxRowsPadded, static_cast<__nv_bfloat16*>(permutedActivations),
-                static_cast<__nv_bfloat16*>(output));
-    }
-    return cudaGetLastError();
+    return launchKernelPdl(gatherPermutedRowsKernel<__nv_bfloat16>, grid, dim3(kThreads), 0, stream, enablePdl,
+        static_cast<__nv_bfloat16 const*>(hiddenStates), permutedIdx, numValidTiles, tokenTile, topK, hiddenSize,
+        numTokens, maxRowsPadded, static_cast<__nv_bfloat16*>(permutedActivations),
+        static_cast<__nv_bfloat16*>(output));
 }
 
 cudaError_t launchSigmoidTopkRoute(float const* logits, float const* correctionBias, int32_t numTokens,
     int32_t numExperts, int32_t topK, bool normTopkProb, float routedScalingFactor, int32_t* topkIndices,
-    float* topkWeights, cudaStream_t stream)
+    float* topkWeights, bool enablePdl, cudaStream_t stream)
 {
     if (numExperts <= 0 || numExperts > 32 * kRouteMaxExpertsPerLane || topK <= 0 || topK > 32 || numTokens <= 0)
     {
@@ -263,22 +265,21 @@ cudaError_t launchSigmoidTopkRoute(float const* logits, float const* correctionB
     constexpr int32_t kWarps{kThreads / 32};
     dim3 const grid(static_cast<unsigned int>((numTokens + kWarps - 1) / kWarps));
     size_t const smem = static_cast<size_t>(kWarps) * (numExperts + 2 * topK) * sizeof(float);
-    sigmoidTopkRouteKernel<kRouteMaxExpertsPerLane><<<grid, kThreads, smem, stream>>>(logits, correctionBias, numTokens,
-        numExperts, topK, normTopkProb, routedScalingFactor, topkIndices, topkWeights);
-    return cudaGetLastError();
+    return launchKernelPdl(sigmoidTopkRouteKernel<kRouteMaxExpertsPerLane>, grid, dim3(kThreads), smem, stream,
+        enablePdl, logits, correctionBias, numTokens, numExperts, topK, normTopkProb, routedScalingFactor, topkIndices,
+        topkWeights);
 }
 
 cudaError_t launchBuildTileLayout(int32_t const* topkIndices, int32_t numSlots, int32_t numExperts, int32_t tokenTile,
-    int32_t* permutedIdx, int32_t* tileGroupIdx, int32_t* numValidTiles, cudaStream_t stream)
+    int32_t* permutedIdx, int32_t* tileGroupIdx, int32_t* numValidTiles, bool enablePdl, cudaStream_t stream)
 {
     if (numExperts <= 0 || numExperts > 32 * 32 || tokenTile <= 0 || numSlots < 0)
     {
         return cudaErrorInvalidValue;
     }
     size_t const smem = static_cast<size_t>(4) * numExperts * sizeof(int32_t);
-    buildTileLayoutKernel<<<1, kLayoutThreads, smem, stream>>>(
-        topkIndices, numSlots, numExperts, tokenTile, permutedIdx, tileGroupIdx, numValidTiles);
-    return cudaGetLastError();
+    return launchKernelPdl(buildTileLayoutKernel, dim3(1), dim3(kLayoutThreads), smem, stream, enablePdl, topkIndices,
+        numSlots, numExperts, tokenTile, permutedIdx, tileGroupIdx, numValidTiles);
 }
 
 } // namespace nvfp4_a16_blackwell_moe

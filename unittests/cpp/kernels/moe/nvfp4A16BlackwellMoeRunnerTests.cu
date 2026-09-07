@@ -239,11 +239,12 @@ public:
         computeReference();
     }
 
-    Nvfp4A16BlackwellMoeParams params(moe::Backend const backend) const
+    Nvfp4A16BlackwellMoeParams params(moe::Backend const backend, bool const enablePdl = false) const
     {
         Nvfp4A16BlackwellMoeParams params{};
         params.dtype = moe::DecodeDtype::kFP16;
         params.backend = backend;
+        params.enablePdl = enablePdl;
         params.numTokens = numTokens_;
         params.numExperts = p_.numExperts;
         params.topK = p_.topK;
@@ -404,9 +405,10 @@ protected:
         }
     }
 
-    void runOnce(MoeFixture& fixture, moe::Backend const backend, cudaStream_t const stream)
+    void runOnce(
+        MoeFixture& fixture, moe::Backend const backend, cudaStream_t const stream, bool const enablePdl = false)
     {
-        Nvfp4A16BlackwellMoeParams const params = fixture.params(backend);
+        Nvfp4A16BlackwellMoeParams const params = fixture.params(backend, enablePdl);
         size_t const workspaceBytes = Nvfp4A16BlackwellMoeRunner::getWorkspaceSize(params);
         ASSERT_GT(workspaceBytes, 0U);
         DeviceBuffer workspace(workspaceBytes);
@@ -457,49 +459,88 @@ TEST_F(Nvfp4A16BlackwellMoeRunnerTest, PrefillMatchesReferenceNemotronShape)
     fixture.expectMatchesReference("prefill auto T=20 nemotron");
 }
 
+TEST_F(Nvfp4A16BlackwellMoeRunnerTest, PdlMatchesReferenceBothBackends)
+{
+    // Every kernel is launched with programmatic stream serialization; the
+    // griddepcontrol waits must still order routing -> layout/gather -> FC1 ->
+    // FC2 (and the reduces) on both paths and shapes.
+    {
+        // Decode is deterministic, so PDL off and on must agree bit for bit.
+        MoeFixture fixture(kSmall, 1, 41);
+        runOnce(fixture, moe::Backend::kAuto, nullptr, /*enablePdl=*/false);
+        std::vector<half> const withoutPdl = fixture.downloadOutput();
+        runOnce(fixture, moe::Backend::kAuto, nullptr, /*enablePdl=*/true);
+        fixture.expectMatchesReference("pdl decode T=1 small");
+        std::vector<half> const withPdl = fixture.downloadOutput();
+        ASSERT_EQ(withoutPdl.size(), withPdl.size());
+        for (size_t i = 0; i < withPdl.size(); ++i)
+        {
+            ASSERT_EQ(__half_as_ushort(withoutPdl[i]), __half_as_ushort(withPdl[i])) << "element " << i;
+        }
+    }
+    {
+        MoeFixture fixture(kSmall, 40, 42);
+        runOnce(fixture, moe::Backend::kAuto, nullptr, /*enablePdl=*/true);
+        fixture.expectMatchesReference("pdl prefill T=40 small");
+    }
+    {
+        MoeFixture fixture(kNemotron, 1, 43);
+        runOnce(fixture, moe::Backend::kAuto, nullptr, /*enablePdl=*/true);
+        fixture.expectMatchesReference("pdl decode T=1 nemotron");
+    }
+    {
+        MoeFixture fixture(kNemotron, 20, 44);
+        runOnce(fixture, moe::Backend::kAuto, nullptr, /*enablePdl=*/true);
+        fixture.expectMatchesReference("pdl prefill T=20 nemotron");
+    }
+}
+
 TEST_F(Nvfp4A16BlackwellMoeRunnerTest, CudaGraphReplayMatchesEager)
 {
-    for (int32_t const numTokens : {1, 24})
-    {
-        MoeFixture fixture(kSmall, numTokens, 30 + numTokens);
-        cudaStream_t stream{};
-        ASSERT_CUDA(cudaStreamCreate(&stream));
-        Nvfp4A16BlackwellMoeParams const params = fixture.params(moe::Backend::kAuto);
-        size_t const workspaceBytes = Nvfp4A16BlackwellMoeRunner::getWorkspaceSize(params);
-        DeviceBuffer workspace(workspaceBytes);
-        // Uncaptured warmup (module load) as the plugin's onShapeChange does.
-        ASSERT_CUDA(Nvfp4A16BlackwellMoeRunner::prepare(params, stream));
-        fixture.zeroOutput();
-        ASSERT_CUDA(Nvfp4A16BlackwellMoeRunner::run(params, workspace.ptr, workspaceBytes, stream));
-        ASSERT_CUDA(cudaStreamSynchronize(stream));
-        std::vector<half> const eager = fixture.downloadOutput();
-
-        cudaGraph_t graph{};
-        cudaGraphExec_t graphExec{};
-        ASSERT_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-        ASSERT_CUDA(Nvfp4A16BlackwellMoeRunner::run(params, workspace.ptr, workspaceBytes, stream));
-        ASSERT_CUDA(cudaStreamEndCapture(stream, &graph));
-        ASSERT_CUDA(cudaGraphInstantiate(&graphExec, graph, 0));
-        for (int32_t replay = 0; replay < 3; ++replay)
+    for (bool const enablePdl : {false, true})
+        for (int32_t const numTokens : {1, 24})
         {
+            MoeFixture fixture(kSmall, numTokens, 30 + numTokens);
+            cudaStream_t stream{};
+            ASSERT_CUDA(cudaStreamCreate(&stream));
+            // PDL launches are captured as programmatic graph edges.
+            Nvfp4A16BlackwellMoeParams const params = fixture.params(moe::Backend::kAuto, enablePdl);
+            size_t const workspaceBytes = Nvfp4A16BlackwellMoeRunner::getWorkspaceSize(params);
+            DeviceBuffer workspace(workspaceBytes);
+            // Uncaptured warmup (module load) as the plugin's onShapeChange does.
+            ASSERT_CUDA(Nvfp4A16BlackwellMoeRunner::prepare(params, stream));
             fixture.zeroOutput();
-            ASSERT_CUDA(cudaGraphLaunch(graphExec, stream));
+            ASSERT_CUDA(Nvfp4A16BlackwellMoeRunner::run(params, workspace.ptr, workspaceBytes, stream));
             ASSERT_CUDA(cudaStreamSynchronize(stream));
-            fixture.expectMatchesReference("graph replay");
-            std::vector<half> const replayed = fixture.downloadOutput();
-            double maxDiff = 0.0;
-            for (size_t i = 0; i < eager.size(); ++i)
+            std::vector<half> const eager = fixture.downloadOutput();
+
+            cudaGraph_t graph{};
+            cudaGraphExec_t graphExec{};
+            ASSERT_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+            ASSERT_CUDA(Nvfp4A16BlackwellMoeRunner::run(params, workspace.ptr, workspaceBytes, stream));
+            ASSERT_CUDA(cudaStreamEndCapture(stream, &graph));
+            ASSERT_CUDA(cudaGraphInstantiate(&graphExec, graph, 0));
+            for (int32_t replay = 0; replay < 3; ++replay)
             {
-                maxDiff = std::max(
-                    maxDiff, std::fabs(static_cast<double>(__half2float(eager[i])) - __half2float(replayed[i])));
+                fixture.zeroOutput();
+                ASSERT_CUDA(cudaGraphLaunch(graphExec, stream));
+                ASSERT_CUDA(cudaStreamSynchronize(stream));
+                fixture.expectMatchesReference(enablePdl ? "graph replay (pdl)" : "graph replay");
+                std::vector<half> const replayed = fixture.downloadOutput();
+                double maxDiff = 0.0;
+                for (size_t i = 0; i < eager.size(); ++i)
+                {
+                    maxDiff = std::max(
+                        maxDiff, std::fabs(static_cast<double>(__half2float(eager[i])) - __half2float(replayed[i])));
+                }
+                // Decode is deterministic; prefill FC2 scatter-adds in a data-dependent order (fp16 ulps).
+                EXPECT_LT(maxDiff, numTokens <= moe::kDecodeMaxTokens ? 1e-6 : 0.05)
+                    << "T=" << numTokens << " pdl=" << enablePdl;
             }
-            // Decode is deterministic; prefill FC2 scatter-adds in a data-dependent order (fp16 ulps).
-            EXPECT_LT(maxDiff, numTokens <= moe::kDecodeMaxTokens ? 1e-6 : 0.05) << "T=" << numTokens;
+            ASSERT_CUDA(cudaGraphExecDestroy(graphExec));
+            ASSERT_CUDA(cudaGraphDestroy(graph));
+            ASSERT_CUDA(cudaStreamDestroy(stream));
         }
-        ASSERT_CUDA(cudaGraphExecDestroy(graphExec));
-        ASSERT_CUDA(cudaGraphDestroy(graph));
-        ASSERT_CUDA(cudaStreamDestroy(stream));
-    }
 }
 
 TEST(Nvfp4A16BlackwellMoeDispatchPolicyTest, LocksSealedPolicy)

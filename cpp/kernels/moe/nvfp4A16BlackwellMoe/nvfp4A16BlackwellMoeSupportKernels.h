@@ -36,7 +36,7 @@ namespace nvfp4_a16_blackwell_moe
 //! Writes topkIndices[T, topK] and topkWeights[T, topK]. numExperts <= 512.
 cudaError_t launchSigmoidTopkRoute(float const* logits, float const* correctionBias, int32_t numTokens,
     int32_t numExperts, int32_t topK, bool normTopkProb, float routedScalingFactor, int32_t* topkIndices,
-    float* topkWeights, cudaStream_t stream);
+    float* topkWeights, bool enablePdl, cudaStream_t stream);
 
 //! Expert-contiguous, tile-padded layout of the numSlots = T * topK routed rows
 //! (single CTA): permutedIdx[r] = token * topK + k or -1 for a pad row (rows of
@@ -46,7 +46,7 @@ cudaError_t launchSigmoidTopkRoute(float const* logits, float const* correctionB
 //! deterministic; every consumer is order independent. Buffers must hold
 //! numSlots + numExperts * (tokenTile - 1) rows and the matching tile count.
 cudaError_t launchBuildTileLayout(int32_t const* topkIndices, int32_t numSlots, int32_t numExperts, int32_t tokenTile,
-    int32_t* permutedIdx, int32_t* tileGroupIdx, int32_t* numValidTiles, cudaStream_t stream);
+    int32_t* permutedIdx, int32_t* tileGroupIdx, int32_t* numValidTiles, bool enablePdl, cudaStream_t stream);
 
 //! Build the permuted, expert-contiguous, tile-padded activation buffer the
 //! grouped GEMM reads, and zero the token output the FC2 scatter-add
@@ -61,7 +61,7 @@ cudaError_t launchBuildTileLayout(int32_t const* topkIndices, int32_t numSlots, 
 //! blocks zero output rows.
 cudaError_t launchGatherPermutedRows(DecodeDtype dtype, void const* hiddenStates, int32_t const* permutedIdx,
     int32_t const* numValidTiles, int32_t tokenTile, int32_t topK, int32_t hiddenSize, int32_t numTokens,
-    int64_t maxRowsPadded, void* permutedActivations, void* output, cudaStream_t stream);
+    int64_t maxRowsPadded, void* permutedActivations, void* output, bool enablePdl, cudaStream_t stream);
 
 } // namespace nvfp4_a16_blackwell_moe
 } // namespace kernel

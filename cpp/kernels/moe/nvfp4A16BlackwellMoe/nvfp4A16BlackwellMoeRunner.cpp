@@ -17,6 +17,7 @@
 
 #include "nvfp4A16BlackwellMoeRunner.h"
 
+#include "common/cudaMacros.h"
 #include "common/cudaUtils.h"
 #include "common/tensor.h"
 #include "kernels/moe/fp4SupportKernels/buildLayout.h"
@@ -83,15 +84,24 @@ int32_t decodeFc1SplitK(Nvfp4A16BlackwellMoeParams const& p) noexcept
     return std::max<int32_t>(1, std::min<int32_t>(requested, p.hiddenSize / nvfp4_a16_blackwell::kKTile));
 }
 
+//! Effective PDL mode: the request from the plugin (EDGELLM_ENABLE_PDL) gated by
+//! toolchain support.  The kernels are SM110-only, so no SM gate is needed.
+constexpr bool usePdl(Nvfp4A16BlackwellMoeParams const& p) noexcept
+{
+    return p.enablePdl && SUPPORTS_PROGRAMMATIC_DEPENDENT_LAUNCH != 0;
+}
+
 //! Sigmoid top-k routing into topkIndices / topkWeights: the warp-per-token fast
 //! path for the ungrouped contract (Nemotron), the shared grouped kernel otherwise.
+//! The shared kernel has no griddepcontrol wait, so it is launched without the
+//! PDL attribute (the following kernel's wait still orders it correctly).
 cudaError_t launchRouting(Nvfp4A16BlackwellMoeParams const& p, int32_t* const topkIndices, float* const topkWeights,
     cudaStream_t const stream) noexcept
 {
     if (p.nGroup == 1 && p.numExperts <= 512)
     {
         return moe::launchSigmoidTopkRoute(p.routerLogits, p.correctionBias, p.numTokens, p.numExperts, p.topK,
-            p.normTopkProb, p.routedScalingFactor, topkIndices, topkWeights, stream);
+            p.normTopkProb, p.routedScalingFactor, topkIndices, topkWeights, usePdl(p), stream);
     }
     try
     {
@@ -247,6 +257,7 @@ struct GroupedArgs
     int32_t numTokens{0};
     int32_t topK{0};
     int32_t maxActiveClusters{0};
+    int32_t enablePdl{0};
 };
 
 template <auto Loader, auto Unloader, auto Wrapper, typename Module>
@@ -265,7 +276,7 @@ cudaError_t launchGrouped(
         const_cast<void*>(a.blockScales), const_cast<float*>(a.globalScales), a.output,
         const_cast<int32_t*>(a.tileGroupIdx), const_cast<int32_t*>(a.numValidTiles),
         const_cast<int32_t*>(a.permutedIdx), const_cast<float*>(a.topkWeights), a.numRowsPadded, a.activationLd,
-        a.outFeatures, a.inFeatures, a.numExperts, a.numTokens, a.topK, a.maxActiveClusters, stream);
+        a.outFeatures, a.inFeatures, a.numExperts, a.numTokens, a.topK, a.maxActiveClusters, a.enablePdl, stream);
     return result == 0 ? cudaSuccess : cudaErrorUnknown;
 }
 
@@ -393,7 +404,7 @@ cudaError_t runPrefill(
             err = moe::launchBuildTileLayout(reinterpret_cast<int32_t const*>(ws + l.topkIndices), slots, p.numExperts,
                 l.tokenTile, reinterpret_cast<int32_t*>(ws + l.permutedIdx),
                 reinterpret_cast<int32_t*>(ws + l.tileGroupIdx), reinterpret_cast<int32_t*>(ws + l.numValidTiles),
-                stream);
+                usePdl(p), stream);
             if (err != cudaSuccess)
             {
                 return err;
@@ -417,7 +428,7 @@ cudaError_t runPrefill(
         err = moe::launchGatherPermutedRows(p.dtype, p.hiddenStates,
             reinterpret_cast<int32_t const*>(ws + l.permutedIdx),
             reinterpret_cast<int32_t const*>(ws + l.numValidTiles), l.tokenTile, p.topK, p.hiddenSize, p.numTokens,
-            l.maxRowsPadded, ws + l.permutedActivations, p.output, stream);
+            l.maxRowsPadded, ws + l.permutedActivations, p.output, usePdl(p), stream);
         if (err != cudaSuccess)
         {
             return err;
@@ -442,6 +453,7 @@ cudaError_t runPrefill(
         fc1.numTokens = p.numTokens;
         fc1.topK = p.topK;
         fc1.maxActiveClusters = gMaxActiveClusters;
+        fc1.enablePdl = usePdl(p) ? 1 : 0;
         err = launchFc1(tile, fc1, stream);
         if (err != cudaSuccess)
         {
@@ -491,6 +503,7 @@ cudaError_t runDecode(
     d.fc2SplitK = std::min<int32_t>(moe::kDecodeFc2SplitK, p.interSize / nvfp4_a16_blackwell::kKTile);
     d.fc1Partials = d.fc1SplitK > 1 ? reinterpret_cast<float*>(ws + l.fc1Partials) : nullptr;
     d.fc2Partials = d.fc2SplitK > 1 ? reinterpret_cast<float*>(ws + l.fc2Partials) : nullptr;
+    d.enablePdl = usePdl(p);
     // Routing runs as its own (tiny) kernel: fusing it into every FC1 CTA cost
     // 131 registers, one CTA per SM and ~40% of FC1's streaming bandwidth.
     cudaError_t err = launchRouting(p, d.topkIndices, d.topkWeights, stream);
