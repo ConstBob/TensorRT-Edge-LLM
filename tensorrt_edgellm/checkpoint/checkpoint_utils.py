@@ -1102,20 +1102,27 @@ def write_runtime_artifacts(model: "CausalLM",
     if root_cfg.get("vision_config"):
         cfg_json["vision_config"] = root_cfg["vision_config"]
     # Propagate eos_token_id so the C++ runtime can stop on any EOS
-    # token (e.g. Gemma4 uses [1, 106]). Check config.json first,
-    # then fall back to generation_config.json (some models only set
-    # eos_token_id there).
-    eos = root_cfg.get("eos_token_id")
-    if eos is None and model_dir:
+    # token (e.g. Gemma4 uses [1, 106]). Union config.json with
+    # generation_config.json: HF generate stops on the generation_config
+    # set, which may extend the model config's single EOS (e.g. HunYuan
+    # adds <|extra_5|> alongside <|eos|>), and some models only set
+    # eos_token_id in one of the two files.
+    def _eos_ids(value) -> "list[int]":
+        if isinstance(value, list):
+            return [int(x) for x in value]
+        if isinstance(value, int):
+            return [value]
+        return []
+
+    eos_ids = _eos_ids(root_cfg.get("eos_token_id"))
+    if model_dir:
         gen_cfg_path = os.path.join(model_dir, "generation_config.json")
         if os.path.exists(gen_cfg_path):
             with open(gen_cfg_path) as _gf:
                 gen_cfg = json.load(_gf)
-            eos = gen_cfg.get("eos_token_id")
-    if isinstance(eos, list):
-        cfg_json["eos_token_id"] = [int(x) for x in eos]
-    elif isinstance(eos, int):
-        cfg_json["eos_token_id"] = [eos]
+            eos_ids += _eos_ids(gen_cfg.get("eos_token_id"))
+    if eos_ids:
+        cfg_json["eos_token_id"] = list(dict.fromkeys(eos_ids))
 
     with open(cfg_path, "w") as f:
         json.dump(cfg_json, f, indent=2)

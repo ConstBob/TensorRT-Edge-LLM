@@ -103,6 +103,15 @@ FAMILIES: Tuple[ModelFamily, ...] = (
         },
     ),
     ModelFamily(
+        "hunyuan_v1_dense",
+        {"hunyuan_v1_dense": _set(Component.LLM)},
+        {
+            Component.LLM:
+            _component("hunyuan_v1_dense.modeling_hunyuan_v1_dense",
+                       "HunYuanDenseV1ForCausalLM")
+        },
+    ),
+    ModelFamily(
         "qwen3_moe",
         {"qwen3_moe": _set(Component.LLM)},
         {

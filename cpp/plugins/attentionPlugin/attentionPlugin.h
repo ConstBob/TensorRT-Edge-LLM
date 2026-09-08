@@ -187,6 +187,9 @@ protected:
     //! Whether the fused per-head q_norm / k_norm RMSNorm is enabled. When set, the q/k gamma
     //! engine-weight constants are wired as optional plugin inputs right after the required ones.
     int32_t mEnableQKNorm{};
+    //! QK-norm order relative to RoPE: 0 = norm then rotate (Qwen3 convention),
+    //! 1 = rotate then norm (HunYuan V1). Meaningful only when mEnableQKNorm.
+    int32_t mQKNormPostRope{};
     //! Whether this layer reads K/V from a donated (shared) cache: the packed input carries
     //! Q only [B, S, Hq*D] and the plugin skips the KV-cache write.
     int32_t mEnableKVShared{};

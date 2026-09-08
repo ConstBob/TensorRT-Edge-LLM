@@ -42,6 +42,7 @@ def attention(
     q_norm_gamma: Optional[Tensor] = None,
     k_norm_gamma: Optional[Tensor] = None,
     rms_norm_eps: float = 1e-6,
+    qk_norm_post_rope: bool = False,
     attention_scale: Optional[float] = None,
     skip_softmax_scale_factor: float = 0.0,
     enable_kv_shared: bool = False,
@@ -67,6 +68,8 @@ def attention(
     enable_qk_norm = q_norm_gamma is not None
     if enable_qk_norm and enable_kv_shared:
         raise ValueError("QK normalization is not supported with shared KV")
+    if qk_norm_post_rope and not enable_qk_norm:
+        raise ValueError("qk_norm_post_rope requires Q/K norm gammas")
     if vision_block_ids is not None and attention_mask is not None:
         raise ValueError(
             "vision-block attention and tree attention are mutually exclusive")
@@ -91,6 +94,11 @@ def attention(
         attributes["attention_scale"] = attention_scale
     if enable_qk_norm:
         attributes["rms_norm_eps"] = rms_norm_eps
+    if qk_norm_post_rope:
+        # QK-norm order: rotate then norm (HunYuan V1). Emitted only when set so
+        # norm-then-rotate families (Qwen3) keep their exact field set; the
+        # plugin defaults the missing field to 0.
+        attributes["qk_norm_post_rope"] = 1
     inputs = [
         qkv, past_kv, context_lengths, rope_cos_sin, kvcache_start_index,
         kv_page_table

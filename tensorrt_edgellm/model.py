@@ -636,6 +636,9 @@ class AutoModel:
                 # dense Qwen3 (default CausalLM). Dense models use the Transformer's
                 # dflash_target_layer_ids parameter to collect target-layer hidden states.
                 model_class = _MODEL_REGISTRY.get(config.model_type, CausalLM)
+                if (key_remap is None
+                        and config.model_type == "hunyuan_v1_dense"):
+                    key_remap = _hunyuan_key_remap
 
         # 4-layer numeric validation: truncate to the first N decoder
         # layers.  The whole pipeline is config-driven (the Transformer builds
@@ -930,6 +933,17 @@ def _resolve_model_variant(config: ModelConfig,
     if eagle_base:
         return "eagle_base"
     return "llm"
+
+
+def _hunyuan_key_remap(key: str) -> "str | None":
+    """Remap HunYuan V1 checkpoint keys to the default CausalLM module tree.
+
+    HunYuan names its per-head QK norms ``query_layernorm`` / ``key_layernorm``
+    where the default :class:`Attention` module uses ``q_norm`` / ``k_norm``.
+    """
+    key = key.replace(".self_attn.query_layernorm.", ".self_attn.q_norm.")
+    key = key.replace(".self_attn.key_layernorm.", ".self_attn.k_norm.")
+    return key
 
 
 def _eagle3_key_remap(key: str) -> "str | None":

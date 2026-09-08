@@ -137,6 +137,9 @@ def attention_plugin(
     rms_norm_eps: float = 1e-6,
     # Default 0 so torch.export strips the kwarg for non-qk_norm models.
     enable_qk_norm: int = 0,
+    # QK-norm order: 0 = norm then RoPE (Qwen3), 1 = RoPE then norm (HunYuan V1).
+    # Only meaningful when enable_qk_norm=1. Default 0 so torch.export strips it.
+    qk_norm_post_rope: int = 0,
     # Whether this layer reads K/V from a donated (shared) cache. Ordinary full-cache
     # and spec layers carry Q only. Runtime-selectable SWA consumers also carry the
     # current donor K/V for bounded prefill. Default 0 for normal layers.
@@ -258,6 +261,7 @@ def _(
     k_norm_gamma=None,
     rms_norm_eps=1e-6,
     enable_qk_norm=0,
+    qk_norm_post_rope=0,
     enable_kv_shared=0,
     skip_softmax_scale=None,
     swa_kv_cache_mode=None,

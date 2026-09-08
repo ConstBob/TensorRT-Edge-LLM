@@ -371,6 +371,7 @@ std::string formatRopeConfig(RopeConfig const& config)
 RopeConfig collectRopeConfig(nlohmann::json const& config)
 {
     RopeConfig ropeConfig{};
+    float dynamicNtkAlpha = 0.0F;
 
     // Check for explicit use_rope flag (set by hybrid model export)
     if (config.contains("use_rope") && config["use_rope"].is_boolean() && !config["use_rope"].get<bool>())
@@ -418,6 +419,13 @@ RopeConfig collectRopeConfig(nlohmann::json const& config)
             else if (ropeTypeStr == "dynamic")
             {
                 ropeConfig.type = RopeType::kDynamic;
+                // HunYuan V1 DynamicNTKAlpha: "dynamic" with an "alpha" field statically
+                // rescales the base (applied after rope_theta detection below).
+                auto alphaIt = ropeScalingIt->find("alpha");
+                if (alphaIt != ropeScalingIt->end() && alphaIt->is_number())
+                {
+                    dynamicNtkAlpha = alphaIt->get<float>();
+                }
             }
             else if (ropeTypeStr == "longrope")
             {
@@ -580,6 +588,27 @@ RopeConfig collectRopeConfig(nlohmann::json const& config)
     else
     {
         LOG_WARNING("rope_theta is not specified in the model config, using default value: %f", ropeConfig.rotaryTheta);
+    }
+
+    // DynamicNTKAlpha (HunYuan V1): unlike HF's factor-based dynamic NTK, the alpha variant
+    // rescales the base once, independent of sequence length:
+    //   base = rope_theta * alpha^(head_dim / (head_dim - 2))
+    if (dynamicNtkAlpha > 0.0F)
+    {
+        float dim = 0.0F;
+        if (config.contains("head_dim"))
+        {
+            dim = config["head_dim"].get<float>();
+        }
+        else if (config.contains("hidden_size") && config.contains("num_attention_heads")
+            && config["num_attention_heads"].get<float>() > 0.0F)
+        {
+            dim = config["hidden_size"].get<float>() / config["num_attention_heads"].get<float>();
+        }
+        check::check(dim > 2.0F,
+            "rope_scaling.alpha requires head_dim > 2 (from head_dim, or hidden_size / num_attention_heads).");
+        ropeConfig.rotaryTheta *= std::pow(dynamicNtkAlpha, dim / (dim - 2.0F));
+        LOG_INFO("DynamicNTKAlpha RoPE: alpha=%f rescales base to %f", dynamicNtkAlpha, ropeConfig.rotaryTheta);
     }
 
     // Detect MaxPositionEmbeddings

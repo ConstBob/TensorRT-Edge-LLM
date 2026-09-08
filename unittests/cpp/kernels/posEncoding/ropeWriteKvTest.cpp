@@ -732,8 +732,10 @@ void BenchmarkRopeWriteKv(
 //! Covers non-power-of-2 lane counts (headDim=96/80 -> ghost-lane padding) and tail tokens
 //! (totalNumTokens not a multiple of tokens-per-CTA), which must join the warp collectives
 //! without storing anything. Reference: per-head RMSNorm + this file's RoPE reference.
+//! With postRopeNorm (HunYuan V1 order), the reference rotates first and normalizes the
+//! rotated head.
 void TestRopePackedFusedNorm(int32_t const batchSize, AttnParams const& attnParams, int32_t const kvCacheCapacity,
-    int32_t const qSeqLen, bool const scramblePages = false)
+    int32_t const qSeqLen, bool const scramblePages = false, bool const postRopeNorm = false)
 {
     cudaStream_t stream{nullptr};
 
@@ -796,7 +798,7 @@ void TestRopePackedFusedNorm(int32_t const batchSize, AttnParams const& attnPara
 
     launchApplyRopeFromPackedToSplit(cosSinCacheTensor, std::nullopt, std::nullopt, packedTensor, qScratchTensor,
         kvCacheTensor, 1.0f, 1.0f, stream, pageTableTensor.dataPointer<int32_t>(), maxPagesPerSeq, nullptr, nullptr,
-        nullptr, 1.0f, qGammaTensor.dataPointer<half>(), kGammaTensor.dataPointer<half>(), rmsEps);
+        nullptr, 1.0f, qGammaTensor.dataPointer<half>(), kGammaTensor.dataPointer<half>(), rmsEps, postRopeNorm);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     auto const qOut = copyDeviceToHost<half>(qScratchTensor);
@@ -858,8 +860,13 @@ void TestRopePackedFusedNorm(int32_t const batchSize, AttnParams const& attnPara
 
             for (int32_t hq = 0; hq < numQHeads; ++hq)
             {
-                auto const normed = rmsNormHead(packedInput.data() + tokenBase + hq * headDim, qGamma);
-                auto const qRef = ropeRefCosSin(normed, 1, headDim, rotaryDim, cosVec, sinVec, permuteRope);
+                half const* const qSrc = packedInput.data() + tokenBase + hq * headDim;
+                auto const qRef = postRopeNorm
+                    ? rmsNormHead(ropeRefCosSin(std::vector<half>(qSrc, qSrc + headDim), 1, headDim, rotaryDim, cosVec,
+                                      sinVec, permuteRope)
+                                      .data(),
+                          qGamma)
+                    : ropeRefCosSin(rmsNormHead(qSrc, qGamma), 1, headDim, rotaryDim, cosVec, sinVec, permuteRope);
                 int64_t const qOffset = (static_cast<int64_t>(i) * qSeqLen + j) * numQHeads * headDim + hq * headDim;
                 for (int32_t d = 0; d < headDim; ++d)
                 {
@@ -869,8 +876,13 @@ void TestRopePackedFusedNorm(int32_t const batchSize, AttnParams const& attnPara
             }
             for (int32_t hkv = 0; hkv < numKVHeads; ++hkv)
             {
-                auto const normed = rmsNormHead(packedInput.data() + tokenBase + (numQHeads + hkv) * headDim, kGamma);
-                auto const kRef = ropeRefCosSin(normed, 1, headDim, rotaryDim, cosVec, sinVec, permuteRope);
+                half const* const kSrc = packedInput.data() + tokenBase + (numQHeads + hkv) * headDim;
+                auto const kRef = postRopeNorm
+                    ? rmsNormHead(ropeRefCosSin(std::vector<half>(kSrc, kSrc + headDim), 1, headDim, rotaryDim, cosVec,
+                                      sinVec, permuteRope)
+                                      .data(),
+                          kGamma)
+                    : ropeRefCosSin(rmsNormHead(kSrc, kGamma), 1, headDim, rotaryDim, cosVec, sinVec, permuteRope);
                 int64_t const vSrcBase = tokenBase + (numQHeads + numKVHeads + hkv) * headDim;
                 for (int32_t d = 0; d < headDim; ++d)
                 {
@@ -968,7 +980,7 @@ TEST(RopePackedRaggedPrefill, SkipsPaddingBeforePagedWrite)
     launchApplyRopeFromPackedToSplit(cosSinCacheTensor, rt::OptionalInputTensor{kvCacheEndLensTensor},
         rt::OptionalInputTensor{}, packedTensor, qScratchTensor, kvCacheTensor, 1.0F, 1.0F, stream,
         pageTableTensor.dataPointer<int32_t>(), maxPagesPerSeq, nullptr, nullptr, nullptr, 1.0F, nullptr, nullptr,
-        1e-6F, rt::OptionalInputTensor{cuQSeqLensTensor});
+        1e-6F, false, rt::OptionalInputTensor{cuQSeqLensTensor});
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
 
@@ -1058,12 +1070,12 @@ TEST(RopePackedSharedKV, ProducesScratchWithoutWritingCache)
         kWritingTensor.rawPointer(), vWritingTensor.rawPointer());
     launchApplyRopeFromPackedToSplit(cosSinCacheTensor, std::nullopt, std::nullopt, packedTensor, qReadOnlyTensor,
         readOnlyCacheTensor, 1.0F, 1.0F, stream, pageTableTensor.dataPointer<int32_t>(), maxPagesPerSeq,
-        kReadOnlyTensor.rawPointer(), vReadOnlyTensor.rawPointer(), nullptr, 1.0F, nullptr, nullptr, 1e-6F,
+        kReadOnlyTensor.rawPointer(), vReadOnlyTensor.rawPointer(), nullptr, 1.0F, nullptr, nullptr, 1e-6F, false,
         std::nullopt, false);
     bool const enablePdl = getSMVersion() >= kMIN_PDL_SM_VERSION;
     launchApplyRopeFromPackedToSplit(cosSinCacheTensor, std::nullopt, std::nullopt, packedTensor, qOnlyTensor,
         qOnlyCacheTensor, 1.0F, 1.0F, stream, pageTableTensor.dataPointer<int32_t>(), maxPagesPerSeq, nullptr, nullptr,
-        nullptr, 1.0F, nullptr, nullptr, 1e-6F, std::nullopt, false /* writeKVCache */, enablePdl);
+        nullptr, 1.0F, nullptr, nullptr, 1e-6F, false, std::nullopt, false /* writeKVCache */, enablePdl);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
 
@@ -1119,6 +1131,14 @@ TEST(RopePackedFusedNorm, Accuracy)
 TEST(RopePackedFusedNorm, ScrambledPageTableSpansPageBoundary)
 {
     TestRopePackedFusedNorm(2, {4, 2, 64, 64}, 256, 130, /*scramblePages=*/true);
+}
+
+TEST(RopePackedFusedNorm, PostRopeAccuracy)
+{
+    // HunYuan V1 order (rotate then normalize); same lane/tail coverage as Accuracy.
+    TestRopePackedFusedNorm(2, {8, 2, 128, 128}, 16, 7, /*scramblePages=*/false, /*postRopeNorm=*/true);
+    TestRopePackedFusedNorm(2, {4, 2, 96, 96}, 16, 5, /*scramblePages=*/false, /*postRopeNorm=*/true);
+    TestRopePackedFusedNorm(1, {4, 2, 80, 80}, 16, 3, /*scramblePages=*/false, /*postRopeNorm=*/true);
 }
 
 TEST(RopeWriteKvPrefill, Accuracy)

@@ -270,6 +270,14 @@ _attention_plugin_schema = OpSchema(
             required=False,
         ),
         OpSchema.Attribute(
+            name="qk_norm_post_rope",
+            type=OpSchema.AttrType.INT,
+            description=
+            "QK-norm order relative to RoPE: 0 = norm then rotate (Qwen3), "
+            "1 = rotate then norm (HunYuan V1). Ignored when enable_qk_norm=0.",
+            required=False,
+        ),
+        OpSchema.Attribute(
             name="rms_norm_eps",
             type=OpSchema.AttrType.FLOAT,
             description=

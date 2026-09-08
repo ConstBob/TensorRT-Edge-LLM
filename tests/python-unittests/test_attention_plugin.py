@@ -275,6 +275,7 @@ def compute_attention(
     q_norm_gamma: Optional[torch.Tensor] = None,
     k_norm_gamma: Optional[torch.Tensor] = None,
     rms_norm_eps: float = 1e-6,
+    qk_norm_post_rope: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Full attention with RoPE + KV cache. Returns (out, k_cache, v_cache).
 
@@ -284,6 +285,7 @@ def compute_attention(
 
     ``q_norm_gamma`` / ``k_norm_gamma`` ([head_size]) enable qk_norm: per-head
     FP32 RMSNorm applied to Q / K before RoPE (V is never normalized).
+    ``qk_norm_post_rope`` flips the order to rotate-then-normalize (HunYuan V1).
     """
     b, s = params.batch_size, params.seq_len
     Hq, Hkv, d = params.num_q_heads, params.num_kv_heads, params.head_size
@@ -296,13 +298,20 @@ def compute_attention(
     k = k.reshape(b, s, Hkv, d).transpose(1, 2)
     v = v.reshape(b, s, Hkv, d).transpose(1, 2)
 
-    if q_norm_gamma is not None:
-        q = rms_norm(q, q_norm_gamma, rms_norm_eps)
-    if k_norm_gamma is not None:
-        k = rms_norm(k, k_norm_gamma, rms_norm_eps)
+    if not qk_norm_post_rope:
+        if q_norm_gamma is not None:
+            q = rms_norm(q, q_norm_gamma, rms_norm_eps)
+        if k_norm_gamma is not None:
+            k = rms_norm(k, k_norm_gamma, rms_norm_eps)
 
     q = apply_rotary_embedding(q, cos_cache, sin_cache, position_ids)
     k = apply_rotary_embedding(k, cos_cache, sin_cache, position_ids)
+
+    if qk_norm_post_rope:
+        if q_norm_gamma is not None:
+            q = rms_norm(q, q_norm_gamma, rms_norm_eps)
+        if k_norm_gamma is not None:
+            k = rms_norm(k, k_norm_gamma, rms_norm_eps)
 
     if params.enable_fp8_kv_cache:
         qs, ks, vs = params.qkv_scales
@@ -431,6 +440,7 @@ class AttentionPluginRunner:
                  enable_tree_attention=False,
                  q_norm_gamma=None,
                  k_norm_gamma=None,
+                 qk_norm_post_rope: bool = False,
                  attention_scale: Optional[float] = None,
                  enable_kv_shared: int = 0,
                  enable_context_mask_selector: bool = False,
@@ -447,6 +457,7 @@ class AttentionPluginRunner:
         self.vision = enable_vision_block_attention
         self.q_norm_gamma = q_norm_gamma
         self.k_norm_gamma = k_norm_gamma
+        self.qk_norm_post_rope = qk_norm_post_rope
         self.attention_scale = attention_scale
         self.kv_shared = enable_kv_shared
         self.shared_current_kv = shared_current_kv
@@ -585,6 +596,8 @@ class AttentionPluginRunner:
             fields.append(pf_float32("attention_scale", self.attention_scale))
         if qk_norm:
             fields.append(pf_float32("rms_norm_eps", p.rms_norm_eps))
+            fields.append(
+                pf_int32("qk_norm_post_rope", int(self.qk_norm_post_rope)))
 
         self.runner.build(
             input_specs=input_specs,
@@ -825,6 +838,7 @@ def _run_rounds(p: AttentionParams,
                 q_prescale: float = 1.0,
                 q_norm_gamma=None,
                 k_norm_gamma=None,
+                qk_norm_post_rope: bool = False,
                 attention_scale: Optional[float] = None,
                 shuffle_pages: bool = False,
                 bounded_swa_cache: bool = False,
@@ -847,6 +861,7 @@ def _run_rounds(p: AttentionParams,
     runner = AttentionPluginRunner(p,
                                    q_norm_gamma=q_norm_gamma,
                                    k_norm_gamma=k_norm_gamma,
+                                   qk_norm_post_rope=qk_norm_post_rope,
                                    attention_scale=attention_scale,
                                    shuffle_pages=shuffle_pages,
                                    bounded_swa_cache=bounded_swa_cache,
@@ -888,18 +903,20 @@ def _run_rounds(p: AttentionParams,
                                        p.sliding_window_size, DEV) \
                 if p.sliding_window_size > 0 else None
 
-        ref_out, ref_k, ref_v = compute_attention(qkv.float(),
-                                                  ref_k,
-                                                  ref_v,
-                                                  cos,
-                                                  sin,
-                                                  position_ids,
-                                                  cache_idx,
-                                                  p,
-                                                  mask,
-                                                  q_norm_gamma=q_norm_gamma,
-                                                  k_norm_gamma=k_norm_gamma,
-                                                  rms_norm_eps=p.rms_norm_eps)
+        ref_out, ref_k, ref_v = compute_attention(
+            qkv.float(),
+            ref_k,
+            ref_v,
+            cos,
+            sin,
+            position_ids,
+            cache_idx,
+            p,
+            mask,
+            q_norm_gamma=q_norm_gamma,
+            k_norm_gamma=k_norm_gamma,
+            rms_norm_eps=p.rms_norm_eps,
+            qk_norm_post_rope=qk_norm_post_rope)
 
         # An empty cache-index binding selects the first prefill.
         input_shapes = {"kv_cache_indices": (0, )} \
@@ -2411,6 +2428,33 @@ def test_prefill_qknorm_odd_tokens():
                 rtol=1e-2,
                 q_norm_gamma=qg,
                 k_norm_gamma=kg)
+
+
+def test_prefill_qknorm_post_rope():
+    """HunYuan V1 order: rotate first, then per-head RMSNorm on the rotated Q/K."""
+    p = AttentionParams(batch_size=2, seq_len=8, is_prefill=True, **BASE)
+    gen = torch.Generator().manual_seed(1015)
+    qg, kg = _make_qk_norm_gammas(p.head_size, gen)
+    _run_rounds(p,
+                num_rounds=3,
+                atol=1e-2,
+                rtol=1e-2,
+                q_norm_gamma=qg,
+                k_norm_gamma=kg,
+                qk_norm_post_rope=True)
+
+
+def test_decode_qknorm_post_rope():
+    p = AttentionParams(batch_size=2, seq_len=1, **BASE)
+    gen = torch.Generator().manual_seed(1016)
+    qg, kg = _make_qk_norm_gammas(p.head_size, gen)
+    _run_rounds(p,
+                num_rounds=4,
+                atol=1e-2,
+                rtol=1e-2,
+                q_norm_gamma=qg,
+                k_norm_gamma=kg,
+                qk_norm_post_rope=True)
 
 
 @pytest.mark.skipif(not _fp8_available(),

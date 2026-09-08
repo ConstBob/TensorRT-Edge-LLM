@@ -80,21 +80,29 @@ def _apply_generic_token_ids(config: Dict[str, Any], root: Dict[str, Any],
             if isinstance(value, int):
                 config[runtime_key] = value
 
-    eos = root.get("eos_token_id")
-    if eos is None:
+    # Union the EOS sets from config.json and generation_config.json: HF
+    # generate stops on the generation_config set, which may extend the model
+    # config's single EOS (e.g. HunYuan adds <|extra_5|> alongside <|eos|>).
+    def _eos_ids(value) -> "list[int]":
+        if isinstance(value, list):
+            return [int(item) for item in value]
+        if isinstance(value, int):
+            return [value]
+        return []
+
+    eos_ids = _eos_ids(root.get("eos_token_id"))
+    if not eos_ids:
         runtime_config_path = os.path.join(runtime_model_dir, "config.json")
         if os.path.isfile(runtime_config_path):
             with open(runtime_config_path) as runtime_config_file:
-                eos = json.load(runtime_config_file).get("eos_token_id")
-    if eos is None:
-        generation_path = os.path.join(runtime_model_dir,
-                                       "generation_config.json")
-        if os.path.isfile(generation_path):
-            with open(generation_path) as generation_file:
-                eos = json.load(generation_file).get("eos_token_id")
-    if eos is not None:
-        config["eos_token_id"] = ([int(value) for value in eos] if isinstance(
-            eos, list) else [int(eos)])
+                eos_ids = _eos_ids(
+                    json.load(runtime_config_file).get("eos_token_id"))
+    generation_path = os.path.join(runtime_model_dir, "generation_config.json")
+    if os.path.isfile(generation_path):
+        with open(generation_path) as generation_file:
+            eos_ids += _eos_ids(json.load(generation_file).get("eos_token_id"))
+    if eos_ids:
+        config["eos_token_id"] = list(dict.fromkeys(eos_ids))
 
 
 def write_runtime_artifacts(cfg: DeviceConfig,

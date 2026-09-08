@@ -22,6 +22,7 @@
 #include "testUtils.h"
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -447,6 +448,50 @@ TEST_F(LLMEngineConfigTest, PartialRotaryFactor)
     LLMEngineConfig cfg = parseEngineConfig(path);
     // rotaryDim = headDim * partial_rotary_factor = 64 * 0.5 = 32
     EXPECT_EQ(cfg.rotaryDim, 32);
+}
+
+TEST_F(LLMEngineConfigTest, DynamicNtkAlphaRescalesRopeBase)
+{
+    // HunYuan V1 DynamicNTKAlpha: base = rope_theta * alpha^(head_dim / (head_dim - 2)).
+    Json json = makeMinimalConfig();
+    json["rope_theta"] = 10000.0F;
+    json["rope_scaling"] = {{"type", "dynamic"}, {"alpha", 1000.0F}, {"factor", 1.0F}};
+    auto const path = writeJsonToTempFile(json);
+
+    LLMEngineConfig cfg = parseEngineConfig(path);
+    EXPECT_EQ(cfg.ropeConfig.type, RopeType::kDynamic);
+    float const headDim = static_cast<float>(cfg.headDim);
+    float const expected = 10000.0F * std::pow(1000.0F, headDim / (headDim - 2.0F));
+    EXPECT_NEAR(cfg.ropeConfig.rotaryTheta / expected, 1.0F, 1e-5F);
+}
+
+TEST_F(LLMEngineConfigTest, DynamicRopeWithoutAlphaKeepsBase)
+{
+    Json json = makeMinimalConfig();
+    json["rope_theta"] = 10000.0F;
+    json["rope_scaling"] = {{"type", "dynamic"}, {"factor", 2.0F}};
+    auto const path = writeJsonToTempFile(json);
+
+    LLMEngineConfig cfg = parseEngineConfig(path);
+    EXPECT_EQ(cfg.ropeConfig.type, RopeType::kDynamic);
+    EXPECT_FLOAT_EQ(cfg.ropeConfig.rotaryTheta, 10000.0F);
+}
+
+TEST_F(LLMEngineConfigTest, DynamicNtkAlphaFallsBackToDerivedHeadDim)
+{
+    // collectRopeConfig may see configs without an explicit head_dim (e.g. per-block
+    // RoPE JSON); the alpha rescale then derives it from hidden_size / num_attention_heads.
+    Json json;
+    json["rope_theta"] = 10000.0F;
+    json["rope_scaling"] = {{"type", "dynamic"}, {"alpha", 1000.0F}};
+    json["hidden_size"] = 4096;
+    json["num_attention_heads"] = 32;
+    json["max_position_embeddings"] = 262144;
+
+    RopeConfig const ropeConfig = collectRopeConfig(json);
+    EXPECT_EQ(ropeConfig.type, RopeType::kDynamic);
+    float const expected = 10000.0F * std::pow(1000.0F, 128.0F / 126.0F);
+    EXPECT_NEAR(ropeConfig.rotaryTheta / expected, 1.0F, 1e-5F);
 }
 
 TEST_F(LLMEngineConfigTest, HybridModelFields)

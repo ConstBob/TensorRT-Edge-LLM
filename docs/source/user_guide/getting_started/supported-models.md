@@ -106,6 +106,20 @@ The model class names were checked against the upstream [Transformers model sour
 </details>
 
 <details>
+<summary><b>HunYuan V1 Dense</b></summary>
+
+HunYuan V1 dense checkpoints (`hunyuan_v1_dense`) apply the per-head QK RMSNorm after RoPE and
+use the DynamicNTKAlpha RoPE variant (`rope_scaling.type == "dynamic"` with `alpha`); both are
+handled automatically by export and runtime.
+
+**Original:**
+
+- [tencent/HY-MT1.5-7B](https://huggingface.co/tencent/HY-MT1.5-7B)
+- [tencent/Hy-MT2-1.8B](https://huggingface.co/tencent/Hy-MT2-1.8B), [tencent/Hy-MT2-7B](https://huggingface.co/tencent/Hy-MT2-7B)
+
+</details>
+
+<details>
 <summary><b>Qwen vision-language families</b></summary>
 
 **Qwen2.5-VL:**

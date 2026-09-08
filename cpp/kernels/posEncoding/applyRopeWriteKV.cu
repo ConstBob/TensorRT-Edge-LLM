@@ -230,6 +230,52 @@ __device__ __forceinline__ DVec<T> vecApplyRmsNormAndRopeNonInterleave(T const* 
     return result;
 }
 
+//! Fused non-interleaved RoPE + post-rotation RMSNorm on one head (HunYuan V1 order:
+//! rotate first, then normalize the rotated head and multiply gamma). The RMS statistic
+//! is reduced over the rotated head with the same warp-shuffle butterfly as the
+//! pre-rotation path. Ghost lanes participate only in the reduction and return data the
+//! caller must NOT store.
+template <typename T>
+__device__ __forceinline__ DVec<T> vecApplyRopeThenRmsNormNonInterleave(T const* dataPtr, T const* gammaPtr,
+    DVec<float> const& cosVec, DVec<float> const& sinVec, uint32_t const rotaryDim, uint32_t const headDim,
+    uint32_t const paddedLanesPerHead, float const rmsEps)
+{
+    uint32_t const vecOffset = threadIdx.x * DVec<T>::vec_size;
+    bool const isActiveLane = (vecOffset < headDim);
+
+    // Rotate the raw slice first; channels beyond rotaryDim pass through unchanged.
+    DVec<T> roped;
+    float partial = 0.f;
+    if (isActiveLane)
+    {
+        roped = vecApplyRopeNonInterleave(dataPtr, cosVec, sinVec, rotaryDim);
+#pragma unroll
+        for (uint32_t i = 0; i < DVec<T>::vec_size; ++i)
+        {
+            float const v = __half2float(roped[i]);
+            partial = __fmaf_rn(v, v, partial);
+        }
+    }
+    // Ghost lanes: partial stays 0; still participate in the warp-wide reduction below.
+    float const headSumSq = warpReduceHeadSumOfSquares(partial, paddedLanesPerHead);
+    float const meanSq = __fdiv_rn(headSumSq, static_cast<float>(headDim));
+    float const invRms = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(meanSq, rmsEps)));
+
+    if (isActiveLane)
+    {
+        DVec<T> gamma;
+        gamma.load(gammaPtr + vecOffset);
+#pragma unroll
+        for (uint32_t i = 0; i < DVec<T>::vec_size; ++i)
+        {
+            // Same backend-matching order as loadAndApplyRmsNorm: fp32 scale, cast to
+            // half, then half-precision gamma multiply.
+            roped[i] = __hmul(__float2half(__fmul_rn(__half2float(roped[i]), invRms)), gamma[i]);
+        }
+    }
+    return roped;
+}
+
 template <typename TCache>
 __device__ __forceinline__ void storeVec(TCache* dst, int64_t base, DVec<half> const& vec, float scaleQuantOrig)
 {
@@ -716,10 +762,10 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
     T* __restrict__ kScratch, T* __restrict__ vScratch, TCache* __restrict__ kvCache, void* __restrict__ fp8QOut,
     float const* __restrict__ cosSinCache, int32_t const* __restrict__ kvCacheEndLens,
     int32_t const* __restrict__ tokenPosIds, int32_t const* __restrict__ cuQSeqLens, T const* __restrict__ qNormGamma,
-    T const* __restrict__ kNormGamma, float rmsNormEps, float qScaleQuantOrig, float kScaleQuantOrig,
-    float vScaleQuantOrig, int32_t qSeqLen, int32_t totalNumTokens, int32_t numPages, uint32_t numQHead,
-    uint32_t numKVHead, uint32_t headDim, uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen,
-    int32_t const* __restrict__ pageTable, int32_t maxPagesPerSeq, bool writeKVCache)
+    T const* __restrict__ kNormGamma, float rmsNormEps, bool qkNormPostRope, float qScaleQuantOrig,
+    float kScaleQuantOrig, float vScaleQuantOrig, int32_t qSeqLen, int32_t totalNumTokens, int32_t numPages,
+    uint32_t numQHead, uint32_t numKVHead, uint32_t headDim, uint32_t rotaryDim, int32_t cosSinCacheBatchSize,
+    int32_t cosSinCacheSeqLen, int32_t const* __restrict__ pageTable, int32_t maxPagesPerSeq, bool writeKVCache)
 {
     // Thread mapping (same as existing kernels for proven memory coalescing):
     //   blockDim.x = headDim / vec_size  (threads per token, cover head vector)
@@ -815,8 +861,10 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
         {
             // ALL lanes (ghosts and padding tokens included) must enter uniformly — the
             // call contains a warp-wide shfl. Padding tokens' qRoped is zeroed below.
-            qRoped = vecApplyRmsNormAndRopeNonInterleave(packedQKV + packedQOffset, qNormGamma, cosVec, sinVec,
-                rotaryDim, headDim, paddedLanesPerHead, rmsNormEps);
+            qRoped = qkNormPostRope ? vecApplyRopeThenRmsNormNonInterleave(packedQKV + packedQOffset, qNormGamma,
+                                          cosVec, sinVec, rotaryDim, headDim, paddedLanesPerHead, rmsNormEps)
+                                    : vecApplyRmsNormAndRopeNonInterleave(packedQKV + packedQOffset, qNormGamma, cosVec,
+                                          sinVec, rotaryDim, headDim, paddedLanesPerHead, rmsNormEps);
             if (isPaddingToken && isActiveLane)
             {
 #pragma unroll
@@ -871,8 +919,10 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
         if (kNormGamma != nullptr)
         {
             // All lanes (including ghosts) participate in the fused-norm shfl reduction.
-            kRoped = vecApplyRmsNormAndRopeNonInterleave(packedQKV + packedKOffset, kNormGamma, cosVec, sinVec,
-                rotaryDim, headDim, paddedLanesPerHead, rmsNormEps);
+            kRoped = qkNormPostRope ? vecApplyRopeThenRmsNormNonInterleave(packedQKV + packedKOffset, kNormGamma,
+                                          cosVec, sinVec, rotaryDim, headDim, paddedLanesPerHead, rmsNormEps)
+                                    : vecApplyRmsNormAndRopeNonInterleave(packedQKV + packedKOffset, kNormGamma, cosVec,
+                                          sinVec, rotaryDim, headDim, paddedLanesPerHead, rmsNormEps);
         }
         else if (isActiveLane)
         {
@@ -942,7 +992,7 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
     rt::OptionalInputTensor tokenPosIds, rt::Tensor const& packedQKV, rt::Tensor& qScratch, rt::Tensor& kvCache,
     float kScale, float vScale, cudaStream_t stream, int32_t const* pageTable, int32_t maxPagesPerSeq,
     void* kScratchOut, void* vScratchOut, void* fp8QOut, float qScale, half const* qNormGamma, half const* kNormGamma,
-    float rmsNormEps, rt::OptionalInputTensor cuQSeqLens, bool writeKVCache, bool enablePdl)
+    float rmsNormEps, bool qkNormPostRope, rt::OptionalInputTensor cuQSeqLens, bool writeKVCache, bool enablePdl)
 {
     auto const dt = kvCache.getDataType();
     constexpr uint32_t kVEC_SIZE = DVec<half>::vec_size;
@@ -1044,15 +1094,16 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
 
         CUDA_CHECK(cudaLaunchKernelEx(&launchConfig, applyRopeFromPackedToSplitKernel<half, TCache, kEnablePdl>,
             packedPtr, qScratchPtr, kScratchPtr, vScratchPtr, kvCachePtr, fp8QOutput, cosSinCachePtr, kvCacheEndLensPtr,
-            tokenPosIdsPtr, cuQSeqLensPtr, qNormGamma, kNormGamma, rmsNormEps, qScaleOrig, kScale, vScale,
-            static_cast<int32_t>(runtimeSeqLen), static_cast<int32_t>(totalNumTokens), static_cast<int32_t>(numPages),
-            static_cast<uint32_t>(numQHeads), static_cast<uint32_t>(numKVHeads), static_cast<uint32_t>(headDim),
-            static_cast<uint32_t>(rotaryDim), static_cast<int32_t>(cosSinCacheBatchSize),
-            static_cast<int32_t>(cosSinCacheSeqLen), pageTable, maxPagesPerSeq, writeKVCache));
+            tokenPosIdsPtr, cuQSeqLensPtr, qNormGamma, kNormGamma, rmsNormEps, qkNormPostRope, qScaleOrig, kScale,
+            vScale, static_cast<int32_t>(runtimeSeqLen), static_cast<int32_t>(totalNumTokens),
+            static_cast<int32_t>(numPages), static_cast<uint32_t>(numQHeads), static_cast<uint32_t>(numKVHeads),
+            static_cast<uint32_t>(headDim), static_cast<uint32_t>(rotaryDim),
+            static_cast<int32_t>(cosSinCacheBatchSize), static_cast<int32_t>(cosSinCacheSeqLen), pageTable,
+            maxPagesPerSeq, writeKVCache));
 #else
         applyRopeFromPackedToSplitKernel<half, TCache, kEnablePdl><<<grid, block, 0, stream>>>(packedPtr, qScratchPtr,
             kScratchPtr, vScratchPtr, kvCachePtr, fp8QOutput, cosSinCachePtr, kvCacheEndLensPtr, tokenPosIdsPtr,
-            cuQSeqLensPtr, qNormGamma, kNormGamma, rmsNormEps, qScaleOrig, kScale, vScale,
+            cuQSeqLensPtr, qNormGamma, kNormGamma, rmsNormEps, qkNormPostRope, qScaleOrig, kScale, vScale,
             static_cast<int32_t>(runtimeSeqLen), static_cast<int32_t>(totalNumTokens), static_cast<int32_t>(numPages),
             static_cast<uint32_t>(numQHeads), static_cast<uint32_t>(numKVHeads), static_cast<uint32_t>(headDim),
             static_cast<uint32_t>(rotaryDim), static_cast<int32_t>(cosSinCacheBatchSize),
