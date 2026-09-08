@@ -498,6 +498,53 @@ def test_fmha_registry_rejects_unsupported_sms(sm):
         build_cutedsl.select_variants(sm, "fmha")
 
 
+_NVFP4_A16_MOE_TOKEN_TILES = (8, 16, 32, 64, 128)
+_NVFP4_A16_MOE_FUSIONS = {
+    "fc1_relu2": "relu2_store",
+    "fc2_scatter": "scatter_add"
+}
+
+
+def test_nvfp4_a16_blackwell_moe_registry_is_sm110_fp16_fixed_set():
+    """The SM110 grouped W4A16 MoE group bakes exactly {FC1, FC2} x fp16 x tn{8,16,32,64,128}."""
+    variants = build_cutedsl.select_variants(110, "nvfp4_a16_blackwell_moe")
+    assert len(variants) == len(_NVFP4_A16_MOE_FUSIONS) * len(
+        _NVFP4_A16_MOE_TOKEN_TILES)
+    assert all(variant.group == "nvfp4_a16_blackwell_moe"
+               for variant in variants)
+    assert all(variant.supported_sms == [110] for variant in variants)
+    assert all(variant.script == ("nvfp4_a16_blackwell_moe/"
+                                  "nvfp4_a16_blackwell_moe_gemm.py")
+               for variant in variants)
+    assert all(not variant.wants_target_sm for variant in variants)
+
+    configurations = set()
+    for variant in variants:
+        args = variant.script_args
+        io_dtype = args[args.index("--io_dtype") + 1]
+        token_tile = int(args[args.index("--token_tile") + 1])
+        fusion_arg = args[args.index("--fusion") + 1]
+        fusion_tag = {
+            v: k
+            for k, v in _NVFP4_A16_MOE_FUSIONS.items()
+        }[fusion_arg]
+        assert io_dtype == "fp16"
+        assert "--export_only" in args
+        assert variant.name == (
+            f"nvfp4_a16_blackwell_moe_{fusion_tag}_{io_dtype}"
+            f"_tm128_tn{token_tile}_tk64")
+        configurations.add((fusion_tag, token_tile))
+    assert configurations == {(fusion, tile)
+                              for fusion in _NVFP4_A16_MOE_FUSIONS
+                              for tile in _NVFP4_A16_MOE_TOKEN_TILES}
+
+
+@pytest.mark.parametrize("sm", [80, 87, 90, 100, 101, 120, 121])
+def test_nvfp4_a16_blackwell_moe_registry_rejects_other_sms(sm):
+    with pytest.raises(ValueError, match="No variants"):
+        build_cutedsl.select_variants(sm, "nvfp4_a16_blackwell_moe")
+
+
 @pytest.mark.parametrize("sm", _RMSNORM_SUPPORTED_SMS)
 def test_rmsnorm_registry_has_all_compile_time_variants(sm):
     variants = build_cutedsl.select_variants(sm, "rmsnorm")

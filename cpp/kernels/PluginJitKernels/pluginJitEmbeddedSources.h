@@ -29,6 +29,7 @@ enum class PluginJitProgram : uint32_t
     kXQA = 0,
     kNVFP4_A16_BLACKWELL_GEMV = 1,
     kQSA_INDEXER = 2,
+    kNVFP4_A16_BLACKWELL_MOE = 3,
 };
 
 struct PluginJitEmbeddedSources

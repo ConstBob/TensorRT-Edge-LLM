@@ -27,6 +27,8 @@ Kernel groups:
   f16_moe          — FP16 grouped FC1/FC2 MoE (Ampere / Blackwell / SM12x)
   nvfp4_moe        — split FC1/FC2 NVFP4 MoE (currently SM110/Thor only)
   nvfp4_a16_blackwell_gemm — SM110 dense NVFP4-weight FP16/BF16 GEMM
+  nvfp4_a16_blackwell_moe  — SM110 grouped (routed-MoE) NVFP4-weight FP16 GEMM:
+                     FC1 relu2-store and FC2 scatter-add variants (tn8/16/32/64/128)
   nvfp4_fused_moe  — End-to-end NvFP4 fused MoE (Blackwell GeForce)
   layernorm        — homogeneous FP16/BF16 LayerNorm for benchmarked hidden sizes
                      plus odd-H correctness coverage
@@ -100,8 +102,8 @@ class KernelVariant:
         name:          Unique identifier — used as --file_name / --function_prefix.
         group:         Logical group ("gdn", "fmha", "qsa", "f16_moe",
                        "layernorm", "nvfp4_fused_moe", "nvfp4_moe",
-                       "rmsnorm", "ssd", "nvfp4_a16_blackwell_gemm", or
-                       "gemm").
+                       "rmsnorm", "ssd", "nvfp4_a16_blackwell_gemm",
+                       "nvfp4_a16_blackwell_moe", or "gemm").
                        cmake sets CUTE_DSL_<GROUP>_ENABLED for integrated groups.
         supported_sms: Explicit SM whitelist. With --kernels ALL, only variants whose
                        supported_sms contains the detected/requested SM are compiled.
@@ -143,6 +145,8 @@ class KernelVariant:
 #   f16_moe          — FP16 grouped FC1/FC2 MoE (Ampere/Blackwell/SM12x)
 #   nvfp4_moe        — split FC1/FC2 NVFP4 MoE (currently SM110/Thor only)
 #   nvfp4_a16_blackwell_gemm — SM110 dense W4A16 TCGen5 GEMM (FP16/BF16)
+#   nvfp4_a16_blackwell_moe  — SM110 grouped W4A16 TCGen5 MoE GEMM (FP16):
+#                      FC1 relu2-store + FC2 scatter-add, one weight layout
 #   nvfp4_fused_moe  — End-to-end NvFP4 fused MoE (Blackwell GeForce)
 #   layernorm        — homogeneous FP16/BF16 LayerNorm for benchmarked hidden sizes
 #                      plus odd-H correctness coverage
@@ -1887,6 +1891,54 @@ for _io_dtype in _NVFP4_A16_BLACKWELL_DTYPES:
                 ],
             )
         )
+
+# ---------------------------------------------------------------------------
+# nvfp4_a16_blackwell_moe group — grouped (routed-MoE) W4A16 TCGen5 GEMM for
+# SM110 (Nvfp4A16BlackwellMoePlugin prefill path).
+#
+# Same mainloop and opaque weight tile as nvfp4_a16_blackwell_gemm, with the
+# expert as the L mode of the weight/scale TMA descriptors:
+#   qweight      [E, N/128, K/64, 128, 32] packed E2M1 bytes
+#   block_scales [E, N/128, K/64, 128, 4]  raw E4M3 bytes
+#   global_scale [E] fp32
+# E, N, K, the padded row count and the token count are runtime arguments.
+# Each variant bakes the fusion (FC1: relu2 + TMA store of the permuted
+# intermediate; FC2: router-weighted red.global scatter-add into [T, N]),
+# the activation dtype and the token (MMA-N) tile.  Only FP16 is baked:
+# the Nemotron 3.5 Lightning export is FP16 and the plugin rejects BF16.
+# The token tile doubles as the per-expert row padding granularity, so the
+# runner picks among these tiles by token count: small tiles (tn8/tn16) cut
+# the padding rows the GEMMs stream at 1-12 routed rows per expert, large
+# tiles amortize dequant/MMA when experts hold dozens of rows.
+# ---------------------------------------------------------------------------
+_NVFP4_A16_BLACKWELL_MOE_TOKEN_TILES = (8, 16, 32, 64, 128)
+_NVFP4_A16_BLACKWELL_MOE_DTYPES = ("fp16", )
+_NVFP4_A16_BLACKWELL_MOE_FUSIONS = (
+    ("fc1_relu2", "relu2_store"),
+    ("fc2_scatter", "scatter_add"),
+)
+
+for _fusion_tag, _fusion_arg in _NVFP4_A16_BLACKWELL_MOE_FUSIONS:
+    for _io_dtype in _NVFP4_A16_BLACKWELL_MOE_DTYPES:
+        for _token_tile in _NVFP4_A16_BLACKWELL_MOE_TOKEN_TILES:
+            KERNEL_VARIANTS.append(
+                KernelVariant(
+                    name=(f"nvfp4_a16_blackwell_moe_{_fusion_tag}_{_io_dtype}_"
+                          f"tm128_tn{_token_tile}_tk64"),
+                    group="nvfp4_a16_blackwell_moe",
+                    supported_sms=[110],
+                    script=("nvfp4_a16_blackwell_moe/"
+                            "nvfp4_a16_blackwell_moe_gemm.py"),
+                    script_args=[
+                        "--io_dtype",
+                        _io_dtype,
+                        "--token_tile",
+                        str(_token_tile),
+                        "--fusion",
+                        _fusion_arg,
+                        "--export_only",
+                    ],
+                ))
 
 
 # ---------------------------------------------------------------------------

@@ -231,7 +231,7 @@ a clean full-matrix rebuild so stale archive members cannot be retained.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--kernels GROUPS` | `ALL` | A registered group such as `f16_moe`, `fmha`, `gdn`, `gemm`, `gemm_nvfp4`, `int4_fp16_gemm`, `nvfp4_moe`, `nvfp4_fused_moe`, or `ssd`; a comma-separated list; or `ALL`. `fmha` is the attention family: the FMHA-v2 kernels plus the optimized Blackwell kernels on SM100/SM101/SM110. Variants whose `supported_sms` excludes the target SM are skipped. |
+| `--kernels GROUPS` | `ALL` | A registered group such as `f16_moe`, `fmha`, `gdn`, `gemm`, `gemm_nvfp4`, `int4_fp16_gemm`, `nvfp4_a16_blackwell_gemm`, `nvfp4_a16_blackwell_moe`, `nvfp4_moe`, `nvfp4_fused_moe`, or `ssd`; a comma-separated list; or `ALL`. `fmha` is the attention family: the FMHA-v2 kernels plus the optimized Blackwell kernels on SM100/SM101/SM110. Variants whose `supported_sms` excludes the target SM are skipped. |
 | `--gpu_arch SM[,SM...]` | auto-detected | One target GPU SM (for example `sm_100`), or an ordered comma-separated set for one runtime-dispatched artifact (for example `sm_110,sm_120`). The CuTe DSL compile architectures are derived automatically, including required Blackwell `a` suffixes. Multi-SM generation uses one worker pool and requires `--clean` when replacing an existing artifact. |
 | `--arch ARCH` | auto-detected | Target CPU arch `x86_64` or `aarch64`. If it differs from the build host, kernels are cross-compiled (target host objects). |
 | `--cuda-version VERSION` | host CUDA | Artifact CUDA flavor used to select `cu12` or `cu13` runtime objects. |
@@ -333,5 +333,6 @@ See the group-specific READMEs for kernel coverage and standalone testing:
 - `kernelSrcs/ssd_cutedsl/README.md` — Mamba2 SSD prefill
 - `kernelSrcs/gemm_cutedsl/README.md` — FP16 Talker MLP GEMM (`gemm`) and NVFP4 blockscaled GEMM (`gemm_nvfp4`)
 - `kernelSrcs/int4_fp16_gemm_cutedsl/README.md` — Ampere-floor W4A16 GEMM
+- `kernelSrcs/nvfp4_a16_blackwell_moe/README.md` — Thor (SM110) grouped W4A16 MoE GEMM for `Nvfp4A16BlackwellMoePlugin`
 - `kernelSrcs/nvfp4_moe_cutedsl/README.md` — NVFP4 MoE
 - `kernelSrcs/nvfp4_fused_moe_cutedsl/README.md` — NVFP4 fused MoE

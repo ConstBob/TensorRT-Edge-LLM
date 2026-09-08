@@ -53,6 +53,8 @@
 #   CUTE_DSL_RMSNORM_ENABLED — set when the rmsnorm group is active
 #   CUTE_DSL_NVFP4_A16_BLACKWELL_GEMM_ENABLED — set when the SM110 dense W4A16
 #                                                GEMM group is active
+#   CUTE_DSL_NVFP4_A16_BLACKWELL_MOE_ENABLED — set when the SM110 grouped W4A16
+#                                               MoE GEMM group is active
 #   CUTE_DSL_GEMM_ENABLED  — set when any gemm variant is active
 # ---------------------------------------------------------------------------
 # cmake-format: on
@@ -1097,6 +1099,38 @@ function(cute_dsl_setup)
       endif()
 
     endforeach()
+  endif()
+
+  # The SM110 grouped W4A16 MoE runner links the fixed FP16 FC1/FC2 variant set;
+  # a partially regenerated artifact must fail at configure time.
+  if("nvfp4_a16_blackwell_moe" IN_LIST _active_groups)
+    set(_nvfp4_a16_moe_tiles 8 16 32 64 128)
+    set(_nvfp4_a16_moe_found_variants)
+    set(_nvfp4_a16_moe_missing_variants)
+    foreach(_nvfp4_a16_moe_fusion fc1_relu2 fc2_scatter)
+      foreach(_nvfp4_a16_moe_tile ${_nvfp4_a16_moe_tiles})
+        set(_nvfp4_a16_moe_variant
+            "nvfp4_a16_blackwell_moe_${_nvfp4_a16_moe_fusion}_fp16_tm128_tn${_nvfp4_a16_moe_tile}_tk64"
+        )
+        list(FIND _variants "${_nvfp4_a16_moe_variant}" _nvfp4_a16_moe_idx)
+        if(NOT ${_nvfp4_a16_moe_idx} EQUAL -1)
+          list(APPEND _nvfp4_a16_moe_found_variants "${_nvfp4_a16_moe_variant}")
+        else()
+          list(APPEND _nvfp4_a16_moe_missing_variants
+               "${_nvfp4_a16_moe_variant}")
+        endif()
+      endforeach()
+    endforeach()
+    list(LENGTH _nvfp4_a16_moe_missing_variants _nvfp4_a16_moe_missing_count)
+    if(NOT _nvfp4_a16_moe_missing_count EQUAL 0)
+      message(
+        FATAL_ERROR
+          "CuTe DSL: incomplete SM110 grouped W4A16 MoE artifact set in ${_metadata}.\n"
+          "Found: ${_nvfp4_a16_moe_found_variants}\n"
+          "Missing: ${_nvfp4_a16_moe_missing_variants}\n"
+          "Regenerate the nvfp4_a16_blackwell_moe group with both fusions and all token tiles."
+      )
+    endif()
   endif()
 
   # Umbrella CUTE_DSL_GEMM_ENABLED — set if ANY gemm variant was found. Source

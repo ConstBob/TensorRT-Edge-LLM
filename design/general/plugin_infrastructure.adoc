@@ -59,6 +59,11 @@ infrastructure and conventions.
 | NVFP4 routed-expert MoE execution using the GeForce-oriented packing and kernel path.
 | GeForce NVFP4 MoE paths.
 
+| `Nvfp4A16BlackwellMoePlugin`
+| link:../concepts/components/moe/[MoE]
+| NVFP4-weight / FP16-activation routed-expert MoE for Thor SM110: tcgen05 grouped GEMM prefill and CUDA-core decode kernels over one `BLACKWELL_MOE_N128_K64_V1` weight layout.
+| Thor exports of Nemotron 3.5 Lightning; other platforms keep `Nvfp4A16MoePlugin` (Marlin).
+
 | `update_ssm_state` (`MambaPlugin`)
 | link:../concepts/components/state_space/[State space]
 | Mamba selective state-space recurrent-state update.
