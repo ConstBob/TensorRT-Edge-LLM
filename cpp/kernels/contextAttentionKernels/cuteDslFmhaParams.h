@@ -136,6 +136,29 @@ struct FmhaV2LlmParams
     int32_t const* blockEnd{};
 };
 
+//! Everything the packed-Q/O FMHA-v2 paged descriptors need, gathered once per ragged launch.
+struct FmhaV2RaggedPagedParams
+{
+    void const* qPtr{};
+    void const* pagedKVPoolPtr{};
+    int32_t const* kvCachePageList{};
+    void* oPtr{};
+    int32_t const* cuQSeqLens{};
+    int32_t const* cuKVSeqLens{};
+    int32_t totalQSeqLen{};
+    int32_t maxQSeqLen{};
+    int32_t batchSize{};
+    int32_t numQHeads{};
+    int32_t numKVHeads{};
+    int32_t headDim{};
+    int32_t numPages{};
+    int32_t maxPagesPerSeq{};
+    int32_t tokensPerPage{};
+    int32_t windowSizeLeft{};
+    float attentionScale{};
+    cudaStream_t stream{};
+};
+
 //! Everything the FMHA-v2 ViT descriptors need, gathered once per CuteDslFMHAV2Runner ViT run()
 //! call. Unlike VitFmhaParams these variants are GQA, so Q and KV head counts differ.
 struct FmhaV2VitParams
