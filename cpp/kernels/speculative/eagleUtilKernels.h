@@ -139,8 +139,8 @@ void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const&
 //! In-place compact the hidden-state buffer to keep only the accepted tokens.
 //!
 //! Updates `hiddenState` inplace from [batch, verify-tree-size, hidden-dim] to
-//! [batch, max-accept-depth, hidden-dim]. Safe because max-accept-depth << verify-tree-size,
-//! so output positions never overwrite unread input data. Layer-agnostic.
+//! [batch, max-accept-depth, hidden-dim]. Each hidden-dimension tile processes batches
+//! in order because a later batch's dense output can overlap an earlier input slab.
 //!
 //! Inputs:
 //!     acceptedIndices [GPU, Int32]: Accepted indices, shape [batch, max-depth].

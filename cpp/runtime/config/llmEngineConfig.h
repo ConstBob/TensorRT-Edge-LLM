@@ -235,8 +235,8 @@ struct LLMEngineConfig
     std::string dsparkHeadsInfoFile{};
     //! Whether the draft engine baked the contiguous-query sliding-window XQA
     //! variant, which reconstructs each query row's position as
-    //! firstQueryPosition + queryRow. Valid only for a linear proposal chain, so
-    //! DDTree drafting (draftingTopK > 1) must be rejected against such engines.
+    //! firstQueryPosition + queryRow. This describes the draft engine query ABI;
+    //! it does not gate the base engine's DDTree verification topology.
     bool dsparkContiguousQuerySwa{false};
     //! When true the anchor slot itself is a proposal and the draft query block is
     //! `block_size` wide; when false slot 0 is the bonus token, the block carries one

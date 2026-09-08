@@ -44,6 +44,7 @@ namespace
 {
 constexpr char const* kMAMBA_PLUGIN_VERSION{"1"};
 constexpr char const* kMAMBA_PLUGIN_NAME{"update_ssm_state"};
+constexpr int32_t kMAMBA_REPLAY_FORMAT_VERSION{2};
 
 // Input indices – matches the trt_edgellm::update_ssm_state ONNX op.
 // x, dt, B, C may carry an optional seq_len dimension (4D instead of 3D).
@@ -62,6 +63,10 @@ constexpr int32_t kIN_STATE_START_INDEX_IDX{9}; // [0] for cold prefill, [batch]
 // prefill/decode, length 1 == speculative verify (capture per-token intermediate states).
 constexpr int32_t kIN_SPEC_VERIFY_PHASE_MARKER_IDX{10};
 
+constexpr int32_t kIN_TREE_PARENT_IDS_IDX{11};
+constexpr int32_t kIN_TREE_DEPTHS_IDX{12};
+constexpr int32_t kNUM_DDTREE_OPTIONAL_INPUTS{2};
+
 // Output indices
 constexpr int32_t kOUT_OUTPUT_IDX{0}; // [batch, (seq_len,) nheads, dim]
 constexpr int32_t kOUT_STATE_IDX{1};  // [batch, nheads, dim, dstate]
@@ -71,14 +76,15 @@ constexpr int32_t kOUT_STATE_IDX{1};  // [batch, nheads, dim, dstate]
 constexpr int32_t kOUT_REPLAY_DA_IDX{2}; // [batch, seq_len, nheads]
 constexpr int32_t kOUT_REPLAY_U_IDX{3};  // [batch, seq_len, nheads, dim]
 constexpr int32_t kOUT_REPLAY_B_IDX{4};  // [batch, seq_len, ngroups, dstate]
+constexpr int32_t kOUT_REPLAY_DT_IDX{5}; // [batch, seq_len, nheads]
 
 // Number of inputs/outputs
 // Base I/O = 10 required inputs (through kIN_STATE_START_INDEX_IDX) + 2 required outputs.
-// Spec-verify mode adds one optional input (phase marker) and the three replay-stash outputs.
+// Spec-verify mode adds one optional input (phase marker) and the four replay-stash outputs.
 constexpr int32_t kNUM_REQUIRED_INPUTS{10};
 constexpr int32_t kNUM_SPEC_VERIFY_OPTIONAL_INPUTS{1};
 constexpr int32_t kNUM_REQUIRED_OUTPUTS{2};
-constexpr int32_t kNUM_SPEC_VERIFY_OPTIONAL_OUTPUTS{3};
+constexpr int32_t kNUM_SPEC_VERIFY_OPTIONAL_OUTPUTS{4};
 
 } // namespace
 
@@ -89,14 +95,16 @@ std::vector<PluginField> MambaPluginCreator::mPluginAttributes;
 REGISTER_TENSORRT_PLUGIN(MambaPluginCreator);
 
 MambaPlugin::MambaPlugin(std::string const& name, int32_t dim, int32_t dstate, int32_t nheads, int32_t ngroups,
-    int32_t dtSoftplus, int32_t useSpecVerifyState)
+    int32_t dtSoftplus, int32_t useSpecVerifyState, int32_t useDDTree, int32_t replayFormatVersion)
     : mLayerName(name)
     , mDim(dim)
     , mDstate(dstate)
     , mNheads(nheads)
     , mNgroups(ngroups)
     , mDtSoftplus(dtSoftplus)
-    , mUseSpecVerifyState(useSpecVerifyState)
+    , mUseSpecVerifyState(useSpecVerifyState || useDDTree)
+    , mUseDDTree(useDDTree)
+    , mReplayFormatVersion(replayFormatVersion)
 {
 }
 
@@ -104,7 +112,8 @@ MambaPlugin::~MambaPlugin() {}
 
 int32_t MambaPlugin::numInputs() const noexcept
 {
-    return kNUM_REQUIRED_INPUTS + (mUseSpecVerifyState ? kNUM_SPEC_VERIFY_OPTIONAL_INPUTS : 0);
+    return kNUM_REQUIRED_INPUTS + (mUseSpecVerifyState ? kNUM_SPEC_VERIFY_OPTIONAL_INPUTS : 0)
+        + (mUseDDTree ? kNUM_DDTREE_OPTIONAL_INPUTS : 0);
 }
 
 int32_t MambaPlugin::numOutputs() const noexcept
@@ -127,8 +136,8 @@ IPluginCapability* MambaPlugin::getCapabilityInterface(PluginCapabilityType type
 
 IPluginV3* MambaPlugin::clone() noexcept
 {
-    MambaPlugin* plugin
-        = new MambaPlugin(mLayerName, mDim, mDstate, mNheads, mNgroups, mDtSoftplus, mUseSpecVerifyState);
+    MambaPlugin* plugin = new MambaPlugin(mLayerName, mDim, mDstate, mNheads, mNgroups, mDtSoftplus,
+        mUseSpecVerifyState, mUseDDTree, mReplayFormatVersion);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
@@ -169,6 +178,7 @@ int32_t MambaPlugin::getOutputDataTypes(DataType* outputTypes, [[maybe_unused]] 
         outputTypes[kOUT_REPLAY_DA_IDX] = DataType::kFLOAT;
         outputTypes[kOUT_REPLAY_U_IDX] = DataType::kFLOAT;
         outputTypes[kOUT_REPLAY_B_IDX] = DataType::kFLOAT;
+        outputTypes[kOUT_REPLAY_DT_IDX] = DataType::kFLOAT;
     }
     return 0;
 }
@@ -209,6 +219,11 @@ int32_t MambaPlugin::getOutputShapes(DimsExprs const* inputs, [[maybe_unused]] i
         outputs[kOUT_REPLAY_B_IDX].d[1] = inputs[kIN_X_IDX].d[1];                            // seq_len
         outputs[kOUT_REPLAY_B_IDX].d[2] = inputs[kIN_B_IDX].d[inputs[kIN_B_IDX].nbDims - 2]; // ngroups
         outputs[kOUT_REPLAY_B_IDX].d[3] = inputs[kIN_STATE_IDX].d[3];                        // dstate
+
+        outputs[kOUT_REPLAY_DT_IDX].nbDims = 3;
+        outputs[kOUT_REPLAY_DT_IDX].d[0] = inputs[kIN_X_IDX].d[0];     // batch
+        outputs[kOUT_REPLAY_DT_IDX].d[1] = inputs[kIN_X_IDX].d[1];     // seq_len
+        outputs[kOUT_REPLAY_DT_IDX].d[2] = inputs[kIN_STATE_IDX].d[1]; // nheads
     }
     return 0;
 }
@@ -217,20 +232,33 @@ bool MambaPlugin::supportsFormatCombination(
     int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
     if (nbOutputs != numOutputs() || nbInputs != numInputs())
+    {
         return false;
+    }
     auto const& desc = inOut[pos].desc;
     if (desc.format != TensorFormat::kLINEAR)
+    {
         return false;
+    }
     // Optional spec-verify phase-marker input (INT32).
     if (mUseSpecVerifyState && pos == kIN_SPEC_VERIFY_PHASE_MARKER_IDX)
+    {
         return desc.type == DataType::kINT32;
+    }
+    if (mUseDDTree && (pos == kIN_TREE_PARENT_IDS_IDX || pos == kIN_TREE_DEPTHS_IDX))
+    {
+        return desc.type == DataType::kINT32;
+    }
     if (pos >= nbInputs)
     {
         // Token/state outputs follow x's type; the spec-verify replay stash (dA/u/B) is FP32.
         int32_t const outIdx = pos - nbInputs;
         if (mUseSpecVerifyState
-            && (outIdx == kOUT_REPLAY_DA_IDX || outIdx == kOUT_REPLAY_U_IDX || outIdx == kOUT_REPLAY_B_IDX))
+            && (outIdx == kOUT_REPLAY_DA_IDX || outIdx == kOUT_REPLAY_U_IDX || outIdx == kOUT_REPLAY_B_IDX
+                || outIdx == kOUT_REPLAY_DT_IDX))
+        {
             return desc.type == DataType::kFLOAT;
+        }
         return desc.type == inOut[kIN_X_IDX].desc.type;
     }
     switch (pos)
@@ -289,6 +317,21 @@ int32_t MambaPlugin::configurePlugin(DynamicPluginTensorDesc const* in, int32_t 
             static_cast<int32_t>(in[kIN_X_IDX].desc.type));
         return -1;
     }
+    if (mUseSpecVerifyState
+        && (in[kIN_SPEC_VERIFY_PHASE_MARKER_IDX].desc.type != DataType::kINT32
+            || in[kIN_SPEC_VERIFY_PHASE_MARKER_IDX].desc.dims.nbDims != 1))
+    {
+        LOG_ERROR("update_ssm_state: spec_verify_phase_marker must be 1D INT32");
+        return -1;
+    }
+    if (mUseDDTree
+        && (in[kIN_TREE_PARENT_IDS_IDX].desc.type != DataType::kINT32
+            || in[kIN_TREE_DEPTHS_IDX].desc.type != DataType::kINT32
+            || in[kIN_TREE_PARENT_IDS_IDX].desc.dims.nbDims != 2 || in[kIN_TREE_DEPTHS_IDX].desc.dims.nbDims != 2))
+    {
+        LOG_ERROR("update_ssm_state: DDTree tree_parent_ids/tree_depths must be 2D INT32");
+        return -1;
+    }
     return 0;
 }
 
@@ -327,6 +370,14 @@ int32_t MambaPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
 
     // Determine seq_len: x is [batch, nheads, dim] (3D) or [batch, seq_len, nheads, dim] (4D)
     bool const hasSeqLen = (xDesc.dims.nbDims == 4);
+    int32_t const phaseLen
+        = mUseSpecVerifyState ? static_cast<int32_t>(inputDesc[kIN_SPEC_VERIFY_PHASE_MARKER_IDX].dims.d[0]) : 0;
+    if (phaseLen < 0 || phaseLen > 1)
+    {
+        LOG_ERROR("update_ssm_state: spec_verify_phase_marker length must be 0 or 1, got %d", phaseLen);
+        return -1;
+    }
+    bool const treeActive = mUseDDTree && phaseLen > 0;
 
 #ifdef CUTE_DSL_SSD_ENABLED
     if (hasSeqLen)
@@ -397,8 +448,7 @@ int32_t MambaPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
         // MTP spec-verify: capture per-token recurrent snapshots only in the verify phase (shape-only
         // marker length 1). The scalar chunked-scan fallback below does the capture, so the CuTe DSL SSD
         // path is disabled when capturing (verify windows are small, well under the 128-token SSD floor).
-        bool const captureIntermediates
-            = mUseSpecVerifyState && static_cast<int32_t>(inputDesc[kIN_SPEC_VERIFY_PHASE_MARKER_IDX].dims.d[0]) > 0;
+        bool const captureIntermediates = mUseSpecVerifyState && phaseLen > 0;
 
 #ifdef CUTE_DSL_SSD_ENABLED
         // CuTe DSL path: chunked SSD prefill, requires seq_len >= 128.
@@ -463,15 +513,17 @@ int32_t MambaPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
                 contextLengthsOpt = std::optional(std::cref(clTensorOpt.value()));
             }
 
-            // MTP spec-verify (replay): stash per-token dA/u/B (FP32) during verify; the runtime
+            // MTP spec-verify (replay): stash per-token dA/x/B/dt (FP32) during verify; the runtime
             // reconstructs the accepted recurrent state from them afterwards. The committed state is
             // left read-only by the kernel while the stash is active.
             rt::OptionalOutputTensor replayDaOpt = std::nullopt;
             rt::OptionalOutputTensor replayUOpt = std::nullopt;
             rt::OptionalOutputTensor replayBOpt = std::nullopt;
+            rt::OptionalOutputTensor replayDtOpt = std::nullopt;
             std::optional<rt::Tensor> replayDaTensorOpt;
             std::optional<rt::Tensor> replayUTensorOpt;
             std::optional<rt::Tensor> replayBTensorOpt;
+            std::optional<rt::Tensor> replayDtTensorOpt;
             if (captureIntermediates && outputs[kOUT_REPLAY_U_IDX] != nullptr)
             {
                 replayDaTensorOpt.emplace(outputs[kOUT_REPLAY_DA_IDX], rt::Coords{batch, seqLen, mNheads},
@@ -480,14 +532,38 @@ int32_t MambaPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
                     rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
                 replayBTensorOpt.emplace(outputs[kOUT_REPLAY_B_IDX], rt::Coords{batch, seqLen, mNgroups, mDstate},
                     rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+                replayDtTensorOpt.emplace(outputs[kOUT_REPLAY_DT_IDX], rt::Coords{batch, seqLen, mNheads},
+                    rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
                 replayDaOpt = std::optional(std::ref(replayDaTensorOpt.value()));
                 replayUOpt = std::optional(std::ref(replayUTensorOpt.value()));
                 replayBOpt = std::optional(std::ref(replayBTensorOpt.value()));
+                replayDtOpt = std::optional(std::ref(replayDtTensorOpt.value()));
             }
-
-            mamba_ssm::invokeSelectiveStateUpdatePrefill(xTensor, aTensor, bTensor, cTensor, dtTensor, dtBiasOpt, dOpt,
-                std::nullopt, stateTensor, outTensor, dt_softplus, contextLengthsOpt, replayDaOpt, replayUOpt,
-                replayBOpt, stream);
+            if (treeActive)
+            {
+                PluginTensorDesc const& parentDesc = inputDesc[kIN_TREE_PARENT_IDS_IDX];
+                PluginTensorDesc const& depthDesc = inputDesc[kIN_TREE_DEPTHS_IDX];
+                if (parentDesc.dims.d[0] != batch || depthDesc.dims.d[0] != batch || parentDesc.dims.d[1] != seqLen
+                    || depthDesc.dims.d[1] != seqLen)
+                {
+                    LOG_ERROR(
+                        "update_ssm_state: DDTree metadata must have shape [batch=%d, seq_len=%d]", batch, seqLen);
+                    return -1;
+                }
+                auto treeParentIds = rt::Tensor{const_cast<void*>(inputs[kIN_TREE_PARENT_IDS_IDX]),
+                    rt::Coords{batch, seqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32};
+                auto treeDepths = rt::Tensor{const_cast<void*>(inputs[kIN_TREE_DEPTHS_IDX]), rt::Coords{batch, seqLen},
+                    rt::DeviceType::kGPU, nvinfer1::DataType::kINT32};
+                mamba_ssm::invokeSelectiveStateUpdateDDTree(xTensor, aTensor, bTensor, cTensor, dtTensor, dtBiasOpt,
+                    dOpt, stateTensor, outTensor, treeParentIds, treeDepths, dt_softplus, replayDaTensorOpt.value(),
+                    replayUTensorOpt.value(), replayBTensorOpt.value(), replayDtTensorOpt.value(), stream);
+            }
+            else
+            {
+                mamba_ssm::invokeSelectiveStateUpdatePrefill(xTensor, aTensor, bTensor, cTensor, dtTensor, dtBiasOpt,
+                    dOpt, std::nullopt, stateTensor, outTensor, dt_softplus, contextLengthsOpt, replayDaOpt, replayUOpt,
+                    replayBOpt, replayDtOpt, stream);
+            }
         }
     }
     else
@@ -519,6 +595,8 @@ PluginFieldCollection const* MambaPlugin::getFieldsToSerialize() noexcept
     mDataToSerialize.emplace_back("ngroups", &mNgroups, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("dt_softplus", &mDtSoftplus, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("use_spec_verify_state", &mUseSpecVerifyState, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("use_ddtree", &mUseDDTree, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("replay_format_version", &mReplayFormatVersion, PluginFieldType::kINT32, 1);
     mFCToSerialize.nbFields = static_cast<int32_t>(mDataToSerialize.size());
     mFCToSerialize.fields = mDataToSerialize.data();
     return &mFCToSerialize;
@@ -538,6 +616,7 @@ MambaPluginCreator::MambaPluginCreator()
     mPluginAttributes.emplace_back(PluginField("chunk_size", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("time_step_limit", nullptr, PluginFieldType::kFLOAT32, 0));
     mPluginAttributes.emplace_back(PluginField("use_spec_verify_state", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("use_ddtree", nullptr, PluginFieldType::kINT32, 1));
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();
 }
@@ -584,6 +663,14 @@ IPluginV3* MambaPluginCreator::createPlugin(
         std::optional<int32_t> dtSoftplus = parsePluginScalarField<int32_t>("dt_softplus", fc);
         // use_spec_verify_state: emit per-token intermediate recurrent states for MTP verification (0=off).
         std::optional<int32_t> useSpecVerifyState = parsePluginScalarField<int32_t>("use_spec_verify_state", fc);
+        std::optional<int32_t> useDDTree = parsePluginScalarField<int32_t>("use_ddtree", fc);
+        std::optional<int32_t> replayFormatVersion = parsePluginScalarField<int32_t>("replay_format_version", fc);
+        int32_t const effectiveUseSpecVerifyState = useSpecVerifyState.value_or(0) || useDDTree.value_or(0);
+        int32_t const effectiveReplayFormatVersion
+            = replayFormatVersion.value_or(phase == TensorRTPhase::kBUILD ? kMAMBA_REPLAY_FORMAT_VERSION : 0);
+        ELLM_CHECK(!effectiveUseSpecVerifyState || effectiveReplayFormatVersion == kMAMBA_REPLAY_FORMAT_VERSION,
+            "update_ssm_state: incompatible serialized spec-replay format; rebuild the engine with the current "
+            "TensorRT Edge-LLM plugin.");
 
         if (phase == TensorRTPhase::kBUILD)
         {
@@ -613,7 +700,8 @@ IPluginV3* MambaPluginCreator::createPlugin(
         }
 
         auto* plugin = new MambaPlugin(std::string(name), dim.value_or(0), dstate.value_or(0), nheads.value_or(0),
-            ngroups.value_or(0), dtSoftplus.value_or(1), useSpecVerifyState.value_or(0));
+            ngroups.value_or(0), dtSoftplus.value_or(1), useSpecVerifyState.value_or(0), useDDTree.value_or(0),
+            effectiveReplayFormatVersion);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }

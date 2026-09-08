@@ -55,7 +55,7 @@ public:
     DecodingStrategyCapabilities capabilities() const noexcept override
     {
         return {/*.ownsBaseVerificationCudaGraphs=*/false, /*.supportsLosslessSampling=*/true,
-            /*.maxSamplingSupport=*/0};
+            /*.maxSamplingSupport=*/0, /*.fallbackToVanillaForNonGreedySampling=*/mUseTree};
     }
 
     DecodingKvHeadroom requiredKvHeadroom() const override;
@@ -150,16 +150,13 @@ private:
     //! Last accepted token per batch [maxBatch] INT32 (GPU)
     Tensor mLastAcceptedTokens;
 
-    //! DDTree drafting state (draftingTopK > 1): the fanout happens in ddtreeBuild
-    //! after drafting, on the stacked per-depth Markov-corrected logits.
-    Tensor mStackedMarkovLogits;  //!< [maxBatch, blockSize+1, vocabSize] FP32, row 0 = root placeholder
+    //! Tree drafting state.
+    Tensor mStackedMarkovLogits;  //!< [maxBatch, blockSize+1, vocabSize] FP32, row 0 is a root placeholder
     Tensor mTreeTokenIds;         //!< [maxBatch, verifySize] INT32 flattened tree token ids
-    Tensor mTreeNodeDepths;       //!< [maxBatch, verifySize] INT32 node depths (root = 0)
-    Tensor mTreeParentIds;        //!< [maxBatch, verifySize] INT32 parent node indices
     Tensor mTreeNodeScores;       //!< [maxBatch, verifySize] FP32 prefix log-prob scores
     Tensor mValidCounts;          //!< [maxBatch] INT32 valid node counts
     Tensor mVerifyTreeMask;       //!< [maxBatch, verifySize, verifySize] INT8 unpacked accept mask
-    Tensor mTreeBuildWorkspace;   //!< ddtreeBuild scratch
+    Tensor mTreeBuildWorkspace;   //!< ddtreeBuild scratch for scheduler and biased requests
     Tensor mAcceptedTokenIndices; //!< [maxBatch, verifySize] INT32 accepted verify-node indices
 
     //! DSpark Markov/confidence sidecars
@@ -172,14 +169,14 @@ private:
     Tensor mConfidenceBias;    //!< [1] FP16
     bool mHasConfidenceHead{false};
     bool mConfidenceHeadWithMarkov{false};
-    bool mUseFp8W2{false}; //!< EDGELLM_DSPARK_W2_FP8=1: FP8 E4M3 markov_w2 in the fused greedy path
+    bool mUseFp8W2{false}; //!< EDGELLM_DSPARK_W2_FP8=1: FP8 E4M3 markov_w2 for greedy drafting
 
     //! System prompt KV cache for draft target KV
     hash_utils::HashMap<SystemPromptCacheKey, SystemPromptKVCache> mSystemPromptKVCacheDraft;
 
     //! DSpark-specific parameters
-    bool mUseTree{false};          //!< draftingTopK > 1 selects DDTree drafting
-    bool mUseTreeScheduler{false}; //!< scheduler!=off in tree mode: log(conf) bias on ddtree growth scores
+    bool mUseTree{false};          //!< draftingTopK > 1 selects tree drafting
+    bool mUseTreeScheduler{false}; //!< threshold scheduling uses confidence-guided ddtreeBuild
     int32_t mProposalLen{7};
     int32_t mVerifyLen{8};
     int32_t mDraftBlockLen{0};

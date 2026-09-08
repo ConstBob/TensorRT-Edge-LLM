@@ -83,7 +83,7 @@ void dsparkComputeConfidenceAndSPSProposalLengths(rt::Tensor const& draftHiddenS
 /*!
  * @brief Compute DSpark per-step acceptance confidence scores only (no scheduling).
  *
- * Used by DDTree drafting to bias tree growth; confidenceScores is [batch, proposalLen].
+ * Retained for chain-side confidence analysis; confidenceScores is [batch, proposalLen].
  */
 void dsparkComputeConfidenceScores(rt::Tensor const& draftHiddenStates, rt::Tensor const& markovW1,
     rt::Tensor const& confidenceWeight, rt::Tensor const& confidenceBias, rt::Tensor const& firstPrevTokens,

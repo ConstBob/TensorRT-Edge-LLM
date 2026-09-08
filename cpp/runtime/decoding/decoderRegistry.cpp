@@ -42,10 +42,12 @@ bool shouldSelectDefaultDecoder(DecodingStrategyKind speculativeDecoderKind,
 {
     bool const nonGreedySampling = shouldUseNonGreedySampling(request.temperature, request.topK, request.topP);
     // EAGLE verification currently assumes greedy sampling; vanilla preserves non-greedy request semantics.
-    bool const nonGreedyEagleFallback = speculativeDecoderKind == DecodingStrategyKind::kEAGLE && nonGreedySampling;
+    bool const nonGreedyUnsupportedFallback = nonGreedySampling
+        && (speculativeDecoderKind == DecodingStrategyKind::kEAGLE
+            || speculativeCapabilities.fallbackToVanillaForNonGreedySampling);
     bool const boundedSamplingFallback = speculativeCapabilities.supportsLosslessSampling && nonGreedySampling
         && speculativeCapabilities.maxSamplingSupport > 0 && request.topK > speculativeCapabilities.maxSamplingSupport;
-    return request.disableSpecDecode || nonGreedyEagleFallback || boundedSamplingFallback;
+    return request.disableSpecDecode || nonGreedyUnsupportedFallback || boundedSamplingFallback;
 }
 
 DecoderRegistry::DecoderRegistry(DecodingRuntimeContext& runtime, DecoderRegistryInit init)
@@ -120,8 +122,9 @@ DecodingStrategy& DecoderRegistry::cachePrimingStrategy() const noexcept
 
 bool DecoderRegistry::captureCudaGraphs(cudaStream_t stream) const
 {
-    bool const skipDefaultCapture
-        = mSpeculativeDecoder && mSpeculativeDecoder->capabilities().ownsBaseVerificationCudaGraphs;
+    bool const skipDefaultCapture = mSpeculativeDecoder
+        && mSpeculativeDecoder->capabilities().ownsBaseVerificationCudaGraphs
+        && !mSpeculativeDecoder->capabilities().requiresDefaultDecoderCudaGraphs;
     if (skipDefaultCapture)
     {
         LOG_INFO("Skipping vanilla CUDA graph capture for %s speculative runtime.", mSpeculativeDecoder->name());

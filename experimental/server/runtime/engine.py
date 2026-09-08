@@ -420,13 +420,13 @@ def _resolve_spec_decode_runtime_options(
 
     if engine_method in {"mtp", "gemma4_mtp"}:
         top_k = draft_top_k or 1
-        if engine_method == "gemma4_mtp" and top_k != 1:
-            raise ValueError("Gemma4 MTP supports linear drafting only; "
-                             "set draft_top_k=1")
         step = num_speculative_tokens or draft_step or _DEFAULT_DRAFT_STEP
         verify_size = (verify_tree_size
                        or (step + 1 if top_k == 1 else max_verify_size))
         return _SpecDecodeRuntimeOptions(top_k, step, verify_size)
+
+    max_draft_size = int(
+        draft.get("builder_config", {}).get("max_draft_tree_size", 0))
 
     if engine_method in {"dflash", "jetspec"}:
         if draft_step not in (None, 1):
@@ -437,18 +437,24 @@ def _resolve_spec_decode_runtime_options(
                        or draft.get("dflash_config") or {})
         checkpoint_block_size = int(
             mode_config.get("block_size", draft.get("block_size", 0)))
-        block_size = num_speculative_tokens or checkpoint_block_size
-        if checkpoint_block_size < 2:
+        compiled_block_size = min(checkpoint_block_size, max_draft_size
+                                  or checkpoint_block_size)
+        if checkpoint_block_size < 2 or compiled_block_size < 2:
             raise ValueError(
                 f"compiled {engine_method} draft has an invalid proposal "
-                f"block size {checkpoint_block_size}")
-        if not 2 <= block_size <= checkpoint_block_size:
+                f"capacity {compiled_block_size}")
+        block_size = num_speculative_tokens or compiled_block_size
+        if not 2 <= block_size <= compiled_block_size:
             raise ValueError(
                 f"{engine_method} num_speculative_tokens must be within the "
-                f"compiled proposal block size [2, {checkpoint_block_size}]")
+                f"compiled proposal capacity [2, {compiled_block_size}]")
         top_k = draft_top_k or 1
         verify_size = (verify_tree_size
                        or (block_size if top_k == 1 else max_verify_size))
+        if not 1 <= verify_size <= max_verify_size:
+            raise ValueError(
+                f"{engine_method} verify_tree_size must be within the "
+                f"compiled verification capacity [1, {max_verify_size}]")
         return _SpecDecodeRuntimeOptions(top_k, 1, verify_size, block_size)
 
     if engine_method == "dspark":
@@ -459,17 +465,38 @@ def _resolve_spec_decode_runtime_options(
         mode_config = draft.get("dspark_config") or {}
         block_size = int(
             mode_config.get("block_size", draft.get("block_size", 0)))
-        proposal_size = num_speculative_tokens or block_size
-        if not 1 <= proposal_size <= block_size:
-            raise ValueError(
-                "dspark num_speculative_tokens must be within the compiled "
-                f"proposal block size [1, {block_size}]")
+        slot_offset = 0 if mode_config.get("sample_from_anchor", True) else 1
+        if max_draft_size <= 0:
+            max_draft_size = block_size + slot_offset
         top_k = draft_top_k or 1
-        if top_k > 1 and proposal_size != block_size:
+        if top_k > 1:
+            if num_speculative_tokens is not None:
+                raise ValueError(
+                    "dspark tree uses verify_tree_size as its node budget; "
+                    "omit num_speculative_tokens")
+            verify_size = verify_tree_size or max_verify_size
+        else:
+            proposal_capacity = min(block_size, max_draft_size - slot_offset)
+            if proposal_capacity < 1:
+                raise ValueError(
+                    "compiled dspark draft has no proposal capacity")
+            proposal_size = num_speculative_tokens or proposal_capacity
+            if not 1 <= proposal_size <= proposal_capacity:
+                raise ValueError(
+                    "dspark num_speculative_tokens must be within the "
+                    f"compiled proposal capacity [1, {proposal_capacity}]")
+            verify_size = verify_tree_size or proposal_size + 1
+        if not 2 <= verify_size <= max_verify_size:
             raise ValueError(
-                "dspark tree drafting always uses the complete checkpoint "
-                "proposal block")
-        verify_size = verify_tree_size or proposal_size + 1
+                "dspark verify_tree_size must be within the compiled "
+                f"verification capacity [2, {max_verify_size}]")
+        if (top_k > 1 and int(base.get("num_linear_attn_layers", 0)) > 0
+                and base.get("recurrent_spec_verify_mode") == "replay"
+                and verify_size != max_verify_size):
+            raise ValueError(
+                "dspark tree recurrent-state replay requires "
+                "verify_tree_size to match the base engine's compiled "
+                f"maximum {max_verify_size}")
         return _SpecDecodeRuntimeOptions(top_k, 1, verify_size)
 
     raise ValueError(f"unsupported speculative engine mode {engine_method!r}")
@@ -833,11 +860,8 @@ class LLM:
             num_speculative_tokens = spec.num_speculative_tokens
 
         resolved_top_k = draft_top_k or (10 if spec_method == "eagle3" else 1)
-        if (options.builder_spec_type == "gemma4_mtp" and resolved_top_k != 1):
-            raise ValueError("Gemma4 MTP supports linear drafting only; "
-                             "set draft_top_k=1")
         tree_base = (resolved_top_k > 1 and options.builder_spec_type
-                     in {"mtp", "dflash", "jetspec"})
+                     in {"mtp", "dflash", "jetspec", "dspark"})
         if options.spec_type != "none":
             options = replace(options, tree_base=tree_base)
 

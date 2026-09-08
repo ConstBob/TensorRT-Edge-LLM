@@ -111,7 +111,8 @@ def _make_flat_wrapper_mamba(model: nn.Module,
                              Na: int,
                              Nm: int,
                              mtp_base: bool = False,
-                             target_hidden_base: bool = False) -> nn.Module:
+                             target_hidden_base: bool = False,
+                             spec_tree_base: bool = False) -> nn.Module:
     """Build an explicit flat forward wrapper for hybrid Mamba+Attention models.
 
     Extends the transformer wrapper with ``conv_state_i`` and ``ssm_state_i``
@@ -138,6 +139,8 @@ def _make_flat_wrapper_mamba(model: nn.Module,
         param_names += [
             "attention_pos_id", "attention_mask", "spec_verify_phase_marker"
         ]
+    if spec_tree_base:
+        param_names += ["tree_parent_ids", "tree_depths"]
 
     past_kv_tuple = "({},)".format(", ".join(
         f"past_key_values_{i}" for i in range(Na))) if Na else "()"
@@ -147,25 +150,29 @@ def _make_flat_wrapper_mamba(model: nn.Module,
                                          for i in range(Nm))) if Nm else "()"
 
     if spec_base:
+        spec_kwargs = ("attention_pos_id=attention_pos_id"
+                       ", attention_mask=attention_mask"
+                       ", spec_verify_phase_marker=spec_verify_phase_marker")
+        if spec_tree_base:
+            spec_kwargs += (", tree_parent_ids=tree_parent_ids"
+                            ", tree_depths=tree_depths")
         second = "dflash_hidden_concat" if target_hidden_base else "hidden_states"
         body = (
             f"    (logits, {second}, present_key_values, "
             f"present_conv_states, present_ssm_states, "
             f"intermediate_conv_states, replay_da_states, replay_u_states, "
-            f"replay_b_states) = self._model(\n"
+            f"replay_b_states, replay_dt_states) = self._model(\n"
             f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
             f"context_lengths, kvcache_start_index, kv_page_table, "
             f"last_token_ids,\n"
             f"        {conv_tuple}, {ssm_tuple},\n"
-            f"        attention_pos_id=attention_pos_id, "
-            f"attention_mask=attention_mask, "
-            f"spec_verify_phase_marker=spec_verify_phase_marker)\n"
+            f"        {spec_kwargs})\n"
             f"    return ((logits, {second}) + tuple(present_key_values)\n"
             f"            + tuple(present_conv_states) "
             f"+ tuple(present_ssm_states)\n"
             f"            + tuple(intermediate_conv_states) "
             f"+ tuple(replay_da_states) + tuple(replay_u_states) "
-            f"+ tuple(replay_b_states))\n")
+            f"+ tuple(replay_b_states) + tuple(replay_dt_states))\n")
     else:
         body = (
             f"    logits, present_key_values, present_conv_states, "
@@ -301,6 +308,8 @@ class MambaMixer(nn.Module):
         state_start_index: torch.Tensor,
         collect_intermediate_states: bool = False,
         spec_verify_phase_marker: Optional[torch.Tensor] = None,
+        tree_parent_ids: Optional[torch.Tensor] = None,
+        tree_depths: Optional[torch.Tensor] = None,
     ):
         batch_size, seq_len, _ = hidden_states.shape
         d_inner = self.num_heads * self.head_dim
@@ -327,6 +336,9 @@ class MambaMixer(nn.Module):
                  dilation=1,
                  groups=self.conv_dim,
                  spec_verify_phase_marker=spec_verify_phase_marker,
+                 tree_parent_ids=tree_parent_ids,
+                 tree_depths=tree_depths,
+                 use_ddtree_state=tree_parent_ids is not None,
              )
         else:
             hidden_states_for_conv, conv_state_out, _ = causal_conv1d(
@@ -355,8 +367,8 @@ class MambaMixer(nn.Module):
         ssm_A = -torch.exp(self.A_log.to(torch.float32))
 
         if collect_intermediate_states:
-            (ssm_output, ssm_state_out, replay_da, replay_u,
-             replay_b) = update_ssm_state_with_intermediate(
+            (ssm_output, ssm_state_out, replay_da, replay_u, replay_b,
+             replay_dt) = update_ssm_state_with_intermediate(
                  ssm_input_states,
                  ssm_A,
                  ssm_b_states,
@@ -370,6 +382,9 @@ class MambaMixer(nn.Module):
                  spec_verify_phase_marker,
                  dt_softplus=1,
                  ngroups=self.n_groups,
+                 tree_parent_ids=tree_parent_ids,
+                 tree_depths=tree_depths,
+                 use_ddtree_state=tree_parent_ids is not None,
              )
         else:
             ssm_output, ssm_state_out = update_ssm_state(
@@ -391,7 +406,8 @@ class MambaMixer(nn.Module):
         normed = self._gated_rmsnorm(ssm_output, gate)
         if collect_intermediate_states:
             return (self.out_proj(normed), conv_state_out, ssm_state_out,
-                    intermediate_conv_state, replay_da, replay_u, replay_b)
+                    intermediate_conv_state, replay_da, replay_u, replay_b,
+                    replay_dt)
         return self.out_proj(normed), conv_state_out, ssm_state_out
 
     def _gated_rmsnorm(self, hidden_states: torch.Tensor,
@@ -976,22 +992,26 @@ class NemotronHDecoderLayer(nn.Module):
         spec_verify_phase_marker: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         attention_pos_id: Optional[torch.Tensor] = None,
+        tree_parent_ids: Optional[torch.Tensor] = None,
+        tree_depths: Optional[torch.Tensor] = None,
     ):
         residual = hidden_states
         normed = self.norm(hidden_states)
         if self.layer_type == LAYER_MAMBA:
             if collect_intermediate_states:
                 (mixer_out, conv_state_out, ssm_state_out, inter_conv,
-                 replay_da, replay_u, replay_b) = self.mixer(
+                 replay_da, replay_u, replay_b, replay_dt) = self.mixer(
                      normed,
                      conv_state,
                      ssm_state,
                      context_lengths,
                      kvcache_start_index,
                      collect_intermediate_states=True,
-                     spec_verify_phase_marker=spec_verify_phase_marker)
+                     spec_verify_phase_marker=spec_verify_phase_marker,
+                     tree_parent_ids=tree_parent_ids,
+                     tree_depths=tree_depths)
                 return (residual + mixer_out, conv_state_out, ssm_state_out,
-                        inter_conv, replay_da, replay_u, replay_b)
+                        inter_conv, replay_da, replay_u, replay_b, replay_dt)
             mixer_out, conv_state_out, ssm_state_out = self.mixer(
                 normed, conv_state, ssm_state, context_lengths,
                 kvcache_start_index)
@@ -1046,6 +1066,8 @@ class NemotronHBackbone(nn.Module):
         spec_verify_phase_marker: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         attention_pos_id: Optional[torch.Tensor] = None,
+        tree_parent_ids: Optional[torch.Tensor] = None,
+        tree_depths: Optional[torch.Tensor] = None,
         dflash_target_layer_ids: Optional[List[int]] = None,
     ):
         hidden_states = inputs_embeds
@@ -1056,6 +1078,7 @@ class NemotronHBackbone(nn.Module):
         replay_da_states_list: List[torch.Tensor] = []
         replay_u_states_list: List[torch.Tensor] = []
         replay_b_states_list: List[torch.Tensor] = []
+        replay_dt_states_list: List[torch.Tensor] = []
         dflash_hidden_list: List[torch.Tensor] = []
         dflash_target_set = set(dflash_target_layer_ids or [])
         last_layer_idx = len(self.layers) - 1
@@ -1067,7 +1090,7 @@ class NemotronHBackbone(nn.Module):
             if lt == LAYER_MAMBA:
                 if collect_intermediate_states:
                     (hidden_states, conv_out, ssm_out, inter_conv, replay_da,
-                     replay_u, replay_b) = layer(
+                     replay_u, replay_b, replay_dt) = layer(
                          hidden_states,
                          context_lengths=context_lengths,
                          kvcache_start_index=kvcache_start_index,
@@ -1075,11 +1098,14 @@ class NemotronHBackbone(nn.Module):
                          ssm_state=ssm_states[mamba_idx],
                          collect_intermediate_states=True,
                          spec_verify_phase_marker=spec_verify_phase_marker,
+                         tree_parent_ids=tree_parent_ids,
+                         tree_depths=tree_depths,
                      )
                     intermediate_conv_states_list.append(inter_conv)
                     replay_da_states_list.append(replay_da)
                     replay_u_states_list.append(replay_u)
                     replay_b_states_list.append(replay_b)
+                    replay_dt_states_list.append(replay_dt)
                 else:
                     hidden_states, conv_out, ssm_out = layer(
                         hidden_states,
@@ -1123,7 +1149,8 @@ class NemotronHBackbone(nn.Module):
                     tuple(present_ssm_states_list),
                     tuple(intermediate_conv_states_list),
                     tuple(replay_da_states_list), tuple(replay_u_states_list),
-                    tuple(replay_b_states_list), dflash_hidden_concat)
+                    tuple(replay_b_states_list), tuple(replay_dt_states_list),
+                    dflash_hidden_concat)
         return (normed, tuple(present_key_values_list),
                 tuple(present_conv_states_list),
                 tuple(present_ssm_states_list), dflash_hidden_concat)
@@ -1176,6 +1203,17 @@ class NemotronHCausalLM(nn.Module):
         embed_weight = self.backbone.embeddings.weight
         self.lm_head.weight = nn.Parameter(embed_weight.detach().clone(),
                                            requires_grad=False)
+
+    def materialize_checkpoint_defaults(self, device: str) -> None:
+        """Materialize the optional Q-cache scale omitted by KV-only checkpoints."""
+        for layer in self.backbone.layers:
+            mixer = layer.mixer
+            q_proj = getattr(mixer, "q_proj", None)
+            q_scale = getattr(q_proj, "q_scale", None)
+            if q_scale is not None and q_scale.device.type == "meta":
+                q_proj.q_scale = torch.ones(q_scale.shape,
+                                            dtype=q_scale.dtype,
+                                            device=device)
 
     def onnx_export_spec(self) -> OnnxSpec:
         """Return all model-specific parameters needed for ONNX export."""
@@ -1255,6 +1293,10 @@ class NemotronHCausalLM(nn.Module):
         dspark_base = bool(getattr(config, "dspark_base", False))
         target_hidden_base = dflash_base or dspark_base
         spec = mtp_base or target_hidden_base
+        spec_tree_base = (dflash_base
+                          or bool(getattr(config, "mtp_tree_base", False))
+                          or bool(getattr(config, "dflash_tree_base", False))
+                          or bool(getattr(config, "dspark_tree_base", False)))
 
         batch = torch.export.Dim("batch", min=1, max=256)
         seq = torch.export.Dim("seq_len", min=1, max=32768)
@@ -1330,6 +1372,22 @@ class NemotronHCausalLM(nn.Module):
             all_shapes.append({0: batch, 1: attn_seq})  # attention_pos_id
             all_shapes.append({0: batch, 1: attn_seq, 2: mask_kv_len})  # mask
             all_shapes.append({0: torch.export.Dim.AUTO})  # phase marker
+            if spec_tree_base:
+                verify_seq = torch.export.Dim("verify_seq_len",
+                                              min=1,
+                                              max=32768)
+                tree_parent_ids = torch.zeros(batch_size,
+                                              seq_len,
+                                              dtype=torch.int32,
+                                              device=device)
+                tree_depths = torch.zeros(batch_size,
+                                          seq_len,
+                                          dtype=torch.int32,
+                                          device=device)
+                args = args + (tree_parent_ids, tree_depths)
+                input_names = input_names + ["tree_parent_ids", "tree_depths"]
+                all_shapes.append({0: batch, 1: verify_seq})
+                all_shapes.append({0: batch, 1: verify_seq})
             # Extra outputs: full hidden + intermediate conv snapshot + the
             # per-token recurrent replay stash (dA / u / B) for spec-verify.
             output_names = (
@@ -1340,14 +1398,16 @@ class NemotronHCausalLM(nn.Module):
                 [f"intermediate_conv_state_{i}" for i in range(Nm)] +
                 [f"replay_da_state_{i}" for i in range(Nm)] +
                 [f"replay_u_state_{i}" for i in range(Nm)] +
-                [f"replay_b_state_{i}" for i in range(Nm)])
+                [f"replay_b_state_{i}" for i in range(Nm)] +
+                [f"replay_dt_state_{i}" for i in range(Nm)])
 
         wrapped = _make_flat_wrapper_mamba(
             self,
             Na,
             Nm,
             mtp_base=mtp_base,
-            target_hidden_base=target_hidden_base)
+            target_hidden_base=target_hidden_base,
+            spec_tree_base=spec_tree_base)
         wrapped.eval()
 
         return OnnxSpec(wrapped=wrapped,
@@ -1370,6 +1430,8 @@ class NemotronHCausalLM(nn.Module):
         attention_pos_id: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         spec_verify_phase_marker: Optional[torch.Tensor] = None,
+        tree_parent_ids: Optional[torch.Tensor] = None,
+        tree_depths: Optional[torch.Tensor] = None,
     ) -> Tuple:
         mtp_base = bool(getattr(self.config, "mtp_base", False))
         dflash_base = bool(getattr(self.config, "dflash_base", False))
@@ -1385,7 +1447,7 @@ class NemotronHCausalLM(nn.Module):
         if spec:
             (hidden_states, present_key_values, present_conv_states,
              present_ssm_states, intermediate_conv_states, replay_da_states,
-             replay_u_states, replay_b_states,
+             replay_u_states, replay_b_states, replay_dt_states,
              dflash_hidden_concat) = self.backbone(
                  inputs_embeds,
                  past_key_values,
@@ -1399,6 +1461,8 @@ class NemotronHCausalLM(nn.Module):
                  spec_verify_phase_marker=spec_verify_phase_marker,
                  attention_mask=attention_mask,
                  attention_pos_id=attention_pos_id,
+                 tree_parent_ids=tree_parent_ids,
+                 tree_depths=tree_depths,
                  dflash_target_layer_ids=dflash_target_ids,
              )
             # Draft consumes the full pre-lm_head hidden; logits use the
@@ -1409,11 +1473,11 @@ class NemotronHCausalLM(nn.Module):
                 return (logits, dflash_hidden_concat, present_key_values,
                         present_conv_states, present_ssm_states,
                         intermediate_conv_states, replay_da_states,
-                        replay_u_states, replay_b_states)
+                        replay_u_states, replay_b_states, replay_dt_states)
             return (logits, hidden_states, present_key_values,
                     present_conv_states, present_ssm_states,
                     intermediate_conv_states, replay_da_states,
-                    replay_u_states, replay_b_states)
+                    replay_u_states, replay_b_states, replay_dt_states)
 
         (hidden_states, present_key_values, present_conv_states,
          present_ssm_states, _dflash_hidden_concat) = self.backbone(

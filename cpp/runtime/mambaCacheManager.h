@@ -132,13 +132,15 @@ public:
     //! Mamba plugin stashes the minimal per-token replay inputs here (instead of full-state
     //! snapshots); scatterAcceptedLinearStates reconstructs the accepted recurrent state from them.
     //!   dA: [maxBatchSize, maxIntermediateSeqLen, recurrentStateNumHeads]
-    //!   u:  [maxBatchSize, maxIntermediateSeqLen, recurrentStateNumHeads, recurrentStateHeadDim]
+    //!   u:  [maxBatchSize, maxIntermediateSeqLen, recurrentStateNumHeads, recurrentStateHeadDim] (stores x)
     //!   B:  [maxBatchSize, maxIntermediateSeqLen, recurrentStateNumGroups, recurrentStateSize]
+    //!   dt: [maxBatchSize, maxIntermediateSeqLen, recurrentStateNumHeads]
     //! @param recurrentLayerIdx The recurrent layer index.
     //! @return A reference to the owned device tensor.
     rt::Tensor& getReplayDaState(int32_t recurrentLayerIdx) noexcept;
     rt::Tensor& getReplayUState(int32_t recurrentLayerIdx) noexcept;
     rt::Tensor& getReplayBState(int32_t recurrentLayerIdx) noexcept;
+    rt::Tensor& getReplayDtState(int32_t recurrentLayerIdx) noexcept;
 
     rt::Tensor& getIntermediateRecurrentState(int32_t recurrentLayerIdx) noexcept;
 
@@ -210,6 +212,7 @@ private:
     std::vector<rt::Tensor> mReplayDaStates;
     std::vector<rt::Tensor> mReplayUStates;
     std::vector<rt::Tensor> mReplayBStates;
+    std::vector<rt::Tensor> mReplayDtStates;
 
     rt::Tensor mDeviceMtpLayerInfos;
     rt::Tensor mDeviceMambaReplayLayerInfos;

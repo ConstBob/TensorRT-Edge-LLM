@@ -246,6 +246,9 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
                     addMambaTensor(binding_names::kReplayBStateTemplate, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
                         {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(cfg.recurrentStateNumGroups),
                             fixed(cfg.recurrentStateSize)});
+                    // replay_dt_state_%d: [batch, seqLen, recurrentNumHeads]
+                    addMambaTensor(binding_names::kReplayDtStateTemplate, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
+                        {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(cfg.recurrentStateNumHeads)});
                 }
                 else
                 {

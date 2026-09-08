@@ -336,6 +336,9 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
     std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream, ParallelMapping const& mapping,
     tokenizer::Tokenizer& tokenizer, ContextCacheConfig const& contextCacheConfig)
 {
+    ELLM_CHECK(artifacts.baseExecutor != nullptr, "Model artifacts require a base engine executor.");
+    validateDsparkTreeMetadataBindings(artifacts.deployment, *artifacts.baseExecutor);
+
     mMapping = mapping;
     mTokenizer = &tokenizer;
     ELLM_CHECK(mMapping.tensorParallelSize > 0, "tensorParallelSize must be positive");
@@ -363,7 +366,6 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
             mDeployment.base.kvPoolPages);
     }
     bool const needsBoundedSwaPageManager = mDeployment.base.usesBoundedSwaKVCache();
-    ELLM_CHECK(mBaseExecutor != nullptr, "Model artifacts require a base engine executor.");
     std::optional<ContextCacheDeploymentProfile> contextCacheDeploymentProfile;
     if (contextCacheConfig.enabled)
     {
@@ -2493,6 +2495,15 @@ bool LLMRankRuntime::validateRequestConfig(LLMGenerationRequest const& request)
         LOG_ERROR(
             "disable_spec_decode is not supported by a Gemma4 MTP verification engine. Use the matched assistant, or "
             "build a standalone target engine for target-only inference.");
+        return false;
+    }
+    bool const gemma4MtpTree = mDeployment.specDecodeMode() == SpecDecodeMode::kGemma4MTP
+        && mDeployment.specConfig.has_value() && mDeployment.specConfig->draftingTopK > 1;
+    if (gemma4MtpTree && shouldUseNonGreedySampling(request.temperature, request.topK, request.topP))
+    {
+        LOG_ERROR(
+            "Gemma4 MTP tree decoding supports greedy requests only. Build a standalone target engine for "
+            "non-greedy sampling.");
         return false;
     }
     if (hasGuidedDecoding(request))

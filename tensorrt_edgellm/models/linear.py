@@ -37,7 +37,7 @@ import torch.nn.functional as F
 from ..config import (QUANT_FP8, QUANT_FP16, QUANT_INT4_AWQ,
                       QUANT_INT4_AWQ_MODELOPT, QUANT_INT4_GPTQ, QUANT_INT8_SQ,
                       QUANT_MXFP8, QUANT_NVFP4, QUANT_NVFP4_A16, Mapping,
-                      ModelConfig, module_quant_type)
+                      ModelConfig, module_quant_group_size, module_quant_type)
 from .ops import (all_reduce, fp8_dequantize, fp8_quantize,
                   fused_nvfp4_gemm_allreduce, int4_gemm_plugin_version,
                   int4_groupwise_gemm, int4_groupwise_gemm_v2, int8_sq_act_qdq,
@@ -883,11 +883,12 @@ def make_linear(
                        Only takes effect when ``config.tp_size > 1``.
     """
     quant_type = module_quant_type(module_name, config)
+    group_size = module_quant_group_size(module_name, config)
 
     # NVFP4 routes through the new composition design.
     tp_mode = TPMode(tp_mode)
     if quant_type == QUANT_NVFP4:
-        method = NVFP4LinearMethod(group_size=config.quant.group_size)
+        method = NVFP4LinearMethod(group_size=group_size)
         if config.tp_size == 1:
             layer = ReplicatedLinear(in_features, out_features, bias,
                                      torch.float16, config.mapping, method)
@@ -910,19 +911,16 @@ def make_linear(
     elif quant_type == QUANT_FP8:
         layer = FP8Linear(in_features, out_features, bias)
     elif quant_type == QUANT_MXFP8:
-        layer = MXFP8Linear(in_features, out_features, config.quant.group_size,
-                            bias)
+        layer = MXFP8Linear(in_features, out_features, group_size, bias)
     elif quant_type == QUANT_INT4_AWQ:
-        layer = AWQLinear(in_features, out_features, config.quant.group_size,
-                          bias)
+        layer = AWQLinear(in_features, out_features, group_size, bias)
     elif quant_type == QUANT_INT4_AWQ_MODELOPT:
         layer = ModelOptAWQPrepackedLinear(in_features, out_features,
-                                           config.quant.group_size, bias)
+                                           group_size, bias)
     elif quant_type == QUANT_NVFP4_A16:
-        layer = NVFP4A16Linear(in_features, out_features,
-                               config.quant.group_size, bias)
+        layer = NVFP4A16Linear(in_features, out_features, group_size, bias)
     elif quant_type == QUANT_INT4_GPTQ:
-        layer = GPTQLinear(in_features, out_features, config.quant.group_size,
+        layer = GPTQLinear(in_features, out_features, group_size,
                            config.quant.gptq_zero_point_offset, bias)
     elif quant_type == QUANT_INT8_SQ:
         layer = INT8SQLinear(in_features, out_features, bias)

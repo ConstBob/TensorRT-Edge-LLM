@@ -154,13 +154,11 @@ def _speculative_build_plan(args: argparse.Namespace, bundle, components):
                               max_draft_tree_size=draft_size)
         args = _copy_args(args, dflash_version=dflash_version)
     if args.spec_type == "dspark":
+        from .models.dspark.configuration import resolve_build_profile
         draft = draft_bundle.component_dict(contracts.Component.LLM)
-        dspark = draft.get("dspark_config") or {}
-        block_size = int(dspark.get("block_size", draft.get("block_size", 7)))
-        draft_tree_size = _value_or_default(args.max_draft_tree_size,
-                                            block_size)
-        verify_tree_size = _value_or_default(args.max_verify_tree_size,
-                                             draft_tree_size + 1)
+        verify_tree_size, draft_tree_size = resolve_build_profile(
+            draft, args.max_draft_tree_size, args.max_verify_tree_size,
+            args.tree_base)
         args = _copy_args(args,
                           max_verify_tree_size=verify_tree_size,
                           max_draft_tree_size=draft_tree_size)
@@ -327,8 +325,8 @@ def _add_build_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--tree-base",
         action="store_true",
-        help=("Build an MTP or DFlash base with DDTree parent/depth metadata "
-              "for hybrid recurrent-state verification."))
+        help=("Build an MTP, DFlash, JetSpec, or DSpark base with DDTree "
+              "parent/depth metadata for recurrent-state verification."))
     parser.add_argument("--min-image-tokens", type=int, default=4)
     parser.add_argument("--max-image-tokens", type=int, default=1024)
     parser.add_argument("--max-image-tokens-per-image", type=int, default=512)

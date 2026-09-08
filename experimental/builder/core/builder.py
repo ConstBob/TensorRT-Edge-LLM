@@ -153,10 +153,19 @@ class BuildArgs:
         return policy
 
     @functools.cached_property
+    def compute_capability(self) -> Tuple[int, int]:
+        """Return the active CUDA device compute capability once per build."""
+        return _active_cuda_compute_capability()
+
+    @property
+    def sm110(self) -> bool:
+        """Return whether the active CUDA device is Thor SM110."""
+        return self.compute_capability == (11, 0)
+
+    @property
     def sm12x(self) -> bool:
         """Return whether the active CUDA device belongs to SM12x."""
-        major, _ = _active_cuda_compute_capability()
-        return major == 12
+        return self.compute_capability[0] == 12
 
     @property
     def resolved_component(self) -> contracts.Component:
@@ -201,10 +210,10 @@ class BuildArgs:
             raise ValueError("--spec-type requires --spec-role base or draft")
         if self.tree_base and not (
                 self.resolved_spec_role == contracts.SpecRole.BASE
-                and self.spec_type in ("mtp", "dflash", "jetspec")):
+                and self.spec_type in ("mtp", "dflash", "jetspec", "dspark")):
             raise ValueError(
-                "--tree-base is only valid for an MTP, DFlash, or JetSpec "
-                "base engine")
+                "--tree-base is only valid for an MTP, DFlash, JetSpec, or "
+                "DSpark base engine")
         if (self.tree_base and self.spec_type == "dflash"
                 and self.dflash_version == DFlashVersion.V2):
             raise ValueError("--tree-base is not supported by DFlash V2")
@@ -361,6 +370,14 @@ def build_engine(args: BuildArgs,
                                       None)
     if component_weight_policy is not None:
         policy = component_weight_policy(args, policy)
+    quant_types = {
+        component_quant.quant_type, *component_quant.layer_overrides.values()
+    }
+    if quantization.QUANT_NVFP4_A16 in quant_types:
+        policy = policy.without((weight_policy.EXTERNAL_WEIGHT_NVFP4_MOE,
+                                 weight_policy.EXTERNAL_WEIGHT_NVFP4_TP,
+                                 weight_policy.EXTERNAL_WEIGHT_LM_HEAD),
+                                strict=bool(args.externalize_weights))
     requested_policy = WeightPolicy.from_request(args.externalize_weights)
     kept = tuple(kind for kind in requested_policy.kinds
                  if kind not in policy.kinds)

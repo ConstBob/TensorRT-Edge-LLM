@@ -20,7 +20,7 @@ from typing import Optional, Sequence
 import numpy as np
 import tensorrt as trt
 
-from ..core import weight_policy
+from ..core import quantization, weight_policy
 from . import functional as F
 from .module import BuildContext, Module
 
@@ -78,6 +78,21 @@ class Linear(Module):
 
         tp_mode = self._tp_mode()
         quant_type = self.quant_type()
+        if quant_type == quantization.QUANT_NVFP4_A16:
+            if self.cfg.tp_size > 1:
+                raise NotImplementedError(
+                    "NVFP4-A16 tensor parallelism is not implemented")
+            descriptor = self._full_descriptor(quant_type, False)
+            output = F.nvfp4_a16_linear_from_weights(hidden_states, descriptor,
+                                                     rank,
+                                                     self.ctx.options.sm110)
+            output = self._apply_static_adapter(hidden_states, output,
+                                                "replicated", rank)
+            if self._uses_lora():
+                output = F.dynamic_lora(hidden_states, output, self.prefix,
+                                        descriptor.in_features,
+                                        descriptor.out_features)
+            return output
         # The fused CuTeDSL kernels currently target SM100/101/103/110. SM12x
         # uses TensorRT's NVFP4 Q/DQ matmul followed by the generic all-reduce.
         use_fused_nvfp4_tp = (tp_mode == "row" and self.cfg.tp_size > 1

@@ -246,6 +246,13 @@ bool MTPDecoder::initializeForGeneration(DecodingInferenceContext& context)
 
 bool MTPDecoder::decodeStep(DecodingInferenceContext& context)
 {
+    if (mUseTree && ::trt_edgellm::shouldUseNonGreedySampling(context.temperature, context.topK, context.topP))
+    {
+        LOG_ERROR(
+            "MTPDecoder: tree drafting supports greedy decoding only; route the request through vanilla or use "
+            "draftingTopK=1.");
+        return false;
+    }
     // Draft KV for a round's accepted tokens is written lazily, by the *next* round's accept-token pass, so the draft
     // cache trails the base cache by the last accepted span (see ContextCacheCommitPolicy::kPrefillStateOnly).
     if (context.generationRound == 0)
@@ -800,11 +807,13 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
         if (mambaMgr.hasIntermediateRecurrentStates() || mambaMgr.hasIntermediateConvStates())
         {
             int32_t const verifySize = mRuntime.deployment.specConfig->verifySize;
-            check::check(kernel::gdnTreeChunkVerifyEnabled(verifySize),
-                "MTP DDTree GDN chunk-form verify supports at most kGDN_TREE_CHUNK_MAX_NODES verify nodes");
-            // Chunk-form verify is stateless: recurrent states commit by replaying
-            // the accepted path; conv states scatter. Must use the same predicate
-            // as the plugin.
+            if (!mambaMgr.recurrentUsesReplay())
+            {
+                check::check(kernel::gdnTreeChunkVerifyEnabled(verifySize),
+                    "MTP DDTree GDN chunk-form verify supports at most kGDN_TREE_CHUNK_MAX_NODES verify nodes");
+            }
+            // Mamba and chunk-form GDN verify are stateless. Reconstruct the
+            // accepted recurrent path and scatter its conv checkpoints.
             mambaMgr.replayCommitAcceptedTreeStates(mAcceptedTokenIndices, mAcceptLength, context.stream);
         }
     }

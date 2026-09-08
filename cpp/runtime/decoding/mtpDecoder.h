@@ -55,6 +55,12 @@ public:
         return true;
     }
 
+    DecodingStrategyCapabilities capabilities() const noexcept override
+    {
+        return {/*.ownsBaseVerificationCudaGraphs=*/false, /*.supportsLosslessSampling=*/false,
+            /*.maxSamplingSupport=*/0, /*.fallbackToVanillaForNonGreedySampling=*/mUseTree};
+    }
+
     DecodingKvHeadroom requiredKvHeadroom() const override;
 
     bool decodeStep(DecodingInferenceContext& context) override;

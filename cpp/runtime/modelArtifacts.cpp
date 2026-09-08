@@ -155,6 +155,34 @@ std::unique_ptr<tokenizer::Tokenizer> loadTokenizer(
 
 } // namespace
 
+void validateDsparkTreeMetadataBindings(DeploymentConfig const& deployment, EngineExecutor const& baseExecutor)
+{
+    if (!deployment.specConfig.has_value() || deployment.specDecodeMode() != SpecDecodeMode::kDSpark
+        || deployment.base.numLinearAttnLayers == 0)
+    {
+        return;
+    }
+
+    bool const hasTreeParentIds = baseExecutor.hasIOTensor(binding_names::kTreeParentIds);
+    bool const hasTreeDepths = baseExecutor.hasIOTensor(binding_names::kTreeDepths);
+    bool const usesDDTree = deployment.specConfig->draftingTopK > 1;
+    ELLM_CHECK(hasTreeParentIds == hasTreeDepths,
+        std::string("DSpark tree-base engine must expose both INT32 tree metadata bindings '")
+            + binding_names::kTreeParentIds + "' and '" + binding_names::kTreeDepths + "'.");
+    if (hasTreeParentIds)
+    {
+        ELLM_CHECK(baseExecutor.getBindingDataType(binding_names::kTreeParentIds) == nvinfer1::DataType::kINT32
+                && baseExecutor.getBindingDataType(binding_names::kTreeDepths) == nvinfer1::DataType::kINT32,
+            std::string("DSpark tree-base engine tree metadata bindings must be INT32: '")
+                + binding_names::kTreeParentIds + "' and '" + binding_names::kTreeDepths + "'.");
+    }
+    ELLM_CHECK(usesDDTree == hasTreeParentIds,
+        usesDDTree ? "Hybrid DSpark DDTree requires a tree-base engine. Re-export with --dspark-tree-base before "
+                     "using --specDraftTopK > 1."
+                   : "Hybrid DSpark base engine was built with --dspark-tree-base, but runtime is configured for "
+                     "linear DSpark. Use --specDraftTopK > 1, or rebuild without --dspark-tree-base.");
+}
+
 ModelArtifacts ModelArtifacts::loadFromEngineDir(std::filesystem::path const& engineDir,
     std::optional<SpecDecodeDraftingConfig> const& draftingConfig, std::filesystem::path const& checkpointDir,
     std::filesystem::path const& draftCheckpointDir, bool contextReuseEnabled, cudaStream_t stream)

@@ -263,10 +263,13 @@ block 8, block 16 is also supported, and DFlash2 does not support DDTree.
 
 The Nemotron-3.5-Lightning DSpark draft differs from the DeepSpec block7 drafts
 above: it uses a block size of 8, sliding-window attention (1024) with a learned
-per-head attention sink, and causal proposal attention. Because the sliding
-window is baked into the draft engine as the contiguous-query XQA variant, this
-draft supports chain drafting only — `--specDraftTopK > 1` (DDTree) is rejected
-at runtime.
+per-head attention sink, and causal proposal attention. The sliding window is
+baked into the draft engine as the contiguous-query XQA variant. The Nemotron
+draft supports both chain decoding and greedy DSpark DDTree; tree mode
+reconstructs path-dependent recurrent state. The published checkpoint uses
+`sample_from_anchor=false`: slot 0 is anchor-only and proposals start at slot 1.
+The runtime also supports the older anchor-sampled layout. Tree mode uses
+`--specDraftTopK > 1` with a tree-capable base.
 
 ### JetSpec Draft Models
 

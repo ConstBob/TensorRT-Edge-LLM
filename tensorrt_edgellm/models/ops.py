@@ -1370,7 +1370,7 @@ def _(hidden_states,
 #   spec-verify. Adds a shape-only spec_verify_phase_marker input (length 0 =
 #   ordinary, 1 = verify). During verify the committed state is left read-only
 #   and the recurrent state is reconstructed from the replay stash after accept.
-#   Emits three FP32 replay outputs (dA / u / B) instead of a full-state snapshot.
+#   Emits four FP32 replay outputs (dA / x / B / dt) instead of a full-state snapshot.
 # ---------------------------------------------------------------------------
 
 
@@ -1392,9 +1392,13 @@ def update_ssm_state_with_intermediate(
     dt_softplus: int,
     ngroups: int,
     chunk_size: int = 0,
+    tree_parent_ids: Optional[
+        torch.Tensor] = None,  # [batch, verify_seq] int32
+    tree_depths: Optional[torch.Tensor] = None,  # [batch, verify_seq] int32
+    use_ddtree_state: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-           torch.Tensor]:
-    """Stub: SSM update with the per-token replay stash (dA / u / B, FP32)."""
+           torch.Tensor, torch.Tensor]:
+    """Stub: SSM update with the per-token replay stash (dA / x / B / dt, FP32)."""
     b, s, nh, hd = hidden_states.shape
     ds = state.shape[3]
     replay_da = torch.zeros(b, s, nh, dtype=torch.float32, device=state.device)
@@ -1410,8 +1414,9 @@ def update_ssm_state_with_intermediate(
                            ds,
                            dtype=torch.float32,
                            device=state.device)
+    replay_dt = torch.zeros(b, s, nh, dtype=torch.float32, device=state.device)
     return (torch.zeros_like(hidden_states), state.clone(), replay_da,
-            replay_u, replay_b)
+            replay_u, replay_b, replay_dt)
 
 
 @update_ssm_state_with_intermediate.register_fake
@@ -1428,7 +1433,10 @@ def _(hidden_states,
       spec_verify_phase_marker,
       dt_softplus,
       ngroups,
-      chunk_size=0):
+      chunk_size=0,
+      tree_parent_ids=None,
+      tree_depths=None,
+      use_ddtree_state=False):
     b, s, nh, hd = hidden_states.shape
     ds = state.shape[3]
     replay_da = torch.empty(b, s, nh, dtype=torch.float32, device=state.device)
@@ -1444,8 +1452,9 @@ def _(hidden_states,
                            ds,
                            dtype=torch.float32,
                            device=state.device)
+    replay_dt = torch.empty(b, s, nh, dtype=torch.float32, device=state.device)
     return (torch.empty_like(hidden_states), state.clone(), replay_da,
-            replay_u, replay_b)
+            replay_u, replay_b, replay_dt)
 
 
 # ---------------------------------------------------------------------------

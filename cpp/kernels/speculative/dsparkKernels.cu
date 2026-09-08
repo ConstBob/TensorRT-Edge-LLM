@@ -20,10 +20,12 @@
 #include "kernels/speculative/dsparkKernels.h"
 #include "kernels/speculative/speculativeKernelsUtils.h"
 
+#include <algorithm>
 #include <cfloat>
 #include <cub/cub.cuh>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <string>
 
 namespace trt_edgellm
 {
@@ -819,7 +821,7 @@ namespace
 constexpr int32_t kMarkovFusedWarpsPerBlock = 8;
 constexpr int32_t kMarkovFusedTokensPerWarp = 8;
 constexpr int32_t kMarkovFusedBlockTokens = kMarkovFusedWarpsPerBlock * kMarkovFusedTokensPerWarp;
-constexpr int32_t kMarkovFusedMaxRank = 256; // shared W1 staging bound; also lanes * 8
+constexpr int32_t kMarkovFusedMaxRank = 512;
 
 //! Orderable-float key in the high bits, (0xFFFFFFFF - vocabIdx) in the low bits so
 //! exact ties resolve to the lowest vocab index under unsigned max. Zero is a valid
@@ -862,7 +864,6 @@ __global__ void dsparkMarkovGreedyFusedKernel(float const* __restrict__ backbone
 
     int32_t const warpId = threadIdx.x / 32;
     int32_t const laneId = threadIdx.x % 32;
-    int32_t const lanesUsed = markovRank / 8; // one 8-rank vector per lane
     float const* stepLogits
         = backboneLogits + (static_cast<int64_t>(batchIdx) * logitsStride + step + logitsOffset) * vocabSize;
     int32_t const wordsPerRow = markovRank / 8;
@@ -877,22 +878,19 @@ __global__ void dsparkMarkovGreedyFusedKernel(float const* __restrict__ backbone
             break;
         }
         float partial = 0.0F;
-        if (laneId < lanesUsed)
+        for (int32_t rankBase = laneId * 8; rankBase < markovRank; rankBase += 32 * 8)
         {
-            int32_t const rankBase = laneId * 8;
             uint4 const packed
-                = reinterpret_cast<uint4 const*>(markovW2)[static_cast<int64_t>(vocabIdx) * wordsPerRow + laneId];
+                = reinterpret_cast<uint4 const*>(markovW2)[static_cast<int64_t>(vocabIdx) * wordsPerRow + rankBase / 8];
             half2 const* w2h2 = reinterpret_cast<half2 const*>(&packed);
             half2 const* w1h2 = reinterpret_cast<half2 const*>(w1Shared + rankBase);
-            float sum = 0.0F;
 #pragma unroll
             for (int32_t j = 0; j < 4; ++j)
             {
                 float2 const a = __half22float2(w2h2[j]);
                 float2 const b = __half22float2(w1h2[j]);
-                sum += a.x * b.x + a.y * b.y;
+                partial += a.x * b.x + a.y * b.y;
             }
-            partial = sum;
         }
         for (int32_t offset = 16; offset > 0; offset >>= 1)
         {

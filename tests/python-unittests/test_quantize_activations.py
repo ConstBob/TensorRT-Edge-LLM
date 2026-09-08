@@ -92,6 +92,20 @@ def test_make_linear_propagates_to_the_layer(quant_type, group_size,
     assert layer.quantize_activations is quantize_activations
 
 
+def test_make_linear_uses_module_group_size_for_mixed_precision():
+    config = _model_config(
+        QuantConfig(quant_type=QUANT_FP8,
+                    group_size=1,
+                    layer_overrides={"lm_head": QUANT_NVFP4},
+                    layer_group_sizes={"lm_head": 16},
+                    is_mixed_precision=True))
+
+    layer = make_linear(config, 64, 128, module_name="lm_head")
+
+    assert layer.group_size == 16
+    assert tuple(layer.weight_scale.shape) == (128, 4)
+
+
 def test_row_parallel_nvfp4_rejects_weight_only():
     """The fused TP plugin quantizes inside the kernel, so it cannot express this.
 

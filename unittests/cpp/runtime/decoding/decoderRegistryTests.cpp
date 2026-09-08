@@ -61,6 +61,25 @@ TEST(DecoderRegistryPolicyTest, ExplicitDisableAndOtherSpeculativeModesRemainUnc
     EXPECT_TRUE(rt::shouldSelectDefaultDecoder(rt::DecodingStrategyKind::kMTP, {}, request));
 }
 
+TEST(DecoderRegistryPolicyTest, UnsupportedTreeSamplingFallsBackBeforeExecution)
+{
+    rt::DecodingStrategyCapabilities treeGreedyOnly{/*.ownsBaseVerificationCudaGraphs=*/true,
+        /*.supportsLosslessSampling=*/false, /*.maxSamplingSupport=*/0,
+        /*.fallbackToVanillaForNonGreedySampling=*/true};
+
+    auto greedy = makeSamplingRequest(1.0F, 1, 1.0F);
+    EXPECT_FALSE(rt::shouldSelectDefaultDecoder(rt::DecodingStrategyKind::kDFlash, treeGreedyOnly, greedy));
+
+    auto topK = makeSamplingRequest(1.0F, 20, 1.0F);
+    EXPECT_TRUE(rt::shouldSelectDefaultDecoder(rt::DecodingStrategyKind::kDFlash, treeGreedyOnly, topK));
+
+    auto topP = makeSamplingRequest(1.0F, 0, 0.95F);
+    EXPECT_TRUE(rt::shouldSelectDefaultDecoder(rt::DecodingStrategyKind::kDFlash, treeGreedyOnly, topP));
+
+    EXPECT_TRUE(rt::shouldSelectDefaultDecoder(rt::DecodingStrategyKind::kMTP, treeGreedyOnly, topK));
+    EXPECT_TRUE(rt::shouldSelectDefaultDecoder(rt::DecodingStrategyKind::kDSpark, treeGreedyOnly, topK));
+}
+
 TEST(DecoderRegistryPolicyTest, BoundedLosslessDecoderSupportsTopPOnlyAndFallsBackForOversizedTopK)
 {
     rt::DecodingStrategyCapabilities boundedLossless{/*.ownsBaseVerificationCudaGraphs=*/true,

@@ -235,6 +235,12 @@ compatibility path rejects DFlash2 rather than routing it through the DFlash v1
 graph. JetSpec reads the provider's
 `jetspec_config` or compatible `dflash_config`, requires its causal proposal
 head, and uses `--tree-base` for the validated tree-verification path.
+MTP, JetSpec, and DSpark accept `--tree-base`; the resulting base engine
+includes DDTree parent/depth inputs and is distinct from a linear-chain base
+engine. A hybrid DFlash v1 base always includes the metadata because recurrent
+state replay also needs it for linear chain verification. The same DFlash v1
+base supports `topK=1` chain and `topK>1` tree decoding. Tree decoding is
+greedy-only.
 
 Qwen3.5 native MTP reads draft layers from the target checkpoint:
 

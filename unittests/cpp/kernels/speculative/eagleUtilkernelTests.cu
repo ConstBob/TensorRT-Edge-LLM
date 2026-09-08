@@ -969,7 +969,7 @@ static rt::Tensor uploadLayerInfos(std::vector<KVLayerInfo> const& hostInfos, cu
 // ============================================================================
 // Test 8: eagleBaseAssembleHiddenState (split out from the old combined kernel)
 // Description: Test inplace compaction of accepted tokens from stride=draftTreeSize to stride=maxDepth
-// Key test: Verify multi-batch scenario where Batch 1+ needs to move ALL tokens including position 0
+// Key test: Verify multi-batch compaction where Batch 1 output overlaps Batch 0 input rows.
 // ============================================================================
 TEST(EagleKernels, EagleBaseAssembleHiddenState)
 {
@@ -988,6 +988,7 @@ TEST(EagleKernels, EagleBaseAssembleHiddenState)
         // Test with 2 batches to verify compaction with stride change
         int32_t batchSize = 2;
 
+        // Batch 1 writes dense output rows [6, 8], overlapping Batch 0 input row 7.
         // Batch 0: accept positions [0, 3, 7] (length=3)
         // Batch 1: accept positions [0, 2, 5] (length=3)
         std::vector<int32_t> inputAcceptedIndices = {

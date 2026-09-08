@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import json
 import threading
 import time
 from types import SimpleNamespace
@@ -25,10 +26,109 @@ from experimental.server.api.errors import (ServerOverloadedError,
 from experimental.server.config import ContextCacheConfig
 from experimental.server.runtime.engine import (
     LLM, SamplingParams, _native_context_cache_config,
-    _set_context_cache_request_policies)
+    _resolve_spec_decode_runtime_options, _set_context_cache_request_policies)
 from experimental.server.runtime.engine_client import (_AdmissionController,
                                                        _iterate_sync)
 from experimental.server.runtime.engine_layout import EngineType
+
+
+def test_gemma4_mtp_tree_runtime_options_follow_compiled_profile(tmp_path):
+    (tmp_path / "base_config.json").write_text(
+        json.dumps({
+            "spec_decode_type": "gemma4_mtp",
+            "builder_config": {
+                "max_verify_tree_size": 13
+            },
+        }))
+    (tmp_path / "draft_config.json").write_text("{}")
+
+    options = _resolve_spec_decode_runtime_options(str(tmp_path), "mtp", None,
+                                                   4, 3, None)
+
+    assert options.top_k == 4
+    assert options.step == 3
+    assert options.verify_size == 13
+
+
+def _write_cached_draft_bundle(path, method, base_max, draft_max, mode):
+    (path / "base_config.json").write_text(
+        json.dumps({
+            "spec_decode_type": method,
+            "builder_config": {
+                "max_verify_tree_size": base_max
+            },
+        }))
+    (path / "draft_config.json").write_text(
+        json.dumps({
+            "builder_config": {
+                "max_draft_tree_size": draft_max
+            },
+            f"{method}_config": mode,
+        }))
+
+
+def test_dflash_runtime_defaults_clamp_to_compiled_draft_profile(tmp_path):
+    _write_cached_draft_bundle(tmp_path, "dflash", 9, 4, {"block_size": 8})
+
+    options = _resolve_spec_decode_runtime_options(str(tmp_path), "dflash",
+                                                   None, 1, None, None)
+
+    assert options.step == 1
+    assert options.verify_size == 4
+    assert options.dflash_block_size == 4
+    with pytest.raises(ValueError, match="compiled proposal capacity"):
+        _resolve_spec_decode_runtime_options(str(tmp_path), "dflash", 5, 1,
+                                             None, None)
+
+
+def test_dspark_runtime_defaults_reserve_non_anchor_mask_slot(tmp_path):
+    _write_cached_draft_bundle(tmp_path, "dspark", 9, 8, {
+        "block_size": 8,
+        "sample_from_anchor": False
+    })
+
+    options = _resolve_spec_decode_runtime_options(str(tmp_path), "dspark",
+                                                   None, 1, None, None)
+
+    assert options.verify_size == 8
+    with pytest.raises(ValueError, match="compiled proposal capacity"):
+        _resolve_spec_decode_runtime_options(str(tmp_path), "dspark", 8, 1,
+                                             None, None)
+
+
+def test_dspark_tree_runtime_defaults_to_compiled_verify_budget(tmp_path):
+    _write_cached_draft_bundle(tmp_path, "dspark", 3, 2, {
+        "block_size": 8,
+        "sample_from_anchor": False
+    })
+
+    options = _resolve_spec_decode_runtime_options(str(tmp_path), "dspark",
+                                                   None, 2, None, None)
+
+    assert options.top_k == 2
+    assert options.step == 1
+    assert options.verify_size == 3
+    with pytest.raises(ValueError, match="uses verify_tree_size"):
+        _resolve_spec_decode_runtime_options(str(tmp_path), "dspark", 2, 2,
+                                             None, None)
+
+
+def test_dspark_tree_replay_rejects_smaller_verify_budget(tmp_path):
+    _write_cached_draft_bundle(tmp_path, "dspark", 9, 9, {
+        "block_size": 8,
+        "sample_from_anchor": False
+    })
+    base_path = tmp_path / "base_config.json"
+    base = json.loads(base_path.read_text())
+    base.update({
+        "num_linear_attn_layers": 23,
+        "recurrent_spec_verify_mode": "replay",
+    })
+    base_path.write_text(json.dumps(base))
+
+    with pytest.raises(ValueError, match="compiled maximum 9"):
+        _resolve_spec_decode_runtime_options(str(tmp_path), "dspark", None, 2,
+                                             None, 5)
 
 
 class _ConcurrentRuntime:

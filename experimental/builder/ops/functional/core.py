@@ -126,6 +126,13 @@ def linear_from_weights(input: Tensor,
                                                     name=name))
 
 
+def nvfp4_a16_linear_from_weights(input: Tensor,
+                                  weights,
+                                  rank: int = 3,
+                                  sm110: bool = False) -> Tensor:
+    return tensor(current_net().nvfp4_a16_linear(input, weights, rank, sm110))
+
+
 def fused_nvfp4_gemm_all_reduce(input: Tensor,
                                 weights,
                                 bias,

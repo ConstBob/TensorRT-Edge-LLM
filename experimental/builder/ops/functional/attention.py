@@ -49,6 +49,8 @@ def attention(
     vision_block_ids: Optional[Tensor] = None,
     attention_mask: Optional[Tensor] = None,
     attention_pos_id: Optional[Tensor] = None,
+    attention_sinks: Optional[Tensor] = None,
+    enable_contiguous_query_swa: bool = False,
 ) -> Tuple[Tensor, Tensor]:
     """Run paged decoder attention and return output plus present KV.
 
@@ -79,6 +81,8 @@ def attention(
         "enable_context_mask_selector": int(context_mask_selector is not None),
         "enable_fp8_kv_cache": int(enable_fp8_kv_cache),
         "enable_vision_block_attention": int(vision_block_ids is not None),
+        "enable_attention_sink": int(attention_sinks is not None),
+        "enable_contiguous_query_swa": int(enable_contiguous_query_swa),
         "sliding_window_size": sliding_window_size,
         "qkv_scales": qkv_scales,
         "skip_softmax_scale_factor": skip_softmax_scale_factor,
@@ -104,6 +108,9 @@ def attention(
         # runtime S override (0 = keep the baked scale factor). The plugin
         # requires it whenever skip-softmax is enabled.
         inputs.append(network_input("skip_softmax_scale", trt.int8, (-1, )))
+    if attention_sinks is not None:
+        inputs.append(attention_sinks)
+
     attn_4d, present_kv = operation("attention",
                                     inputs,
                                     output_count=2,

@@ -160,8 +160,10 @@ def build_runtime_config(cfg: DeviceConfig, args) -> Dict[str, Any]:
             "recurrent_state_num_heads": mc.num_heads,
             "recurrent_state_head_dim": mc.head_dim,
             "recurrent_state_size": mc.ssm_state_size,
+            "recurrent_state_num_groups": mc.n_groups,
             "conv_dim": mc.conv_dim,
             "conv_kernel": mc.conv_kernel,
+            "recurrent_spec_verify_mode": "replay",
             "use_rope": cfg.num_attn_layers > 0 and cfg.hybrid_uses_rope,
             "recurrent_state_dtype": "fp16",
             "conv_state_dtype": "fp16",
@@ -222,6 +224,13 @@ def build_runtime_config(cfg: DeviceConfig, args) -> Dict[str, Any]:
             out["base_model_hidden_size"] = target_hidden * len(target_layers)
         elif args.spec_type == "mtp":
             out["base_model_hidden_size"] = cfg.hidden_size
+            if cfg.root_model_type == "nemotron_h":
+                out["num_attention_layers"] = cfg.num_attn_layers
+                out["layer_types"] = ["attention"]
+                out["kv_layer_configs"] = [{
+                    "num_kv_heads": cfg.num_key_value_heads,
+                    "head_dim": cfg.head_dim,
+                }]
         elif args.spec_type in ("dflash", "jetspec"):
             targets = cfg.dflash_target_layer_ids or [1, 8, 15, 22, 29]
             out["base_model_hidden_size"] = len(targets) * cfg.hidden_size
@@ -304,9 +313,13 @@ def build_runtime_config(cfg: DeviceConfig, args) -> Dict[str, Any]:
             cfg.dspark_confidence_head_with_markov,
             "markov_head_type": cfg.dspark_markov_head_type,
             "markov_rank": cfg.dspark_markov_rank,
+            "causal_head": cfg.dspark_causal_proposal,
+            "contiguous_query_swa": cfg.dspark_contiguous_query_swa,
+            "sample_from_anchor": cfg.dspark_sample_from_anchor,
             "heads_file": "dspark_heads.safetensors",
             "heads_info_file": "dspark_heads_info.json",
         }
+        out["dspark_tree_base"] = cfg.dspark_tree_base
     if cfg.eagle_base:
         out["eagle_hidden_state_layers"] = list(cfg.eagle3_target_layer_ids)
 
