@@ -331,8 +331,12 @@ TEST_F(ContextCacheRequestTests, BatchCompactionUsesThePreparedMapping)
                   cudaMemcpyDeviceToHost),
         cudaSuccess);
     EXPECT_EQ(uploadedMapping, (std::vector<int32_t>{-1, 0}));
-    ASSERT_TRUE(request->completeBatchCompaction());
+    // The runtime-side reuse mirror must compact with the same keep-mapping, or reuseTokenLength
+    // reads the evicted slot's prefix afterwards.
+    int32_t const survivorReuse = request->reuseTokenLength(1);
+    ASSERT_TRUE(request->completeBatchCompaction({-1, 0}));
     EXPECT_TRUE(std::equal(survivingRow.begin(), survivingRow.end(), mPageTable->hostRow(0)));
+    EXPECT_EQ(request->reuseTokenLength(0), survivorReuse);
     ASSERT_TRUE(request->finish());
 }
 

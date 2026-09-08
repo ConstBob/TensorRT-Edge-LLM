@@ -65,8 +65,21 @@ public:
     bool prepareDecodeStep(DecodingInferenceContext const& context, DecodingKvHeadroom const& headroom);
     bool completeDecodeStep(DecodingInferenceContext const& context, std::vector<int32_t> const& commonStateLengths);
     bool beginBatchCompaction(std::vector<int32_t> const& oldToNew, int32_t newBatchSize, Tensor& deviceBatchMapping);
-    bool completeBatchCompaction();
+    bool completeBatchCompaction(std::vector<int32_t> const& keepMapping);
     bool finish();
+
+    //! @name In-flight admission, context-reuse backend only.
+    //! The bounded-SWA backend has no live-slot admission (its per-slot window state cannot join a
+    //! running batch), and supportsSeatedAdmission() refuses such deployments before an engine that
+    //! would call these is ever constructed; the kFailed/false returns here are the backstop.
+    //! @{
+    ContextCacheRequest::AdmitSequenceStatus admitSequence(std::vector<int32_t> const& tokenIds,
+        std::string const& loraWeightsName, DecodingKvHeadroom const& headroom, int32_t& prefillStart,
+        std::vector<int32_t> const& mediaTokenIds = {}, std::vector<imageUtils::ImageData> const& imageBuffers = {},
+        std::vector<audioUtils::AudioData> const& audioBuffers = {});
+    bool finalizeSequenceAdmission(int32_t slot, int32_t const& lookaheadToken, int32_t fullInputLength);
+    void retractSequenceAdmission();
+    //! @}
 
 private:
     using Backend = std::variant<ContextCacheRequest, BoundedSwaKVPageManager::RequestHandle>;

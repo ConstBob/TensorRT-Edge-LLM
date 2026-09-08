@@ -979,3 +979,67 @@ TEST(HybridCacheManagerTests, CaptureKVCacheRejectsFp8)
 
     EXPECT_THROW(mgr.captureKVCache(0, 8, stream), std::exception);
 }
+
+// --- swapSlotState: the device half of seating a slot at another index ------
+
+TEST(HybridCacheManagerTests, SwapSlotStateExchangesLengthsAndIsItsOwnInverse)
+{
+    cudaStream_t stream{};
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    constexpr int32_t maxBatch = 3;
+    rt::HybridCacheManager::Config cfg{};
+    cfg.layerTypes.assign(2, rt::HybridCacheManager::LayerType::kAttention);
+    cfg.kvConfig = makeUniformKVConfig(/*numLayers=*/2, maxBatch, /*maxSeq=*/128, /*numKVHeads=*/4, /*headDim=*/64);
+    cfg.mambaConfig = makeMambaConfig(/*numLayers=*/0, maxBatch);
+    cfg.maxBatchSize = maxBatch;
+    rt::HybridCacheManager mgr(cfg, stream);
+
+    std::vector<int32_t> const reuse{3, 11, 5};
+    rt::Tensor reuseT({3}, rt::DeviceType::kCPU, DataType::kINT32);
+    std::memcpy(reuseT.rawPointer(), reuse.data(), reuse.size() * sizeof(int32_t));
+    mgr.resetForNewSequences(reuseT, stream);
+
+    mgr.swapSlotState(0, 1, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    auto lengths = copyDeviceToHost<int32_t>(mgr.getKVCacheLengths());
+    ASSERT_EQ(lengths.size(), 3U);
+    EXPECT_EQ(lengths[0], 11);
+    EXPECT_EQ(lengths[1], 3);
+    EXPECT_EQ(lengths[2], 5) << "a bystander slot's length moved";
+
+    // Self-inverse: the restore is the same call, so a caller keeps no copy of what it displaced.
+    mgr.swapSlotState(0, 1, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    lengths = copyDeviceToHost<int32_t>(mgr.getKVCacheLengths());
+    EXPECT_EQ(lengths[0], 3);
+    EXPECT_EQ(lengths[1], 11);
+
+    mgr.swapSlotState(2, 2, stream); // self-swap is a no-op, not an error
+    EXPECT_THROW(mgr.swapSlotState(0, maxBatch, stream), std::runtime_error);
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
+TEST(HybridCacheManagerTests, SwapSlotStateRefusesMambaState)
+{
+    // Mamba rows hold the sequence's recurrent state by value, per slot. Exchanging them is a far
+    // heavier operation than two lengths, and nothing needs it yet -- so a hybrid deployment must
+    // refuse loudly rather than corrupt recurrent state by moving only half the picture.
+    cudaStream_t stream{};
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    constexpr int32_t maxBatch = 2;
+    rt::HybridCacheManager::Config cfg{};
+    cfg.layerTypes.assign(3, rt::HybridCacheManager::LayerType::kAttention);
+    cfg.layerTypes.push_back(rt::HybridCacheManager::LayerType::kMamba);
+    cfg.kvConfig = makeUniformKVConfig(3, maxBatch, 128, 4, 64);
+    cfg.mambaConfig = makeMambaConfig(/*numLayers=*/1, maxBatch);
+    cfg.maxBatchSize = maxBatch;
+    rt::HybridCacheManager mgr(cfg, stream);
+
+    std::vector<int32_t> const reuse{0, 0};
+    rt::Tensor reuseT({2}, rt::DeviceType::kCPU, DataType::kINT32);
+    std::memcpy(reuseT.rawPointer(), reuse.data(), reuse.size() * sizeof(int32_t));
+    mgr.resetForNewSequences(reuseT, stream);
+
+    EXPECT_THROW(mgr.swapSlotState(0, 1, stream), std::runtime_error);
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}

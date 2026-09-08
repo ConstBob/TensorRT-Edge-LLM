@@ -218,8 +218,8 @@ void validateCompactionMapping(std::vector<int32_t> const& oldToNew, int32_t old
 class ActiveRequestRollback final
 {
 public:
-    explicit ActiveRequestRollback(bool& active) noexcept
-        : mActive(active)
+    explicit ActiveRequestRollback(int32_t& activeRequests) noexcept
+        : mActiveRequests(activeRequests)
     {
     }
 
@@ -227,7 +227,7 @@ public:
     {
         if (mArmed)
         {
-            mActive = false;
+            --mActiveRequests;
         }
     }
 
@@ -237,7 +237,7 @@ public:
     }
 
 private:
-    bool& mActive;
+    int32_t& mActiveRequests;
     bool mArmed{true};
 };
 
@@ -265,7 +265,7 @@ struct ContextCacheCoordinator::RequestHandle::Impl
         {
             if (owner != nullptr)
             {
-                owner->mRequestActive = false;
+                --owner->mActiveRequests;
             }
         }
 
@@ -311,8 +311,10 @@ struct ContextCacheCoordinator::RequestHandle::Impl
     {
     }
 
-    //! Declared before sequences so its destructor clears the admission flag only after every lease is released.
+    //! Declared before sequences so its destructor drops the active-request count only after every
+    //! lease is released.
     RequestSlotToken requestSlot;
+    std::unique_ptr<PublicationPolicy> publicationPolicy;
     ContextCacheCoordinator* owner{};
     cudaStream_t stream{};
     bool speculativeRequest{};
@@ -939,7 +941,7 @@ ContextCacheCoordinator::ContextCacheCoordinator(ContextCacheConfig const& confi
 
 ContextCacheCoordinator::~ContextCacheCoordinator() noexcept
 {
-    if (mQuarantinedRequest != nullptr || mRequestActive)
+    if (!mQuarantinedRequests.empty() || mActiveRequests != 0)
     {
         LOG_ERROR(
             "ContextCacheCoordinator destroyed with unresolved request ownership; shutdown must prove "
@@ -1043,6 +1045,61 @@ ContextCacheCoordinator::AcquireSequenceResult ContextCacheCoordinator::acquireS
     return AcquireSequenceResult{std::move(acquired.lease), acquired.status, std::move(acquired.plan), forcedCold};
 }
 
+bool ContextCacheCoordinator::acquireIntoRequest(RequestHandle::Impl& request,
+    ContextCacheSequenceAdmission const& admission, ContextCacheLookupPolicy lookupPolicy,
+    ContextCacheCommitPolicy commitPolicy, int32_t replayTailLength, DecodingKvHeadroom const& headroom,
+    bool* insufficientCapacity)
+{
+    AcquireSequenceResult acquired = acquireSequence(admission, request.speculativeRequest, lookupPolicy, headroom);
+    if (acquired.status != AcquireStatus::kAcquired || !acquired.lease.has_value())
+    {
+        if (insufficientCapacity != nullptr)
+        {
+            *insufficientCapacity = acquired.status == AcquireStatus::kInsufficientCapacity;
+        }
+        return false;
+    }
+
+    RequestHandle::Impl::SequenceState sequence;
+    sequence.lease = std::move(*acquired.lease);
+    sequence.tokenIds = admission.tokenIds;
+    sequence.keyExtras = admission.keyExtras;
+    sequence.perPositionMediaHash = admission.perPositionMediaHash;
+    sequence.reuseTokenLength = acquired.plan.reuseTokenLength;
+    sequence.lookupPolicy = lookupPolicy;
+    sequence.commitPolicy = commitPolicy;
+    sequence.replayTailLength = replayTailLength;
+    sequence.committedStateLength = acquired.plan.reuseTokenLength;
+    sequence.commonStateLength = acquired.plan.reuseTokenLength;
+    request.sequences.push_back(std::move(sequence));
+    LOG_INFO("Context cache: sequence %zu reuse %d/%zu tokens (%d pages)", request.sequences.size() - 1,
+        acquired.plan.reuseTokenLength, admission.tokenIds.size(), acquired.plan.reuseTokenLength / kTOKENS_PER_PAGE);
+    ++mMetrics.admittedSequences;
+    mMetrics.mediaAwareSequences += static_cast<uint64_t>(!admission.perPositionMediaHash.empty());
+    mMetrics.matchedTokens += static_cast<uint64_t>(acquired.plan.matchedTokenLength);
+    mMetrics.reusedTokens += static_cast<uint64_t>(acquired.plan.reuseTokenLength);
+    mMetrics.hitSequences += static_cast<uint64_t>(acquired.plan.matchedTokenLength > 0);
+    mMetrics.lookupBypassSequences
+        += static_cast<uint64_t>(lookupPolicy == ContextCacheLookupPolicy::kBypass || acquired.forcedCold);
+    if (acquired.forcedCold)
+    {
+        ++mMetrics.forcedColdSequences;
+        if (shouldLogDegradation(mMetrics.forcedColdSequences))
+        {
+            LOG_WARNING("Context cache forced-cold fallback count reached %llu",
+                static_cast<unsigned long long>(mMetrics.forcedColdSequences));
+        }
+    }
+    switch (acquired.plan.kind)
+    {
+    case ReusePlanKind::kStandard: ++mMetrics.standardPlans; break;
+    case ReusePlanKind::kNoReusablePrefix: ++mMetrics.noReusablePrefixPlans; break;
+    case ReusePlanKind::kFullInputRewind: ++mMetrics.fullInputRewindPlans; break;
+    }
+    mMetrics.specFullPageReplays += static_cast<uint64_t>(acquired.plan.specReplayMode == SpecReplayMode::kFullPage);
+    return true;
+}
+
 ContextCacheCoordinator::BeginRequestResult ContextCacheCoordinator::beginRequest(
     ContextCacheBatchAdmission const& admission, DecodingKvHeadroom const& headroom, cudaStream_t stream)
 {
@@ -1067,18 +1124,19 @@ ContextCacheCoordinator::BeginRequestResult ContextCacheCoordinator::beginReques
         return BeginRequestResult{ContextCacheCoordinatorStatus::kPoisoned, std::nullopt};
     }
 
-    if (mRequestActive)
-    {
-        return BeginRequestResult{ContextCacheCoordinatorStatus::kRequestFailed, std::nullopt};
-    }
-    mRequestActive = true;
+    // quarantine() is noexcept and runs on the device-failure path, where a bad_alloc would abort
+    // the process instead of holding the pages. Buy the storage here, where throwing is harmless,
+    // so every request that can become resident already has a quarantine slot waiting for it.
+    mQuarantinedRequests.reserve(static_cast<size_t>(mActiveRequests) + 1U);
 
-    ActiveRequestRollback activeRollback(mRequestActive);
+    ++mActiveRequests;
+
+    ActiveRequestRollback activeRollback(mActiveRequests);
     auto request = std::make_unique<RequestHandle::Impl>(*this, stream);
     activeRollback.dismiss();
     request->speculativeRequest = admission.speculativeRequest;
     request->tokenStateContract = admission.tokenStateContract;
-    mPublicationPolicy = makePublicationPolicy(admission.speculativeRequest);
+    request->publicationPolicy = makePublicationPolicy(admission.speculativeRequest);
     int32_t maxBatchSize = mBaseCache.getKVCacheManager().getConfig().maxBatchSize;
     if (admission.speculativeRequest && ownsPagedSpecState())
     {
@@ -1092,57 +1150,111 @@ ContextCacheCoordinator::BeginRequestResult ContextCacheCoordinator::beginReques
 
     for (ContextCacheSequenceAdmission const& sequenceAdmission : admission.sequences)
     {
-        AcquireSequenceResult acquired
-            = acquireSequence(sequenceAdmission, admission.speculativeRequest, lookupPolicy, headroom);
-        if (acquired.status != AcquireStatus::kAcquired || !acquired.lease.has_value())
+        if (!acquireIntoRequest(*request, sequenceAdmission, lookupPolicy, admission.commitPolicy,
+                admission.replayTailLength, headroom, /*insufficientCapacity=*/nullptr))
         {
             return BeginRequestResult{ContextCacheCoordinatorStatus::kRequestFailed, std::nullopt};
         }
-
-        RequestHandle::Impl::SequenceState sequence;
-        sequence.lease = std::move(*acquired.lease);
-        sequence.tokenIds = sequenceAdmission.tokenIds;
-        sequence.keyExtras = sequenceAdmission.keyExtras;
-        sequence.perPositionMediaHash = sequenceAdmission.perPositionMediaHash;
-        sequence.reuseTokenLength = acquired.plan.reuseTokenLength;
-        sequence.lookupPolicy = lookupPolicy;
-        sequence.commitPolicy = admission.commitPolicy;
-        sequence.replayTailLength = admission.replayTailLength;
-        sequence.committedStateLength = acquired.plan.reuseTokenLength;
-        sequence.commonStateLength = acquired.plan.reuseTokenLength;
-        request->sequences.push_back(std::move(sequence));
-        prefillStarts.push_back(acquired.plan.reuseTokenLength);
-        LOG_INFO("Context cache: sequence %zu reuse %d/%zu tokens (%d pages)", request->sequences.size() - 1,
-            acquired.plan.reuseTokenLength, sequenceAdmission.tokenIds.size(),
-            acquired.plan.reuseTokenLength / kTOKENS_PER_PAGE);
-        ++mMetrics.admittedSequences;
-        mMetrics.mediaAwareSequences += static_cast<uint64_t>(!sequenceAdmission.perPositionMediaHash.empty());
-        mMetrics.matchedTokens += static_cast<uint64_t>(acquired.plan.matchedTokenLength);
-        mMetrics.reusedTokens += static_cast<uint64_t>(acquired.plan.reuseTokenLength);
-        mMetrics.hitSequences += static_cast<uint64_t>(acquired.plan.matchedTokenLength > 0);
-        mMetrics.lookupBypassSequences
-            += static_cast<uint64_t>(lookupPolicy == ContextCacheLookupPolicy::kBypass || acquired.forcedCold);
-        if (acquired.forcedCold)
-        {
-            ++mMetrics.forcedColdSequences;
-            if (shouldLogDegradation(mMetrics.forcedColdSequences))
-            {
-                LOG_WARNING("Context cache forced-cold fallback count reached %llu",
-                    static_cast<unsigned long long>(mMetrics.forcedColdSequences));
-            }
-        }
-        switch (acquired.plan.kind)
-        {
-        case ReusePlanKind::kStandard: ++mMetrics.standardPlans; break;
-        case ReusePlanKind::kNoReusablePrefix: ++mMetrics.noReusablePrefixPlans; break;
-        case ReusePlanKind::kFullInputRewind: ++mMetrics.fullInputRewindPlans; break;
-        }
-        mMetrics.specFullPageReplays
-            += static_cast<uint64_t>(acquired.plan.specReplayMode == SpecReplayMode::kFullPage);
+        prefillStarts.push_back(request->sequences.back().reuseTokenLength);
     }
 
     AdmissionResult admitted{RequestHandle(std::move(request)), std::move(prefillStarts)};
     return BeginRequestResult{ContextCacheCoordinatorStatus::kOk, std::move(admitted)};
+}
+
+void ContextCacheCoordinator::retractSequenceAdmission(RequestHandle& request)
+{
+    RequestHandle::Impl& impl = checkedImpl(request);
+    ELLM_CHECK(impl.sequences.size() > 1, "Context cache admission retraction requires an admitted tail sequence");
+    int32_t const slot = static_cast<int32_t>(impl.sequences.size()) - 1;
+    impl.sequences.pop_back(); // The lease releases with the sequence state.
+    mBasePageTable.setRows({KVPageTableRowUpdate{slot, nullptr, 0}});
+    mBasePageTable.upload(impl.stream);
+}
+
+ContextCacheCoordinator::AdmitSequenceResult ContextCacheCoordinator::admitSequence(
+    RequestHandle& request, ContextCacheSequenceAdmission const& admission, DecodingKvHeadroom const& headroom)
+{
+    RequestHandle::Impl& impl = checkedImpl(request);
+    ELLM_CHECK(impl.executing() && !impl.hasPendingDeviceWork(),
+        "Context cache sequence admission requires a settled executing request");
+    ELLM_CHECK(impl.pendingCompactionBatchSize < 0,
+        "Context cache sequence admission cannot interleave a pending batch compaction");
+    // V0 scope: vanilla attention only. Hybrid/MTP admission needs a snapshot restore into a live
+    // batch and speculative admission a coherent draft path; both arrive with later stages.
+    ELLM_CHECK(!impl.speculativeRequest && !usesCheckpointReuse() && deploymentHasAttention(),
+        "Context cache sequence admission is limited to vanilla attention deployments");
+    ELLM_CHECK(!impl.sequences.empty(), "Context cache sequence admission requires a live founding batch");
+    if (mPoisoned)
+    {
+        return AdmitSequenceResult{ContextCacheCoordinatorStatus::kPoisoned, false, 0};
+    }
+    int32_t const maxBatchSize = mBaseCache.getKVCacheManager().getConfig().maxBatchSize;
+    ELLM_CHECK(impl.sequences.size() < static_cast<size_t>(maxBatchSize),
+        "Context cache sequence admission exceeds the engine batch size");
+
+    // The batch-wide policies travel with the request: the scheduler admits only requests whose
+    // cache policies match the resident batch (BatchCompatibility), so the founder's are the
+    // joiner's.
+    ContextCacheLookupPolicy const lookupPolicy = impl.sequences.front().lookupPolicy;
+    ContextCacheCommitPolicy const commitPolicy = impl.sequences.front().commitPolicy;
+    int32_t const replayTailLength = impl.sequences.front().replayTailLength;
+
+    bool insufficientCapacity = false;
+    if (!acquireIntoRequest(
+            impl, admission, lookupPolicy, commitPolicy, replayTailLength, headroom, &insufficientCapacity))
+    {
+        return AdmitSequenceResult{ContextCacheCoordinatorStatus::kRequestFailed, insufficientCapacity, 0};
+    }
+
+    // Bind exactly the new row; resident rows keep serving the running batch. The device KV length
+    // for the slot is the runtime's business -- its seating sequence owns the cache-manager view.
+    auto const& sequence = impl.sequences.back();
+    int32_t const slot = static_cast<int32_t>(impl.sequences.size()) - 1;
+    auto const& pages = sequence.lease.basePages();
+    try
+    {
+        mBasePageTable.setRows(
+            {KVPageTableRowUpdate{slot, pages.empty() ? nullptr : pages.data(), static_cast<int32_t>(pages.size())}});
+        mBasePageTable.upload(impl.stream);
+    }
+    catch (...)
+    {
+        // The lease is filed but the runtime never learns of the slot. Release it so the
+        // coordinator's sequences stay aligned with the batch, and let the error that actually
+        // threw reach the caller -- reservation is the stage that may fail, and it fails whole.
+        impl.sequences.pop_back();
+        throw;
+    }
+    return AdmitSequenceResult{ContextCacheCoordinatorStatus::kOk, false, sequence.reuseTokenLength};
+}
+
+ContextCacheCoordinatorStatus ContextCacheCoordinator::finalizeSequenceAdmission(
+    RequestHandle& request, int32_t slot, ContextCacheSequenceAdvance const& advance)
+{
+    RequestHandle::Impl& impl = checkedImpl(request);
+    ELLM_CHECK(impl.executing(), "Context cache sequence-admission finalization requires an executing request");
+    ELLM_CHECK(slot >= 0 && slot < static_cast<int32_t>(impl.sequences.size()),
+        "Context cache sequence-admission finalization slot is outside the active batch");
+    auto& sequence = impl.sequences[static_cast<size_t>(slot)];
+    if (mPoisoned)
+    {
+        return ContextCacheCoordinatorStatus::kPoisoned;
+    }
+    // The single-slot form of finalizePrefillPublication's contract: the seated prefill computed
+    // the complete input and sampled one lookahead token. Recording that token here is what keeps
+    // the committed-plus-lookahead invariant -- and therefore every published block hash -- aligned
+    // with what the pages actually contain.
+    ELLM_CHECK(advance.acceptedTokenCount == 1 && advance.acceptedTokenIds != nullptr
+            && advance.committedStateLength == static_cast<int32_t>(sequence.tokenIds.size()),
+        "Context cache sequence-admission progress does not describe a complete input plus one lookahead");
+    sequence.tokenIds.push_back(*advance.acceptedTokenIds);
+    sequence.committedStateLength = advance.committedStateLength;
+    sequence.commonStateLength = advance.committedStateLength;
+    // Vanilla-attention publication, matching BaseEndpointPolicy::onPrefillFinalized for one slot;
+    // admitSequence pinned the request to that deployment shape.
+    publishReadyEndpoint(impl, slot, PublicationPoint::kPrefillEnd);
+    return ContextCacheCoordinatorStatus::kOk;
 }
 
 ContextCacheCoordinator::RequestHandle::Impl& ContextCacheCoordinator::checkedImpl(RequestHandle& request) const
@@ -1288,6 +1400,13 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::applyAdvances(
         ELLM_CHECK(delta.acceptedTokenCount >= 0, "Context cache accepted-token count must be non-negative");
         ELLM_CHECK(delta.acceptedTokenCount == 0 || delta.acceptedTokenIds != nullptr,
             "Context cache accepted-token delta has a null token pointer");
+        if (delta.acceptedTokenCount == 0
+            && delta.committedStateLength == ContextCacheSequenceAdvance::kHoldCommittedStateLength)
+        {
+            continue; // A hold: the ledger stays exactly where it is (a slot cancelled at the top of a step).
+        }
+        // Otherwise a zero-token advance still commits state -- a fully committed prefill records the
+        // whole prompt without a sampled token -- and is checked like any other.
         size_t const acceptedCount = static_cast<size_t>(delta.acceptedTokenCount);
         ELLM_CHECK(sequence.tokenIds.size() <= static_cast<size_t>(std::numeric_limits<int32_t>::max()) - acceptedCount,
             "Context cache token history exceeds int32");
@@ -1301,11 +1420,13 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::applyAdvances(
     {
         ContextCacheSequenceAdvance const& delta = advances[slot];
         auto& sequence = request.sequences[slot];
-        if (delta.acceptedTokenCount > 0)
+        if (delta.acceptedTokenCount == 0
+            && delta.committedStateLength == ContextCacheSequenceAdvance::kHoldCommittedStateLength)
         {
-            sequence.tokenIds.insert(sequence.tokenIds.end(), delta.acceptedTokenIds,
-                delta.acceptedTokenIds + static_cast<std::ptrdiff_t>(delta.acceptedTokenCount));
+            continue; // A hold; validation accepted the sentinel.
         }
+        sequence.tokenIds.insert(sequence.tokenIds.end(), delta.acceptedTokenIds,
+            delta.acceptedTokenIds + static_cast<std::ptrdiff_t>(delta.acceptedTokenCount));
         sequence.committedStateLength = delta.committedStateLength;
     }
     return ContextCacheCoordinatorStatus::kOk;
@@ -1565,6 +1686,15 @@ void ContextCacheCoordinator::validateCommittedLookaheadAdvances(RequestHandle::
     {
         auto const& sequence = request.sequences[slot];
         auto const& delta = advances[slot];
+        // A slot cancelled at the top of a step appends nothing that step: a zero advance holding
+        // the committed length in place is the legal way to say so. The pages stay leased and
+        // consistent; the slot leaves through the ordinary eviction after this step.
+        if (delta.acceptedTokenCount == 0)
+        {
+            ELLM_CHECK(delta.committedStateLength == ContextCacheSequenceAdvance::kHoldCommittedStateLength,
+                "Context cache zero advance must carry the hold sentinel");
+            continue;
+        }
         int64_t const expectedCommittedStateLength = static_cast<int64_t>(sequence.committedStateLength)
             + (multiToken ? static_cast<int64_t>(delta.acceptedTokenCount) : 1);
         int64_t const expectedTokenCount = static_cast<int64_t>(sequence.committedStateLength) + 1;
@@ -1614,27 +1744,27 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::finalizePrefillPublicatio
                 "Context cache prefill progress does not describe a complete input plus one lookahead");
         }
     }
-    mPublicationPolicy->onPrefillFinalized(request, advances, commonStateLengths);
+    impl.publicationPolicy->onPrefillFinalized(request, advances, commonStateLengths);
     return ContextCacheCoordinatorStatus::kOk;
 }
 
 ContextCacheCoordinatorStatus ContextCacheCoordinator::publishHybridMtpEndpoint(RequestHandle& request, int32_t slot,
     int32_t residentStateLength, Tensor const& baseHiddenStates, int32_t boundaryHiddenRow)
 {
-    checkedImpl(request);
+    RequestHandle::Impl& impl = checkedImpl(request);
     ELLM_CHECK(mProfile.isHybrid() && mProfile.isSpeculative() && mHybridSnapshots != nullptr,
         "Hybrid+MTP endpoint publication requires a Hybrid+MTP deployment with snapshot storage");
-    return mPublicationPolicy->publishMtpBoundary(
+    return impl.publicationPolicy->publishMtpBoundary(
         request, slot, residentStateLength, baseHiddenStates, boundaryHiddenRow);
 }
 
 ContextCacheCoordinatorStatus ContextCacheCoordinator::restoreHybridMtpBoundaryHidden(
     RequestHandle& request, int32_t slot, Tensor& baseHiddenStates, int32_t destinationRow)
 {
-    checkedImpl(request);
+    RequestHandle::Impl& impl = checkedImpl(request);
     ELLM_CHECK(mProfile.isHybrid() && mProfile.isSpeculative() && mHybridSnapshots != nullptr,
         "Hybrid+MTP boundary-hidden restore requires a Hybrid+MTP deployment with snapshot storage");
-    return mPublicationPolicy->restoreMtpBoundary(request, slot, baseHiddenStates, destinationRow);
+    return impl.publicationPolicy->restoreMtpBoundary(request, slot, baseHiddenStates, destinationRow);
 }
 
 ContextCacheCoordinatorStatus ContextCacheCoordinator::prepareDecodeStep(
@@ -1776,7 +1906,7 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::completeDecodeStep(Reques
         "Context cache decode completion requires pending decode work");
     ELLM_CHECK(
         advances.size() == impl.sequences.size(), "Context cache decode advances must describe every active sequence");
-    return mPublicationPolicy->onDecodeCompleted(request, advances, publishableCompletedSlots, commonStateLengths);
+    return impl.publicationPolicy->onDecodeCompleted(request, advances, publishableCompletedSlots, commonStateLengths);
 }
 
 ContextCacheCoordinatorStatus ContextCacheCoordinator::beginBatchCompaction(
@@ -1784,7 +1914,7 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::beginBatchCompaction(
 {
     RequestHandle::Impl& impl = checkedImpl(request);
     // EAGLE finalizes its two-phase draft init before compaction; other flavors no-op.
-    ContextCacheCoordinatorStatus const terminalStatus = mPublicationPolicy->onTerminalize(request);
+    ContextCacheCoordinatorStatus const terminalStatus = impl.publicationPolicy->onTerminalize(request);
     if (terminalStatus != ContextCacheCoordinatorStatus::kOk)
     {
         return terminalStatus;
@@ -1891,11 +2021,7 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::compactBatch(RequestHandl
 void ContextCacheCoordinator::quarantine(RequestHandle& request) noexcept
 {
     mPoisoned = true;
-    if (mQuarantinedRequest != nullptr)
-    {
-        std::terminate();
-    }
-    mQuarantinedRequest = std::move(request.mImpl);
+    mQuarantinedRequests.push_back(std::move(request.mImpl));
 }
 
 ContextCacheCoordinatorStatus ContextCacheCoordinator::finish(RequestHandle& request)
@@ -1905,7 +2031,7 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::finish(RequestHandle& req
         return ContextCacheCoordinatorStatus::kOk;
     }
     // EAGLE finalizes its two-phase draft init at completion; other flavors no-op.
-    ContextCacheCoordinatorStatus const terminalStatus = mPublicationPolicy->onTerminalize(request);
+    ContextCacheCoordinatorStatus const terminalStatus = checkedImpl(request).publicationPolicy->onTerminalize(request);
     if (terminalStatus != ContextCacheCoordinatorStatus::kOk)
     {
         return terminalStatus;
@@ -1949,21 +2075,18 @@ void ContextCacheCoordinator::abandon(std::unique_ptr<RequestHandle::Impl> reque
     }
 
     mPoisoned = true;
-    if (mQuarantinedRequest != nullptr)
-    {
-        std::terminate();
-    }
-    mQuarantinedRequest = std::move(request);
+    mQuarantinedRequests.push_back(std::move(request));
 }
 
 ContextCacheCoordinatorStatus ContextCacheCoordinator::shutdown() noexcept
 {
-    if (mQuarantinedRequest != nullptr)
+    while (!mQuarantinedRequests.empty())
     {
+        std::unique_ptr<RequestHandle::Impl>& quarantined = mQuarantinedRequests.back();
         cudaError_t status{cudaErrorUnknown};
         try
         {
-            status = mSynchronizer(mQuarantinedRequest->stream);
+            status = mSynchronizer(quarantined->stream);
         }
         catch (...)
         {
@@ -1973,10 +2096,10 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::shutdown() noexcept
         {
             return ContextCacheCoordinatorStatus::kPoisoned;
         }
-        mQuarantinedRequest->markDeviceWorkSynchronized();
-        mQuarantinedRequest.reset();
+        quarantined->markDeviceWorkSynchronized();
+        mQuarantinedRequests.pop_back();
     }
-    if (mRequestActive)
+    if (mActiveRequests != 0)
     {
         return ContextCacheCoordinatorStatus::kRequestFailed;
     }

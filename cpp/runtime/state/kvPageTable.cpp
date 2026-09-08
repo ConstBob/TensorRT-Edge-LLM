@@ -316,6 +316,37 @@ void KVPageTable::compactRows(std::vector<int32_t> const& oldToNew, int32_t newB
     mIsIdentity = false;
 }
 
+void KVPageTable::swapRows(int32_t slotA, int32_t slotB)
+{
+    ELLM_CHECK(slotA >= 0 && slotA < mMaxBatch && slotB >= 0 && slotB < mMaxBatch,
+        "KVPageTable::swapRows: slot is out of range.");
+    // Sparse-window rows carry per-slot page-set maps this exchange does not move; swapping only
+    // the flat rows would silently desynchronize them, so a sparse table refuses.
+    ELLM_CHECK(mMode == Mode::kDense, "KVPageTable::swapRows: only dense tables can exchange rows.");
+    if (slotA == slotB)
+    {
+        return;
+    }
+
+    // Element-wise through setHostValue, not a raw swap_ranges: the entry-level dirty bookkeeping
+    // (mDirtyIndices / mUploadedHost) is what uploadDirty() and later setEntry/setRow calls trust,
+    // and a raw swap would leave it blind to the exchange.
+    size_t const rowElements = static_cast<size_t>(kKV_HALVES * mMaxPagesPerSeq);
+    size_t const offsetA = static_cast<size_t>(slotA) * rowElements;
+    size_t const offsetB = static_cast<size_t>(slotB) * rowElements;
+    for (size_t j = 0; j < rowElements; ++j)
+    {
+        int32_t const a = mHost[offsetA + j];
+        int32_t const b = mHost[offsetB + j];
+        setHostValue(offsetA + j, b);
+        setHostValue(offsetB + j, a);
+    }
+
+    // Even if the two rows happened to be identical, the identity mapping is no longer something
+    // this table can promise; isIdentity() is documented to fail closed.
+    mIsIdentity = false;
+}
+
 bool KVPageTable::checkInvariants(std::string& error) const
 {
     error.clear();

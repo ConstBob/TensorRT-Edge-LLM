@@ -24,6 +24,9 @@
 
 #include "substituteEngine.h"
 
+#include "runtime/llmRankRuntime.h"
+#include "runtime/runtimeStepper.h"
+
 using namespace trt_edgellm;
 using namespace substitute_engine;
 
@@ -829,3 +832,369 @@ TEST_F(LogprobsTest, ReportEverySlotOfABatchFromItsOwnRow)
     }
 }
 } // namespace
+
+// ---------------------------------------------------------------------------
+// In-flight admission: a second sequence joins through the boundary hook while
+// the first decodes, and each sequence's tokens are exactly what a serial run
+// with the same engine outputs would have produced. The mock names every row's
+// argmax per forward pass, so a token landing in the wrong slot -- through the
+// seated prefill's swaps or the eviction that follows -- changes an assertion,
+// not a probability.
+// ---------------------------------------------------------------------------
+TEST_F(RuntimeAssemblyTest, AdmitsASecondSequenceMidFlightAndKeepsBothTokenStreamsIntact)
+{
+    using ::testing::_;
+
+    constexpr int64_t kMaxGenerateLength{4};
+    constexpr int32_t kA1 = 3, kA2 = 4, kA3 = 5, kA4 = 6;
+    constexpr int32_t kB1 = 7, kB2 = 8, kB3 = 9, kB4 = 10;
+    constexpr int32_t kAdmittedIndexBase = 1; // A's request holds index 0
+
+    auto engine = makeEngine();
+    auto& mock = *engine;
+
+    // Two prefill passes: A's founding one, and B's seated batch-1 pass mid-flight.
+    EXPECT_CALL(mock, prepare(kPrefillProfile, _, _, _)).Times(2);
+    EXPECT_CALL(mock, prepare(kDecodeProfile, _, _, _)).Times(4);
+    {
+        ::testing::InSequence forwardOrder;
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kA1}));      // A prefill
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kA2}));      // decode, A alone
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kB1}));      // B's seated prefill (batch 1)
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kA3, kB2})); // decode, both resident
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kA4, kB3})); // A finishes and is evicted
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kB4}));      // B, compacted to row 0, finishes
+    }
+
+    auto artifacts = makeVanillaArtifacts(mModelDir, std::move(engine), mStream);
+    rt::LLMInferenceRuntime runtime{
+        std::move(artifacts), mModelDir.string(), /*multimodalEngineDir=*/"", {}, std::nullopt, mStream};
+
+    int32_t boundaryCalls = 0;
+    bool admitted = false;
+    std::unordered_map<int32_t, rt::BatchResult> harvested;
+    auto hook = [&](rt::GenerationBoundary& batch) {
+        ++boundaryCalls;
+        // The second boundary sits after A's first decode step -- mid-generation by construction.
+        if (boundaryCalls == 2)
+        {
+            rt::SlotSeed seed;
+            seed.promptTokenIds = {42};
+            seed.originalIndex = kAdmittedIndexBase;
+            ASSERT_FALSE(admitted);
+            EXPECT_EQ(batch.admitSequence(std::move(seed)), rt::AdmitDecision::kAdmitted);
+            EXPECT_EQ(batch.residentCount(), 2);
+            admitted = true;
+        }
+        for (auto& [index, result] : batch.takeCompletedAtOrAbove(kAdmittedIndexBase))
+        {
+            harvested.emplace(index, std::move(result));
+        }
+    };
+
+    auto const request = makeGreedyRequest("a", kMaxGenerateLength);
+    rt::LLMGenerationResponse response;
+    ASSERT_TRUE(runtime.handleRequest(request, response, mStream, /*outputThinkerEmbeddings=*/false, hook));
+    ASSERT_TRUE(admitted);
+
+    // A's response is exactly its serial token stream, and covers only A: B's result must have
+    // left through the harvest, not through the founding caller's response.
+    expectResponseCoversEverySlot(response, 1);
+    ASSERT_EQ(response.outputIds.size(), 1U);
+    EXPECT_EQ(response.outputIds[0], (std::vector<int32_t>{kA1, kA2, kA3, kA4}));
+    EXPECT_EQ(response.finishReasons[0], rt::FinishReason::kLength);
+
+    // B's stream, token for token, through admission, two shared steps, A's eviction and its own.
+    ASSERT_EQ(harvested.size(), 1U);
+    auto const& resultB = harvested.at(kAdmittedIndexBase);
+    EXPECT_EQ(resultB.generateLength, static_cast<int32_t>(kMaxGenerateLength));
+    ASSERT_GE(resultB.tokenIds.size(), 4U);
+    EXPECT_EQ(std::vector<int32_t>(resultB.tokenIds.end() - 4, resultB.tokenIds.end()),
+        (std::vector<int32_t>{kB1, kB2, kB3, kB4}));
+    EXPECT_EQ(resultB.terminalReason, rt::FinishReason::kLength);
+}
+
+TEST_F(RuntimeAssemblyTest, SteppedAdmissionMatchesTheFusedPathTokenForToken)
+{
+    using ::testing::_;
+
+    // The same script as the fused mid-flight admission test; only the admission travels through
+    // the stepper's typed admit + prefill split. Both streams must come out identical.
+    constexpr int64_t kMaxGenerateLength{4};
+    constexpr int32_t kA1 = 3, kA2 = 4, kA3 = 5, kA4 = 6;
+    constexpr int32_t kB1 = 7, kB2 = 8, kB3 = 9, kB4 = 10;
+    constexpr int32_t kAdmittedIndexBase = 1;
+
+    auto engine = makeEngine();
+    auto& mock = *engine;
+    EXPECT_CALL(mock, prepare(kPrefillProfile, _, _, _)).Times(2);
+    EXPECT_CALL(mock, prepare(kDecodeProfile, _, _, _)).Times(4);
+    {
+        ::testing::InSequence forwardOrder;
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kA1}));
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kA2}));
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kB1}));
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kA3, kB2}));
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kA4, kB3}));
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kB4}));
+    }
+
+    auto artifacts = makeVanillaArtifacts(mModelDir, std::move(engine), mStream);
+    rt::LLMInferenceRuntime runtime{
+        std::move(artifacts), mModelDir.string(), /*multimodalEngineDir=*/"", {}, std::nullopt, mStream};
+
+    int32_t boundaryCalls = 0;
+    std::optional<rt::RuntimeStepper> stepper;
+    std::unordered_map<int32_t, rt::BatchResult> harvested;
+    auto hook = [&](rt::GenerationBoundary& batch) {
+        ++boundaryCalls;
+        auto& session = static_cast<rt::LLMRankRuntime::GenerationSession&>(batch);
+        if (!stepper.has_value())
+        {
+            stepper.emplace(session);
+        }
+        if (boundaryCalls == 2)
+        {
+            rt::AdmissionIntent intent;
+            intent.seed.promptTokenIds = {42};
+            intent.seed.originalIndex = kAdmittedIndexBase;
+            rt::AdmissionResult const admitted = stepper->admit(std::move(intent));
+            ASSERT_EQ(admitted.status, rt::AdmissionResult::Status::kAdmitted);
+            EXPECT_EQ(admitted.ref.slot, 1);
+            EXPECT_EQ(admitted.ref.epoch, 0U);
+
+            rt::StepResult const seated = stepper->prefill({admitted.ref});
+            ASSERT_TRUE(seated.ok);
+            // B's delta is its lookahead token. A also reports here: the stepper was constructed
+            // mid-request, so A's tokens outstanding at construction ride the first operation --
+            // watermark semantics, exercised on purpose by this transitional construction point.
+            ASSERT_EQ(seated.deltas.size(), 2U);
+            std::unordered_map<int32_t, std::vector<int32_t>> deltasBySlot;
+            for (auto const& [ref, delta] : seated.deltas)
+            {
+                deltasBySlot.emplace(ref.slot, delta.tokenIds);
+            }
+            EXPECT_EQ(deltasBySlot.at(0), (std::vector<int32_t>{kA1, kA2}));
+            EXPECT_EQ(deltasBySlot.at(admitted.ref.slot), (std::vector<int32_t>{kB1}));
+            EXPECT_TRUE(seated.finished.empty());
+            EXPECT_FALSE(seated.publishedPrefix); // no context cache in this deployment
+            EXPECT_EQ(batch.residentCount(), 2);
+        }
+        for (auto& [index, result] : batch.takeCompletedAtOrAbove(kAdmittedIndexBase))
+        {
+            harvested.emplace(index, std::move(result));
+        }
+    };
+
+    auto const request = makeGreedyRequest("a", kMaxGenerateLength);
+    rt::LLMGenerationResponse response;
+    ASSERT_TRUE(runtime.handleRequest(request, response, mStream, /*outputThinkerEmbeddings=*/false, hook));
+
+    expectResponseCoversEverySlot(response, 1);
+    ASSERT_EQ(response.outputIds.size(), 1U);
+    EXPECT_EQ(response.outputIds[0], (std::vector<int32_t>{kA1, kA2, kA3, kA4}));
+
+    ASSERT_EQ(harvested.size(), 1U);
+    auto const& resultB = harvested.at(kAdmittedIndexBase);
+    ASSERT_GE(resultB.tokenIds.size(), 4U);
+    EXPECT_EQ(std::vector<int32_t>(resultB.tokenIds.end() - 4, resultB.tokenIds.end()),
+        (std::vector<int32_t>{kB1, kB2, kB3, kB4}));
+    EXPECT_EQ(resultB.terminalReason, rt::FinishReason::kLength);
+}
+
+TEST_F(RuntimeAssemblyTest, StepperKeepsRefsStableAcrossEviction)
+{
+    using ::testing::_;
+
+    // A stepper-driven decode carries the batch across A's eviction: the StepResult must file A
+    // under finished and credit B's token to its ref -- which stays identical across the eviction,
+    // because refs are stable handles and dense-row compaction is runtime-private.
+    constexpr int64_t kMaxGenerateLength{3};
+    constexpr int32_t kA1 = 3, kA2 = 4, kA3 = 5;
+    constexpr int32_t kB1 = 7, kB2 = 8, kB3 = 9;
+    constexpr int32_t kAdmittedIndexBase = 1;
+
+    auto engine = makeEngine();
+    auto& mock = *engine;
+    EXPECT_CALL(mock, prepare(kPrefillProfile, _, _, _)).Times(2);
+    EXPECT_CALL(mock, prepare(kDecodeProfile, _, _, _)).Times(3);
+    {
+        ::testing::InSequence forwardOrder;
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kA1}));      // A prefill
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kA2}));      // decode, A alone
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kB1}));      // B's seated prefill
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kA3, kB2})); // stepper decode: A finishes
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kB3}));      // loop decode: B finishes
+    }
+
+    auto artifacts = makeVanillaArtifacts(mModelDir, std::move(engine), mStream);
+    rt::LLMInferenceRuntime runtime{
+        std::move(artifacts), mModelDir.string(), /*multimodalEngineDir=*/"", {}, std::nullopt, mStream};
+
+    int32_t boundaryCalls = 0;
+    std::optional<rt::RuntimeStepper> stepper;
+    bool stepped = false;
+    std::unordered_map<int32_t, rt::BatchResult> harvested;
+    auto hook = [&](rt::GenerationBoundary& batch) {
+        ++boundaryCalls;
+        auto& session = static_cast<rt::LLMRankRuntime::GenerationSession&>(batch);
+        if (!stepper.has_value())
+        {
+            stepper.emplace(session);
+        }
+        if (boundaryCalls == 2)
+        {
+            rt::AdmissionIntent intent;
+            intent.seed.promptTokenIds = {42};
+            intent.seed.originalIndex = kAdmittedIndexBase;
+            rt::AdmissionResult const admitted = stepper->admit(std::move(intent));
+            ASSERT_EQ(admitted.status, rt::AdmissionResult::Status::kAdmitted);
+            rt::ResidentRef const refB = admitted.ref;
+            ASSERT_TRUE(stepper->prefill({refB}).ok);
+
+            // One typed decode across A's finish: this is the extra forward pass the mock script
+            // accounts for at position four.
+            rt::StepResult const step = stepper->decode({stepper->residents()});
+            ASSERT_TRUE(step.ok);
+
+            // Deltas: A's final token is inside its finished snapshot, not a delta; B's token is
+            // credited to the ref the caller held when it built the view.
+            ASSERT_EQ(step.deltas.size(), 1U);
+            EXPECT_EQ(step.deltas.front().first, refB);
+            EXPECT_EQ(step.deltas.front().second.tokenIds, (std::vector<int32_t>{kB2}));
+
+            ASSERT_EQ(step.finished.size(), 1U);
+            EXPECT_EQ(step.finished.front().first, (rt::ResidentRef{0, 0}));
+            auto const& resultA = step.finished.front().second;
+            ASSERT_GE(resultA.tokenIds.size(), 3U);
+            EXPECT_EQ(std::vector<int32_t>(resultA.tokenIds.end() - 3, resultA.tokenIds.end()),
+                (std::vector<int32_t>{kA1, kA2, kA3}));
+            EXPECT_EQ(resultA.terminalReason, rt::FinishReason::kLength);
+
+            // Middle/head retirement: the survivor's execution row changed underneath, but its
+            // handle -- the only identity the scheduler ever saw -- did not.
+            ASSERT_EQ(stepper->residents().size(), 1U);
+            EXPECT_EQ(stepper->residents().front(), refB);
+            stepped = true;
+        }
+        for (auto& [index, result] : batch.takeCompletedAtOrAbove(kAdmittedIndexBase))
+        {
+            harvested.emplace(index, std::move(result));
+        }
+    };
+
+    auto const request = makeGreedyRequest("a", kMaxGenerateLength);
+    rt::LLMGenerationResponse response;
+    ASSERT_TRUE(runtime.handleRequest(request, response, mStream, /*outputThinkerEmbeddings=*/false, hook));
+    ASSERT_TRUE(stepped);
+
+    // A's result left through the stepper's StepResult, so the founding response is empty of it;
+    // B still finishes through the loop's own advance and leaves through the harvest.
+    ASSERT_EQ(harvested.size(), 1U);
+    EXPECT_EQ(harvested.at(kAdmittedIndexBase).terminalReason, rt::FinishReason::kLength);
+}
+
+TEST_F(RuntimeAssemblyTest, ASteppedRequestRunsEndToEndWithoutTheHook)
+{
+    using ::testing::_;
+
+    // The canonical A/B interleave, driven entirely through the stepped control plane: no
+    // handleRequest, no GenerationBoundaryHook. Every tick is an explicit typed operation and
+    // every outcome leaves through a StepResult.
+    constexpr int64_t kMaxGenerateLength{4};
+    constexpr int32_t kA1 = 3, kA2 = 4, kA3 = 5, kA4 = 6;
+    constexpr int32_t kB1 = 7, kB2 = 8, kB3 = 9, kB4 = 10;
+    constexpr int32_t kC1 = 11, kC2 = 12, kC3 = 13, kC4 = 14;
+    constexpr int32_t kIndexB = 1;
+    constexpr int32_t kIndexC = 2;
+
+    auto engine = makeEngine();
+    auto& mock = *engine;
+    EXPECT_CALL(mock, prepare(kPrefillProfile, _, _, _)).Times(3);
+    EXPECT_CALL(mock, prepare(kDecodeProfile, _, _, _)).Times(6);
+    {
+        ::testing::InSequence forwardOrder;
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kA1}));      // founding prefill (inside begin)
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kA2}));      // decode, A alone
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kB1}));      // B's seated prefill tick
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kA3, kB2})); // decode, both resident
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kA4, kB3})); // A finishes and is evicted
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kC1}));      // C's seated prefill tick
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kB4, kC2})); // B finishes and is evicted
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kC3}));
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kC4})); // C finishes
+    }
+
+    auto artifacts = makeVanillaArtifacts(mModelDir, std::move(engine), mStream);
+    rt::LLMInferenceRuntime runtime{
+        std::move(artifacts), mModelDir.string(), /*multimodalEngineDir=*/"", {}, std::nullopt, mStream};
+    ASSERT_TRUE(runtime.supportsSteppedExecution());
+
+    auto stepped = runtime.beginStepped(makeGreedyRequest("a", kMaxGenerateLength), mStream);
+    ASSERT_NE(stepped, nullptr);
+    rt::SteppedExecution& stepper = *stepped;
+
+    std::unordered_map<int32_t, rt::LLMGenerationResponse> outcomes; // keyed by founding order
+    auto commit = [&](rt::StepResult const& result, std::vector<std::string> const& stops) {
+        ASSERT_TRUE(result.ok);
+        for (auto const& [ref, snapshot] : result.finished)
+        {
+            outcomes.emplace(static_cast<int32_t>(outcomes.size()), stepped->materialize(snapshot, stops));
+            (void) ref;
+        }
+    };
+
+    // Tick 1: the founding prefill's post-pass primes A's first token.
+    rt::StepResult const founding = stepper.prefill({stepper.residents().front()});
+    ASSERT_TRUE(founding.ok);
+    ASSERT_EQ(founding.deltas.size(), 1U);
+    EXPECT_EQ(founding.deltas.front().second.tokenIds, (std::vector<int32_t>{kA1}));
+
+    // Tick 2: decode, A alone.
+    commit(stepper.decode({stepper.residents()}), {});
+
+    // Tick 3: admit B (logical only), then its seated prefill tick.
+    rt::LLMGenerationRequest requestB = makeGreedyRequest("b", kMaxGenerateLength);
+    requestB.preTokenizedInputIds = {{43}};
+    rt::AdmissionResult const admitted = stepper.admit(requestB, kIndexB);
+    ASSERT_EQ(admitted.status, rt::AdmissionResult::Status::kAdmitted);
+    rt::StepResult const seated = stepper.prefill({admitted.ref});
+    ASSERT_TRUE(seated.ok);
+    ASSERT_EQ(seated.deltas.size(), 1U);
+    EXPECT_EQ(seated.deltas.front().second.tokenIds, (std::vector<int32_t>{kB1}));
+
+    // Decode until A retires; its finished ref releases handle 0.
+    while (outcomes.empty())
+    {
+        commit(stepper.decode({stepper.residents()}), {});
+    }
+
+    // Tail-retirement reuse, the aliasing case from review: C is admitted after A released its
+    // handle, so C reuses handle 0 -- with the epoch bumped, so A's stale ref can never name C.
+    rt::LLMGenerationRequest requestC = makeGreedyRequest("c", kMaxGenerateLength);
+    requestC.preTokenizedInputIds = {{44}};
+    rt::AdmissionResult const admittedC = stepper.admit(requestC, kIndexC);
+    ASSERT_EQ(admittedC.status, rt::AdmissionResult::Status::kAdmitted);
+    EXPECT_EQ(admittedC.ref, (rt::ResidentRef{0, 1}));
+    EXPECT_FALSE(admittedC.ref == (rt::ResidentRef{0, 0}));
+    rt::StepResult const seatedC = stepper.prefill({admittedC.ref});
+    ASSERT_TRUE(seatedC.ok);
+    ASSERT_EQ(seatedC.deltas.size(), 1U);
+    EXPECT_EQ(seatedC.deltas.front().second.tokenIds, (std::vector<int32_t>{kC1}));
+
+    // Drain the rest; every terminal leaves through a StepResult.
+    while (!stepper.residents().empty())
+    {
+        commit(stepper.decode({stepper.residents()}), {});
+    }
+    ASSERT_EQ(outcomes.size(), 3U);
+    EXPECT_EQ(outcomes.at(0).outputIds.front(), (std::vector<int32_t>{kA1, kA2, kA3, kA4}));
+    EXPECT_EQ(outcomes.at(0).finishReasons.front(), rt::FinishReason::kLength);
+    EXPECT_EQ(outcomes.at(1).outputIds.front(), (std::vector<int32_t>{kB1, kB2, kB3, kB4}));
+    EXPECT_EQ(outcomes.at(1).finishReasons.front(), rt::FinishReason::kLength);
+    EXPECT_EQ(outcomes.at(2).outputIds.front(), (std::vector<int32_t>{kC1, kC2, kC3, kC4}));
+    EXPECT_EQ(outcomes.at(2).finishReasons.front(), rt::FinishReason::kLength);
+
+    rt::LLMGenerationResponse response;
+    EXPECT_TRUE(stepped->finish(response));
+}

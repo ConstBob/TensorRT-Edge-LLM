@@ -392,6 +392,227 @@ TEST_F(ContextCacheCoordinatorTests, CompactionRejectsSurvivorReordering)
     finish(*request.admission);
 }
 
+TEST_F(ContextCacheCoordinatorTests, AdmitsASequenceMidRequestAndReusesThePublishedPrefix)
+{
+    // Founder publishes two full blocks (256 tokens + lookahead), then a sequence sharing that
+    // prefix joins the live request: its lookup must land on the published pages, and its own
+    // finalization must publish, so a later request can reuse what the admitted sequence computed.
+    constexpr int32_t kPrefix = 2 * kTOKENS_PER_PAGE;
+    auto founder = begin({makeTokens(kPrefix)});
+    ASSERT_TRUE(founder.admission.has_value());
+    finalizePrefillWithLengths(*founder.admission, {kPrefix});
+
+    std::vector<int32_t> joiningTokens = makeTokens(kPrefix);
+    joiningTokens.push_back(7001); // diverges after the shared prefix
+    ContextCacheCoordinator::AdmitSequenceResult admitted = mCoordinator->admitSequence(
+        founder.admission->request, ContextCacheSequenceAdmission{joiningTokens, {}}, DecodingKvHeadroom{1, 0});
+    ASSERT_EQ(admitted.status, ContextCacheCoordinatorStatus::kOk);
+    EXPECT_EQ(admitted.prefillStart, kPrefix) << "the shared prefix must be reused, not recomputed";
+
+    // The seated prefill sampled one lookahead token; finalization aligns the ledger and publishes.
+    int32_t const lookahead = 7002;
+    ASSERT_EQ(mCoordinator->finalizeSequenceAdmission(founder.admission->request, 1,
+                  ContextCacheSequenceAdvance{&lookahead, 1, static_cast<int32_t>(joiningTokens.size())}),
+        ContextCacheCoordinatorStatus::kOk);
+
+    // Both slots advance one decode step together -- the admitted slot is an ordinary batch member.
+    ASSERT_EQ(mCoordinator->prepareDecodeStep(founder.admission->request, DecodingKvHeadroom{1, 0}),
+        ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    std::vector<int32_t> const next{7003, 7004};
+    std::vector<ContextCacheSequenceAdvance> progress{ContextCacheSequenceAdvance{&next[0], 1, kPrefix + 1},
+        ContextCacheSequenceAdvance{&next[1], 1, static_cast<int32_t>(joiningTokens.size()) + 1}};
+    ASSERT_EQ(
+        mCoordinator->completeDecodeStep(founder.admission->request, progress, {}), ContextCacheCoordinatorStatus::kOk);
+    finish(*founder.admission);
+
+    // The admitted sequence's own full blocks are findable afterwards.
+    auto reader = begin({joiningTokens});
+    ASSERT_TRUE(reader.admission.has_value());
+    EXPECT_EQ(reader.admission->prefillStarts[0], kPrefix)
+        << "the admitted sequence's published prefix must be visible to later lookups";
+    finalizePrefillWithLengths(*reader.admission, {static_cast<int32_t>(joiningTokens.size())});
+    finish(*reader.admission);
+}
+
+TEST_F(ContextCacheCoordinatorTests, RetractingAnAdmissionUnwindsTheLeaseAndTheRowStaysUsable)
+{
+    // The recovery path for a seating that threw between lease and slot append: the retraction
+    // must release the lease and clear the row so a later admission can take the same seat.
+    constexpr int32_t kPrefix = 2 * kTOKENS_PER_PAGE;
+    auto founder = begin({makeTokens(kPrefix)});
+    ASSERT_TRUE(founder.admission.has_value());
+    finalizePrefillWithLengths(*founder.admission, {kPrefix});
+
+    std::vector<int32_t> joiningTokens = makeTokens(kPrefix);
+    joiningTokens.push_back(7101);
+    ContextCacheCoordinator::AdmitSequenceResult admitted = mCoordinator->admitSequence(
+        founder.admission->request, ContextCacheSequenceAdmission{joiningTokens, {}}, DecodingKvHeadroom{1, 0});
+    ASSERT_EQ(admitted.status, ContextCacheCoordinatorStatus::kOk);
+
+    mCoordinator->retractSequenceAdmission(founder.admission->request);
+
+    // The founder is alone again and fully functional: it can decode, and the seat is reusable.
+    ASSERT_EQ(mCoordinator->prepareDecodeStep(founder.admission->request, DecodingKvHeadroom{1, 0}),
+        ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    int32_t const sampled = 7102;
+    std::vector<ContextCacheSequenceAdvance> progress{ContextCacheSequenceAdvance{&sampled, 1, kPrefix + 1}};
+    ASSERT_EQ(
+        mCoordinator->completeDecodeStep(founder.admission->request, progress, {}), ContextCacheCoordinatorStatus::kOk);
+
+    ContextCacheCoordinator::AdmitSequenceResult readmitted = mCoordinator->admitSequence(
+        founder.admission->request, ContextCacheSequenceAdmission{joiningTokens, {}}, DecodingKvHeadroom{1, 0});
+    EXPECT_EQ(readmitted.status, ContextCacheCoordinatorStatus::kOk) << "the retracted seat must be admittable again";
+    int32_t const lookahead = 7103;
+    ASSERT_EQ(mCoordinator->finalizeSequenceAdmission(founder.admission->request, 1,
+                  ContextCacheSequenceAdvance{&lookahead, 1, static_cast<int32_t>(joiningTokens.size())}),
+        ContextCacheCoordinatorStatus::kOk);
+    finish(*founder.admission);
+}
+
+TEST_F(ContextCacheCoordinatorTests, AnUnfinalizedAdmissionHoldsAtZeroAdvanceInsteadOfFailingTheBatch)
+{
+    // A seated prefill that failed leaves its slot terminal from birth: never finalized, no
+    // generate length. The zero advance's hold sentinel must be legal for it -- the earlier
+    // rebuilt-arithmetic form threw here and killed the whole founding request.
+    constexpr int32_t kPrefix = 2 * kTOKENS_PER_PAGE;
+    auto founder = begin({makeTokens(kPrefix)});
+    ASSERT_TRUE(founder.admission.has_value());
+    finalizePrefillWithLengths(*founder.admission, {kPrefix});
+
+    std::vector<int32_t> joiningTokens = makeTokens(kPrefix);
+    joiningTokens.push_back(7201);
+    ContextCacheCoordinator::AdmitSequenceResult admitted = mCoordinator->admitSequence(
+        founder.admission->request, ContextCacheSequenceAdmission{joiningTokens, {}}, DecodingKvHeadroom{1, 0});
+    ASSERT_EQ(admitted.status, ContextCacheCoordinatorStatus::kOk);
+    // No finalizeSequenceAdmission: the seated prefill failed and the slot is a kError ghost.
+
+    ASSERT_EQ(mCoordinator->prepareDecodeStep(founder.admission->request, DecodingKvHeadroom{1, 0}),
+        ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    int32_t const sampled = 7202;
+    std::vector<ContextCacheSequenceAdvance> progress{ContextCacheSequenceAdvance{&sampled, 1, kPrefix + 1},
+        ContextCacheSequenceAdvance{nullptr, 0, ContextCacheSequenceAdvance::kHoldCommittedStateLength}};
+    EXPECT_EQ(
+        mCoordinator->completeDecodeStep(founder.admission->request, progress, {}), ContextCacheCoordinatorStatus::kOk)
+        << "a ghost slot's zero advance must not fail the founding batch";
+    finish(*founder.admission);
+}
+
+TEST_F(ContextCacheCoordinatorTests, ACancelledSlotAdvancesByZeroWithoutFailingTheStep)
+{
+    // A slot cancelled at the top of a step appends nothing that step; the decode completion must
+    // treat that as a legal zero advance holding the committed length, not a broken invariant that
+    // fails the whole batch (the chaos-found failure mode: one client disconnect killing every
+    // request sharing the batch).
+    auto request = begin({makeTokens(100), makeTokens(101)});
+    ASSERT_TRUE(request.admission.has_value());
+    finalizePrefillWithLengths(*request.admission, {100, 101});
+
+    ASSERT_EQ(mCoordinator->prepareDecodeStep(request.admission->request, DecodingKvHeadroom{1, 0}),
+        ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    int32_t const sampled = 9002;
+    std::vector<ContextCacheSequenceAdvance> progress{
+        ContextCacheSequenceAdvance{&sampled, 1, 101}, // slot 0 decoded normally
+        // slot 1 was cancelled: a zero advance carries the hold sentinel, not a rebuilt length --
+        // a slot that failed before its admission was finalized has none to rebuild.
+        ContextCacheSequenceAdvance{nullptr, 0, ContextCacheSequenceAdvance::kHoldCommittedStateLength},
+    };
+    EXPECT_EQ(
+        mCoordinator->completeDecodeStep(request.admission->request, progress, {}), ContextCacheCoordinatorStatus::kOk);
+
+    // The sentinel is mandatory: a zero advance carrying a concrete length -- even the correct
+    // one -- is a producer that thinks it knows better than the ledger.
+    ASSERT_EQ(mCoordinator->prepareDecodeStep(request.admission->request, DecodingKvHeadroom{1, 0}),
+        ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    std::vector<ContextCacheSequenceAdvance> crooked{
+        ContextCacheSequenceAdvance{&sampled, 1, 102},
+        ContextCacheSequenceAdvance{nullptr, 0, 101},
+    };
+    EXPECT_THROW(mCoordinator->completeDecodeStep(request.admission->request, crooked, {}), std::runtime_error);
+    finish(*request.admission);
+}
+
+TEST_F(ContextCacheCoordinatorTests, FounderRetiresWhileTheAdmittedSequenceKeepsItsSharedPages)
+{
+    // The refcount question concurrency poses: founder and joiner lease the same prefix pages;
+    // compacting the founder out must not strand or free pages the survivor still reads.
+    constexpr int32_t kPrefix = 2 * kTOKENS_PER_PAGE;
+    auto founder = begin({makeTokens(kPrefix)});
+    ASSERT_TRUE(founder.admission.has_value());
+    finalizePrefillWithLengths(*founder.admission, {kPrefix});
+
+    std::vector<int32_t> joiningTokens = makeTokens(kPrefix);
+    joiningTokens.push_back(7001);
+    ContextCacheCoordinator::AdmitSequenceResult admitted = mCoordinator->admitSequence(
+        founder.admission->request, ContextCacheSequenceAdmission{joiningTokens, {}}, DecodingKvHeadroom{1, 0});
+    ASSERT_EQ(admitted.status, ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(admitted.prefillStart, kPrefix);
+    int32_t const lookahead = 7002;
+    ASSERT_EQ(mCoordinator->finalizeSequenceAdmission(founder.admission->request, 1,
+                  ContextCacheSequenceAdvance{&lookahead, 1, static_cast<int32_t>(joiningTokens.size())}),
+        ContextCacheCoordinatorStatus::kOk);
+
+    // The shared prefix pages are referenced by both leases (and the published records).
+    std::vector<int32_t> const sharedPages(mPageTable->hostRow(0), mPageTable->hostRow(0) + 2);
+    for (PageId const page : sharedPages)
+    {
+        EXPECT_GE(mCoordinator->manager().pools().activeRefCount({ResourceType::kBaseKvPage, page}), 2);
+    }
+
+    // Founder finishes and is compacted out; the survivor moves to slot 0 with its pages intact.
+    // The runtime keeps the cache manager's active view in step with the batch; mirror that here
+    // so the slot-state compaction sees a two-wide batch.
+    mCache->setActiveBatchSize(2);
+    Tensor deviceMapping({2}, rt::DeviceType::kGPU, DataType::kINT32, "coordinatorTestMapping");
+    ASSERT_EQ(mCoordinator->beginBatchCompaction(founder.admission->request, {-1, 0}, 1, deviceMapping),
+        ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(mCoordinator->compactBatch(founder.admission->request), ContextCacheCoordinatorStatus::kOk);
+    for (PageId const page : sharedPages)
+    {
+        EXPECT_GE(mCoordinator->manager().pools().activeRefCount({ResourceType::kBaseKvPage, page}), 1)
+            << "compacting the founder out must not free pages the admitted sequence still reads";
+    }
+    finish(*founder.admission);
+}
+
+TEST_F(ContextCacheCoordinatorTests, AdmissionRefusalOnPoolPressureLeavesTheRequestIntact)
+{
+    // The cache manager refuses pools smaller than maxBatch * pagesPerSlot, so within one request
+    // a free batch slot always has quota -- pool pressure on admission comes from OVERLAPPING
+    // leases, the ownership shape in-flight batching created. A bystander request holds a full
+    // sequence's pages; the running batch then has a slot free but not enough pages behind it.
+    // The refusal must say "transient capacity", and the founder must keep decoding as if the
+    // admission attempt never happened.
+    auto bystander = begin({makeTokens(kMAX_SEQUENCE_LENGTH - 4)});
+    ASSERT_TRUE(bystander.admission.has_value());
+    auto pressured = begin({makeTokens(kMAX_SEQUENCE_LENGTH - 1), makeTokens(kMAX_SEQUENCE_LENGTH - 2)});
+    ASSERT_TRUE(pressured.admission.has_value());
+    finalizePrefillWithLengths(*pressured.admission, {kMAX_SEQUENCE_LENGTH - 1, kMAX_SEQUENCE_LENGTH - 2});
+
+    std::vector<int32_t> disjoint(static_cast<size_t>(kMAX_SEQUENCE_LENGTH - 1));
+    std::iota(disjoint.begin(), disjoint.end(), 100000);
+    ContextCacheCoordinator::AdmitSequenceResult refused = mCoordinator->admitSequence(
+        pressured.admission->request, ContextCacheSequenceAdmission{disjoint, {}}, DecodingKvHeadroom{1, 0});
+    EXPECT_EQ(refused.status, ContextCacheCoordinatorStatus::kRequestFailed);
+    EXPECT_TRUE(refused.insufficientCapacity) << "pool pressure must read as retry-later, not failure";
+
+    // The founder decodes on undisturbed.
+    ASSERT_EQ(mCoordinator->prepareDecodeStep(pressured.admission->request, DecodingKvHeadroom{1, 0}),
+        ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    std::vector<int32_t> const next{9002, 9003};
+    std::vector<ContextCacheSequenceAdvance> progress{ContextCacheSequenceAdvance{&next[0], 1, kMAX_SEQUENCE_LENGTH},
+        ContextCacheSequenceAdvance{&next[1], 1, kMAX_SEQUENCE_LENGTH - 1}};
+    ASSERT_EQ(mCoordinator->completeDecodeStep(pressured.admission->request, progress, {}),
+        ContextCacheCoordinatorStatus::kOk);
+    finish(*pressured.admission);
+    finish(*bystander.admission);
+}
+
 TEST_F(ContextCacheCoordinatorTests, FailedDrainQuarantinesOwnershipUntilShutdownSucceeds)
 {
     ASSERT_EQ(mCoordinator->shutdown(), ContextCacheCoordinatorStatus::kOk);
@@ -416,6 +637,54 @@ TEST_F(ContextCacheCoordinatorTests, FailedDrainQuarantinesOwnershipUntilShutdow
     EXPECT_EQ(poisoned.status, ContextCacheCoordinatorStatus::kPoisoned);
     EXPECT_EQ(mCoordinator->shutdown(), ContextCacheCoordinatorStatus::kOk);
     EXPECT_EQ(synchronizeCalls, 2);
+    EXPECT_EQ(mCoordinator->manager().pools().freeCount(ResourceType::kBaseKvPage), mEngine.kvPoolPages);
+}
+
+TEST_F(ContextCacheCoordinatorTests, ConcurrentRequestsMayOverlapInLifetime)
+{
+    auto first = begin({makeTokens(129)});
+    ASSERT_EQ(first.status, ContextCacheCoordinatorStatus::kOk);
+    ASSERT_TRUE(first.admission.has_value());
+
+    // The single-occupancy gate used to reject this while the first handle was still alive.
+    auto second = begin({makeTokens(130)});
+    EXPECT_EQ(second.status, ContextCacheCoordinatorStatus::kOk);
+    ASSERT_TRUE(second.admission.has_value());
+
+    first.admission.reset();
+    second.admission.reset();
+    EXPECT_EQ(mCoordinator->shutdown(), ContextCacheCoordinatorStatus::kOk);
+    EXPECT_EQ(mCoordinator->manager().pools().freeCount(ResourceType::kBaseKvPage), mEngine.kvPoolPages);
+}
+
+TEST_F(ContextCacheCoordinatorTests, FailedDrainQuarantinesEveryResidentRequest)
+{
+    ASSERT_EQ(mCoordinator->shutdown(), ContextCacheCoordinatorStatus::kOk);
+    mCoordinator.reset();
+    int32_t synchronizeCalls = 0;
+    createCoordinator([&](cudaStream_t stream) {
+        // Both resident requests fail to drain; only shutdown is allowed to succeed.
+        if (++synchronizeCalls <= 2)
+        {
+            return cudaErrorUnknown;
+        }
+        return cudaStreamSynchronize(stream);
+    });
+
+    auto first = begin({makeTokens(129)});
+    ASSERT_TRUE(first.admission.has_value());
+    ASSERT_EQ(mCoordinator->preparePrefill(first.admission->request), ContextCacheCoordinatorStatus::kOk);
+    auto second = begin({makeTokens(130)});
+    ASSERT_TRUE(second.admission.has_value());
+    ASSERT_EQ(mCoordinator->preparePrefill(second.admission->request), ContextCacheCoordinatorStatus::kOk);
+
+    // A single quarantine slot used to std::terminate() on the second failure.
+    first.admission.reset();
+    second.admission.reset();
+    EXPECT_EQ(synchronizeCalls, 2);
+
+    EXPECT_EQ(mCoordinator->shutdown(), ContextCacheCoordinatorStatus::kOk);
+    EXPECT_EQ(synchronizeCalls, 4);
     EXPECT_EQ(mCoordinator->manager().pools().freeCount(ResourceType::kBaseKvPage), mEngine.kvPoolPages);
 }
 

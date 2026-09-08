@@ -370,6 +370,61 @@ void HybridCacheManager::compactBatch(
     compactBatchSlotState(batchMapping, oldBatch, newBatch, stream);
 }
 
+void HybridCacheManager::swapSlotState(int32_t slotA, int32_t slotB, cudaStream_t stream)
+{
+    // The lengths tensor is kept reshaped to the active batch, so this bound is "resident slots",
+    // which is the only range a swap makes sense over anyway.
+    auto const activeBatch = static_cast<int32_t>(mDeviceKVCacheLengths.getShape()[0]);
+    ELLM_CHECK(slotA >= 0 && slotA < activeBatch && slotB >= 0 && slotB < activeBatch,
+        "HybridCacheManager::swapSlotState: slot is out of range.");
+    ELLM_CHECK(mMambaCache.numLayers() == 0,
+        "HybridCacheManager::swapSlotState: Mamba state is per-slot by value and is not relocatable this way.");
+    if (slotA == slotB)
+    {
+        return;
+    }
+
+    // Two int32s exchanged entirely on the device: scratch <- a, a <- b, b <- scratch. Nothing
+    // bounces through the host, so the swap enqueues onto the stream without one synchronization
+    // and stays ordered against the caller's surrounding work by the stream itself.
+    if (mLengthSwapScratch.isEmpty())
+    {
+        mLengthSwapScratch
+            = rt::Tensor({1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "hybridCache::lengthSwapScratch");
+    }
+    int32_t* const device = mDeviceKVCacheLengths.dataPointer<int32_t>();
+    int32_t* const scratch = mLengthSwapScratch.dataPointer<int32_t>();
+    CUDA_CHECK(cudaMemcpyAsync(scratch, device + slotA, sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(device + slotA, device + slotB, sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(device + slotB, scratch, sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+}
+
+void HybridCacheManager::setSlotLength(int32_t slot, int32_t length, cudaStream_t stream)
+{
+    auto const activeBatch = static_cast<int32_t>(mDeviceKVCacheLengths.getShape()[0]);
+    ELLM_CHECK(slot >= 0 && slot < activeBatch, "HybridCacheManager::setSlotLength: slot is out of range.");
+    ELLM_CHECK(mMambaCache.numLayers() == 0,
+        "HybridCacheManager::setSlotLength: Mamba state is per-slot by value; its rows cannot be reseeded this way.");
+    ELLM_CHECK(length >= 0, "HybridCacheManager::setSlotLength: length must be non-negative.");
+
+    // Pinned staging (Tensor's CPU allocation is cudaMallocHost), so the upload is a genuinely
+    // asynchronous copy. The synchronize guards the staging buffer's reuse by the next call, not
+    // the copy's visibility -- stream order already provides that.
+    if (mLengthStaging.isEmpty())
+    {
+        mLengthStaging
+            = rt::Tensor({1}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "hybridCache::lengthStaging");
+    }
+    *mLengthStaging.dataPointer<int32_t>() = length;
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceKVCacheLengths.dataPointer<int32_t>() + slot,
+        mLengthStaging.dataPointer<int32_t>(), sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (length > 0)
+    {
+        mKVCacheAllEmpty = false;
+    }
+}
+
 void HybridCacheManager::compactBatchSlotState(
     rt::Tensor const& batchMapping, int32_t oldBatch, int32_t newBatch, cudaStream_t stream)
 {

@@ -17,6 +17,8 @@
 
 #include "runtime/multiDevice/runtimeCoordinator.h"
 
+#include "runtime/runtimeStepper.h"
+
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/logger.h"
@@ -864,13 +866,24 @@ void RuntimeCoordinator::setVisualPrunerConfig(VisualPrunerConfig const& config)
     rootRuntime().setVisualPrunerConfig(config);
 }
 
-bool RuntimeCoordinator::dispatchRequest(
-    LLMGenerationRequest const& request, bool enableProfiling, bool outputThinkerEmbeddings, cudaStream_t stream)
+bool RuntimeCoordinator::supportsBoundaryScheduling() const noexcept
+{
+    return mInlineSingleRank;
+}
+
+bool RuntimeCoordinator::dispatchRequest(LLMGenerationRequest const& request, bool enableProfiling,
+    bool outputThinkerEmbeddings, cudaStream_t stream, GenerationBoundaryHook const& boundaryHook)
 {
     if (mInlineSingleRank)
     {
-        return runInline(request, enableProfiling, outputThinkerEmbeddings, stream);
+        return runInline(request, enableProfiling, outputThinkerEmbeddings, stream, boundaryHook);
     }
+
+    // The boundary-hook control plane never crosses ranks anymore: the stepped command stream
+    // (beginStepped) is how a scheduler drives a multi-rank runtime. A hooked dispatch here would
+    // silently run without admissions on the followers, so it is refused loudly instead.
+    ELLM_CHECK(!boundaryHook,
+        "Boundary hooks are single-rank only; multi-rank scheduling goes through the stepped command stream.");
 
     if (mWorkerFailed.load(std::memory_order_acquire))
     {
@@ -950,8 +963,44 @@ bool RuntimeCoordinator::dispatchRequest(
     return true;
 }
 
-bool RuntimeCoordinator::runInline(
-    LLMGenerationRequest const& request, bool enableProfiling, bool outputThinkerEmbeddings, cudaStream_t stream)
+bool RuntimeCoordinator::supportsSteppedExecution() const noexcept
+{
+    // Inline single-rank in this change; the thread-parallel command stream arrives with the
+    // integration part of this series.
+    return mInlineSingleRank;
+}
+
+std::unique_ptr<SteppedExecution> RuntimeCoordinator::beginStepped(
+    LLMGenerationRequest const& request, bool enableProfiling, cudaStream_t stream)
+{
+    if (mInlineSingleRank)
+    {
+        int32_t const rank = mLocalRanks.front();
+        CUDA_CHECK(cudaSetDevice(deviceForRank(rank)));
+        setProfilingEnabled(enableProfiling);
+        cudaStream_t const executionStream = stream != nullptr ? stream : mStreams[rank];
+
+        LLMGenerationRequest prepared;
+        try
+        {
+            prepared = prepareRequestState(request);
+        }
+        catch (std::exception const& e)
+        {
+            LOG_ERROR("[stepped] Failed to prepare request: %s", e.what());
+            return nullptr;
+        }
+        return SteppedRequest::begin(*mRuntimes[rank], std::move(prepared), executionStream);
+    }
+
+    ELLM_CHECK(false,
+        "Stepped execution is inline single-rank in this change; the thread-parallel command "
+        "stream arrives with the integration part of this series.");
+    return nullptr;
+}
+
+bool RuntimeCoordinator::runInline(LLMGenerationRequest const& request, bool enableProfiling,
+    bool outputThinkerEmbeddings, cudaStream_t stream, GenerationBoundaryHook const& boundaryHook)
 {
     int32_t const rank = mLocalRanks.front();
     CUDA_CHECK(cudaSetDevice(deviceForRank(rank)));
@@ -977,7 +1026,7 @@ bool RuntimeCoordinator::runInline(
         // parallelRank=-1 keeps streaming and audio callbacks on that thread.
         mWorkerTask.statuses[rank] = mRuntimes[rank]->handleRequest(mWorkerTask.requests[rank],
                                          mWorkerTask.responses[rank], executionStream, outputThinkerEmbeddings,
-                                         /*tokenBroadcast=*/nullptr, /*parallelRank=*/-1)
+                                         /*tokenBroadcast=*/nullptr, /*parallelRank=*/-1, boundaryHook)
             ? 1
             : 0;
     }

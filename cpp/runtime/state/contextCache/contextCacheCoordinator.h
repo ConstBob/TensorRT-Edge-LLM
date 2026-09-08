@@ -76,6 +76,11 @@ struct ContextCacheBatchAdmission
 //! Host-visible sequence advance observed after an existing stream synchronization.
 struct ContextCacheSequenceAdvance
 {
+    //! committedStateLength value for a zero advance: hold the ledger's current committed length
+    //! in place. The producer cannot reconstruct that length for a slot that failed before its
+    //! admission was finalized, and must not have to -- the ledger already knows it.
+    static constexpr int32_t kHoldCommittedStateLength = -1;
+
     int32_t const* acceptedTokenIds{};
     int32_t acceptedTokenCount{};
     //! Greatest logical token boundary whose model state is materialized in the bound cache.
@@ -91,10 +96,22 @@ enum class ContextCacheCoordinatorStatus : uint8_t
 
 //! Owns the complete host/device lifecycle around the CUDA-free ContextCacheManager.
 //!
-//! The coordinator has no worker and is deliberately single-request-at-a-time under the runtime's serialized request
-//! contract. Normal publication occurs only at host-visible completion points already present in the runtime. An
-//! abnormal exit drains the bound stream before releasing active page references; a failed drain quarantines the
-//! entire request and poisons the coordinator until runtime-owned shutdown can establish quiescence.
+//! The coordinator has no worker of its own; every call is made by the caller's thread and callers must keep those
+//! calls serialized. Request handles may overlap in lifetime: several may be admitted and hold a page lease at once,
+//! which is the ownership shape in-flight batching needs.
+//!
+//! Overlapping leases are not overlapping execution, and the distinction is load-bearing. Page-table rows and the
+//! reuse-length staging buffer are addressed per request starting at row zero, so preparing request B rewrites the
+//! shared rows describing request A. Resuming A afterwards would run it against B's page mapping, and a prepare
+//! issued before the previous request's async copy has landed would corrupt that staging buffer. A caller must
+//! therefore still finish one request's steps before preparing the next; what a count rather than a flag permits is
+//! that the leases, not the execution, may interleave.
+//!
+//! Normal publication occurs only at host-visible completion points already present in the runtime. An abnormal exit
+//! drains the bound stream before releasing active page references; a failed drain quarantines the entire request and
+//! poisons the coordinator until runtime-owned shutdown can establish quiescence. Poisoning gates new admissions, so
+//! a request already admitted when the stream failed is quarantined by its own drain rather than by the first
+//! failure.
 class ContextCacheCoordinator final
 {
 public:
@@ -141,6 +158,40 @@ public:
 
     BeginRequestResult beginRequest(
         ContextCacheBatchAdmission const& admission, DecodingKvHeadroom const& headroom, cudaStream_t stream);
+
+    struct AdmitSequenceResult
+    {
+        ContextCacheCoordinatorStatus status{ContextCacheCoordinatorStatus::kRequestFailed};
+        //! True when the refusal is transient pool pressure rather than an error: pages free as
+        //! resident sequences retire, so the caller may retry at a later step boundary.
+        bool insufficientCapacity{};
+        //! Logical token offset at which the runtime's prefill begins (== the reused prefix length).
+        int32_t prefillStart{};
+    };
+
+    //! @brief Join one more sequence to a live request: look up its prefix, lease its pages, and
+    //!        bind exactly its page-table row. Vanilla attention deployments only.
+    //!
+    //! The device KV length for the new slot stays the runtime's business -- its seating sequence
+    //! owns the cache-manager view -- and the ledger is not advanced until
+    //! finalizeSequenceAdmission reports the seated prefill's outcome.
+    AdmitSequenceResult admitSequence(
+        RequestHandle& request, ContextCacheSequenceAdmission const& admission, DecodingKvHeadroom const& headroom);
+
+    //! @brief The single-slot form of finalizePrefillPublication: record the seated prefill's
+    //!        lookahead token, advance the slot's committed prefix to the full input, and publish
+    //!        its ready full-block endpoints.
+    ContextCacheCoordinatorStatus finalizeSequenceAdmission(
+        RequestHandle& request, int32_t slot, ContextCacheSequenceAdvance const& advance);
+
+    //! @brief Undo the most recent admitSequence before its slot ever joined the runtime batch:
+    //!        release the lease, drop the sequence, and clear its page-table row.
+    //!
+    //! Only legal while the admitted sequence is still the batch's tail and the runtime holds no
+    //! slot for it -- the recovery path for a seating that threw between lease and slot append. A
+    //!        seated slot that failed later stays, terminal from birth, and leaves through the
+    //!        ordinary eviction instead.
+    void retractSequenceAdmission(RequestHandle& request);
 
     //! Bind every admitted row and reset logical cache lengths to the selected reuse boundaries.
     ContextCacheCoordinatorStatus preparePrefill(RequestHandle& request);
@@ -201,6 +252,13 @@ private:
     class SharedKvSpecPolicy;
 
     std::unique_ptr<PublicationPolicy> makePublicationPolicy(bool speculativeRequest);
+
+    //! Shared tail of beginRequest and admitSequence: acquire one sequence's lease and file its
+    //! SequenceState and metrics. On failure nothing is modified; *insufficientCapacity (when
+    //! non-null) reports whether the refusal was transient pool pressure.
+    bool acquireIntoRequest(RequestHandle::Impl& request, ContextCacheSequenceAdmission const& admission,
+        ContextCacheLookupPolicy lookupPolicy, ContextCacheCommitPolicy commitPolicy, int32_t replayTailLength,
+        DecodingKvHeadroom const& headroom, bool* insufficientCapacity);
 
     AcquireSequenceResult acquireSequence(ContextCacheSequenceAdmission const& admission, bool speculativeRequest,
         ContextCacheLookupPolicy lookupPolicy, DecodingKvHeadroom const& headroom);
@@ -276,12 +334,10 @@ private:
     StreamSynchronizer mSynchronizer;
     ContextCacheMetrics mMetrics;
     std::unique_ptr<Tensor> mHostReuseLengths;
-    bool mRequestActive{};
+    int32_t mActiveRequests{};
     bool mPoisoned{};
     //! Declared after mManager so quarantined leases are destroyed first during normal shutdown.
-    std::unique_ptr<RequestHandle::Impl> mQuarantinedRequest;
-    //! Publication strategy for the in-flight request; (re)selected per request in beginRequest.
-    std::unique_ptr<PublicationPolicy> mPublicationPolicy;
+    std::vector<std::unique_ptr<RequestHandle::Impl>> mQuarantinedRequests;
 };
 
 } // namespace rt

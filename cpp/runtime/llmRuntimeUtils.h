@@ -136,6 +136,10 @@ enum class SpecProposalSampling : uint8_t
 
 inline constexpr uint64_t kDefaultSamplingSeed = 0xED6E5EED20260001ULL;
 
+//! Adding a field? Decide whether two requests that differ on it may share a forward pass, and
+//! record that decision in scheduler/batchCompatibility.cpp -- either in the compared list or the
+//! exempt list. An unclassified batch-relevant field lets one request generate with another's
+//! settings, silently.
 struct LLMGenerationRequest
 {
     //! \cond INTERNAL
