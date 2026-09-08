@@ -41,8 +41,15 @@ class NemotronHMamba2Mixer(Module):
         self.in_proj = Linear(ctx, self.key("in_proj"))
         self.out_proj = Linear(ctx, self.key("out_proj"))
 
-    def forward(self, hidden_states, conv_state, recurrent_state,
-                context_lengths, state_start_index):
+    def forward(self,
+                hidden_states,
+                conv_state,
+                recurrent_state,
+                context_lengths,
+                state_start_index,
+                spec_metadata=(),
+                use_ddtree=False,
+                use_intermediate=False):
         mamba = self.cfg.mamba_cfg
         d_inner = mamba.intermediate_size
         d_state = mamba.n_groups * mamba.ssm_state_size
@@ -58,9 +65,17 @@ class NemotronHMamba2Mixer(Module):
         if conv_bias_data is None:
             conv_bias_data = np.zeros(mamba.conv_dim, dtype=np.float16)
         conv_bias = F.constant(conv_bias_data, "conv_bias")
-        conv_output, conv_state_out, _ = F.causal_conv1d(
-            conv_input, conv_weight, conv_bias, conv_state, context_lengths,
-            mamba.conv_dim, mamba.conv_kernel - 1)
+        conv_output, conv_state_out, intermediate_conv = F.causal_conv1d(
+            conv_input,
+            conv_weight,
+            conv_bias,
+            conv_state,
+            context_lengths,
+            mamba.conv_dim,
+            mamba.conv_kernel - 1,
+            spec_metadata=spec_metadata,
+            use_ddtree=use_ddtree,
+            use_intermediate=use_intermediate)
         conv_output = conv_output.activation(self.cfg.mamba_hidden_act)
         x = conv_output.slice_last_dim(0, d_inner, 3).reshape(
             (0, 0, mamba.num_heads, mamba.head_dim))
@@ -72,10 +87,24 @@ class NemotronHMamba2Mixer(Module):
         a = F.constant(-np.exp(a_log).astype(np.float32), "ssm_A")
         d = F.constant(self.weights.f16(self.key("D")), "ssm_D")
         dt_bias = F.constant(self.weights.f16(self.key("dt_bias")), "dt_bias")
-        output, recurrent_state_out = F.update_ssm_state(
-            x, a, b, c, d, dt, dt_bias, recurrent_state, context_lengths,
-            state_start_index, d_inner, mamba.ssm_state_size, mamba.num_heads,
-            mamba.n_groups)
+        state_outputs = F.update_ssm_state(x,
+                                           a,
+                                           b,
+                                           c,
+                                           d,
+                                           dt,
+                                           dt_bias,
+                                           recurrent_state,
+                                           context_lengths,
+                                           state_start_index,
+                                           d_inner,
+                                           mamba.ssm_state_size,
+                                           mamba.num_heads,
+                                           mamba.n_groups,
+                                           spec_metadata=spec_metadata,
+                                           use_ddtree=use_ddtree,
+                                           use_intermediate=use_intermediate)
+        output, recurrent_state_out = state_outputs[:2]
         output = output.reshape((0, 0, d_inner))
         gated = (output * gate.silu()).cast(trt.float32)
         group_size = d_inner // mamba.n_groups
@@ -89,7 +118,11 @@ class NemotronHMamba2Mixer(Module):
             self.weights.f16(self.key("norm.weight")).reshape(1, 1, -1),
             "mamba_norm")
         normalized = normalized * norm_weight
-        return (self.out_proj(normalized), conv_state_out, recurrent_state_out)
+        result = (self.out_proj(normalized), conv_state_out,
+                  recurrent_state_out)
+        if use_intermediate:
+            return result + (intermediate_conv, ) + tuple(state_outputs[2:])
+        return result
 
 
 class NemotronHMLP(Module):
@@ -160,13 +193,18 @@ class NemotronHBlock(Module):
                 conv_state=None,
                 recurrent_state=None,
                 attention_mask=None,
-                attention_pos_id=None):
+                attention_pos_id=None,
+                spec_metadata=(),
+                use_ddtree=False,
+                use_intermediate=False):
         normalized = self.input_norm(hidden_states)
         if self.layer_type == config.LAYER_MAMBA:
-            mixed, conv_out, recurrent_out = self.mixer(
-                normalized, conv_state, recurrent_state, context_lengths,
-                cache_start)
-            present = (conv_out, recurrent_out)
+            state_outputs = self.mixer(normalized, conv_state, recurrent_state,
+                                       context_lengths, cache_start,
+                                       spec_metadata, use_ddtree,
+                                       use_intermediate)
+            mixed = state_outputs[0]
+            present = state_outputs[1:]
         elif self.layer_type == config.LAYER_ATTN:
             mixed, present = self.mixer(normalized, past_key_value, rope,
                                         context_lengths, cache_start,
@@ -248,10 +286,29 @@ class NemotronHForCausalLM(NetworkModule):
                 "attention_pos_id", trt.int32, (-1, -1))
             result["attention_mask"] = self.add_input("attention_mask",
                                                       trt.int32, (-1, -1, -1))
+            if cfg.mtp_base or cfg.dflash_base or cfg.dspark_base:
+                result["spec_verify_phase_marker"] = self.add_input(
+                    "spec_verify_phase_marker", trt.int32, (-1, ))
+                if (cfg.mtp_tree_base or cfg.dflash_tree_base
+                        or cfg.dspark_tree_base):
+                    result["tree_parent_ids"] = self.add_input(
+                        "tree_parent_ids", trt.int32, (-1, -1))
+                    result["tree_depths"] = self.add_input(
+                        "tree_depths", trt.int32, (-1, -1))
+                else:
+                    result["tree_parent_ids"] = None
+                    result["tree_depths"] = None
+            else:
+                result["spec_verify_phase_marker"] = None
+                result["tree_parent_ids"] = None
+                result["tree_depths"] = None
         else:
             result.update({
                 "attention_pos_id": None,
                 "attention_mask": None,
+                "spec_verify_phase_marker": None,
+                "tree_parent_ids": None,
+                "tree_depths": None,
             })
         return result
 
@@ -266,6 +323,13 @@ class NemotronHForCausalLM(NetworkModule):
         all_hidden_states = []
         attention_index = 0
         state_index = 0
+        spec_metadata = ()
+        if io["spec_verify_phase_marker"] is not None:
+            spec_metadata = (io["spec_verify_phase_marker"], )
+            if io["tree_parent_ids"] is not None:
+                spec_metadata += (io["tree_parent_ids"], io["tree_depths"])
+        use_intermediate = bool(spec_metadata)
+        use_ddtree = io["tree_parent_ids"] is not None
         for layer_index, (layer, layer_type) in enumerate(
                 zip(self.layers, self.cfg.layer_types)):
             LOGGER.info("building layer %d/%d", layer_index + 1,
@@ -276,13 +340,16 @@ class NemotronHForCausalLM(NetworkModule):
                     io["context_lengths"],
                     conv_state=io["conv_states"][state_index],
                     recurrent_state=io["recurrent_states"][state_index],
-                    cache_start=io["cache_start"])
+                    cache_start=io["cache_start"],
+                    spec_metadata=spec_metadata,
+                    use_ddtree=use_ddtree,
+                    use_intermediate=use_intermediate)
                 present_conv.append(states[0])
                 present_recurrent.append(states[1])
                 if len(states) > 2 and states[2] is not None:
                     intermediate_conv.append(states[2])
-                if len(states) > 3 and states[3] is not None:
-                    intermediate_recurrent.append(states[3])
+                if len(states) > 3:
+                    intermediate_recurrent.append(states[3:])
                 state_index += 1
             elif layer_type == config.LAYER_ATTN:
                 hidden_states, present = layer(
@@ -315,5 +382,9 @@ class NemotronHForCausalLM(NetworkModule):
         for index, tensor in enumerate(intermediate_conv):
             outputs[f"intermediate_conv_state_{index}"] = tensor
         for index, tensor in enumerate(intermediate_recurrent):
-            outputs[f"intermediate_recurrent_state_{index}"] = tensor
+            replay_da, replay_u, replay_b, replay_dt = tensor
+            outputs[f"replay_da_state_{index}"] = replay_da
+            outputs[f"replay_u_state_{index}"] = replay_u
+            outputs[f"replay_b_state_{index}"] = replay_b
+            outputs[f"replay_dt_state_{index}"] = replay_dt
         return outputs

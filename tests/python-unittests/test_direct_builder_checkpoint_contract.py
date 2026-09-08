@@ -262,6 +262,39 @@ def test_nvfp4_weight_layout_takes_precedence_over_activation_precision():
             quantization.QUANT_NVFP4)
 
 
+def test_mixed_precision_preserves_module_group_sizes():
+    dominant, group_size, overrides, group_sizes = (
+        quantization._parse_mixed_precision(
+            {
+                "model.layers.0.self_attn.o_proj": {
+                    "quant_algo": "FP8",
+                    "group_size": 1
+                },
+                "model.layers.1.self_attn.o_proj": {
+                    "quant_algo": "FP8",
+                    "group_size": 1
+                },
+                "model.layers.0.mlp.gate_proj": {
+                    "quant_algo": "NVFP4",
+                    "group_size": 16
+                },
+            }, None))
+
+    assert dominant == quantization.QUANT_FP8
+    assert group_size == 1
+    assert overrides["layers.0.mlp.gate_proj"] == quantization.QUANT_NVFP4
+    assert group_sizes["layers.0.mlp.gate_proj"] == 16
+
+    config = quantization.QuantConfig(quant_type=dominant,
+                                      group_size=group_size,
+                                      layer_overrides=overrides,
+                                      layer_group_sizes=group_sizes,
+                                      is_mixed_precision=True)
+    assert config.module_group_size("model.layers.0.mlp.gate_proj") == 16
+    assert config.module_group_size("model.layers.0.self_attn.o_proj") == 1
+    assert config.is_quantized is True
+
+
 def test_unknown_compressed_tensor_format_is_not_fp16(tmp_path):
     embedded = {
         "quantization_config": {

@@ -846,7 +846,7 @@ void runMambaMultiStepTest(
 
     invokeSelectiveStateUpdatePrefill(xDevice, ADevice, BDevice, CDevice, dtDevice, dtBiasOpt, DOpt, zOpt, stateDevice,
         outputDevice, config.dtSoftplus, clOpt, /*replayDA=*/std::nullopt, /*replayU=*/std::nullopt,
-        /*replayB=*/std::nullopt, stream);
+        /*replayB=*/std::nullopt, /*replayDT=*/std::nullopt, stream);
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -965,4 +965,175 @@ TEST(MambaSelectiveStateUpdate, Padding_AllShorter)
     config.dtSoftplus = true;
     std::vector<int32_t> cl = {3, 7};
     runMambaMultiStepTest(config, 16, &cl);
+}
+
+TEST(MambaSelectiveStateUpdate, DDTreeSiblingPaddingAndNoncontiguousReplay)
+{
+    int32_t constexpr batch = 2;
+    int32_t constexpr seqLen = 5;
+    int32_t constexpr nheads = 1;
+    int32_t constexpr dim = 64;
+    int32_t constexpr dstate = 64;
+    int32_t constexpr ngroups = 1;
+
+    std::vector<half> stateHost(batch * nheads * dim * dstate);
+    std::vector<half> xHost(batch * seqLen * nheads * dim);
+    std::vector<half> dtHost(batch * seqLen * nheads);
+    std::vector<float> aHost(nheads, -0.2F);
+    std::vector<half> bHost(batch * seqLen * ngroups * dstate);
+    std::vector<half> cHost(batch * seqLen * ngroups * dstate);
+    std::vector<half> dHost(nheads, __float2half(0.1F));
+    std::vector<half> dtBiasHost(nheads, __float2half(0.02F));
+    for (size_t i = 0; i < stateHost.size(); ++i)
+    {
+        stateHost[i] = __float2half((static_cast<int32_t>(i % 7) - 3) * 0.01F);
+    }
+    for (int32_t b = 0; b < batch; ++b)
+    {
+        for (int32_t t = 0; t < seqLen; ++t)
+        {
+            dtHost[(b * seqLen + t) * nheads] = __float2half(0.05F * (t + 1));
+            for (int32_t d = 0; d < dim; ++d)
+            {
+                xHost[((b * seqLen + t) * nheads) * dim + d]
+                    = __float2half(0.01F * (b + 1) + 0.02F * (t + 1) + 0.001F * (d % 5));
+            }
+            for (int32_t i = 0; i < dstate; ++i)
+            {
+                bHost[((b * seqLen + t) * ngroups) * dstate + i] = __float2half(0.01F * (t + 1) + 0.001F * (i % 3));
+                cHost[((b * seqLen + t) * ngroups) * dstate + i] = __float2half(0.02F + 0.001F * (i % 5));
+            }
+        }
+    }
+
+    std::vector<int32_t> const parents{-1, 0, 0, 1, 2, -1, 0, 0, -1, -1};
+    std::vector<int32_t> const depths{0, 1, 1, 2, 2, 0, 1, 1, 0, 0};
+    std::vector<std::vector<int32_t>> const paths{{0}, {0, 1}, {0, 2}, {0, 1, 3}, {0, 2, 4}};
+
+    auto applyToken = [&](int32_t b, int32_t token, std::vector<float>& state, std::vector<half>* output) {
+        float dtValue
+            = thresholdedSoftplus(__half2float(dtHost[(b * seqLen + token) * nheads]) + __half2float(dtBiasHost[0]));
+        float const decay = std::exp(aHost[0] * dtValue);
+        for (int32_t row = 0; row < dim; ++row)
+        {
+            float const xValue = __half2float(xHost[((b * seqLen + token) * nheads) * dim + row]);
+            float outValue = __half2float(dHost[0]) * xValue;
+            for (int32_t i = 0; i < dstate; ++i)
+            {
+                int64_t const stateIdx = static_cast<int64_t>(row) * dstate + i;
+                float const bValue = __half2float(bHost[((b * seqLen + token) * ngroups) * dstate + i]);
+                float const dB = bValue * dtValue;
+                float const newState = state[stateIdx] * decay + dB * xValue;
+                outValue += newState * __half2float(cHost[((b * seqLen + token) * ngroups) * dstate + i]);
+                state[stateIdx] = __half2float(__float2half(newState));
+            }
+            if (output != nullptr)
+            {
+                (*output)[((b * seqLen + token) * nheads) * dim + row] = __float2half(outValue);
+            }
+        }
+    };
+
+    std::vector<half> outputRef(batch * seqLen * nheads * dim, __float2half(0.F));
+    for (int32_t b = 0; b < batch; ++b)
+    {
+        int32_t const validNodes = b == 0 ? seqLen : 3;
+        for (int32_t node = 0; node < validNodes; ++node)
+        {
+            std::vector<float> pathState(dim * dstate);
+            int64_t const stateBase = static_cast<int64_t>(b) * dim * dstate;
+            for (int32_t i = 0; i < dim * dstate; ++i)
+            {
+                pathState[i] = __half2float(stateHost[stateBase + i]);
+            }
+            for (int32_t token : paths[node])
+            {
+                applyToken(b, token, pathState, token == node ? &outputRef : nullptr);
+            }
+        }
+    }
+
+    auto stateDevice = rt::Tensor({batch, nheads, dim, dstate}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto xDevice = rt::Tensor({batch, seqLen, nheads, dim}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto dtDevice = rt::Tensor({batch, seqLen, nheads}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto aDevice = rt::Tensor({nheads}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    auto bDevice = rt::Tensor({batch, seqLen, ngroups, dstate}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto cDevice = rt::Tensor({batch, seqLen, ngroups, dstate}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto dDevice = rt::Tensor({nheads}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto dtBiasDevice = rt::Tensor({nheads}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto parentDevice = rt::Tensor({batch, seqLen}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto depthDevice = rt::Tensor({batch, seqLen}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto outputDevice = rt::Tensor({batch, seqLen, nheads, dim}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto replayDa = rt::Tensor({batch, seqLen, nheads}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    auto replayU = rt::Tensor({batch, seqLen, nheads, dim}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    auto replayB = rt::Tensor({batch, seqLen, ngroups, dstate}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    auto replayDt = rt::Tensor({batch, seqLen, nheads}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    copyHostToDevice<half>(stateDevice, stateHost);
+    copyHostToDevice<half>(xDevice, xHost);
+    copyHostToDevice<half>(dtDevice, dtHost);
+    copyHostToDevice<float>(aDevice, aHost);
+    copyHostToDevice<half>(bDevice, bHost);
+    copyHostToDevice<half>(cDevice, cHost);
+    copyHostToDevice<half>(dDevice, dHost);
+    copyHostToDevice<half>(dtBiasDevice, dtBiasHost);
+    copyHostToDevice<int32_t>(parentDevice, parents);
+    copyHostToDevice<int32_t>(depthDevice, depths);
+
+    cudaStream_t stream{};
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    rt::OptionalInputTensor const dtBiasOpt{std::cref(dtBiasDevice)};
+    rt::OptionalInputTensor const dOpt{std::cref(dDevice)};
+    invokeSelectiveStateUpdateDDTree(xDevice, aDevice, bDevice, cDevice, dtDevice, dtBiasOpt, dOpt, stateDevice,
+        outputDevice, parentDevice, depthDevice, true, replayDa, replayU, replayB, replayDt, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    auto const outputHost = copyDeviceToHost<half>(outputDevice);
+    auto const stateAfterVerify = copyDeviceToHost<half>(stateDevice);
+    EXPECT_EQ(stateAfterVerify, stateHost);
+    auto [rtol, atol] = getTolerance<half>();
+    for (size_t i = 0; i < outputRef.size(); ++i)
+    {
+        EXPECT_TRUE(isclose(outputHost[i], outputRef[i], rtol, atol)) << "output mismatch at " << i;
+    }
+    EXPECT_NE(outputHost[1 * dim], outputHost[2 * dim]);
+
+    std::vector<int32_t> const acceptedIds{0, 2, 4, 0, 1, -1};
+    std::vector<int32_t> const acceptedLengths{3, 2};
+    auto acceptedIdsDevice = rt::Tensor({batch, 3}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto acceptedLengthsDevice = rt::Tensor({batch}, rt::DeviceType::kGPU, DataType::kINT32);
+    copyHostToDevice<int32_t>(acceptedIdsDevice, acceptedIds);
+    copyHostToDevice<int32_t>(acceptedLengthsDevice, acceptedLengths);
+    MambaReplayLayerInfo const hostInfo{stateDevice.rawPointer(), replayDa.rawPointer(), replayU.rawPointer(),
+        replayB.rawPointer(), replayDt.rawPointer()};
+    auto infoDevice
+        = rt::Tensor({static_cast<int64_t>(sizeof(MambaReplayLayerInfo))}, rt::DeviceType::kGPU, DataType::kUINT8);
+    CUDA_CHECK(cudaMemcpyAsync(infoDevice.rawPointer(), &hostInfo, sizeof(hostInfo), cudaMemcpyHostToDevice, stream));
+    invokeMambaReplayReconstructBatched(static_cast<MambaReplayLayerInfo const*>(infoDevice.rawPointer()), 1,
+        stateDevice, replayU, replayB, replayDt, acceptedLengthsDevice, batch, stream, &acceptedIdsDevice, 3);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<half> replayStateRef(stateHost.size());
+    for (int32_t b = 0; b < batch; ++b)
+    {
+        std::vector<float> state(dim * dstate);
+        int64_t const stateBase = static_cast<int64_t>(b) * dim * dstate;
+        for (int32_t i = 0; i < dim * dstate; ++i)
+        {
+            state[i] = __half2float(stateHost[stateBase + i]);
+        }
+        for (int32_t i = 0; i < acceptedLengths[b]; ++i)
+        {
+            applyToken(b, acceptedIds[b * 3 + i], state, nullptr);
+        }
+        for (int32_t i = 0; i < dim * dstate; ++i)
+        {
+            replayStateRef[stateBase + i] = __float2half(state[i]);
+        }
+    }
+    auto const replayStateHost = copyDeviceToHost<half>(stateDevice);
+    for (size_t i = 0; i < replayStateRef.size(); ++i)
+    {
+        EXPECT_EQ(replayStateHost[i], replayStateRef[i]) << "replay mismatch at " << i;
+    }
+    CUDA_CHECK(cudaStreamDestroy(stream));
 }

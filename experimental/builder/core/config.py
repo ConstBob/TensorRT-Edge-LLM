@@ -28,6 +28,7 @@ from tensorrt_edgellm.dflash import DFlashVersion, resolve_dflash_contract
 
 from . import contracts, quantization
 from .bundle import LLM_COMPONENTS, BundleConfig
+from .dspark_config import resolve_dspark_config
 
 # Per-layer block type labels.
 LAYER_ATTN = "attention"
@@ -102,6 +103,7 @@ class DeviceConfig:
     full_rope_config: Optional[dict] = None
     attention_layer_types: List[str] = field(default_factory=list)
     attention_bias: bool = False
+    attention_sink_bias: bool = False
     attention_k_eq_v: bool = False
     tie_word_embeddings: bool = False
     sliding_window_size: int = -1
@@ -170,6 +172,7 @@ class DeviceConfig:
     dflash2_selector_rank: int = 0
     dflash2_selector_top_k: int = 0
     dspark_base: bool = False
+    dspark_tree_base: bool = False
     dspark_target_layer_ids: List[int] = field(default_factory=list)
     dspark_block_size: int = 7
     dspark_mask_token_id: int = 151669
@@ -177,6 +180,9 @@ class DeviceConfig:
     dspark_confidence_head_with_markov: bool = False
     dspark_markov_head_type: str = ""
     dspark_markov_rank: int = 0
+    dspark_causal_proposal: bool = False
+    dspark_contiguous_query_swa: bool = False
+    dspark_sample_from_anchor: bool = True
     draft_vocab_size: Optional[int] = None
     target_hidden_size: Optional[int] = None
 
@@ -376,6 +382,9 @@ class DeviceConfig:
                                         llm.get("num_nextn_predict_layers"))
 
         dflash_contract = resolve_dflash_contract(root, llm)
+        dspark_sliding_window = _get_sliding_window(llm)
+        dspark = resolve_dspark_config(llm, dspark_sliding_window)
+        dspark_sliding_window = int(dspark["sliding_window_size"])
         result = cls(
             model_type=model_type,
             model_dir=model_dir,
@@ -405,9 +414,10 @@ class DeviceConfig:
             full_rope_config=dual_rope.get("full_rope_config"),
             attention_layer_types=attention_layer_types,
             attention_bias=bool(llm.get("attention_bias", False)),
+            attention_sink_bias=bool(dspark["attention_sink_bias"]),
             attention_k_eq_v=bool(llm.get("attention_k_eq_v", False)),
             tie_word_embeddings=bool(llm.get("tie_word_embeddings", False)),
-            sliding_window_size=_get_sliding_window(llm),
+            sliding_window_size=dspark_sliding_window,
             skip_softmax_scale_factor=_get_skip_softmax_scale_factor(
                 llm, root),
             final_logit_softcapping=(float(llm["final_logit_softcapping"])
@@ -494,31 +504,43 @@ class DeviceConfig:
             dflash2_selector_top_k=int((llm.get("dflash_config")
                                         or {}).get("selector_top_k", 0)),
             dspark_base=bool(llm.get("dspark_base", False)),
-            dspark_target_layer_ids=list((llm.get("dspark_config") or {}).get(
-                "target_layer_ids",
-                llm.get("dspark_target_layer_ids",
-                        llm.get("target_layer_ids", [])))),
-            dspark_block_size=int((llm.get("dspark_config") or {}).get(
-                "block_size",
-                llm.get("dspark_block_size", llm.get("block_size", 7)))),
-            dspark_mask_token_id=int((llm.get("dspark_config") or {}).get(
-                "mask_token_id",
-                llm.get("dspark_mask_token_id",
-                        llm.get("mask_token_id", 151669)))),
+            dspark_tree_base=bool(llm.get("dspark_tree_base", False)),
+            dspark_target_layer_ids=list(
+                dspark.get(
+                    "target_layer_ids",
+                    llm.get("dspark_target_layer_ids",
+                            llm.get("target_layer_ids", [])))),
+            dspark_block_size=int(
+                dspark.get(
+                    "block_size",
+                    llm.get("dspark_block_size", llm.get("block_size", 7)))),
+            dspark_mask_token_id=int(
+                dspark.get(
+                    "mask_token_id",
+                    llm.get("dspark_mask_token_id",
+                            llm.get("mask_token_id", 151669)))),
             dspark_enable_confidence_head=bool(
-                (llm.get("dspark_config")
-                 or {}).get("enable_confidence_head",
-                            llm.get("enable_confidence_head", False))),
+                dspark.get("enable_confidence_head",
+                           llm.get("enable_confidence_head", False))),
             dspark_confidence_head_with_markov=bool(
-                (llm.get("dspark_config")
-                 or {}).get("confidence_head_with_markov",
-                            llm.get("confidence_head_with_markov", False))),
+                dspark.get("confidence_head_with_markov",
+                           llm.get("confidence_head_with_markov", False))),
             dspark_markov_head_type=str(
-                (llm.get("dspark_config")
-                 or {}).get("markov_head_type",
-                            llm.get("markov_head_type", ""))),
-            dspark_markov_rank=int((llm.get("dspark_config") or {}).get(
-                "markov_rank", llm.get("markov_rank", 0)) or 0),
+                dspark.get("markov_head_type", llm.get("markov_head_type",
+                                                       ""))),
+            dspark_markov_rank=int(
+                dspark.get("markov_rank", llm.get("markov_rank", 0)) or 0),
+            dspark_causal_proposal=bool(
+                dspark.get(
+                    "causal_head",
+                    dspark.get(
+                        "causal",
+                        llm.get("causal_head",
+                                llm.get("dflash_query_causal", False))))),
+            dspark_contiguous_query_swa=bool(dspark["contiguous_query_swa"]),
+            dspark_sample_from_anchor=bool(
+                dspark.get("sample_from_anchor",
+                           llm.get("sample_from_anchor", True))),
             draft_vocab_size=(int(llm["draft_vocab_size"])
                               if llm.get("draft_vocab_size") is not None else
                               None),

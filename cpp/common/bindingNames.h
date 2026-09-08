@@ -374,12 +374,14 @@ inline constexpr char const* kIntermediateRecurrentStateTemplate = "intermediate
  * snapshot, the Mamba plugin stashes the minimal per-token replay inputs; the runtime reconstructs
  * the accepted recurrent state from them after verification.
  *   dA: [batch, seq_len, recurrentNumHeads]
- *   u:  [batch, seq_len, recurrentNumHeads, recurrentHeadDim]
+ *   u:  [batch, seq_len, recurrentNumHeads, recurrentHeadDim] (stores x)
+ *   dt: [batch, seq_len, recurrentNumHeads]
  *   B:  [batch, seq_len, recurrentNumGroups, recurrentStateSize]
  */
 inline constexpr char const* kReplayDaStateTemplate = "replay_da_state";
 inline constexpr char const* kReplayUStateTemplate = "replay_u_state";
 inline constexpr char const* kReplayBStateTemplate = "replay_b_state";
+inline constexpr char const* kReplayDtStateTemplate = "replay_dt_state";
 
 /*! @} */
 
@@ -874,6 +876,11 @@ inline std::string formatReplayUStateName(int32_t recurrentLayerIdx)
 inline std::string formatReplayBStateName(int32_t recurrentLayerIdx)
 {
     return std::string(kReplayBStateTemplate) + "_" + std::to_string(recurrentLayerIdx);
+}
+
+inline std::string formatReplayDtStateName(int32_t recurrentLayerIdx)
+{
+    return std::string(kReplayDtStateTemplate) + "_" + std::to_string(recurrentLayerIdx);
 }
 
 /*!

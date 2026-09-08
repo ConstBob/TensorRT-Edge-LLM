@@ -38,6 +38,10 @@ def causal_conv1d(
     if use_ddtree and not modern_abi:
         raise RuntimeError(
             "loaded causal_conv1d operation does not support DDTree inputs")
+    if use_intermediate and not modern_abi:
+        raise RuntimeError(
+            "loaded causal_conv1d operation does not support speculative "
+            "verification state")
     if modern_abi and use_intermediate and not spec_metadata:
         raise RuntimeError(
             "modern causal_conv1d MTP ABI requires phase metadata")
@@ -119,16 +123,40 @@ def update_ssm_state(
     dstate: int,
     nheads: int,
     ngroups: int,
-) -> Tuple[Tensor, Tensor]:
-    """Run selective state update."""
-    return operation("update_ssm_state", [
+    spec_metadata: Sequence[Tensor] = (),
+    use_ddtree: bool = False,
+    use_intermediate: bool = False,
+):
+    """Run selective state update and optionally emit spec-verify replay data."""
+    use_intermediate = use_intermediate or bool(spec_metadata)
+    modern_abi = supports_operation_attribute("update_ssm_state", "use_ddtree")
+    if use_ddtree and not modern_abi:
+        raise RuntimeError(
+            "loaded update_ssm_state operation does not support DDTree inputs")
+    if use_intermediate and not modern_abi:
+        raise RuntimeError(
+            "loaded update_ssm_state operation does not support speculative "
+            "verification state")
+    if modern_abi and use_intermediate and not spec_metadata:
+        raise RuntimeError(
+            "modern update_ssm_state spec-verify ABI requires phase metadata")
+    inputs = [
         x, a, b, c, d, dt, dt_bias, state, context_lengths, state_start_index
-    ],
-                     output_count=2,
-                     dim=dim,
-                     dstate=dstate,
-                     nheads=nheads,
-                     ngroups=ngroups,
-                     dt_softplus=1,
-                     chunk_size=1,
-                     time_step_limit=[0.0, float("inf")])
+    ]
+    attributes = {
+        "dim": dim,
+        "dstate": dstate,
+        "nheads": nheads,
+        "ngroups": ngroups,
+        "dt_softplus": 1,
+        "chunk_size": 1,
+        "time_step_limit": [0.0, float("inf")],
+    }
+    if modern_abi:
+        attributes["use_spec_verify_state"] = int(use_intermediate)
+        attributes["use_ddtree"] = int(use_ddtree)
+        inputs.extend(spec_metadata)
+    return operation("update_ssm_state",
+                     inputs,
+                     output_count=6 if use_intermediate else 2,
+                     **attributes)

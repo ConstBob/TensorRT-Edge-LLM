@@ -25,6 +25,7 @@ def build_model(net, bundle, cfg, weights, args) -> None:
         dense_quant=args.dense_quant,
         int4_gemm_plugin_version=args.int4_gemm_plugin_version,
         sm12x=args.sm12x,
+        sm110=args.sm110,
         max_lora_rank=args.max_lora_rank,
     )
     context = BuildContext(net=net,

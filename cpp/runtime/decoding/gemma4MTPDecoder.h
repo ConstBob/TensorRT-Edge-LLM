@@ -56,6 +56,13 @@ public:
         return true;
     }
 
+    DecodingStrategyCapabilities capabilities() const noexcept override
+    {
+        // The paired speculative base is not a standalone target engine, so VanillaDecoder fallback is invalid.
+        return {/*.ownsBaseVerificationCudaGraphs=*/false, /*.supportsLosslessSampling=*/false,
+            /*.maxSamplingSupport=*/0, /*.fallbackToVanillaForNonGreedySampling=*/false};
+    }
+
     DecodingKvHeadroom requiredKvHeadroom() const override;
 
     bool decodeStep(DecodingInferenceContext& context) override;
@@ -79,6 +86,7 @@ private:
     bool runDraftProposal(DecodingInferenceContext& context);
     bool prepareSeed(DecodingInferenceContext& context);
     bool runAssistantDraftChain(DecodingInferenceContext& context);
+    bool buildTreeVerifyInputs(int32_t activeBatchSize, cudaStream_t stream);
     bool runBaseVerification(DecodingInferenceContext& context);
     bool acceptAndCommit(DecodingInferenceContext& context);
     bool updateNextSeed(DecodingInferenceContext& context);
@@ -100,6 +108,14 @@ private:
     Tensor mHostAcceptLengths;    //!< [B] INT32 host staging.
     Tensor mHostAcceptedTokenIds; //!< [B, specDraftStep + 1] INT32 host staging.
     Tensor mArgmaxScratch;        //!< [B * (specDraftStep + 1)] INT32 accept argmax scratch.
+
+    bool mUseTree{false};
+    Tensor mStackedDraftLogits; //!< [B, specDraftStep + 1, draftVocab] per-depth proposal logits.
+    Tensor mTreeTokenIds;       //!< [B, verifySize] flattened tree token ids.
+    Tensor mTreeNodeScores;     //!< [B, verifySize] prefix log-prob scores.
+    Tensor mValidCounts;        //!< [B] valid tree node counts.
+    Tensor mVerifyTreeMask;     //!< [B, verifySize, verifySize] unpacked ancestor mask.
+    Tensor mTreeBuildWorkspace; //!< DDTree build workspace.
 
     hash_utils::HashMap<SystemPromptCacheKey, bool> mSystemPromptCacheKeys;
 };

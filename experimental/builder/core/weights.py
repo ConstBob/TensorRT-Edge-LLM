@@ -105,7 +105,8 @@ class LinearWeights:
         """Infer the input dimension for supported checkpoint layouts."""
         if self.logical_in_features is not None:
             return self.logical_in_features
-        if self.quant_type == quantization.QUANT_NVFP4:
+        if self.quant_type in (quantization.QUANT_NVFP4,
+                               quantization.QUANT_NVFP4_A16):
             return int(self.weight.shape[1]) * 2
         return int(self.weight.shape[1])
 
@@ -251,6 +252,13 @@ class Weights:
             name = normalize(name)
         return self.quant.module_type(name, tie_word_embeddings)
 
+    def module_quant_group_size(self, name: str) -> int:
+        """Return the checkpoint group size owned by one model projection."""
+        normalize = getattr(self.conversion, "normalize_checkpoint_name", None)
+        if normalize is not None:
+            name = normalize(name)
+        return self.quant.module_group_size(name)
+
     def parameter_spec(self,
                        name: str,
                        dtype=np.float16,
@@ -394,7 +402,8 @@ class Weights:
                 bias,
                 weight_recipe=(self.checkpoint_binding(
                     [prefix + ".weight"], "fp16") if verbatim else None))
-        if quant_type == quantization.QUANT_NVFP4:
+        if quant_type in (quantization.QUANT_NVFP4,
+                          quantization.QUANT_NVFP4_A16):
             raw = self.linear_nvfp4_raw(prefix)
             return LinearWeights(
                 quant_type,
@@ -403,7 +412,7 @@ class Weights:
                 weight_scale=raw["weight_scale"],
                 weight_scale_2=raw["weight_scale_2"],
                 input_scale=raw["input_scale"],
-                group_size=self.group_size,
+                group_size=self.module_quant_group_size(prefix),
             )
         if quant_type == quantization.QUANT_FP8:
             return LinearWeights(
@@ -428,7 +437,7 @@ class Weights:
                 bias,
                 weight_scale=self.array(prefix + ".weight_scale").astype(
                     np.uint8, copy=False),
-                group_size=self.group_size,
+                group_size=self.module_quant_group_size(prefix),
             )
         if quant_type == quantization.QUANT_INT4_AWQ:
             qweight = self.array(prefix + ".qweight")
@@ -453,7 +462,7 @@ class Weights:
                 packed,
                 bias,
                 weight_scale=scales,
-                group_size=self.group_size,
+                group_size=self.module_quant_group_size(prefix),
                 weight_recipe=None if reduced else self.checkpoint_binding(
                     [prefix + ".qweight", prefix + ".qzeros"],
                     assemble="awq_ffn_qweight",
@@ -487,7 +496,7 @@ class Weights:
                 bias,
                 weight_scale=np.ascontiguousarray(scales),
                 pre_quant_scale=np.ascontiguousarray(pre_quant_scale),
-                group_size=self.group_size,
+                group_size=self.module_quant_group_size(prefix),
                 weight_recipe=None if reduced else self.checkpoint_binding(
                     [prefix + ".weight"],
                     "int4_modelopt_uint8",
@@ -535,7 +544,7 @@ class Weights:
                 bias,
                 weight_scale=scales,
                 activation_permutation=permutation,
-                group_size=self.group_size,
+                group_size=self.module_quant_group_size(prefix),
                 weight_recipe=None if reduced else self.checkpoint_binding(
                     [
                         prefix + ".qweight", prefix + ".qzeros", prefix +
@@ -568,7 +577,8 @@ class Weights:
 
     def linear(self, prefix: str, quant_type: str) -> LinearWeights:
         """Load a linear and apply an optional output-vocabulary map."""
-        if (quant_type == quantization.QUANT_NVFP4
+        if (quant_type
+                in (quantization.QUANT_NVFP4, quantization.QUANT_NVFP4_A16)
                 and not self.is_nvfp4(prefix)):
             raise ValueError(
                 f"{prefix}: quantization config selects NVFP4, but the "
@@ -698,7 +708,7 @@ class Weights:
                 activation_permutation_recipe = self.checkpoint_binding(
                     [prefix + ".g_idx"],
                     assemble="gptq_activation_permutation",
-                    group_size=self.group_size)
+                    group_size=self.module_quant_group_size(prefix))
             else:
                 activation_permutation = np.arange(in_features, dtype=np.int64)
                 activation_permutation_recipe = None
@@ -717,7 +727,7 @@ class Weights:
             weight_scale=scale,
             pre_quant_scale=pre_quant_scale,
             activation_permutation=activation_permutation,
-            group_size=self.group_size,
+            group_size=self.module_quant_group_size(prefix),
             weight_recipe=weight_recipe,
             scale_recipe=scale_recipe,
             pre_quant_recipe=pre_quant_recipe,
@@ -755,7 +765,8 @@ class Weights:
                 f"{prefix}: NVFP4 weight and scale must be rank-2")
         out_features = int(weight_shape[0])
         in_features = int(weight_shape[1]) * 2
-        expected_scale_shape = (out_features, in_features // self.group_size)
+        expected_scale_shape = (out_features, in_features //
+                                self.module_quant_group_size(prefix))
         if tuple(scale_shape) != expected_scale_shape:
             raise ValueError(
                 f"{prefix}: NVFP4 scale shape {scale_shape} does not match "
@@ -777,7 +788,7 @@ class Weights:
             weight_scale=ParameterSpec(scale_shape, np.uint8),
             weight_scale_2=weight_scale_2,
             input_scale=input_scale,
-            group_size=self.group_size,
+            group_size=self.module_quant_group_size(prefix),
             weight_recipe=self.checkpoint_binding([weight_name],
                                                   "nvfp4_packed"),
             scale_recipe=self.checkpoint_binding([scale_name], "nvfp4_scale"),
@@ -791,7 +802,8 @@ class Weights:
                           *,
                           external_kind: str = "") -> LinearWeights:
         """Return a dense projection payload or metadata, as required."""
-        if (quant_type == quantization.QUANT_NVFP4
+        if (quant_type
+                in (quantization.QUANT_NVFP4, quantization.QUANT_NVFP4_A16)
                 and not self.is_nvfp4(prefix)):
             raise ValueError(
                 f"{prefix}: quantization config selects NVFP4, but the "
@@ -888,6 +900,10 @@ class Weights:
         """Return one tensor-parallel shard of a linear."""
         if tp_size == 1 or mode == "replicated":
             return linear
+        if linear.quant_type == quantization.QUANT_NVFP4_A16:
+            raise NotImplementedError(
+                "NVFP4-A16 tensor parallelism requires repacking each raw shard"
+            )
         full_out = linear.out_features
         full_in = linear.in_features
         split_size = full_out if mode == "column" else full_in
@@ -1037,8 +1053,8 @@ class Weights:
             ws2 = self._nvfp4_global_scale(
                 self.store.get_scalar_f32(self._resolve(global_scale_name)),
                 reciprocal)
-            dense = nvfp4_pack.decode_modelopt_nvfp4(packed, sf, ws2,
-                                                     self.group_size)
+            dense = nvfp4_pack.decode_modelopt_nvfp4(
+                packed, sf, ws2, self.module_quant_group_size(prefix))
             w = dense.astype(np.float16)
         elif self.has(prefix + ".weight"):
             w = self.f16(prefix + ".weight")
@@ -1099,8 +1115,8 @@ class Weights:
         ws2 = self._nvfp4_global_scale(
             self.store.get_scalar_f32(self._resolve(global_scale_name)),
             reciprocal)
-        return nvfp4_pack.decode_modelopt_nvfp4(packed, sf, ws2,
-                                                self.group_size)
+        return nvfp4_pack.decode_modelopt_nvfp4(
+            packed, sf, ws2, self.module_quant_group_size(prefix))
 
     def expert_raw_nvfp4(self, prefix: str) -> dict:
         """Return raw NVFP4 bytes for one expert projection (byte-reuse path)."""

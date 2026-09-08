@@ -443,18 +443,23 @@ draft artifacts and supports non-greedy sampling. `--dsparkScheduler threshold`
 and `--dsparkScheduler sps` enable adaptive chain lengths; use
 `--dsparkMinProposalLen` and `--dsparkMaxProposalLen` to bound them.
 
-The ONNX export/build path also supports greedy DSpark DDTree. Build the base
-engine with a larger verification profile, such as `--maxVerifyTreeSize 16`,
-use a greedy input (`"temperature": 0.0`, `"top_k": 1`), and run with
+The ONNX export/build path also supports greedy DSpark DDTree. Export a
+tree-capable base with `--dspark-tree-base --dspark-draft-dir "$DRAFT_DIR"`,
+then build that ONNX with the intended verification budget, such as
+`--maxVerifyTreeSize 16`. Hybrid recurrent-state replay requires runtime
+`--specVerifySize` to equal this build-time budget. Use a greedy input
+(`"temperature": 0.0`, `"top_k": 1`) and run with
 `--specDraftTopK 4 --specVerifySize 16`. Tree mode accepts
 `--dsparkScheduler off` or `threshold`; `sps` applies only to chain mode.
 
 Setting the environment variable `EDGELLM_DSPARK_W2_FP8=1` converts the Markov
 correction weight (`markov_w2`) to FP8 E4M3 with per-row scales at load time,
-reducing the greedy proposal cost on bandwidth-bound devices. It applies to the
-greedy path only (non-greedy sampling keeps FP16 weights), requires a Markov
-rank of `16 * 2^k`, and costs about 0.04 acceptance length; startup fails
-loudly on unsupported ranks rather than silently falling back.
+reducing the greedy proposal cost on bandwidth-bound devices. It applies to
+greedy chain drafting and, for rank 512, the parent-conditioned tree scorer.
+Non-greedy sampling keeps FP16 weights. Chain mode requires a Markov rank of
+`16 * 2^k` up to 512; unsupported ranks fail at startup rather than silently
+falling back. Acceptance changes from FP8 quantization are model-dependent, so
+validate both acceptance and end-to-end throughput on the deployment workload.
 
 ## JetSpec
 
@@ -613,7 +618,8 @@ tensorrt-edgellm-build \
 ```
 
 For DFlash or DSpark, use that section's checkpoint paths, tree sizes, and
-`--spec-type`; direct-built DSpark engines currently use chain mode. Run
+`--spec-type`. Direct-built DSpark supports both chain mode and greedy tree
+mode; pass `--tree-base` when building a tree-verification base. Run
 direct-built engines with the same method-specific inference settings shown
 above. Change `--engineDir` to the direct engine directory and add
 `--checkpointDir <base_checkpoint>`. Paired methods also require

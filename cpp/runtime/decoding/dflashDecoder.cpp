@@ -242,6 +242,14 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
 
 bool DFlashDecoder::decodeStep(DecodingInferenceContext& context)
 {
+    if (usesGreedyOnlyTree()
+        && ::trt_edgellm::shouldUseNonGreedySampling(context.temperature, context.topK, context.topP))
+    {
+        LOG_ERROR(
+            "DFlashDecoder: tree verification supports greedy decoding only; route the request through vanilla "
+            "or use a lossless chain configuration.");
+        return false;
+    }
     NVTX_SCOPED_RANGE(nvtx_dflash_decode, "DFlashDecoder::decodeStep", nvtx_colors::GREEN);
     cudaGetLastError();
 
@@ -1012,11 +1020,13 @@ void DFlashDecoder::commitAcceptedTreePath(
     cacheMgrBase.commitSequenceLength(mAcceptLength, context.stream);
     if (hasHybridStates)
     {
-        check::check(kernel::gdnTreeChunkVerifyEnabled(verifySize),
-            "DDTree GDN chunk-form verify supports at most kGDN_TREE_CHUNK_MAX_NODES verify nodes");
-        // Chunk-form verify is stateless: recurrent states commit by replaying
-        // the accepted path; conv states scatter. Must use the same predicate
-        // as the plugin.
+        if (!mambaMgr.recurrentUsesReplay())
+        {
+            check::check(kernel::gdnTreeChunkVerifyEnabled(verifySize),
+                "DDTree GDN chunk-form verify supports at most kGDN_TREE_CHUNK_MAX_NODES verify nodes");
+        }
+        // Mamba and chunk-form GDN verify are stateless. Reconstruct the
+        // accepted recurrent path and scatter its conv checkpoints.
         mambaMgr.replayCommitAcceptedTreeStates(mAcceptedTokenIndices, mAcceptLength, context.stream);
     }
 

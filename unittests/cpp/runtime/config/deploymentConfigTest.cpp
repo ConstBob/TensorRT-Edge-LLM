@@ -268,21 +268,21 @@ Json makeJetSpecDraftConfig(int32_t maxDraftTreeSize, int32_t maxBatchSize = 2)
 }
 
 //! Gemma4-MTP base config: gemma4_mtp spec type, engine_role=base.
-Json makeGemma4MTPBaseConfig(int32_t maxBatchSize = 2, int32_t maxKVCacheCapacity = 256)
+Json makeGemma4MTPBaseConfig(int32_t maxBatchSize = 2, int32_t maxKVCacheCapacity = 256, int32_t maxVerifyTreeSize = 4)
 {
     Json config = makeBaseConfig(/*maxVerify=*/0, /*maxDraft=*/0, maxBatchSize);
     config["spec_decode_type"] = "gemma4_mtp";
     config["engine_role"] = "base";
     config["model"] = "gemma4_text";
     config["builder_config"]["spec_base"] = true;
-    config["builder_config"]["max_verify_tree_size"] = 4;
+    config["builder_config"]["max_verify_tree_size"] = maxVerifyTreeSize;
     config["builder_config"]["max_kv_cache_capacity"] = maxKVCacheCapacity;
     config["builder_config"]["max_kv_pool_pages"] = computeMinimumKvPoolPages(maxBatchSize, maxKVCacheCapacity);
     return config;
 }
 
 //! Gemma4-MTP assistant (draft) config: shares the target KV, no own cache.
-Json makeGemma4MTPDraftConfig(int32_t maxBatchSize = 2, int32_t maxKVCacheCapacity = 256)
+Json makeGemma4MTPDraftConfig(int32_t maxBatchSize = 2, int32_t maxKVCacheCapacity = 256, int32_t maxDraftTreeSize = 4)
 {
     Json config;
     config["spec_decode_type"] = "gemma4_mtp";
@@ -308,7 +308,7 @@ Json makeGemma4MTPDraftConfig(int32_t maxBatchSize = 2, int32_t maxKVCacheCapaci
     bc["max_kv_pool_pages"] = computeMinimumKvPoolPages(maxBatchSize, maxKVCacheCapacity);
     bc["max_lora_rank"] = 0;
     bc["spec_base"] = false;
-    bc["max_draft_tree_size"] = 4;
+    bc["max_draft_tree_size"] = maxDraftTreeSize;
     config["builder_config"] = bc;
     return config;
 }
@@ -1479,6 +1479,56 @@ TEST_F(DeploymentConfigTest, Gemma4MTPMatchingPoolGeometryValidatesOk)
     EXPECT_NO_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath}, std::nullopt));
 }
 
+TEST_F(DeploymentConfigTest, Gemma4MTPTreeValidatesOk)
+{
+    auto const basePath = writeJsonToTempFile(makeGemma4MTPBaseConfig(), "base");
+    auto const draftPath = writeJsonToTempFile(makeGemma4MTPDraftConfig(), "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 2;
+    drafting.draftingStep = 3;
+    drafting.verifySize = 4;
+
+    DeploymentConfig const bundle = createDeploymentConfig(
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting});
+
+    EXPECT_EQ(bundle.specDecodeMode(), SpecDecodeMode::kGemma4MTP);
+    ASSERT_TRUE(bundle.specConfig.has_value());
+    EXPECT_EQ(bundle.specConfig->draftingTopK, 2);
+    EXPECT_EQ(bundle.specConfig->draftingStep, 3);
+    EXPECT_EQ(bundle.specConfig->verifySize, 4);
+}
+
+TEST_F(DeploymentConfigTest, Gemma4MTPLinearChainRejectsMismatchedVerifySize)
+{
+    auto const basePath = writeJsonToTempFile(makeGemma4MTPBaseConfig(), "base");
+    auto const draftPath = writeJsonToTempFile(makeGemma4MTPDraftConfig(), "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 1;
+    drafting.draftingStep = 2;
+    drafting.verifySize = 4;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+}
+TEST_F(DeploymentConfigTest, Gemma4MTPLongLinearChainRemainsSupported)
+{
+    auto const basePath
+        = writeJsonToTempFile(makeGemma4MTPBaseConfig(/*maxBatch=*/2, /*maxCap=*/256, /*maxVerify=*/17), "base");
+    auto const draftPath
+        = writeJsonToTempFile(makeGemma4MTPDraftConfig(/*maxBatch=*/2, /*maxCap=*/256, /*maxDraft=*/16), "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 1;
+    drafting.draftingStep = 16;
+    drafting.verifySize = 17;
+
+    EXPECT_NO_THROW(createDeploymentConfig(
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting}));
+}
+
 // Differing max batch sizes imply different fixed pool page counts -> must be rejected with the
 // geometry error, not a late TensorRT profile failure.
 TEST_F(DeploymentConfigTest, Gemma4MTPMismatchedMaxBatchThrows)
@@ -1561,6 +1611,94 @@ TEST_F(DeploymentConfigTest, DSparkCandidateTopKGreaterThanOneSelectsTree)
     EXPECT_EQ(bundle.specConfig->draftingTopK, 4);
 }
 
+TEST_F(DeploymentConfigTest, DSparkTreeRecurrentReplayRequiresExactVerifyProfile)
+{
+    Json baseJson = makeDSparkBaseConfig(/*maxVerify=*/16);
+    baseJson["num_attention_layers"] = 8;
+    baseJson["num_linear_attn_layers"] = 4;
+    baseJson["recurrent_state_num_heads"] = 4;
+    baseJson["recurrent_state_head_dim"] = 64;
+    baseJson["recurrent_state_size"] = 64;
+    baseJson["conv_dim"] = 768;
+    baseJson["conv_kernel"] = 4;
+    baseJson["recurrent_state_dtype"] = "fp16";
+    baseJson["conv_state_dtype"] = "fp16";
+    baseJson["recurrent_spec_verify_mode"] = "replay";
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(makeDSparkDraftConfig(/*maxDraft=*/7), "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 2;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 3;
+
+    try
+    {
+        static_cast<void>(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+            std::optional<SpecDecodeDraftingConfig>{drafting}));
+        FAIL() << "Expected an exact recurrent replay verify-profile error";
+    }
+    catch (std::runtime_error const& error)
+    {
+        EXPECT_NE(std::string(error.what()).find("tree recurrent-state replay requires verifySize"), std::string::npos);
+        EXPECT_NE(std::string(error.what()).find("maxVerifyTreeSize"), std::string::npos);
+    }
+
+    drafting.verifySize = 16;
+    EXPECT_NO_THROW(createDeploymentConfig(
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting}));
+
+    drafting.draftingTopK = 1;
+    drafting.verifySize = 4;
+    EXPECT_NO_THROW(createDeploymentConfig(
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting}));
+}
+
+TEST_F(DeploymentConfigTest, DSparkCausalTreeRequiresFullBlockDraftProfile)
+{
+    Json baseJson = makeDSparkBaseConfig(/*maxVerify=*/3, /*blockSize=*/16);
+    Json draftJson = makeDSparkDraftConfig(/*maxDraft=*/1, /*blockSize=*/16);
+    baseJson["dspark_config"]["causal_head"] = true;
+    draftJson["dspark_config"]["causal_head"] = true;
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 2;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 3;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, DSparkCausalTreeAccountsForNonAnchorInputSlot)
+{
+    Json baseJson = makeDSparkBaseConfig(/*maxVerify=*/3, /*blockSize=*/16);
+    Json draftJson = makeDSparkDraftConfig(/*maxDraft=*/16, /*blockSize=*/16);
+    baseJson["dspark_config"]["causal_head"] = true;
+    draftJson["dspark_config"]["causal_head"] = true;
+    baseJson["dspark_config"]["sample_from_anchor"] = false;
+    draftJson["dspark_config"]["sample_from_anchor"] = false;
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 2;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 3;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+
+    draftJson["builder_config"]["max_draft_tree_size"] = 17;
+    draftPath = writeJsonToTempFile(draftJson, "draft_with_anchor_slot");
+    EXPECT_NO_THROW(createDeploymentConfig(
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting}));
+}
+
 TEST_F(DeploymentConfigTest, DSparkTreeRejectsTopKNotLessThanVerifySize)
 {
     auto const basePath = writeJsonToTempFile(makeDSparkBaseConfig(/*maxVerify=*/8), "base");
@@ -1606,10 +1744,8 @@ TEST_F(DeploymentConfigTest, DSparkTreeVerifySizeAboveNodeBudgetThrows)
         std::runtime_error);
 }
 
-TEST_F(DeploymentConfigTest, DSparkTreeAllowsScheduler)
+TEST_F(DeploymentConfigTest, DSparkTreeAllowsThresholdScheduler)
 {
-    // Tree mode supports confidence scheduling: scheduled depths shrink the DDTree
-    // verify budget (dynamic window), so threshold/sps both validate.
     auto const basePath = writeJsonToTempFile(makeDSparkBaseConfig(/*maxVerify=*/16), "base");
     auto const draftPath = writeJsonToTempFile(makeDSparkDraftConfig(/*maxDraft=*/7), "draft");
 
@@ -1628,7 +1764,6 @@ TEST_F(DeploymentConfigTest, DSparkTreeAllowsScheduler)
 
 TEST_F(DeploymentConfigTest, DSparkTreeRejectsSPS)
 {
-    // Fixed tree budget has no verify cost for SPS to trade; only threshold applies.
     auto const basePath = writeJsonToTempFile(makeDSparkBaseConfig(/*maxVerify=*/16), "base");
     auto const draftPath = writeJsonToTempFile(makeDSparkDraftConfig(/*maxDraft=*/7), "draft");
 

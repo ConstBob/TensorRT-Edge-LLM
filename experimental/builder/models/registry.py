@@ -600,6 +600,8 @@ SPECULATIVE_ARTIFACT_WRITERS = {
 }
 
 FAMILY_SPECULATIVE_DRAFTS = {
+    ("nemotron_h", "mtp"):
+    _component("nemotron_h.modeling_nemotron_h_mtp", "NemotronHMtpDraftModel"),
     ("qwen3_5_moe", "mtp"):
     _component("qwen3_5_moe.modeling_qwen3_5_moe_mtp",
                "Qwen3_5MoeMtpDraftModel"),
@@ -611,12 +613,14 @@ FAMILY_SPECULATIVE_DRAFTS = {
 }
 
 FAMILY_SPECULATIVE_WEIGHT_CONVERSIONS = {
+    ("nemotron_h", "mtp"): "nemotron_h.weights",
     ("qwen3_5_moe", "mtp"): "qwen3_5_moe.weights",
     ("qwen3_omni_moe", "mtp"): "qwen3_omni.weights",
     ("qwen3_omni_next", "mtp"): "qwen3_omni_next.weights",
 }
 
 FAMILY_SPECULATIVE_CONFIGURATIONS = {
+    ("nemotron_h", "mtp"): "nemotron_h.configuration",
     ("qwen3_5_moe", "mtp"): "qwen3_5_moe.configuration",
     ("qwen3_omni_moe", "mtp"): "qwen3_omni.configuration",
     ("qwen3_omni_next", "mtp"): "qwen3_omni_next.configuration",

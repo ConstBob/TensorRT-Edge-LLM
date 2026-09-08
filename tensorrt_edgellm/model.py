@@ -33,12 +33,12 @@ import torch.nn as nn
 
 from .checkpoint.checkpoint_utils import load_checkpoint_config_dicts
 from .checkpoint.loader import load_weights
-from .config import (QUANT_FP16, QUANT_INT4_AWQ, QUANT_INT4_AWQ_MODELOPT,
-                     QUANT_INT4_GPTQ, QUANT_MXFP8, QUANT_NVFP4, ModelConfig,
+from .config import (QUANT_FP16, QUANT_INT4_GPTQ, ModelConfig,
                      _is_gemma4_assistant_model_type,
                      make_dflash2_draft_config, make_dflash_draft_config,
                      make_dspark_draft_config, make_jetspec_draft_config,
-                     make_mtp_draft_config, module_quant_type)
+                     make_mtp_draft_config, module_quant_group_size,
+                     module_quant_type)
 from .dflash import DFlashVersion, resolve_dflash_contract
 
 __all__ = [
@@ -98,13 +98,55 @@ def _is_qwen3_5_mtp_draft_supported(model_type: str) -> bool:
     return model_type in _QWEN3_5_MTP_DRAFT_MODEL_TYPES
 
 
-_GROUP_SIZE_LM_HEAD_QUANTS = frozenset({
-    QUANT_INT4_AWQ,
-    QUANT_INT4_AWQ_MODELOPT,
-    QUANT_INT4_GPTQ,
-    QUANT_MXFP8,
-    QUANT_NVFP4,
-})
+def _inherit_dspark_base_metadata(config: ModelConfig,
+                                  dspark_draft_dir: "str | None") -> None:
+    if not dspark_draft_dir:
+        return
+
+    draft_cfg_path = os.path.join(dspark_draft_dir, "config.json")
+    if not os.path.isfile(draft_cfg_path):
+        raise FileNotFoundError(
+            f"DSpark draft config does not exist: {draft_cfg_path}")
+    _, draft_cfg = load_checkpoint_config_dicts(dspark_draft_dir)
+    dspark_cfg = (draft_cfg.get("dspark_config")
+                  or draft_cfg.get("dflash_config") or {})
+
+    target_layer_ids = (dspark_cfg.get("target_layer_ids")
+                        or draft_cfg.get("target_layer_ids")
+                        or config.dspark_target_layer_ids)
+    config.dspark_target_layer_ids = list(target_layer_ids)
+    config.dspark_block_size = int(
+        dspark_cfg.get("block_size",
+                       draft_cfg.get("block_size", config.dspark_block_size)))
+    default_mask_token_id = (4 if str(draft_cfg.get(
+        "model_type", "")).startswith("gemma4") else
+                             config.dspark_mask_token_id)
+    config.dspark_mask_token_id = int(
+        dspark_cfg.get("mask_token_id",
+                       draft_cfg.get("mask_token_id", default_mask_token_id)))
+    config.dspark_enable_confidence_head = bool(
+        dspark_cfg.get(
+            "enable_confidence_head",
+            draft_cfg.get("enable_confidence_head",
+                          config.dspark_enable_confidence_head)))
+    config.dspark_confidence_head_with_markov = bool(
+        dspark_cfg.get(
+            "confidence_head_with_markov",
+            draft_cfg.get("confidence_head_with_markov",
+                          config.dspark_confidence_head_with_markov)))
+    config.dspark_markov_head_type = str(
+        dspark_cfg.get(
+            "markov_head_type",
+            draft_cfg.get("markov_head_type", config.dspark_markov_head_type)))
+    config.dspark_markov_rank = int(
+        dspark_cfg.get("markov_rank",
+                       draft_cfg.get("markov_rank",
+                                     config.dspark_markov_rank)))
+    config.dspark_sample_from_anchor = bool(
+        dspark_cfg.get(
+            "sample_from_anchor",
+            draft_cfg.get("sample_from_anchor",
+                          config.dspark_sample_from_anchor)))
 
 
 def register_model(model_type: str, model_class: Type[nn.Module],
@@ -179,6 +221,7 @@ class AutoModel:
                         jetspec_draft: bool = False,
                         jetspec_draft_dir: "str | None" = None,
                         dspark_base: bool = False,
+                        dspark_tree_base: bool = False,
                         dspark_draft: bool = False,
                         dspark_draft_dir: "str | None" = None,
                         gemma4_mtp_base: bool = False,
@@ -239,6 +282,9 @@ class AutoModel:
             jetspec_draft_dir:
                             Path to the JetSpec draft checkpoint directory.
             dspark_base:    When True, export as DSpark base model.
+            dspark_tree_base:
+                            When True, add DDTree parent/depth metadata inputs
+                            for hybrid DSpark base verification.
             dspark_draft:   When True, build the DSpark draft backbone model.
             dspark_draft_dir:
                             Path to the DSpark draft checkpoint directory.
@@ -295,9 +341,8 @@ class AutoModel:
         if gemma4_mtp_base:
             config.gemma4_mtp_base = True
         if mtp_tree_base:
-            config.mtp_base = True
             config.mtp_tree_base = True
-        elif config.mtp_tree_base:
+        if config.mtp_tree_base and not config.gemma4_mtp_base:
             config.mtp_base = True
         if dflash_base:
             config.dflash_base = True
@@ -394,45 +439,15 @@ class AutoModel:
                 config.jetspec_target_layer_ids)
             config.dflash_block_size = config.jetspec_block_size
             config.dflash_mask_token_id = config.jetspec_mask_token_id
+        if dspark_tree_base:
+            config.dspark_base = True
+            config.dspark_tree_base = True
+        elif config.dspark_tree_base:
+            config.dspark_base = True
         if dspark_base:
             config.dspark_base = True
-            if not config.dspark_target_layer_ids and dspark_draft_dir:
-                import json
-                draft_cfg_path = os.path.join(dspark_draft_dir, "config.json")
-                if os.path.isfile(draft_cfg_path):
-                    with open(draft_cfg_path) as f:
-                        draft_cfg = json.load(f)
-                    dspark_cfg = (draft_cfg.get("dspark_config")
-                                  or draft_cfg.get("dflash_config", {}) or {})
-                    config.dspark_target_layer_ids = (
-                        dspark_cfg.get("target_layer_ids")
-                        or draft_cfg.get("target_layer_ids", []))
-                    config.dspark_block_size = int(
-                        dspark_cfg.get("block_size",
-                                       draft_cfg.get("block_size", 7)))
-                    default_mask_token_id = (4 if str(
-                        draft_cfg.get("model_type", "")).startswith("gemma4")
-                                             else 151669)
-                    config.dspark_mask_token_id = int(
-                        dspark_cfg.get(
-                            "mask_token_id",
-                            draft_cfg.get("mask_token_id",
-                                          default_mask_token_id)))
-                    config.dspark_enable_confidence_head = bool(
-                        dspark_cfg.get(
-                            "enable_confidence_head",
-                            draft_cfg.get("enable_confidence_head", False)))
-                    config.dspark_confidence_head_with_markov = bool(
-                        dspark_cfg.get(
-                            "confidence_head_with_markov",
-                            draft_cfg.get("confidence_head_with_markov",
-                                          False)))
-                    config.dspark_markov_head_type = str(
-                        dspark_cfg.get("markov_head_type",
-                                       draft_cfg.get("markov_head_type", "")))
-                    config.dspark_markov_rank = int(
-                        dspark_cfg.get("markov_rank",
-                                       draft_cfg.get("markov_rank", 0)))
+        if config.dspark_base:
+            _inherit_dspark_base_metadata(config, dspark_draft_dir)
             if not config.dspark_target_layer_ids:
                 raise ValueError(
                     "dspark_base requires DSpark target_layer_ids; pass "
@@ -785,17 +800,18 @@ def _inherit_dflash_lm_head_quant(draft_config: ModelConfig,
 
     draft_quant = draft_config.quant
     base_quant = base_config.quant
-    use_base_group_size = lm_head_quant in _GROUP_SIZE_LM_HEAD_QUANTS
+    lm_head_group_size = module_quant_group_size("lm_head", base_config)
 
     layer_overrides = dict(draft_quant.layer_overrides)
     layer_overrides["lm_head"] = lm_head_quant
     excluded = [name for name in draft_quant.excluded if name != "lm_head"]
+    layer_group_sizes = dict(draft_quant.layer_group_sizes)
+    layer_group_sizes["lm_head"] = lm_head_group_size
     quant_updates = {
         "excluded": excluded,
         "layer_overrides": layer_overrides,
+        "layer_group_sizes": layer_group_sizes,
     }
-    if use_base_group_size:
-        quant_updates["group_size"] = base_quant.group_size
     if lm_head_quant == QUANT_INT4_GPTQ:
         quant_updates[
             "gptq_zero_point_offset"] = base_quant.gptq_zero_point_offset

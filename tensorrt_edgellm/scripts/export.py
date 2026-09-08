@@ -997,6 +997,7 @@ def _export_llm(model_dir: str,
                 jetspec_tree_base: bool = False,
                 jetspec_draft_dir: str = "",
                 dspark_base: bool = False,
+                dspark_tree_base: bool = False,
                 dspark_draft_dir: str = "",
                 gemma4_mtp_base: bool = False,
                 externalize_weights: "list[str] | None" = None,
@@ -1098,6 +1099,7 @@ def _export_llm(model_dir: str,
                 jetspec_tree_base=jetspec_tree_base,
                 jetspec_draft_dir=jetspec_draft_dir or None,
                 dspark_base=dspark_base,
+                dspark_tree_base=dspark_tree_base,
                 dspark_draft_dir=dspark_draft_dir or None,
                 gemma4_mtp_base=gemma4_mtp_base,
                 tp_size=world,
@@ -4187,6 +4189,12 @@ def main() -> None:
         help="Export as DSpark base model (adds target hidden-state output).",
     )
     p.add_argument(
+        "--dspark-tree-base",
+        action="store_true",
+        help="Export DSpark base with DDTree parent/depth metadata inputs "
+        "(implies --dspark-base).",
+    )
+    p.add_argument(
         "--dspark-draft",
         action="store_true",
         help=
@@ -4400,8 +4408,8 @@ def main() -> None:
         args.mtp = True
     if args.tp_size > 1 and (args.eagle_base or args.mtp or args.dflash_base
                              or args.dflash_tree_base or args.dflash_draft
-                             or args.dspark_base or args.dspark_draft
-                             or gemma4_mtp_requested):
+                             or args.dspark_base or args.dspark_tree_base
+                             or args.dspark_draft or gemma4_mtp_requested):
         p.error(
             "Tensor-parallel speculative decoding export is not supported.")
     if args.tp_size > 1 and externalize_weights:
@@ -4423,6 +4431,8 @@ def main() -> None:
         args.dflash_base = True
     if args.jetspec_tree_base:
         args.jetspec_base = True
+    if args.dspark_tree_base:
+        args.dspark_base = True
     if mtp_draft_dir_arg and (args.dflash_base or args.dflash_draft
                               or args.jetspec_base or args.jetspec_draft
                               or args.dspark_base or args.dspark_draft):
@@ -4726,6 +4736,7 @@ def main() -> None:
              jetspec_tree_base=args.jetspec_tree_base,
              jetspec_draft_dir=args.jetspec_draft_dir,
              dspark_base=args.dspark_base,
+             dspark_tree_base=args.dspark_tree_base,
              dspark_draft_dir=args.dspark_draft_dir,
              gemma4_mtp_base=gemma4_mtp_requested,
              fp8_embedding=args.fp8_embedding,

@@ -1056,11 +1056,11 @@ _update_ssm_state_schema = OpSchema(
             "[0] initial-prefill sentinel or [batch] restored-state marker",
             type_str="T_CL"),
         OpSchema.FormalParameter(
-            name="spec_verify_phase_marker",
-            description="Optional shape-only INT32 marker (len 0=ordinary, "
-            "1=verify) enabling per-token intermediate state capture",
+            name="spec_decode_metadata",
+            description=
+            "Optional speculative metadata: spec_verify_phase_marker, tree_parent_ids, tree_depths",
             type_str="T_CL",
-            param_option=OpSchema.FormalParameterOption.Optional),
+            param_option=OpSchema.FormalParameterOption.Variadic),
     ],
     outputs=[
         OpSchema.FormalParameter(name="output",
@@ -1085,6 +1085,12 @@ _update_ssm_state_schema = OpSchema(
             name="replay_b",
             description="Optional spec-verify replay stash: per-token key "
             "B [batch, seq, ngroups, dstate] FP32",
+            type_str="T_F32",
+            param_option=OpSchema.FormalParameterOption.Optional),
+        OpSchema.FormalParameter(
+            name="replay_dt",
+            description="Optional spec-verify replay stash: per-token dt "
+            "[batch, seq, nheads] FP32",
             type_str="T_F32",
             param_option=OpSchema.FormalParameterOption.Optional),
     ],
@@ -1117,6 +1123,12 @@ _update_ssm_state_schema = OpSchema(
             type=OpSchema.AttrType.INT,
             description="Emit per-token intermediate recurrent states (1) or "
             "not (0)",
+            required=False),
+        OpSchema.Attribute(
+            name="use_ddtree",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Evaluate each tree node from its ancestor state and emit replay data",
             required=False),
     ],
 )

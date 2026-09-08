@@ -89,6 +89,7 @@ MambaCacheManager::MambaCacheManager(Config const& config, cudaStream_t stream)
             mReplayDaStates.reserve(mConfig.numRecurrentLayers);
             mReplayUStates.reserve(mConfig.numRecurrentLayers);
             mReplayBStates.reserve(mConfig.numRecurrentLayers);
+            mReplayDtStates.reserve(mConfig.numRecurrentLayers);
         }
         else
         {
@@ -101,7 +102,7 @@ MambaCacheManager::MambaCacheManager(Config const& config, cudaStream_t stream)
             auto const idx = std::to_string(i);
             if (useReplay)
             {
-                // Replay stash (FP32): dA [B,S,H], u [B,S,H,dim], B [B,S,ngroups,dstate].
+                // Replay stash (FP32): dA/dt [B,S,H], x in u [B,S,H,dim], B [B,S,ngroups,dstate].
                 int64_t const daVolume = stashSeq * mConfig.recurrentStateNumHeads;
                 int64_t const uVolume = daVolume * mConfig.recurrentStateHeadDim;
                 int64_t const bVolume = stashSeq * mConfig.recurrentStateNumGroups * mConfig.recurrentStateSize;
@@ -116,10 +117,14 @@ MambaCacheManager::MambaCacheManager(Config const& config, cudaStream_t stream)
                 mReplayBStates.emplace_back(rt::Tensor({mConfig.maxBatchSize, mConfig.maxIntermediateSeqLen,
                                                            mConfig.recurrentStateNumGroups, mConfig.recurrentStateSize},
                     DeviceType::kGPU, DataType::kFLOAT, "MambaCacheManager::replayB_" + idx));
+                mReplayDtStates.emplace_back(
+                    rt::Tensor({mConfig.maxBatchSize, mConfig.maxIntermediateSeqLen, mConfig.recurrentStateNumHeads},
+                        DeviceType::kGPU, DataType::kFLOAT, "MambaCacheManager::replayDt_" + idx));
                 CUDA_CHECK(cudaMemsetAsync(mReplayDaStates.back().rawPointer(), 0, daVolume * sizeof(float), stream));
                 CUDA_CHECK(cudaMemsetAsync(mReplayUStates.back().rawPointer(), 0, uVolume * sizeof(float), stream));
                 CUDA_CHECK(cudaMemsetAsync(mReplayBStates.back().rawPointer(), 0, bVolume * sizeof(float), stream));
-                totalBytes += static_cast<size_t>(daVolume + uVolume + bVolume) * sizeof(float);
+                CUDA_CHECK(cudaMemsetAsync(mReplayDtStates.back().rawPointer(), 0, daVolume * sizeof(float), stream));
+                totalBytes += static_cast<size_t>(2 * daVolume + uVolume + bVolume) * sizeof(float);
             }
             else
             {
@@ -171,7 +176,7 @@ MambaCacheManager::MambaCacheManager(Config const& config, cudaStream_t stream)
             for (int32_t i = 0; i < mConfig.numRecurrentLayers; ++i)
             {
                 replayInfos[i] = {mRecurrentStates[i].rawPointer(), mReplayDaStates[i].rawPointer(),
-                    mReplayUStates[i].rawPointer(), mReplayBStates[i].rawPointer()};
+                    mReplayUStates[i].rawPointer(), mReplayBStates[i].rawPointer(), mReplayDtStates[i].rawPointer()};
             }
             size_t const replayInfoBytes = replayInfos.size() * sizeof(mamba_ssm::MambaReplayLayerInfo);
             mDeviceMambaReplayLayerInfos = rt::Tensor({static_cast<int64_t>(replayInfoBytes)}, DeviceType::kGPU,
@@ -202,6 +207,7 @@ MambaCacheManager::MambaCacheManager(MambaCacheManager&& other) noexcept
     mReplayDaStates = std::move(other.mReplayDaStates);
     mReplayUStates = std::move(other.mReplayUStates);
     mReplayBStates = std::move(other.mReplayBStates);
+    mReplayDtStates = std::move(other.mReplayDtStates);
     mDeviceMtpLayerInfos = std::move(other.mDeviceMtpLayerInfos);
     mDeviceMambaReplayLayerInfos = std::move(other.mDeviceMambaReplayLayerInfos);
 
@@ -220,6 +226,7 @@ MambaCacheManager& MambaCacheManager::operator=(MambaCacheManager&& other) noexc
         mReplayDaStates = std::move(other.mReplayDaStates);
         mReplayUStates = std::move(other.mReplayUStates);
         mReplayBStates = std::move(other.mReplayBStates);
+        mReplayDtStates = std::move(other.mReplayDtStates);
         mDeviceMtpLayerInfos = std::move(other.mDeviceMtpLayerInfos);
         mDeviceMambaReplayLayerInfos = std::move(other.mDeviceMambaReplayLayerInfos);
 
@@ -319,6 +326,8 @@ void MambaCacheManager::reshapeIntermediateStates(int32_t activeBatchSize, int32
             check::check(mReplayBStates[i].reshape(
                              {activeBatchSize, seqLen, mConfig.recurrentStateNumGroups, mConfig.recurrentStateSize}),
                 "Replay B reshape failed");
+            check::check(mReplayDtStates[i].reshape({activeBatchSize, seqLen, mConfig.recurrentStateNumHeads}),
+                "Replay dt reshape failed");
         }
         else
         {
@@ -345,6 +354,11 @@ rt::Tensor& MambaCacheManager::getReplayUState(int32_t recurrentLayerIdx) noexce
 rt::Tensor& MambaCacheManager::getReplayBState(int32_t recurrentLayerIdx) noexcept
 {
     return mReplayBStates[recurrentLayerIdx];
+}
+
+rt::Tensor& MambaCacheManager::getReplayDtState(int32_t recurrentLayerIdx) noexcept
+{
+    return mReplayDtStates[recurrentLayerIdx];
 }
 
 rt::Tensor& MambaCacheManager::getIntermediateRecurrentState(int32_t recurrentLayerIdx) noexcept
@@ -404,7 +418,7 @@ void MambaCacheManager::scatterAcceptedLinearStates(rt::Tensor const& acceptLeng
         auto const* const replayInfos
             = static_cast<mamba_ssm::MambaReplayLayerInfo const*>(mDeviceMambaReplayLayerInfos.rawPointer());
         mamba_ssm::invokeMambaReplayReconstructBatched(replayInfos, mConfig.numRecurrentLayers, mRecurrentStates[0],
-            mReplayUStates[0], mReplayBStates[0], acceptLengths, activeBatchSize, stream);
+            mReplayUStates[0], mReplayBStates[0], mReplayDtStates[0], acceptLengths, activeBatchSize, stream);
     }
     else
     {
@@ -474,27 +488,49 @@ void MambaCacheManager::scatterAcceptedTreeStates(
 void MambaCacheManager::replayCommitAcceptedTreeStates(
     rt::Tensor const& acceptedStateNodeIds, rt::Tensor const& acceptLengths, cudaStream_t stream)
 {
-    if (mIntermediateRecurrentStates.empty())
-    {
-        check::check(mReplayUStates.empty(),
-            "Tree MTP is not supported for Mamba SSD replay recurrent states; chunk-form tree replay commit requires "
-            "GDN intermediate recurrent states.");
-        return;
-    }
-
     check::check(!mIntermediateConvStates.empty(), "Intermediate conv states are not allocated.");
-    check::check(mConfig.recurrentStateType == DataType::kFLOAT, "Replay commit supports FP32 recurrent states only.");
+    check::check(
+        acceptedStateNodeIds.getDeviceType() == DeviceType::kGPU, "acceptedStateNodeIds must be a GPU tensor.");
+    check::check(acceptLengths.getDeviceType() == DeviceType::kGPU, "acceptLengths must be a GPU tensor.");
     check::check(
         acceptedStateNodeIds.getDataType() == DataType::kINT32, "acceptedStateNodeIds must have INT32 data type.");
     check::check(acceptLengths.getDataType() == DataType::kINT32, "acceptLengths must have INT32 data type.");
 
     auto const idsShape = acceptedStateNodeIds.getShape();
+    auto const acceptLengthsShape = acceptLengths.getShape();
+    check::check(idsShape.getNumDims() == 2, "acceptedStateNodeIds must have shape [B, maxAcceptLen].");
+    check::check(acceptLengthsShape.getNumDims() == 1, "acceptLengths must have shape [B].");
     int32_t const activeBatchSize = static_cast<int32_t>(idsShape[0]);
+    check::check(
+        acceptLengthsShape[0] == activeBatchSize, "acceptedStateNodeIds and acceptLengths batch sizes differ.");
     int32_t const maxAcceptLen = static_cast<int32_t>(idsShape[1]);
     if (activeBatchSize == 0 || maxAcceptLen == 0)
     {
         return;
     }
+
+    if (!mReplayUStates.empty())
+    {
+        auto const replayShape = mReplayUStates[0].getShape();
+        check::check(replayShape[0] == activeBatchSize,
+            "Mamba replay states must be reshaped to the active batch size before tree commit.");
+        int32_t const verifyTreeSize = static_cast<int32_t>(replayShape[1]);
+        check::check(maxAcceptLen <= verifyTreeSize, "maxAcceptLen must not exceed the Mamba replay tree size.");
+        auto const* const replayInfos
+            = static_cast<mamba_ssm::MambaReplayLayerInfo const*>(mDeviceMambaReplayLayerInfos.rawPointer());
+        mamba_ssm::invokeMambaReplayReconstructBatched(replayInfos, mConfig.numRecurrentLayers, mRecurrentStates[0],
+            mReplayUStates[0], mReplayBStates[0], mReplayDtStates[0], acceptLengths, activeBatchSize, stream,
+            &acceptedStateNodeIds, maxAcceptLen);
+
+        int32_t const convElements = mConfig.convDim * mConfig.convKernel;
+        auto const* const layerInfos = static_cast<kernel::MtpLayerInfo const*>(mDeviceMtpLayerInfos.rawPointer());
+        kernel::mtpScatterAcceptedTreeConvStates(layerInfos, mConfig.numRecurrentLayers, activeBatchSize,
+            verifyTreeSize, convElements, acceptedStateNodeIds.dataPointer<int32_t>(), maxAcceptLen,
+            acceptLengths.dataPointer<int32_t>(), stream);
+        return;
+    }
+    check::check(!mIntermediateRecurrentStates.empty(), "Intermediate recurrent states are not allocated.");
+    check::check(mConfig.recurrentStateType == DataType::kFLOAT, "Replay commit supports FP32 recurrent states only.");
     check::check(maxAcceptLen <= kernel::kGDN_TREE_CHUNK_MAX_ACCEPT,
         format::fmtstr("replayCommitAcceptedTreeStates: maxAcceptLen (%d) exceeds kGDN_TREE_CHUNK_MAX_ACCEPT (%d); "
                        "blockSize must not exceed %d for the chunk-form replay kernel.",

@@ -249,6 +249,8 @@ static void buildTensorMapImpl(TensorMap& map, PipelineIO& io, SharedResources& 
                         binding_names::formatReplayUStateName(localMambaIdx), mambaMgr.getReplayUState(localMambaIdx));
                     map.set(
                         binding_names::formatReplayBStateName(localMambaIdx), mambaMgr.getReplayBState(localMambaIdx));
+                    map.set(binding_names::formatReplayDtStateName(localMambaIdx),
+                        mambaMgr.getReplayDtState(localMambaIdx));
                 }
                 else
                 {
@@ -600,7 +602,9 @@ PipelineIO PipelineIO::createForSpecDecode(
 
     SpecDecodeMode const mode = bundle.specDecodeMode();
     bool const useSpecTree = mode == SpecDecodeMode::kDFlash
-        || ((isCachedBlockDraftMode(mode) || mode == SpecDecodeMode::kMTP) && bundle.specConfig->draftingTopK > 1);
+        || ((isCachedBlockDraftMode(mode) || mode == SpecDecodeMode::kMTP || mode == SpecDecodeMode::kGemma4MTP
+                || mode == SpecDecodeMode::kDSpark)
+            && bundle.specConfig->draftingTopK > 1);
     if (useSpecTree)
     {
         io.specTreeParentIds = Tensor({maxRuntimeBatchSize, effectiveMaxDraftProposalSize}, DeviceType::kGPU,

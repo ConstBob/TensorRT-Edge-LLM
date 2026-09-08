@@ -531,9 +531,10 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
         }
         else
         {
-            // For MTP/DSpark tree drafting, draftingTopK is the DDTree candidate fanout
+            // For MTP-family/DSpark tree drafting, draftingTopK is the DDTree candidate fanout
             // applied after drafting, not a draft-input multiplier.
             bool const fanoutTree = (cfg.base.specDecodeType == SpecDecodeMode::kMTP
+                                        || cfg.base.specDecodeType == SpecDecodeMode::kGemma4MTP
                                         || cfg.base.specDecodeType == SpecDecodeMode::kDSpark)
                 && specConfig.draftingTopK > 1;
             int64_t const requiredDraftInputSize = fanoutTree
@@ -548,21 +549,20 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
             ELLM_CHECK(specConfig.dflashBlockSize == 0,
                 "dflashBlockSize can only be set for a cached-block speculative mode.");
 
-            if (cfg.base.specDecodeType == SpecDecodeMode::kMTP)
+            if (cfg.base.specDecodeType == SpecDecodeMode::kMTP
+                || cfg.base.specDecodeType == SpecDecodeMode::kGemma4MTP)
             {
-                // MTP base verification currently reuses EAGLE utility kernels for accept, KV commit,
-                // and hidden-state compaction. Those kernels support maxDepth <= 16. Each round
-                // accepts at most draftingStep matched proposals plus one bonus token, for both
-                // the linear chain and tree drafting, so the same depth bound applies to either mode.
+                bool const useTree = specConfig.draftingTopK > 1;
                 static constexpr int32_t kMTPMaxAcceptDepthForCurrentEagleUtilityKernels = 16;
                 int32_t const maxAcceptDepth = specConfig.draftingStep + 1;
-                ELLM_CHECK(maxAcceptDepth <= kMTPMaxAcceptDepthForCurrentEagleUtilityKernels,
-                    "MTP max accept depth (draftingStep+1)=" + std::to_string(maxAcceptDepth)
-                        + " exceeds the current MTP EAGLE utility kernel max depth of "
-                        + std::to_string(kMTPMaxAcceptDepthForCurrentEagleUtilityKernels)
-                        + ". Extend eagleUtilKernels before using larger MTP draft steps.");
-
-                bool const useTree = specConfig.draftingTopK > 1;
+                if (cfg.base.specDecodeType == SpecDecodeMode::kMTP || useTree)
+                {
+                    ELLM_CHECK(maxAcceptDepth <= kMTPMaxAcceptDepthForCurrentEagleUtilityKernels,
+                        "MTP-family tree max accept depth (draftingStep+1)=" + std::to_string(maxAcceptDepth)
+                            + " exceeds the current EAGLE utility kernel max depth of "
+                            + std::to_string(kMTPMaxAcceptDepthForCurrentEagleUtilityKernels)
+                            + ". Extend eagleUtilKernels before using larger tree draft steps.");
+                }
                 if (!useTree)
                 {
                     // Linear chain: the verification input covers the root plus the draftingStep
@@ -625,14 +625,6 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
                 "DSpark scheduler options are only valid for spec_decode_type=dspark.");
         }
 
-        if (cfg.base.specDecodeType == SpecDecodeMode::kGemma4MTP)
-        {
-            ELLM_CHECK(specConfig.draftingTopK == 1,
-                "Gemma4 MTP currently supports greedy chain drafting only; draftingTopK must be 1.");
-            ELLM_CHECK(specConfig.verifySize == specConfig.draftingStep + 1,
-                "Gemma4 MTP verifySize must equal draftingStep + 1 to include the root token and all draft tokens.");
-        }
-
         if (cfg.base.specDecodeType == SpecDecodeMode::kDSpark)
         {
             static constexpr int32_t kDSparkMaxVerifySizeForCurrentUtilityKernels = 17;
@@ -641,14 +633,20 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
             static constexpr int32_t kDSparkTreeMaxCandidateFanout = 8;
             static constexpr int32_t kDSparkTreeMaxAcceptedPathLength = 16;
 
-            ELLM_CHECK(
-                specConfig.draftingStep == 1, "DSpark drafts one full block per iteration; draftingStep must be 1.");
+            ELLM_CHECK(specConfig.draftingStep == 1,
+                "DSpark executes one proposal forward per iteration; draftingStep must be 1.");
             ELLM_CHECK(cfg.draft.has_value(), "DSpark requires a draft engine.");
 
             bool const useTree = specConfig.draftingTopK > 1;
-            // Tree decouples the proposal from the verify window: the draft always
-            // emits the full block and verifySize is the tree node budget.
+            if (useTree && cfg.base.numLinearAttnLayers > 0 && cfg.base.recurrentSpecVerifyUsesReplay)
+            {
+                ELLM_CHECK(specConfig.verifySize == specConfig.maxVerifySize,
+                    "DSpark tree recurrent-state replay requires verifySize to match base.maxVerifyTreeSize exactly. "
+                    "Build the base engine with maxVerifyTreeSize="
+                        + std::to_string(specConfig.verifySize) + " for this decoding topology.");
+            }
             int32_t const proposalLen = useTree ? cfg.draft->specDraftBlockSize : specConfig.verifySize - 1;
+            int32_t const draftInputLen = proposalLen + (cfg.draft->dsparkSampleFromAnchor ? 0 : 1);
 
             if (!useTree)
             {
@@ -683,8 +681,6 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
                     "DSpark DDTree max accepted path length=" + std::to_string(maxAcceptedPathLength)
                         + " exceeds indexed commit path limit of " + std::to_string(kDSparkTreeMaxAcceptedPathLength)
                         + ".");
-                // threshold enables confidence-guided growth; SPS schedules verify
-                // cost, which a fixed node budget cannot trade.
                 ELLM_CHECK(specConfig.dsparkSchedulerMode != DSparkSchedulerMode::kSPS,
                     "DSpark DDTree has a fixed verify budget; SPS does not apply. Use threshold to enable "
                     "confidence-guided growth, or off.");
@@ -692,10 +688,10 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
                     "DSpark DDTree survival threshold must be in [0, 1): the root always survives, so a "
                     "floor of 1 would forbid all growth.");
             }
-            ELLM_CHECK(proposalLen <= specConfig.maxDraftProposalSize,
-                "DSpark proposalLen=" + std::to_string(proposalLen)
+            ELLM_CHECK(draftInputLen <= specConfig.maxDraftProposalSize,
+                "DSpark draft input length=" + std::to_string(draftInputLen)
                     + " exceeds draft.maxDraftTreeSize=" + std::to_string(specConfig.maxDraftProposalSize)
-                    + ". The draft engine profile must cover the drafted block.");
+                    + ". The draft engine profile must cover the executed proposal prefix.");
 
             if (specConfig.dsparkSchedulerMode != DSparkSchedulerMode::kOff)
             {

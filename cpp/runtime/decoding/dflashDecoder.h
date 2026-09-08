@@ -55,9 +55,12 @@ public:
 
     DecodingStrategyCapabilities capabilities() const noexcept override
     {
+        bool const greedyOnlyTree = !isV2() && useTreeVerification();
         return {/*.ownsBaseVerificationCudaGraphs=*/true,
-            /*.supportsLosslessSampling=*/mVersion == DFlashVersion::kV2,
-            /*.maxSamplingSupport=*/mVersion == DFlashVersion::kV2 ? dflash_utils::kDFlash2MaxSamplingSupport : 0};
+            /*.supportsLosslessSampling=*/isV2(),
+            /*.maxSamplingSupport=*/isV2() ? dflash_utils::kDFlash2MaxSamplingSupport : 0,
+            /*.fallbackToVanillaForNonGreedySampling=*/greedyOnlyTree,
+            /*.requiresDefaultDecoderCudaGraphs=*/greedyOnlyTree};
     }
 
     DecodingKvHeadroom requiredKvHeadroom() const override;
@@ -112,6 +115,10 @@ private:
     {
         return mBlockDraft.userMode == SpecDecodeMode::kDFlash
             || mBlockDraft.treePolicy == dflash_utils::BlockDraftTreePolicy::kDDTree;
+    }
+    bool usesGreedyOnlyTree() const noexcept
+    {
+        return !isV2() && useTreeVerification();
     }
     bool causalProposalMask() const noexcept
     {

@@ -433,6 +433,8 @@ class QuantConfig:
     # make_linear() uses module_name together with ``excluded`` and (for
     # lm_head) ``ModelConfig.tie_word_embeddings`` to pick FP16 vs overrides.
     layer_overrides: dict = field(default_factory=dict)
+    # Per-layer group sizes use the same normalized names as layer_overrides.
+    layer_group_sizes: dict = field(default_factory=dict)
     # True when quant_algo is MIXED_PRECISION: unlisted modules are FP16.
     is_mixed_precision: bool = False
     # False exports quantized dense Linears without the activation Q-DQ pair,
@@ -493,6 +495,13 @@ def module_quant_type(module_name: str, model_config: "ModelConfig") -> str:
         fallback = QUANT_FP16 if quant.is_mixed_precision else quant_type
         quant_type = quant.layer_overrides.get(module_name, fallback)
     return quant_type
+
+
+def module_quant_group_size(module_name: str,
+                            model_config: "ModelConfig") -> int:
+    """Return the checkpoint group size for a quantized linear module."""
+    quant = model_config.quant
+    return int(quant.layer_group_sizes.get(module_name, quant.group_size))
 
 
 @dataclass
@@ -796,6 +805,8 @@ class ModelConfig:
     # DSpark uses the DFlash-like target-hidden feedback path, then applies
     # a sequential Markov/confidence head outside the draft backbone engine.
     dspark_base: bool = False
+    # When True, DSpark base export exposes DDTree parent/depth metadata.
+    dspark_tree_base: bool = False
     is_dspark_draft_flag: bool = False
     dspark_target_layer_ids: List[int] = field(default_factory=list)
     dspark_block_size: int = 7
@@ -1314,6 +1325,7 @@ class ModelConfig:
                  or {}).get("target_layer_ids")
                 or llm_dict.get("eagle_aux_hidden_state_layer_ids") or []),
             dspark_base=bool(llm_dict.get("dspark_base", False)),
+            dspark_tree_base=bool(llm_dict.get("dspark_tree_base", False)),
             num_deepstack_features=_parse_num_deepstack_features(
                 llm_dict, model_type, root_config=root),
             accept_hidden_layer=_parse_accept_hidden_layer(llm_dict,
@@ -1448,6 +1460,11 @@ def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
             for k, v in base_config.quant.layer_overrides.items()
             if any(k == p or k.startswith(p) for p in _DRAFT_MODULE_PREFIXES)
         }
+        draft_group_sizes = {
+            k: v
+            for k, v in base_config.quant.layer_group_sizes.items()
+            if any(k == p or k.startswith(p) for p in _DRAFT_MODULE_PREFIXES)
+        }
         # Preserve MTP-specific exclusions (e.g. mtp.lm_head when lm_head
         # is FP16) but drop base-model exclusions irrelevant to the draft.
         draft_excluded = [
@@ -1460,6 +1477,7 @@ def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
         draft_quant = replace(base_config.quant,
                               excluded=draft_excluded,
                               layer_overrides=draft_overrides,
+                              layer_group_sizes=draft_group_sizes,
                               is_mixed_precision=False)
     else:
         # MTP draft lm_head is borrowed from the base model and may itself be quantized.
@@ -1468,7 +1486,13 @@ def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
             for k, v in base_config.quant.layer_overrides.items()
             if k == "lm_head" or k.startswith("lm_head.")
         }
-        draft_quant = QuantConfig(layer_overrides=lm_head_overrides)
+        lm_head_group_sizes = {
+            k: v
+            for k, v in base_config.quant.layer_group_sizes.items()
+            if k == "lm_head" or k.startswith("lm_head.")
+        }
+        draft_quant = QuantConfig(layer_overrides=lm_head_overrides,
+                                  layer_group_sizes=lm_head_group_sizes)
 
     return replace(
         base_config,
@@ -2403,7 +2427,7 @@ def _parse_quant(model_dir: str,
             )
         if algo == "MIXED_PRECISION":
             quantized_layers = q.get("quantized_layers", {})
-            dominant, group_size, layer_overrides = _parse_mixed_precision(
+            dominant, group_size, layer_overrides, layer_group_sizes = _parse_mixed_precision(
                 quantized_layers,
                 config.get("model_type") or "")
             return QuantConfig(
@@ -2416,6 +2440,7 @@ def _parse_quant(model_dir: str,
                     _scope_exclusions(list(q.get("exclude_modules", [])),
                                       submodel_prefix)),
                 layer_overrides=layer_overrides,
+                layer_group_sizes=layer_group_sizes,
                 is_mixed_precision=True,
             )
         qt = _algo_to_quant_type(algo)
@@ -2572,11 +2597,13 @@ def _algo_to_quant_type(algo: str) -> str:
     return QUANT_FP16
 
 
-def _parse_mixed_precision(quantized_layers: dict,
-                           model_type: str = "") -> "tuple[str, int, dict]":
+def _parse_mixed_precision(
+        quantized_layers: dict,
+        model_type: str = "") -> "tuple[str, int, dict, dict]":
     """Parse MIXED_PRECISION quantized_layers dict.
 
-    Returns ``(dominant_quant_type, dominant_group_size, layer_overrides)``.
+    Returns ``(dominant_quant_type, dominant_group_size, layer_overrides,
+    layer_group_sizes)``.
     ``layer_overrides`` maps **every** quantized module name to its quant-type
     string.  Modules not listed in ``quantized_layers`` are unquantized (FP16);
     ``make_linear`` falls back to FP16 when a module_name is absent from
@@ -2592,7 +2619,7 @@ def _parse_mixed_precision(quantized_layers: dict,
         if algo not in algo_group_size:
             algo_group_size[algo] = int(layer_cfg.get("group_size", 1))
     if not algo_count:
-        return QUANT_FP16, 1, {}
+        return QUANT_FP16, 1, {}, {}
 
     def _mixed_quant_type(algo: str) -> str:
         # Nemotron-H W4A16 layers require the Marlin path; other model families
@@ -2610,21 +2637,28 @@ def _parse_mixed_precision(quantized_layers: dict,
     # ``mlp.gate_up_proj``) into the split names ``make_linear`` looks up
     # (``q_proj``/``k_proj``/``v_proj`` and ``gate_proj``/``up_proj``).
     layer_overrides: dict = {}
+    layer_group_sizes: dict = {}
     for name, layer_cfg in quantized_layers.items():
         algo = layer_cfg.get("quant_algo", "").upper()
         short_name = _normalize_module_name(name)
         quant_type = _mixed_quant_type(algo)
+        group_size = int(layer_cfg.get("group_size", 1))
+
         if short_name.endswith(".self_attn.qkv_proj"):
             prefix = short_name[:-len("qkv_proj")]
-            for proj in ("q_proj", "k_proj", "v_proj"):
-                layer_overrides[f"{prefix}{proj}"] = quant_type
+            module_names = tuple(f"{prefix}{proj}"
+                                 for proj in ("q_proj", "k_proj", "v_proj"))
         elif short_name.endswith(".mlp.gate_up_proj"):
             prefix = short_name[:-len("gate_up_proj")]
-            for proj in ("gate_proj", "up_proj"):
-                layer_overrides[f"{prefix}{proj}"] = quant_type
+            module_names = tuple(f"{prefix}{proj}"
+                                 for proj in ("gate_proj", "up_proj"))
         else:
-            layer_overrides[short_name] = quant_type
-    return dominant_type, dominant_group_size, layer_overrides
+            module_names = (short_name, )
+        for module_name in module_names:
+            layer_overrides[module_name] = quant_type
+            layer_group_sizes[module_name] = group_size
+    return (dominant_type, dominant_group_size, layer_overrides,
+            layer_group_sizes)
 
 
 def _kv_norm(s: Optional[str]) -> Optional[str]:

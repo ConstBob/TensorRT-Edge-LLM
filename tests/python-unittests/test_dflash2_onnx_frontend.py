@@ -27,7 +27,7 @@ import tensorrt_edgellm.scripts.export as export_script
 from tensorrt_edgellm.checkpoint.checkpoint_utils import \
     build_runtime_llm_config_dict
 from tensorrt_edgellm.checkpoint.loader import load_weights
-from tensorrt_edgellm.config import (QUANT_NVFP4, QuantConfig,
+from tensorrt_edgellm.config import (QUANT_FP8, QUANT_NVFP4, QuantConfig,
                                      make_dflash2_draft_config)
 from tensorrt_edgellm.dflash import DFlashVersion, resolve_dflash_contract
 from tensorrt_edgellm.model import _inherit_dflash_lm_head_quant
@@ -269,8 +269,26 @@ def test_shared_lm_head_inherits_base_group_size(tmp_path):
 
     inherited = _inherit_dflash_lm_head_quant(draft, base)
 
-    assert inherited.quant.group_size == 16
+    assert inherited.quant.group_size == 128
     assert inherited.quant.layer_overrides["lm_head"] == QUANT_NVFP4
+    assert inherited.quant.layer_group_sizes["lm_head"] == 16
+
+
+def test_shared_lm_head_uses_module_group_size_for_mixed_precision(tmp_path):
+    draft = make_dflash2_draft_config(str(_write_dflash2_config(tmp_path)),
+                                      lambda head_dim: head_dim**-0.5)
+    base = replace(draft,
+                   quant=QuantConfig(quant_type=QUANT_FP8,
+                                     group_size=1,
+                                     layer_overrides={"lm_head": QUANT_NVFP4},
+                                     layer_group_sizes={"lm_head": 16},
+                                     is_mixed_precision=True))
+
+    inherited = _inherit_dflash_lm_head_quant(draft, base)
+
+    assert inherited.quant.group_size == 1
+    assert inherited.quant.layer_overrides["lm_head"] == QUANT_NVFP4
+    assert inherited.quant.layer_group_sizes["lm_head"] == 16
 
 
 def test_dflash2_grouped_conv_fake_contract_matches_plugin_shapes():

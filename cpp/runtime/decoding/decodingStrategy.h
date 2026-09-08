@@ -75,6 +75,10 @@ struct DecodingStrategyCapabilities
     bool ownsBaseVerificationCudaGraphs{false};
     bool supportsLosslessSampling{false};
     int32_t maxSamplingSupport{0}; //!< 0 when the decoder does not require a bounded sampling support.
+    //! Preserve request sampling semantics instead of coercing a greedy-only strategy.
+    bool fallbackToVanillaForNonGreedySampling{false};
+    //! Capture vanilla graphs when request routing may select the default decoder.
+    bool requiresDefaultDecoderCudaGraphs{false};
 };
 
 struct SamplingBuffers

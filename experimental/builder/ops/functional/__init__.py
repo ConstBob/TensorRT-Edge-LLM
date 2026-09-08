@@ -29,14 +29,15 @@ from .core import (
     concatenate, constant, convolution, deconvolution, dynamic_lora,
     dynamic_reshape, dynamic_slice, embedding_lookup, empty_sequence,
     fourier_features, fused_nvfp4_gemm_all_reduce, gather_last_tokens,
-    gather_nd, kv_cache_update, layer_norm, linear, linear_f32,
-    linear_f32_from_weights, linear_from_weights, linear_with_weights, matmul,
-    normalization, pad_last_dim, pixel_unshuffle, reduce, reshape, rms_norm,
-    rotary_embedding, scaled_dot_product_attention, select, shape_of,
-    slice_last_dim, tensor, topk, unwrap)
+    nvfp4_a16_linear_from_weights, gather_nd, kv_cache_update, layer_norm,
+    linear, linear_f32, linear_f32_from_weights, linear_from_weights,
+    linear_with_weights, matmul, normalization, pad_last_dim, pixel_unshuffle,
+    reduce, reshape, rms_norm, rotary_embedding, scaled_dot_product_attention,
+    select, shape_of, slice_last_dim, tensor, topk, unwrap)
 # isort: on
 from .distributed import all_reduce
-from .moe import MoeActivation, MoeRouting, fp16_moe, int4_moe, nvfp4_moe
+from .moe import (MoeActivation, MoeRouting, fp16_moe, int4_moe, nvfp4_a16_moe,
+                  nvfp4_moe)
 from .recurrent import causal_conv1d, gated_delta_net, update_ssm_state
 from .speculative import (dflash2_grouped_dynamic_conv, hidden_state_feedback,
                           update_dflash_target_cache)
@@ -81,6 +82,8 @@ __all__ = [
     "linear_with_weights",
     "matmul",
     "normalization",
+    "nvfp4_a16_linear_from_weights",
+    "nvfp4_a16_moe",
     "nvfp4_moe",
     "parameter",
     "pad_last_dim",

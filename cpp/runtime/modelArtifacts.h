@@ -35,6 +35,9 @@ namespace trt_edgellm
 namespace rt
 {
 
+//! Validate the runtime drafting mode against the tree-metadata ABI exported by a hybrid DSpark base engine.
+void validateDsparkTreeMetadataBindings(DeploymentConfig const& deployment, EngineExecutor const& baseExecutor);
+
 //! Everything LLMInferenceRuntime reads off disk before it can assemble itself: the parsed deployment
 //! configuration, the engines, and the weight-shaped files that sit next to them.
 //!

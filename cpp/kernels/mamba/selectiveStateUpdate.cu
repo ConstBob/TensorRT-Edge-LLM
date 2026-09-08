@@ -76,17 +76,19 @@ struct SelectiveStateUpdateParams
     // state after every draft token, the prefill kernel stashes the minimal per-token replay inputs
     // needed to rebuild the accepted state. During verification the committed state is left read-only
     // (update_state=false); after acceptance the runtime replays the recurrence
-    //   S = dA * S + u ⊗ B
+    //   dB = B * dt; S = dA * S + dB * x
     // over the first ``p`` accepted tokens from the read-only committed state (see
     // invokeMambaReplayReconstruct). The stash buffers are fp32 and contiguous:
     //   replay_dA [batch, replay_seq_len, nheads]           per-token decay exp(A * softplus(dt))
-    //   replay_u  [batch, replay_seq_len, nheads, dim]      per-token input factor dt * x
+    //   replay_u  [batch, replay_seq_len, nheads, dim]      per-token unscaled input x
     //   replay_B  [batch, replay_seq_len, ngroups, dstate]  per-token key B
+    //   replay_dt [batch, replay_seq_len, nheads]           per-token discretization step dt
     // replay_seq_len is the seq-dim capacity; writes at t >= replay_seq_len are dropped (CUDA-graph
     // capture may pass a dummy context length exceeding the buffer extent).
     void* __restrict__ replay_dA{nullptr};
     void* __restrict__ replay_u{nullptr};
     void* __restrict__ replay_B{nullptr};
+    void* __restrict__ replay_dt{nullptr};
     int64_t replay_seq_len{};
 
     void* __restrict__ state{nullptr};
@@ -122,6 +124,14 @@ inline void setContiguousStrides(SelectiveStateUpdateParams& params)
 }
 
 using namespace conversion;
+
+template <typename state_t>
+__device__ __forceinline__ float roundTripState(float value)
+{
+    state_t rounded;
+    convertAndStore(&rounded, value);
+    return toFloat(rounded);
+}
 
 // Allowed (dim, dstate) for kernel instantiation
 using AllowedDims = std::integer_sequence<int, 64, 80, 128, 256>;
@@ -382,8 +392,9 @@ __global__ void selective_state_update_prefill_kernel_simple(SelectiveStateUpdat
                         = toFloat(B[batch * params.B_stride_batch + t * params.B_stride_seq + group * DSTATE + i]);
                     float const C_val
                         = toFloat(C[batch * params.C_stride_batch + t * params.C_stride_seq + group * DSTATE + i]);
-                    // Key: runState stays float — no fp16 quantisation between tokens.
-                    runState[ii] = runState[ii] * dA + B_val * dt_val * x_val;
+                    // The current-token output uses FP32 state before the token-boundary state_t round-trip below.
+                    float const dB = B_val * dt_val;
+                    runState[ii] = runState[ii] * dA + dB * x_val;
                     out_val += runState[ii] * C_val;
                 }
             }
@@ -406,13 +417,16 @@ __global__ void selective_state_update_prefill_kernel_simple(SelectiveStateUpdat
             if (params.replay_u && t < params.replay_seq_len)
             {
                 int64_t const tokenRow = static_cast<int64_t>(batch) * params.replay_seq_len + t;
-                // u[batch, t, head, _d] = dt * x — identical across lanes, so only lane 0 writes.
+                // x is identical across lanes, so only lane 0 writes.
                 if (lane == 0)
                 {
-                    reinterpret_cast<float*>(params.replay_u)[(tokenRow * nheads + head) * DIM + _d] = dt_val * x_val;
+                    reinterpret_cast<float*>(params.replay_u)[(tokenRow * nheads + head) * DIM + _d] = x_val;
                     // dA[batch, t, head] — one value per (batch, t, head).
                     if (_d == 0)
+                    {
                         reinterpret_cast<float*>(params.replay_dA)[tokenRow * nheads + head] = dA;
+                        reinterpret_cast<float*>(params.replay_dt)[tokenRow * nheads + head] = dt_val;
+                    }
                 }
                 // B[batch, t, group, i] — one value per (batch, t, group); the first head of each
                 // group (first dim row) writes it, lanes split the dstate slice.
@@ -427,6 +441,21 @@ __global__ void selective_state_update_prefill_kernel_simple(SelectiveStateUpdat
                         if (i < DSTATE)
                             replayB[bOff + i] = toFloat(
                                 B[batch * params.B_stride_batch + t * params.B_stride_seq + group * DSTATE + i]);
+                    }
+                }
+            }
+
+            // Decode persists state_t after every token. Preserve that boundary during
+            // speculative verification so later rows do not depend on the verify grouping.
+            if (params.replay_u && t + 1 < effectiveSeqLen)
+            {
+#pragma unroll
+                for (int ii = 0; ii < dstatePerLane; ++ii)
+                {
+                    int const i = lane * dstatePerLane + ii;
+                    if (i < DSTATE)
+                    {
+                        runState[ii] = roundTripState<state_t>(runState[ii]);
                     }
                 }
             }
@@ -457,13 +486,197 @@ __global__ void selective_state_update_prefill_kernel_simple(SelectiveStateUpdat
     }
 }
 
+// DDTree verify reconstructs every node from the committed state along its own ancestor path.
+constexpr int32_t kMAMBA_TREE_MAX_PATH{128};
+
+template <typename input_t, typename weight_t, typename matrixA_t, typename state_t, int DIM, int DSTATE, int numWarps>
+__global__ void mamba_tree_verify_kernel(
+    SelectiveStateUpdateParams params, int32_t const* treeParentIds, int32_t const* treeDepths)
+{
+    constexpr int32_t dstatePerLane = (DSTATE + kWARP_SIZE - 1) / kWARP_SIZE;
+    __shared__ int32_t path[kMAMBA_TREE_MAX_PATH];
+    __shared__ int32_t pathLength;
+    __shared__ float pathDt[kMAMBA_TREE_MAX_PATH];
+    __shared__ float pathDA[kMAMBA_TREE_MAX_PATH];
+
+    int32_t const batchNode = blockIdx.x;
+    int32_t const batch = batchNode / params.seq_len;
+    int32_t const node = batchNode % params.seq_len;
+    int32_t const head = blockIdx.y;
+    int32_t const lane = threadIdx.x;
+    int32_t const warp = threadIdx.y;
+    int32_t const group = head / (params.nheads / params.ngroups);
+
+    if (threadIdx.x == 0 && threadIdx.y == 0)
+    {
+        int32_t const treeOffset = batch * params.seq_len;
+        int32_t const depth = treeDepths[treeOffset + node];
+        bool valid = depth >= 0 && depth < kMAMBA_TREE_MAX_PATH;
+        int32_t current = node;
+        if (valid)
+        {
+            for (int32_t pos = depth; pos >= 0; --pos)
+            {
+                if (current < 0 || current >= params.seq_len)
+                {
+                    valid = false;
+                    break;
+                }
+                path[pos] = current;
+                int32_t const parent = treeParentIds[treeOffset + current];
+                if ((pos == 0 && (current != 0 || parent >= 0)) || (pos > 0 && (parent < 0 || parent >= current)))
+                {
+                    valid = false;
+                    break;
+                }
+                current = parent;
+            }
+        }
+        pathLength = valid ? depth + 1 : 0;
+    }
+    __syncthreads();
+
+    auto const* x = static_cast<input_t const*>(params.x);
+    auto const* dt = static_cast<weight_t const*>(params.dt);
+    auto const* dtBias = static_cast<weight_t const*>(params.dt_bias);
+    auto const* A = static_cast<matrixA_t const*>(params.A);
+    auto const* B = static_cast<input_t const*>(params.B);
+    auto const* C = static_cast<input_t const*>(params.C);
+    auto const* D = static_cast<input_t const*>(params.D);
+    auto const* state = static_cast<state_t const*>(params.state) + batch * params.state_stride_batch
+        + head * params.state_stride_head;
+    auto* output = static_cast<input_t*>(params.output);
+
+    if (threadIdx.x == 0 && threadIdx.y == 0)
+    {
+        for (int32_t pos = 0; pos < pathLength; ++pos)
+        {
+            int32_t const token = path[pos];
+            float dtValue = toFloat(dt[batch * params.dt_stride_batch + token * params.dt_stride_seq + head]);
+            if (dtBias != nullptr)
+            {
+                dtValue += toFloat(dtBias[head]);
+            }
+            if (params.dt_softplus)
+            {
+                dtValue = thresholded_softplus(dtValue);
+            }
+            pathDt[pos] = dtValue;
+            pathDA[pos] = __expf(toFloat(A[head]) * dtValue);
+        }
+    }
+    __syncthreads();
+
+    constexpr int32_t rowsPerWarp = (DIM + numWarps - 1) / numWarps;
+    for (int32_t d = warp * rowsPerWarp; d < (warp + 1) * rowsPerWarp && d < DIM; ++d)
+    {
+        float runState[dstatePerLane];
+#pragma unroll
+        for (int32_t ii = 0; ii < dstatePerLane; ++ii)
+        {
+            int32_t const i = lane * dstatePerLane + ii;
+            runState[ii] = i < DSTATE ? toFloat(state[d * params.state_stride_dim + i]) : 0.F;
+        }
+
+        for (int32_t pos = 0; pos < pathLength; ++pos)
+        {
+            int32_t const token = path[pos];
+            float const dtValue = pathDt[pos];
+            float const dA = pathDA[pos];
+            float const xValue = toFloat(
+                x[batch * params.x_stride_batch + token * params.x_stride_seq + head * params.x_stride_head + d]);
+
+#pragma unroll
+            for (int32_t ii = 0; ii < dstatePerLane; ++ii)
+            {
+                int32_t const i = lane * dstatePerLane + ii;
+                if (i < DSTATE)
+                {
+                    float const bValue
+                        = toFloat(B[batch * params.B_stride_batch + token * params.B_stride_seq + group * DSTATE + i]);
+                    float const dB = bValue * dtValue;
+                    runState[ii] = runState[ii] * dA + dB * xValue;
+                }
+            }
+
+            if (token == node)
+            {
+                int64_t const tokenRow = static_cast<int64_t>(batch) * params.replay_seq_len + node;
+                if (lane == 0)
+                {
+                    reinterpret_cast<float*>(params.replay_u)[(tokenRow * params.nheads + head) * DIM + d] = xValue;
+                    if (d == 0)
+                    {
+                        reinterpret_cast<float*>(params.replay_dA)[tokenRow * params.nheads + head] = dA;
+                        reinterpret_cast<float*>(params.replay_dt)[tokenRow * params.nheads + head] = dtValue;
+                    }
+                }
+                if (d == 0 && head % (params.nheads / params.ngroups) == 0)
+                {
+                    float* replayB
+                        = reinterpret_cast<float*>(params.replay_B) + (tokenRow * params.ngroups + group) * DSTATE;
+#pragma unroll
+                    for (int32_t ii = 0; ii < dstatePerLane; ++ii)
+                    {
+                        int32_t const i = lane * dstatePerLane + ii;
+                        if (i < DSTATE)
+                        {
+                            replayB[i] = toFloat(
+                                B[batch * params.B_stride_batch + token * params.B_stride_seq + group * DSTATE + i]);
+                        }
+                    }
+                }
+            }
+
+            if (pos + 1 < pathLength)
+            {
+#pragma unroll
+                for (int32_t ii = 0; ii < dstatePerLane; ++ii)
+                {
+                    int32_t const i = lane * dstatePerLane + ii;
+                    if (i < DSTATE)
+                    {
+                        runState[ii] = roundTripState<state_t>(runState[ii]);
+                    }
+                }
+            }
+        }
+
+        float outValue = 0.F;
+        if (pathLength > 0)
+        {
+            float const xValue = toFloat(
+                x[batch * params.x_stride_batch + node * params.x_stride_seq + head * params.x_stride_head + d]);
+            outValue = lane == 0 && D != nullptr ? toFloat(D[head]) * xValue : 0.F;
+#pragma unroll
+            for (int32_t ii = 0; ii < dstatePerLane; ++ii)
+            {
+                int32_t const i = lane * dstatePerLane + ii;
+                if (i < DSTATE)
+                {
+                    float const cValue
+                        = toFloat(C[batch * params.C_stride_batch + node * params.C_stride_seq + group * DSTATE + i]);
+                    outValue += runState[ii] * cValue;
+                }
+            }
+            outValue = warpReduceSum(outValue);
+        }
+        if (lane == 0)
+        {
+            convertAndStore(&output[batch * params.out_stride_batch + node * params.out_stride_seq
+                                + head * params.out_stride_head + d],
+                outValue);
+        }
+    }
+}
+
 // MTP spec-verify (replay): rebuild the committed recurrent state after acceptance by re-running the
 // SSD recurrence  S = dA * S + u ⊗ B  over the first ``p`` accepted tokens (params.context_lengths[b])
 // from the read-only committed state. The stash (replay_dA/u/B) was produced by the prefill kernel.
 // Same block/warp/lane mapping as the forward scan; the update is in-place on disjoint state elements.
 template <typename state_t, int DIM, int DSTATE, int numWarps>
-__global__ void mamba_replay_reconstruct_batched_kernel(
-    MambaReplayLayerInfo const* __restrict__ layerInfos, SelectiveStateUpdateParams params)
+__global__ void mamba_replay_reconstruct_batched_kernel(MambaReplayLayerInfo const* __restrict__ layerInfos,
+    SelectiveStateUpdateParams params, int32_t const* __restrict__ acceptedNodeIds, int32_t maxAcceptLen)
 {
     constexpr int dstatePerLane = (DSTATE + kWARP_SIZE - 1) / kWARP_SIZE;
 
@@ -473,6 +686,7 @@ __global__ void mamba_replay_reconstruct_batched_kernel(
     auto const* __restrict__ replayDA = static_cast<float const*>(layerInfo.replayDa);
     auto const* __restrict__ replayU = static_cast<float const*>(layerInfo.replayU);
     auto const* __restrict__ replayB = static_cast<float const*>(layerInfo.replayB);
+    auto const* __restrict__ replayDt = static_cast<float const*>(layerInfo.replayDt);
 
     int const nheads = params.nheads;
     int const ngroups = params.ngroups;
@@ -505,18 +719,30 @@ __global__ void mamba_replay_reconstruct_batched_kernel(
             runState[ii] = (i < DSTATE) ? toFloat(state[_d * params.state_stride_dim + i]) : 0.f;
         }
 
-        for (int t = 0; t < p && t < params.replay_seq_len; ++t)
+        int const replaySeqLen = static_cast<int>(params.replay_seq_len);
+        int const replayCount
+            = acceptedNodeIds != nullptr ? min(min(p, replaySeqLen), maxAcceptLen) : min(p, replaySeqLen);
+        for (int t = 0; t < replayCount; ++t)
         {
-            int64_t const tokenRow = static_cast<int64_t>(batch) * params.replay_seq_len + t;
+            int32_t const token = acceptedNodeIds != nullptr ? acceptedNodeIds[batch * maxAcceptLen + t] : t;
+            if (token < 0 || token >= params.replay_seq_len)
+            {
+                continue;
+            }
+            int64_t const tokenRow = static_cast<int64_t>(batch) * params.replay_seq_len + token;
             float const dA = replayDA[tokenRow * nheads + head];
-            float const u = replayU[(tokenRow * nheads + head) * DIM + _d];
+            float const x = replayU[(tokenRow * nheads + head) * DIM + _d];
+            float const dt = replayDt[tokenRow * nheads + head];
             int64_t const bOff = (tokenRow * ngroups + group) * DSTATE;
 #pragma unroll
             for (int ii = 0; ii < dstatePerLane; ++ii)
             {
                 int const i = lane * dstatePerLane + ii;
                 if (i < DSTATE)
-                    runState[ii] = runState[ii] * dA + u * replayB[bOff + i];
+                {
+                    float const dB = replayB[bOff + i] * dt;
+                    runState[ii] = roundTripState<state_t>(runState[ii] * dA + dB * x);
+                }
             }
         }
 
@@ -574,12 +800,32 @@ struct SsmPrefillKernelLauncher
     }
 };
 
+template <typename input_t, typename weight_t, typename matrixA_t, typename state_t>
+struct SsmTreeVerifyLauncher
+{
+    SelectiveStateUpdateParams& params;
+    int32_t const* treeParentIds;
+    int32_t const* treeDepths;
+    cudaStream_t stream;
+
+    template <int DIM, int DSTATE>
+    void operator()()
+    {
+        constexpr int32_t numWarps = 16;
+        dim3 const block(kWARP_SIZE, numWarps);
+        dim3 const grid(params.batch * params.seq_len, params.nheads);
+        mamba_tree_verify_kernel<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, numWarps>
+            <<<grid, block, 0, stream>>>(params, treeParentIds, treeDepths);
+    }
+};
 template <typename state_t>
 struct SsmReplayReconstructLauncher
 {
     SelectiveStateUpdateParams& params;
     MambaReplayLayerInfo const* layerInfos;
     int32_t numLayers;
+    int32_t const* acceptedNodeIds;
+    int32_t maxAcceptLen;
     cudaStream_t stream;
 
     template <int DIM, int DSTATE>
@@ -589,7 +835,7 @@ struct SsmReplayReconstructLauncher
         dim3 block(kWARP_SIZE, numWarps);
         dim3 grid(params.batch, params.nheads, numLayers);
         mamba_replay_reconstruct_batched_kernel<state_t, DIM, DSTATE, numWarps>
-            <<<grid, block, 0, stream>>>(layerInfos, params);
+            <<<grid, block, 0, stream>>>(layerInfos, params, acceptedNodeIds, maxAcceptLen);
     }
 };
 
@@ -688,7 +934,7 @@ void invokeSelectiveStateUpdatePrefill(trt_edgellm::rt::Tensor const& x, trt_edg
     trt_edgellm::rt::OptionalInputTensor z, trt_edgellm::rt::Tensor& state, trt_edgellm::rt::Tensor& output,
     bool dt_softplus, trt_edgellm::rt::OptionalInputTensor contextLengths,
     trt_edgellm::rt::OptionalOutputTensor replayDA, trt_edgellm::rt::OptionalOutputTensor replayU,
-    trt_edgellm::rt::OptionalOutputTensor replayB, cudaStream_t stream)
+    trt_edgellm::rt::OptionalOutputTensor replayB, trt_edgellm::rt::OptionalOutputTensor replayDT, cudaStream_t stream)
 {
     SelectiveStateUpdateParams params{};
     fillCommonParamsFromTensors(x, A, B, C, dt, dt_bias, D, z, state, output, dt_softplus, params);
@@ -696,13 +942,14 @@ void invokeSelectiveStateUpdatePrefill(trt_edgellm::rt::Tensor const& x, trt_edg
 
     // MTP spec-verify (replay): optional per-token replay stash. When present, keep the committed
     // recurrent state read-only (the runtime reconstructs the accepted state after verification via
-    // invokeMambaReplayReconstruct) and stash dA/u/B [batch, seq_len, ...] for that replay.
+    // invokeMambaReplayReconstruct) and stash dA/dt/x/B [batch, seq_len, ...] for that replay.
     if (replayU.has_value())
     {
         params.replay_dA = replayDA->get().rawPointer();
         params.replay_u = replayU->get().rawPointer();
         params.replay_B = replayB->get().rawPointer();
         params.replay_seq_len = replayU->get().getShape()[1];
+        params.replay_dt = replayDT->get().rawPointer();
         params.update_state = false;
     }
 
@@ -739,11 +986,75 @@ void invokeSelectiveStateUpdatePrefill(trt_edgellm::rt::Tensor const& x, trt_edg
     }
 }
 
+// Public non-templated API (DDTree spec-verify).
+void invokeSelectiveStateUpdateDDTree(trt_edgellm::rt::Tensor const& x, trt_edgellm::rt::Tensor const& A,
+    trt_edgellm::rt::Tensor const& B, trt_edgellm::rt::Tensor const& C, trt_edgellm::rt::Tensor const& dt,
+    trt_edgellm::rt::OptionalInputTensor dtBias, trt_edgellm::rt::OptionalInputTensor D, trt_edgellm::rt::Tensor& state,
+    trt_edgellm::rt::Tensor& output, trt_edgellm::rt::Tensor const& treeParentIds,
+    trt_edgellm::rt::Tensor const& treeDepths, bool dtSoftplus, trt_edgellm::rt::Tensor& replayDA,
+    trt_edgellm::rt::Tensor& replayU, trt_edgellm::rt::Tensor& replayB, trt_edgellm::rt::Tensor& replayDT,
+    cudaStream_t stream)
+{
+    int32_t const seqLen = static_cast<int32_t>(x.getShape()[1]);
+    if (treeParentIds.getShape().getNumDims() != 2 || treeDepths.getShape().getNumDims() != 2
+        || treeParentIds.getShape()[0] != x.getShape()[0] || treeDepths.getShape()[0] != x.getShape()[0]
+        || treeParentIds.getShape()[1] != seqLen || treeDepths.getShape()[1] != seqLen)
+    {
+        throw std::runtime_error("invokeSelectiveStateUpdateDDTree: tree metadata must have shape [batch, seq_len].");
+    }
+    if (treeParentIds.getDataType() != nvinfer1::DataType::kINT32
+        || treeDepths.getDataType() != nvinfer1::DataType::kINT32)
+    {
+        throw std::runtime_error("invokeSelectiveStateUpdateDDTree: tree metadata must be INT32.");
+    }
+
+    SelectiveStateUpdateParams params{};
+    fillCommonParamsFromTensors(x, A, B, C, dt, dtBias, D, std::nullopt, state, output, dtSoftplus, params);
+    params.seq_len = seqLen;
+    params.x_stride_batch = x.getStride(0);
+    params.x_stride_seq = x.getStride(1);
+    params.x_stride_head = x.getStride(2);
+    params.dt_stride_batch = dt.getStride(0);
+    params.dt_stride_seq = dt.getStride(1);
+    params.B_stride_batch = B.getStride(0);
+    params.B_stride_seq = B.getStride(1);
+    params.C_stride_batch = C.getStride(0);
+    params.C_stride_seq = C.getStride(1);
+    params.out_stride_batch = output.getStride(0);
+    params.out_stride_seq = output.getStride(1);
+    params.out_stride_head = output.getStride(2);
+    params.replay_dA = replayDA.rawPointer();
+    params.replay_u = replayU.rawPointer();
+    params.replay_B = replayB.rawPointer();
+    params.replay_seq_len = replayU.getShape()[1];
+    params.replay_dt = replayDT.rawPointer();
+    params.update_state = false;
+
+    if (x.getDataType() == nvinfer1::DataType::kHALF && dt.getDataType() == nvinfer1::DataType::kHALF)
+    {
+        SsmTreeVerifyLauncher<half, half, float, half> launcher{
+            params, treeParentIds.dataPointer<int32_t>(), treeDepths.dataPointer<int32_t>(), stream};
+        dispatchDimDstate(params, AllowedDims{}, AllowedDstates{}, launcher);
+    }
+    else if (x.getDataType() == nvinfer1::DataType::kHALF && dt.getDataType() == nvinfer1::DataType::kFLOAT)
+    {
+        SsmTreeVerifyLauncher<half, float, float, half> launcher{
+            params, treeParentIds.dataPointer<int32_t>(), treeDepths.dataPointer<int32_t>(), stream};
+        dispatchDimDstate(params, AllowedDims{}, AllowedDstates{}, launcher);
+    }
+    else
+    {
+        throw std::runtime_error("invokeSelectiveStateUpdateDDTree: only (x=half, dt=half or float) is supported.");
+    }
+    CUDA_CHECK(cudaPeekAtLastError());
+}
+
 // Public non-templated API (MTP spec-verify replay reconstruction).
 void invokeMambaReplayReconstructBatched(MambaReplayLayerInfo const* deviceLayerInfos, int32_t numLayers,
     trt_edgellm::rt::Tensor const& state, trt_edgellm::rt::Tensor const& replayU,
-    trt_edgellm::rt::Tensor const& replayB, trt_edgellm::rt::Tensor const& acceptedLengths, int32_t activeBatchSize,
-    cudaStream_t stream)
+    trt_edgellm::rt::Tensor const& replayB, trt_edgellm::rt::Tensor const& replayDT,
+    trt_edgellm::rt::Tensor const& acceptedLengths, int32_t activeBatchSize, cudaStream_t stream,
+    trt_edgellm::rt::Tensor const* acceptedNodeIds, int32_t maxAcceptLen)
 {
     if (activeBatchSize <= 0 || numLayers <= 0)
     {
@@ -757,6 +1068,17 @@ void invokeMambaReplayReconstructBatched(MambaReplayLayerInfo const* deviceLayer
     {
         throw std::runtime_error(
             "invokeMambaReplayReconstructBatched: activeBatchSize exceeds the state pool batch size.");
+    }
+    if (acceptedNodeIds != nullptr)
+    {
+        auto const idsShape = acceptedNodeIds->getShape();
+        if (maxAcceptLen <= 0 || idsShape.getNumDims() != 2 || idsShape[0] < activeBatchSize
+            || idsShape[1] < maxAcceptLen || acceptedNodeIds->getDataType() != nvinfer1::DataType::kINT32
+            || acceptedNodeIds->getDeviceType() != trt_edgellm::rt::DeviceType::kGPU)
+        {
+            throw std::runtime_error(
+                "invokeMambaReplayReconstructBatched: acceptedNodeIds must be GPU INT32 [batch, maxAcceptLen].");
+        }
     }
 
     SelectiveStateUpdateParams params{};
@@ -777,18 +1099,21 @@ void invokeMambaReplayReconstructBatched(MambaReplayLayerInfo const* deviceLayer
 
     if (state.getDataType() == nvinfer1::DataType::kHALF)
     {
-        SsmReplayReconstructLauncher<half> launcher{params, deviceLayerInfos, numLayers, stream};
+        SsmReplayReconstructLauncher<half> launcher{params, deviceLayerInfos, numLayers,
+            acceptedNodeIds != nullptr ? acceptedNodeIds->dataPointer<int32_t>() : nullptr, maxAcceptLen, stream};
         dispatchDimDstate(params, AllowedDims{}, AllowedDstates{}, launcher);
     }
     else if (state.getDataType() == nvinfer1::DataType::kFLOAT)
     {
-        SsmReplayReconstructLauncher<float> launcher{params, deviceLayerInfos, numLayers, stream};
+        SsmReplayReconstructLauncher<float> launcher{params, deviceLayerInfos, numLayers,
+            acceptedNodeIds != nullptr ? acceptedNodeIds->dataPointer<int32_t>() : nullptr, maxAcceptLen, stream};
         dispatchDimDstate(params, AllowedDims{}, AllowedDstates{}, launcher);
     }
     else
     {
         throw std::runtime_error("invokeMambaReplayReconstructBatched: state must be half or float.");
     }
+    CUDA_CHECK(cudaPeekAtLastError());
 }
 
 } // namespace mamba_ssm

@@ -845,7 +845,7 @@ def _update_ssm_state_translation(
 
 
 @script()
-def _update_ssm_state_with_intermediate_translation(
+def _update_ssm_state_with_intermediate_linear_translation(
     hidden_states: onnxscript.FLOAT16,
     ssm_a: onnxscript.FLOAT,
     ssm_b: onnxscript.FLOAT16,
@@ -861,10 +861,10 @@ def _update_ssm_state_with_intermediate_translation(
     ngroups: int,
     chunk_size: int = 0,
 ) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16, onnxscript.FLOAT,
-           onnxscript.FLOAT, onnxscript.FLOAT]:
-    # Spec-verify replay stash (dA / u / B) is FP32; the token output and state
+           onnxscript.FLOAT, onnxscript.FLOAT, onnxscript.FLOAT]:
+    # Spec-verify replay stash (dA / x / B / dt) is FP32; the token output and state
     # output follow the FP16 x/state types.
-    output, state_out, replay_da, replay_u, replay_b = _trt_edgellm.update_ssm_state(
+    output, state_out, replay_da, replay_u, replay_b, replay_dt = _trt_edgellm.update_ssm_state(
         hidden_states,
         ssm_a,
         ssm_b,
@@ -880,9 +880,87 @@ def _update_ssm_state_with_intermediate_translation(
         ngroups=ngroups,
         chunk_size=chunk_size,
         use_spec_verify_state=1,
-        _outputs=5,
+        _outputs=6,
     )
-    return output, state_out, replay_da, replay_u, replay_b
+    return output, state_out, replay_da, replay_u, replay_b, replay_dt
+
+
+@script()
+def _update_ssm_state_with_intermediate_tree_translation(
+    hidden_states: onnxscript.FLOAT16,
+    ssm_a: onnxscript.FLOAT,
+    ssm_b: onnxscript.FLOAT16,
+    ssm_c: onnxscript.FLOAT16,
+    ssm_d: onnxscript.FLOAT16,
+    dt: onnxscript.FLOAT16,
+    dt_bias: onnxscript.FLOAT16,
+    state: onnxscript.FLOAT16,
+    context_lengths: onnxscript.INT32,
+    state_start_index: onnxscript.INT32,
+    spec_verify_phase_marker: onnxscript.INT32,
+    tree_parent_ids: onnxscript.INT32,
+    tree_depths: onnxscript.INT32,
+    dt_softplus: int,
+    ngroups: int,
+    chunk_size: int = 0,
+) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16, onnxscript.FLOAT,
+           onnxscript.FLOAT, onnxscript.FLOAT, onnxscript.FLOAT]:
+    output, state_out, replay_da, replay_u, replay_b, replay_dt = _trt_edgellm.update_ssm_state(
+        hidden_states,
+        ssm_a,
+        ssm_b,
+        ssm_c,
+        ssm_d,
+        dt,
+        dt_bias,
+        state,
+        context_lengths,
+        state_start_index,
+        spec_verify_phase_marker,
+        tree_parent_ids,
+        tree_depths,
+        dt_softplus=dt_softplus,
+        ngroups=ngroups,
+        chunk_size=chunk_size,
+        use_spec_verify_state=1,
+        use_ddtree=1,
+        _outputs=6,
+    )
+    return output, state_out, replay_da, replay_u, replay_b, replay_dt
+
+
+def _update_ssm_state_with_intermediate_dispatch(
+    hidden_states,
+    ssm_a,
+    ssm_b,
+    ssm_c,
+    ssm_d,
+    dt,
+    dt_bias,
+    state,
+    context_lengths,
+    state_start_index,
+    spec_verify_phase_marker,
+    dt_softplus,
+    ngroups,
+    chunk_size=0,
+    tree_parent_ids=None,
+    tree_depths=None,
+    use_ddtree_state=False,
+):
+    if use_ddtree_state:
+        if tree_parent_ids is None or tree_depths is None:
+            raise ValueError(
+                "update_ssm_state DDTree path requires tree_parent_ids and tree_depths"
+            )
+        return _update_ssm_state_with_intermediate_tree_translation(
+            hidden_states, ssm_a, ssm_b, ssm_c, ssm_d, dt, dt_bias, state,
+            context_lengths, state_start_index, spec_verify_phase_marker,
+            tree_parent_ids, tree_depths, dt_softplus, ngroups, chunk_size)
+    return _update_ssm_state_with_intermediate_linear_translation(
+        hidden_states, ssm_a, ssm_b, ssm_c, ssm_d, dt, dt_bias, state,
+        context_lengths, state_start_index, spec_verify_phase_marker,
+        dt_softplus, ngroups, chunk_size)
 
 
 # ---------------------------------------------------------------------------
@@ -1529,7 +1607,7 @@ def build_custom_translation_table() -> dict:
         torch.ops.trt_edgellm.update_ssm_state.default:
         _update_ssm_state_translation,
         torch.ops.trt_edgellm.update_ssm_state_with_intermediate.default:
-        _update_ssm_state_with_intermediate_translation,
+        _update_ssm_state_with_intermediate_dispatch,
         torch.ops.trt_edgellm.gated_delta_net.default:
         _gated_delta_net_dispatch,
         torch.ops.trt_edgellm.gated_delta_net_with_intermediate.default:

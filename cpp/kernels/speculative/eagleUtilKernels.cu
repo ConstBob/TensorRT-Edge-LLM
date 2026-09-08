@@ -769,20 +769,7 @@ __global__ void eagleBaseAssembleHiddenStateKernel(int32_t const* acceptedIndice
 {
     DVec<half> tempBuffer[MAX_PATH];
 
-    // The kernel performs INPLACE compaction of accepted tokens within the same buffer.
-    // Since maxAcceptDepth (e.g., 7) << numTokens (e.g., 60), we can safely write compacted
-    // data at the beginning of each batch's region without overwriting unread data.
-    //
-    // Assumptions:
-    //     1. Each thread copies 16 bytes of data (half[8]), each warp copies 512 bytes (half[256]) per iteration.
-    //     2. Each CTA contains 128 threads (4 warps), total of 128*8=1024 elements.
-    //         Since hiddenDim can be very large, each CTA handles part of a batch.
-    //     3. acceptedIndices has layout [batch, max-depth]
-    //     4. hiddenState buffer has layout [batch, num-tokens, hidden-dim]
-    //     5. Output will be compacted inplace to [batch, actual-accept-length, hidden-dim]
-
-    int32_t const batchIdx = blockIdx.x;
-    int32_t const dimIdx = blockIdx.y * blockDim.x + threadIdx.x;
+    int32_t const dimIdx = blockIdx.x * blockDim.x + threadIdx.x;
     int32_t const startIdx = dimIdx * DVec<half>::vec_size;
 
     if (startIdx >= hiddenDim)
@@ -790,34 +777,33 @@ __global__ void eagleBaseAssembleHiddenStateKernel(int32_t const* acceptedIndice
         return;
     }
 
-    int32_t const actualAcceptLength = acceptLengths[batchIdx];
-
-    // Input uses stride=numTokens (e.g., verifyTreeSize=60)
-    int32_t const inputOffset = batchIdx * numTokens * hiddenDim;
-
-    // The accepted token lengths are usually not equal. We will pad the output till
-    // maxAcceptDepth instead of making it a true ragged tensor.
-    int32_t const outputOffset = batchIdx * maxDepth * hiddenDim;
-
-    // PHASE 1: Collect all accepted tokens from INPUT layout (stride=numTokens)
-    // Read from positions scattered in the input space (e.g., [0, 3, 5, 12, ...])
-    for (int32_t i = 0; i < actualAcceptLength; ++i)
+    // Dense in-place output for batch b overlaps the input slab of earlier batches.
+    // A single CTA owns each hidden-dimension tile and visits batches in order, so it
+    // always consumes an earlier slab before a later batch can overwrite that tile.
+    for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {
-        int32_t const acceptedIdx = acceptedIndices[batchIdx * maxDepth + i];
-        if (acceptedIdx >= 0 && acceptedIdx < numTokens)
+        int32_t const actualAcceptLength = max(0, min(acceptLengths[batchIdx], maxDepth));
+        int32_t const inputOffset = batchIdx * numTokens * hiddenDim;
+        int32_t const outputOffset = batchIdx * maxDepth * hiddenDim;
+
+        for (int32_t i = 0; i < actualAcceptLength; ++i)
         {
-            int32_t const srcOffset = inputOffset + acceptedIdx * hiddenDim + startIdx;
-            tempBuffer[i].load(hiddenState + srcOffset);
+            int32_t const acceptedIdx = acceptedIndices[batchIdx * maxDepth + i];
+            if (acceptedIdx >= 0 && acceptedIdx < numTokens)
+            {
+                int32_t const srcOffset = inputOffset + acceptedIdx * hiddenDim + startIdx;
+                tempBuffer[i].load(hiddenState + srcOffset);
+            }
+            else
+            {
+                tempBuffer[i] = DVec<half>{};
+            }
         }
-    }
-
-    // PHASE 2: Write to compacted OUTPUT layout (stride=maxDepth)
-    // Write to consecutive positions in the compacted space (e.g., [0, 1, 2, 3, ...])
-    // This is safe because outputOffset <= inputOffset (since maxDepth < numTokens)
-    for (int32_t i = 0; i < actualAcceptLength; ++i)
-    {
-        int32_t const dstOffset = outputOffset + i * hiddenDim + startIdx;
-        tempBuffer[i].store(hiddenState + dstOffset);
+        for (int32_t i = 0; i < actualAcceptLength; ++i)
+        {
+            int32_t const dstOffset = outputOffset + i * hiddenDim + startIdx;
+            tempBuffer[i].store(hiddenState + dstOffset);
+        }
     }
 }
 
@@ -986,12 +972,13 @@ void eagleBaseAssembleHiddenState(
     constexpr uint32_t threadsPerBlock = 128;
     int32_t const numTokens = hiddenStateShape[1];
     int32_t const hiddenDim = hiddenStateShape[2];
+    check::check(maxDepth <= numTokens, "maxDepth must not exceed the number of verify tokens.");
     check::check(hiddenDim % vecSize == 0, "hiddenDim must be divisible by vecSize.");
 
     uint32_t const dimPerBlock = threadsPerBlock * vecSize;
-    uint32_t const gridY = (hiddenDim + dimPerBlock - 1) / dimPerBlock;
+    uint32_t const gridX = (hiddenDim + dimPerBlock - 1) / dimPerBlock;
     dim3 const blockDim2(threadsPerBlock);
-    dim3 const gridDim2{batchSize, gridY};
+    dim3 const gridDim2{gridX};
 
     eagleBaseAssembleHiddenStateKernel<kEagleMaxAcceptedPathLength><<<gridDim2, blockDim2, 0, stream>>>(
         acceptedIndices.dataPointer<int32_t>(), acceptLengths.dataPointer<int32_t>(), hiddenState.dataPointer<half>(),

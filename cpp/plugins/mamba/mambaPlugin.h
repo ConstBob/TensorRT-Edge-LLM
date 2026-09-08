@@ -57,6 +57,9 @@ namespace plugins
 //!   [7] state      [batch, nheads, dim, dstate]          FP16 or FP32
 //!   [8] context_lengths [batch]                          INT32
 //!   [9] state_start_index [0] or [batch]                 INT32
+//!   [10] spec_verify_phase_marker [0] or [1]             INT32 (spec mode)
+//!   [11] tree_parent_ids [batch, seq_len]                 INT32 (DDTree mode)
+//!   [12] tree_depths [batch, seq_len]                     INT32 (DDTree mode)
 //!
 //! `state_start_index` shares the runtime's `kvcache_start_index` sentinel
 //! contract: shape [0] selects the faster zero-state prefill kernel, while
@@ -66,9 +69,17 @@ namespace plugins
 //! TRT selects FP32 when the ONNX graph declares FP32, and may optimize to
 //! FP16 during the builder phase when the FP16 flag is set.
 //!
+//! `spec_verify_phase_marker` is shape-only: length 0 selects ordinary
+//! prefill/decode, while length 1 selects verify without mutating committed
+//! recurrent state. DDTree mode evaluates each node from its parent chain.
+//!
 //! Outputs:
 //!   [0] output     [batch, (seq_len,) nheads, dim]       same as input type
 //!   [1] state_out  [batch, nheads, dim, dstate]          same as input type
+//!   [2] replay_da  [batch, seq_len, nheads]              FP32 (spec mode)
+//!   [3] replay_u   [batch, seq_len, nheads, dim]         FP32 x input (spec mode)
+//!   [4] replay_b   [batch, seq_len, ngroups, dstate]     FP32 (spec mode)
+//!   [5] replay_dt  [batch, seq_len, nheads]              FP32 (spec mode)
 class MambaPlugin : public nvinfer1::IPluginV3,
                     public nvinfer1::IPluginV3OneCore,
                     public nvinfer1::IPluginV3OneBuild,
@@ -76,7 +87,7 @@ class MambaPlugin : public nvinfer1::IPluginV3,
 {
 public:
     MambaPlugin(std::string const& name, int32_t dim, int32_t dstate, int32_t nheads, int32_t ngroups,
-        int32_t dtSoftplus, int32_t useSpecVerifyState = 0);
+        int32_t dtSoftplus, int32_t useSpecVerifyState = 0, int32_t useDDTree = 0, int32_t replayFormatVersion = 0);
 
     MambaPlugin() = delete;
     MambaPlugin(MambaPlugin const&) = delete;
@@ -114,8 +125,8 @@ public:
     void setPluginNamespace(char const* pluginNamespace) noexcept;
 
 protected:
-    //! Plugin input/output counts depend on the spec-verify mode: it adds a trailing
-    //! ``spec_verify_phase_marker`` input and an ``intermediate_recurrent_states`` output.
+    //! Plugin input/output counts depend on spec-verify mode. DDTree additionally
+    //! consumes the parent/depth inputs; both spec modes emit the replay stash.
     int32_t numInputs() const noexcept;
     int32_t numOutputs() const noexcept;
 
@@ -129,6 +140,10 @@ protected:
     int32_t mDtSoftplus{};
     //! MTP spec-verify: emit per-token intermediate recurrent states for accepted-token rollback.
     int32_t mUseSpecVerifyState{};
+    //! DDTree verify consumes parent/depth inputs and evaluates each node from its ancestor state.
+    int32_t mUseDDTree{};
+    //! Serialized spec-replay ABI. Legacy non-spec engines do not require this field.
+    int32_t mReplayFormatVersion{};
 
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFCToSerialize;
