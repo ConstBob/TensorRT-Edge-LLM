@@ -609,10 +609,13 @@ inline constexpr char const* kVocabMapFileName = "vocab_map.safetensors";
  *
  * SafeTensors file containing mapping from reduced draft vocabulary to full vocabulary.
  *
- * @note Currently consumed only by DFlashDecoder (gated on the draft engine config's
- *       reduced_vocab_size > 0) and produced only by the DFlash draft export path. If a
- *       future decoder adopts draft vocab reduction, it must (a) gate the load on the same
- *       config field and (b) be added as a consumer of this constant.
+ * @note Consumed by DFlashDecoder and MTPDecoder (chain mode only), each gated on the
+ *       draft engine config's reduced_vocab_size > 0; produced by the DFlash, MTP, and
+ *       JetSpec draft export paths (one shared writer: export.py
+ *       _write_draft_vocab_sidecar). The sidecar always stores the DIRECT map
+ *       (full = T[reduced]); DFlashDecoder consumes it as-is, MTPDecoder converts it to
+ *       offsets at load. If a future decoder adopts draft vocab reduction, it must
+ *       (a) gate the load on the same config field and (b) be added to this list.
  */
 inline constexpr char const* kDraftVocabMapFileName = "draft_vocab_map.safetensors";
 

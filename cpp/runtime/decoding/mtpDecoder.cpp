@@ -16,6 +16,7 @@
  */
 
 #include "runtime/decoding/mtpDecoder.h"
+#include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/logger.h"
@@ -41,6 +42,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <filesystem>
 #include <functional>
 #include <optional>
 #include <string>
@@ -56,8 +58,9 @@ constexpr int32_t kPrefillProfile{0};
 constexpr int32_t kDecodeProfile{1};
 } // namespace
 
-MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, SpecDecodeDraftingConfig const& draftingConfig,
-    std::unique_ptr<EngineExecutor> draftExecutor, ExternalWeightManager draftWeights, cudaStream_t stream)
+MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, std::filesystem::path const& engineDir,
+    SpecDecodeDraftingConfig const& draftingConfig, std::unique_ptr<EngineExecutor> draftExecutor,
+    ExternalWeightManager draftWeights, cudaStream_t stream)
     : mRuntime(runtime)
     , mDraftCacheManager(*runtime.base.sharedResources.cacheManagers[1])
     , mDraftExecutor(std::move(draftExecutor))
@@ -155,9 +158,51 @@ MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, SpecDecodeDraftingConfig
         CUDA_CHECK(cudaMemsetAsync(mDraftRootTokenId.rawPointer(), 0, mDraftRootTokenId.getMemoryCapacity(), stream));
     }
 
-    // MTP: identity vocab mapping (zero-fill)
-    CUDA_CHECK(
-        cudaMemsetAsync(mDraftVocabMappingTable.rawPointer(), 0, mDraftVocabMappingTable.getMemoryCapacity(), stream));
+    if (mRuntime.deployment.draft->reducedVocabSize > 0)
+    {
+        // The sidecar is DIRECT (full = T[i]), while the EAGLE utility kernels consume
+        // OFFSETS (full = i + T[i]); normalize it once at load.
+        ELLM_CHECK(!mUseTree,
+            "MTP tree drafting (draftingTopK > 1) does not support a reduced draft vocabulary; use "
+            "--specDraftTopK 1 or re-export the draft without --draft-reduced-vocab-dir.");
+        auto const draftVocabMapPath = engineDir / binding_names::kDraftVocabMapFileName;
+        ELLM_CHECK(std::filesystem::exists(draftVocabMapPath),
+            "Draft engine declares reduced_vocab_size > 0 but " + std::string(binding_names::kDraftVocabMapFileName)
+                + " is missing from engine directory");
+        std::vector<Tensor> vocabMapTensors;
+        ELLM_CHECK(safetensors::loadSafetensors(draftVocabMapPath, vocabMapTensors, stream),
+            "Failed to load " + std::string(binding_names::kDraftVocabMapFileName) + " from engine directory");
+        check::check(vocabMapTensors.size() == 1,
+            std::string(binding_names::kDraftVocabMapFileName) + " should contain exactly one tensor");
+        // dataPointer<int32_t>() below is an unchecked reinterpret_cast: a
+        // wrong-dtype sidecar (e.g. int64) of the right length would pass the
+        // shape/range checks and silently corrupt the table, so refuse it here.
+        check::check(
+            vocabMapTensors[0].getDataType() == nvinfer1::DataType::kINT32, "draft vocab_map tensor should be INT32");
+        check::check(vocabMapTensors[0].getShape().getNumDims() == 1, "draft vocab_map tensor should be 1D");
+        int32_t const reducedVocabSize = static_cast<int32_t>(vocabMapTensors[0].getShape()[0]);
+        check::check(reducedVocabSize == mRuntime.deployment.draft->outputVocabSize,
+            "draft vocab_map tensor length should match the draft model reduced vocab size");
+
+        int32_t const baseVocabSize = mRuntime.deployment.base.vocabSize;
+        std::vector<int32_t> hostMap(static_cast<size_t>(reducedVocabSize));
+        CUDA_CHECK(cudaMemcpyAsync(hostMap.data(), vocabMapTensors[0].dataPointer<int32_t>(),
+            static_cast<size_t>(reducedVocabSize) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        decoder_utils::directVocabMapToOffsets(hostMap, baseVocabSize);
+        CUDA_CHECK(cudaMemcpyAsync(mDraftVocabMappingTable.dataPointer<int32_t>(), hostMap.data(),
+            static_cast<size_t>(reducedVocabSize) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        LOG_INFO(
+            "MTPDecoder: reduced draft vocabulary active (%d of %d base tokens); "
+            "loaded %s as an offset table",
+            reducedVocabSize, baseVocabSize, binding_names::kDraftVocabMapFileName);
+    }
+    else
+    {
+        // MTP full-vocab: identity vocab mapping (zero-fill offsets)
+        CUDA_CHECK(cudaMemsetAsync(
+            mDraftVocabMappingTable.rawPointer(), 0, mDraftVocabMappingTable.getMemoryCapacity(), stream));
+    }
 }
 
 DecodingKvHeadroom MTPDecoder::requiredKvHeadroom() const
@@ -582,7 +627,8 @@ bool MTPDecoder::buildTreeVerifyInputs(int32_t activeBatchSize, cudaStream_t str
     check::check(
         mRuntime.base.pipelineIO.selectTokenIndices.reshape({activeBatchSize, verifySize}), "Tensor reshape failed");
 
-    // MTP has no draft vocab reduction, so no reduced-to-full mapping is passed.
+    // Reduced-vocabulary MTP is chain-only. ddtreeBuild expects a DIRECT map
+    // (full = T[i]), while mDraftVocabMappingTable holds OFFSETS (full = i + T[i]).
     Tensor const& baseKVCacheLengths = mRuntime.base.cacheManager.getKVCacheLengths();
     kernel::DDTreeBuildParams const buildParams{{mStackedDraftLogits, mDraftRootTokenId, baseKVCacheLengths, nullptr},
         {mTreeTokenIds, mRuntime.base.pipelineIO.specTreeDepths, mRuntime.base.pipelineIO.specTreeParentIds,

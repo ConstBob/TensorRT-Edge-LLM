@@ -2116,7 +2116,7 @@ bool LLMBuilder::copyDFlash2Files()
 bool LLMBuilder::copyVocabMappingFiles()
 {
     // Copy the vocab map sidecar if reduced vocabulary is used. Base engines
-    // consume vocab_map.safetensors; DFlash draft engines consume
+    // consume vocab_map.safetensors; speculative draft engines consume
     // draft_vocab_map.safetensors. Pick the right filename based on the build
     // role so the runtime finds the sidecar in mEngineDir.
     if (mModelConfig.contains(binding_names::kReducedVocabSizeKey)
@@ -2130,10 +2130,8 @@ bool LLMBuilder::copyVocabMappingFiles()
         if (!file_io::copyFile(vocabMapPath, targetVocabMapPath))
         {
             // The enclosing guard already proved reduced_vocab_size > 0, so the
-            // sidecar is required. Runtime will refuse to load (DFlashDecoder
-            // hard-errors when reducedVocabSize > 0 and the file is missing;
-            // base-model runtime falls back to no remap but produces wrong IDs).
-            // Fail the build instead of letting a broken engine ship.
+            // sidecar is required to translate reduced output token IDs. Fail the
+            // build instead of letting a broken engine ship.
             LOG_ERROR(
                 "%s not found in %s but reduced_vocab_size > 0; the sidecar is "
                 "required for the runtime to remap reduced->full vocabulary IDs.",

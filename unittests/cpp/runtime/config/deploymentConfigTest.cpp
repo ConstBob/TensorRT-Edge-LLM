@@ -675,6 +675,31 @@ TEST_F(DeploymentConfigTest, MTPTopKGreaterThanOneSelectsTree)
     EXPECT_EQ(bundle.specConfig->verifySize, 8);
 }
 
+TEST_F(DeploymentConfigTest, MTPTreeRejectsReducedDraftVocabMap)
+{
+    Json const baseJson = makeMTPBaseConfig(/*maxVerify=*/16);
+    Json draftJson = makeMTPDraftConfig(/*maxDraft=*/16);
+    draftJson["reduced_vocab_size"] = 16000;
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 2;
+    drafting.draftingStep = 4;
+    drafting.verifySize = 8;
+
+    try
+    {
+        static_cast<void>(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+            std::optional<SpecDecodeDraftingConfig>{drafting}));
+        FAIL() << "Expected reduced-vocabulary MTP tree drafting to be rejected.";
+    }
+    catch (std::runtime_error const& error)
+    {
+        EXPECT_NE(std::string(error.what()).find("use --specDraftTopK 1"), std::string::npos) << error.what();
+    }
+}
+
 TEST_F(DeploymentConfigTest, MTPTreeRejectsTopKNotLessThanVerifySize)
 {
     Json const baseJson = makeMTPBaseConfig(/*maxVerify=*/16);

@@ -27,6 +27,7 @@
 - Fixed cross-platform GPU memory reporting
 
 ## 0.10.0
+- Added chain-MTP reduced draft vocabulary export/runtime support and `spec_draft_accept` component benchmarking
 - Added Day-0 support for Qwen3.8-27B
 - Added NVIDIA Nemotron-3.5 Lightning support with MTP and DFlash speculative decoding
 - Added an experimental ONNX-less workflow to build TensorRT engines directly from supported checkpoints

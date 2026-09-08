@@ -66,7 +66,7 @@ DecoderRegistry::DecoderRegistry(DecodingRuntimeContext& runtime, DecoderRegistr
         switch (runtime.deployment.specDecodeMode())
         {
         case SpecDecodeMode::kMTP:
-            mSpeculativeDecoder = std::make_unique<MTPDecoder>(runtime, *init.draftingConfig,
+            mSpeculativeDecoder = std::make_unique<MTPDecoder>(runtime, init.engineDir, *init.draftingConfig,
                 std::move(init.draftExecutor), std::move(init.draftWeights), init.stream);
             break;
         case SpecDecodeMode::kEAGLE:

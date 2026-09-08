@@ -1360,22 +1360,74 @@ def _export_diffusion_gemma(model_dir: str,
     logger.info("[DiffusionGemma] Done: %s", output_dir)
 
 
+def _write_draft_vocab_sidecar(model, draft_out_dir: str, full_size: int,
+                               reduced_size: "int | None",
+                               draft_reduced_vocab_dir: str,
+                               log_tag: str) -> None:
+    """Write the draft vocab map sidecar the C++ runtime consumes, plus a provenance JSON.
+
+    Single writer for every draft export path (MTP, DFlash, JetSpec): the
+    sidecar is a runtime contract — kDraftVocabMapFileName; see its @note in
+    cpp/common/bindingNames.h for the consumers and their semantics — so the
+    writer must not fork per draft family.
+    """
+    from tensorrt_edgellm._safetensors_io import save_file as _save_safetensors
+
+    from ..vocab_reduction.constants import (DRAFT_VOCAB_INFO_NAME,
+                                             DRAFT_VOCAB_MAP_NAME)
+    vocab_map = model._reduced_vocab_map_for_runtime
+
+    map_path = os.path.join(draft_out_dir, DRAFT_VOCAB_MAP_NAME)
+    _save_safetensors({"vocab_map": vocab_map.cpu().to(torch.int32)}, map_path)
+    logger.info("%s Wrote draft vocab map: %s (%d tokens)", log_tag, map_path,
+                vocab_map.numel())
+
+    with open(os.path.join(draft_out_dir, DRAFT_VOCAB_INFO_NAME), "w") as fh:
+        json.dump(
+            {
+                "vocab_size": full_size,
+                "reduced_vocab_size": reduced_size,
+                "source": draft_reduced_vocab_dir
+            },
+            fh,
+            indent=2)
+
+
 def _export_mtp_draft(model_dir: str,
                       draft_out_dir: str,
-                      externalize_weights: "list[str] | None" = None) -> None:
-    """Export the MTP draft model."""
+                      externalize_weights: "list[str] | None" = None,
+                      draft_reduced_vocab_dir: str = "") -> None:
+    """Export the MTP draft model, optionally with a reduced lm_head vocabulary.
+
+    Chain mode only — the runtime rejects tree drafting with a reduced draft
+    vocabulary. The slice applies to this export's own model instance, so a
+    checkpoint that borrows the base lm_head is safe too.
+    """
     os.makedirs(draft_out_dir, exist_ok=True)
     output_path = os.path.join(draft_out_dir, "model.onnx")
 
     logger.info("[MTP Draft] Loading checkpoint from %s", model_dir)
+    if draft_reduced_vocab_dir:
+        logger.info("[MTP Draft] Applying vocab reduction from %s",
+                    draft_reduced_vocab_dir)
     try:
         from ..model import AutoModel
-        model = AutoModel.from_pretrained(model_dir,
-                                          device="cpu",
-                                          mtp_draft=True)
-    except (OSError, ValueError, RuntimeError, ImportError) as exc:
+        model = AutoModel.from_pretrained(
+            model_dir,
+            device="cpu",
+            mtp_draft=True,
+            reduced_vocab_dir=draft_reduced_vocab_dir or None)
+    except (OSError, ValueError, RuntimeError, ImportError, KeyError,
+            TypeError) as exc:
         logger.exception("[MTP Draft] Failed to load checkpoint")
         raise SystemExit(1) from exc
+
+    full_size = model.config.vocab_size
+    reduced_size = None
+    if draft_reduced_vocab_dir:
+        reduced_size = model.config.reduced_vocab_size
+        logger.info("[MTP Draft] lm_head reduced: %d → %d", full_size,
+                    reduced_size)
 
     logger.info("[MTP Draft] Exporting to %s", output_path)
     try:
@@ -1387,6 +1439,12 @@ def _export_mtp_draft(model_dir: str,
     except (OSError, ValueError, RuntimeError) as exc:
         logger.exception("[MTP Draft] ONNX export failed")
         raise SystemExit(1) from exc
+
+    # --- Save draft vocab map sidecar for the C++ runtime ---
+    if draft_reduced_vocab_dir:
+        _write_draft_vocab_sidecar(model, draft_out_dir, full_size,
+                                   reduced_size, draft_reduced_vocab_dir,
+                                   "[MTP Draft]")
 
     logger.info("[MTP Draft] Done: %s", output_path)
 
@@ -1514,29 +1572,9 @@ def _export_dflash_draft(model_dir: str,
 
     # --- Save draft vocab map sidecar for C++ runtime ---
     if draft_reduced_vocab_dir:
-        from tensorrt_edgellm._safetensors_io import \
-            save_file as _save_safetensors
-
-        from ..vocab_reduction.constants import (DRAFT_VOCAB_INFO_NAME,
-                                                 DRAFT_VOCAB_MAP_NAME)
-        vocab_map = model._reduced_vocab_map_for_runtime
-
-        map_path = os.path.join(draft_out_dir, DRAFT_VOCAB_MAP_NAME)
-        _save_safetensors({"vocab_map": vocab_map.cpu().to(torch.int32)},
-                          map_path)
-        logger.info("[DFlash Draft] Wrote draft vocab map: %s (%d tokens)",
-                    map_path, vocab_map.numel())
-
-        with open(os.path.join(draft_out_dir, DRAFT_VOCAB_INFO_NAME),
-                  "w") as fh:
-            json.dump(
-                {
-                    "vocab_size": full_size,
-                    "reduced_vocab_size": reduced_size,
-                    "source": draft_reduced_vocab_dir
-                },
-                fh,
-                indent=2)
+        _write_draft_vocab_sidecar(model, draft_out_dir, full_size,
+                                   reduced_size, draft_reduced_vocab_dir,
+                                   "[DFlash Draft]")
 
     logger.info("[DFlash Draft] Done: %s", output_path)
 
@@ -1586,27 +1624,9 @@ def _export_jetspec_draft(model_dir: str,
         raise SystemExit(1) from exc
 
     if draft_reduced_vocab_dir:
-        from tensorrt_edgellm._safetensors_io import \
-            save_file as _save_safetensors
-
-        from ..vocab_reduction.constants import (DRAFT_VOCAB_INFO_NAME,
-                                                 DRAFT_VOCAB_MAP_NAME)
-        vocab_map = model._reduced_vocab_map_for_runtime
-        map_path = os.path.join(draft_out_dir, DRAFT_VOCAB_MAP_NAME)
-        _save_safetensors({"vocab_map": vocab_map.cpu().to(torch.int32)},
-                          map_path)
-        logger.info("[JetSpec Draft] Wrote draft vocab map: %s (%d tokens)",
-                    map_path, vocab_map.numel())
-        with open(os.path.join(draft_out_dir, DRAFT_VOCAB_INFO_NAME),
-                  "w") as fh:
-            json.dump(
-                {
-                    "vocab_size": full_size,
-                    "reduced_vocab_size": reduced_size,
-                    "source": draft_reduced_vocab_dir
-                },
-                fh,
-                indent=2)
+        _write_draft_vocab_sidecar(model, draft_out_dir, full_size,
+                                   reduced_size, draft_reduced_vocab_dir,
+                                   "[JetSpec Draft]")
 
     logger.info("[JetSpec Draft] Done: %s", output_path)
 
@@ -4126,9 +4146,10 @@ def main() -> None:
         default="",
         metavar="DIR",
         help=
-        ("Directory containing vocab_map.safetensors for the DFlash draft model "
-         "(from tensorrt_edgellm/scripts/reduce_vocab.py). "
-         "Reduces the DFlash draft lm_head output dimension."),
+        ("Directory containing vocab_map.safetensors for a spec-decode draft "
+         "model (from tensorrt_edgellm/scripts/reduce_vocab.py). Reduces the "
+         "draft lm_head output dimension. Supported for DFlash V1, JetSpec, "
+         "and chain-MTP drafts (tree-MTP is rejected)."),
     )
     p.add_argument(
         "--mtp",
@@ -4339,6 +4360,33 @@ def main() -> None:
     config = _load_config(model_dir)
     model_type: str = config.get("model_type", "unknown")
     dtype = _dtype_from_str(args.dtype)
+    is_gemma4_target = model_type in _GEMMA4_MODEL_TYPES
+    requested_components = {
+        c.strip()
+        for c in args.components.split(",") if c.strip()
+    }
+    is_cosmos3_target = (model_type in ("cosmos3_edge", "cosmos3_omni")
+                         or _is_cosmos3_checkpoint(model_dir))
+
+    if args.mtp_tree_base:
+        args.mtp = True
+        if args.draft_reduced_vocab_dir:
+            p.error("--draft-reduced-vocab-dir is not supported with "
+                    "--mtp-tree-base (chain-MTP only, --specDraftTopK 1)")
+
+    gemma4_mtp_requested = args.mtp and is_gemma4_target
+    consumes_chain_mtp_draft = (args.mtp and not gemma4_mtp_requested
+                                and not is_cosmos3_target
+                                and (not requested_components
+                                     or "mtp_draft" in requested_components))
+    consumes_standalone_draft = (not is_cosmos3_target
+                                 and (args.dflash_draft or args.jetspec_draft))
+    consumes_draft_reduced_vocab = (consumes_chain_mtp_draft
+                                    or consumes_standalone_draft)
+    if args.draft_reduced_vocab_dir and not consumes_draft_reduced_vocab:
+        p.error("--draft-reduced-vocab-dir requires a consuming draft stage: "
+                "chain-MTP (--mtp), DFlash V1 (--dflash-draft), or JetSpec "
+                "(--jetspec-draft)")
 
     # Cosmos3-Edge checkpoints carry two model families that run on DIFFERENT
     # runtime paths; ``--task`` selects which artifact set this invocation
@@ -4349,8 +4397,7 @@ def main() -> None:
     #     the standard llm_build + visual_build + llm_inference VLM flow.
     # Both the root ``model_type`` and the diffusers ``model_index.json``
     # identify them.
-    if model_type in ("cosmos3_edge",
-                      "cosmos3_omni") or _is_cosmos3_checkpoint(model_dir):
+    if is_cosmos3_target:
         has_reasoner = model_type == "cosmos3_edge"
         if args.task == "reasoning" and not has_reasoner:
             p.error("--task reasoning requires a cosmos3_edge checkpoint "
@@ -4406,9 +4453,7 @@ def main() -> None:
         return
 
     has_mtp_draft = _has_mtp(config)
-    is_gemma4_target = model_type in _GEMMA4_MODEL_TYPES
     mtp_draft_dir_arg = args.mtp_draft_dir or args.gemma4_mtp_assistant_dir
-    gemma4_mtp_requested = args.mtp and is_gemma4_target
     gemma4_mtp_assistant_dir = ""
     gemma4_kv_sharing_map: list[dict] = []
     externalize_weights = resolve_externalize_weights(args.externalize_weights)
@@ -4419,8 +4464,6 @@ def main() -> None:
             "Only Qwen3-TTS CustomVoice / VoiceDesign / Base checkpoints are "
             f"supported. Got tts_model_type={config.get('tts_model_type')!r}.")
 
-    if args.mtp_tree_base:
-        args.mtp = True
     if args.tp_size > 1 and (args.eagle_base or args.mtp or args.dflash_base
                              or args.dflash_tree_base or args.dflash_draft
                              or args.dspark_base or args.dspark_draft
@@ -4549,10 +4592,6 @@ def main() -> None:
         "thinker", "mtp_draft", "dflash_draft", "jetspec_draft",
         "dspark_draft", "talker", "code_predictor", "visual", "audio",
         "code2wav", "action", "dllm"
-    }
-    requested_components = {
-        c.strip()
-        for c in args.components.split(",") if c.strip()
     }
     unknown = requested_components - _VALID_COMPONENTS
     if unknown:
@@ -4762,7 +4801,10 @@ def main() -> None:
              quantization_override=getattr(args, 'quantization', None))),
         (args.mtp and not gemma4_mtp_requested
          and _allow("mtp_draft"), "mtp_draft", lambda out: _export_mtp_draft(
-             model_dir, out, externalize_weights=externalize_weights)),
+             model_dir,
+             out,
+             externalize_weights=externalize_weights,
+             draft_reduced_vocab_dir=args.draft_reduced_vocab_dir)),
         (gemma4_mtp_requested and _allow("mtp_draft"),
          "mtp_draft", lambda out: _export_gemma4_mtp_draft(
              model_dir, out, gemma4_mtp_assistant_dir, gemma4_kv_sharing_map)),
@@ -4842,6 +4884,9 @@ def main() -> None:
     logger.info("DSpark draft  : %s", "yes" if args.dspark_draft else "no")
     logger.info("Reduced vocab : %s",
                 args.reduced_vocab_dir if args.reduced_vocab_dir else "no")
+    logger.info(
+        "Draft reduced vocab: %s",
+        args.draft_reduced_vocab_dir if args.draft_reduced_vocab_dir else "no")
     logger.info(
         "External weights: %s",
         ", ".join(externalize_weights) if externalize_weights else "no")

@@ -700,8 +700,8 @@ def build_runtime_llm_config_dict(
         })
 
     if config.is_mtp_draft:
-        # MTP draft shares vocab with base (no reduced vocab) and receives
-        # base hidden states of size hidden_size (not 3x like EAGLE3).
+        # draft_vocab_size stays the full vocab; reduced_vocab_size, if set,
+        # narrows only the logits width. Base hidden states use hidden_size.
         out.update({
             "draft_vocab_size": config.vocab_size,
             "base_model_hidden_size": config.hidden_size,

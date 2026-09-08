@@ -244,7 +244,7 @@ void assembleIntermediateData(rt::Tensor const& cuLogProbs, rt::Tensor const& se
 //!     selectedIndices [GPU, Int32]: Selected indices from top logits, shape [batch, draftTopK, draftTopK].
 //!     logProbs [GPU, Float]: Log probabilities of the selected tokens, shape [batch, draftTopK, draftTopK].
 //!     intermediateScores [GPU, Float]: Intermediate scores of the selected tokens, shape [batch, draftTopK].
-//!     vocabMappingTable [GPU, Int32]: The mapping table from draft vocab token to full vocab token, shape [draft-vocab-size].
+//!     vocabMappingTable [GPU, Int32]: Draft-token to target-token offset table, shape [draft-vocab-size].
 //! Outputs:
 //!     draftIdTable [GPU, Int32]: Store the translated token ids. shape [batch, draft-topK, draft-topK]
 //!     draftScoreTable [GPU, Float]: Cumulative scores of the selected tokens, shape [batch, draftTopK, draftTopK].

@@ -439,9 +439,9 @@ float runRepeatedE2ETiming(
 
 //! Run sequential E2E timing: runs decodeSteps in a single timed block. Used for osl>1 decode.
 template <typename ResetFn, typename StepFn, typename PostStepFn, typename CaptureGraphFn>
-float runSequentialE2ETiming(std::string const& modeName, int32_t decodeSteps, ResetFn const& resetState,
-    StepFn const& step, PostStepFn const& postStep, bool useCudaGraph, CaptureGraphFn const& captureGraph,
-    cudaStream_t stream)
+float runSequentialE2ETiming(std::string const& modeName, int32_t decodeSteps, int32_t numTokens,
+    ResetFn const& resetState, StepFn const& step, PostStepFn const& postStep, bool useCudaGraph,
+    CaptureGraphFn const& captureGraph, cudaStream_t stream)
 {
     if (useCudaGraph)
     {
@@ -488,7 +488,7 @@ float runSequentialE2ETiming(std::string const& modeName, int32_t decodeSteps, R
 
     LOG_INFO("E2E Time: %.3f ms (steps=%d)", totalTimeMs, decodeSteps);
     LOG_INFO("Per-step avg: %.3f ms", totalTimeMs / decodeSteps);
-    LOG_INFO("Throughput: %.2f tokens/sec", 1000.0f * decodeSteps / totalTimeMs);
+    LOG_INFO("Throughput: %.2f tokens/sec", 1000.0f * numTokens / totalTimeMs);
 
     return totalTimeMs;
 }
