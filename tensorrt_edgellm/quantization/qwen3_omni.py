@@ -723,6 +723,46 @@ def _calib_full_multimodal(model, calib_dataset,
               f"due to processor errors")
 
 
+# Release name first; some checkpoints ship the same payload as ``code2wav/``.
+# Duplicated in ``scripts/export.py`` and the builder's
+# ``models/qwen3_omni_next/weights.py`` -- quantization runs in its own venv and
+# does not import the exporter.
+_VOCODER_DIR = "codec_decode_online"
+_VOCODER_DIR_ALIASES = (_VOCODER_DIR, "code2wav")
+_VOCODER_FILES = ("config.yaml", "model_weights.pt")
+
+
+def _has_vocoder_payload(path: str) -> bool:
+    """True when *path* holds both Code2Wav files."""
+    return all(os.path.isfile(os.path.join(path, f)) for f in _VOCODER_FILES)
+
+
+def _copy_vocoder_dir(model_dir: str, output_dir: str) -> None:
+    """Copy the Code2Wav vocoder next to the quantized weights.
+
+    ``export_hf_checkpoint`` writes weights + configs only, and the exporter
+    reads the vocoder from the checkpoint directory. An aliased source is
+    normalized to the release name.
+    """
+    for name in _VOCODER_DIR_ALIASES:
+        src = os.path.join(model_dir, name)
+        if not _has_vocoder_payload(src):
+            continue
+        dst = os.path.join(output_dir, _VOCODER_DIR)
+        if os.path.realpath(src) == os.path.realpath(dst):
+            return  # quantizing in place -- rmtree would eat the source
+        # Always replace: a leftover is either partial (interrupted run) or
+        # stale (earlier run against a different model_dir).
+        shutil.rmtree(dst, ignore_errors=True)
+        try:
+            shutil.copytree(src, dst)
+        except OSError:
+            shutil.rmtree(dst, ignore_errors=True)
+            raise
+        print(f"[copy] {name}/ -> {dst}")
+        return
+
+
 # ---------------------------------------------------------------------------
 # Top-level entry
 # ---------------------------------------------------------------------------
@@ -918,6 +958,7 @@ def quantize_qwen3_omni(
         src = os.path.join(model_dir, fname)
         if os.path.isfile(src):
             shutil.copy2(src, os.path.join(output_dir, fname))
+    _copy_vocoder_dir(model_dir, output_dir)
 
     print(f"[done] {output_dir}  (total {time.time() - t0:.1f}s)")
     return output_dir
@@ -1724,6 +1765,7 @@ def quantize_and_export_omni(
     tokenizer.save_pretrained(output_dir)
     if processor is not None:
         processor.save_pretrained(output_dir)
+    _copy_vocoder_dir(model_dir, output_dir)
 
     print(f"Saved to {output_dir} (total {time.time() - t0:.1f}s)")
     return output_dir

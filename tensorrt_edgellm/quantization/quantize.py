@@ -51,8 +51,8 @@ from .qwen3_asr_loader import (asr_calibration_dataloader, is_qwen3_asr_model,
 from .qwen3_cp_loader import (has_code_predictor, is_qwen3_next_omni,
                               qwen3_cp_calibration_loop,
                               qwen3_next_cp_calibration_loop)
-from .qwen3_omni import (_load_omni_model, is_omni_model_dir,
-                         quantize_and_export_omni)
+from .qwen3_omni import (_copy_vocoder_dir, _load_omni_model,
+                         is_omni_model_dir, quantize_and_export_omni)
 
 
 def _text_calib_dataloader(tokenizer,
@@ -1245,6 +1245,7 @@ def quantize_and_export(
         src = os.path.join(model_dir, fname)
         if os.path.isfile(src):
             shutil.copy2(src, os.path.join(output_dir, fname))
+    _copy_vocoder_dir(model_dir, output_dir)
 
     # Qwen3-ASR: convert the vanilla-Qwen3-shaped output back into the
     # qwen3_asr layout the runtime expects (re-prefix safetensors keys with
