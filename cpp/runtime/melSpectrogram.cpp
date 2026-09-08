@@ -603,7 +603,12 @@ bool MelExtractor::extract(AudioPCM const& pcm, Tensor& out)
                     float const d = outData[idx] - mean;
                     ss += d * d;
                 }
-                float const denom = std::sqrt(ss / static_cast<float>(validT)) + kEps;
+                // Bessel-corrected, matching HF ParakeetFeatureExtractor's
+                // `variance = ... / (features_lengths - 1)` and the GPU path in
+                // `melStatsLnPerFeature`. Dividing by validT instead scales
+                // every feature by sqrt(validT / (validT - 1)).
+                int32_t const dof = validT > 1 ? validT - 1 : 1;
+                float const denom = std::sqrt(ss / static_cast<float>(dof)) + kEps;
                 for (int32_t t = 0; t < outFrames; ++t)
                 {
                     size_t const idx = (mConfig.layout == MelLayout::kMelTime) ? static_cast<size_t>(m) * outFrames + t

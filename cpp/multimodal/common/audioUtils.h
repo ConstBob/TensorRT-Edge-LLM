@@ -280,10 +280,8 @@ struct FbankResourcesParakeet
 //!
 //! Output shape/dtype matches the CPU MelExtractor → uploadHostMelFp32ToFp16Gpu
 //! parakeet contract ([1, T_out, nMel] Half, time-first), so the GPU fbank and the
-//! CPU fallback are shape/dtype-compatible. (Numerically the GPU per-feature std
-//! uses an unbiased N-1 divisor, matching HF ParakeetFeatureExtractor, while the CPU
-//! MelExtractor uses a biased N divisor — a sub-threshold sqrt(N/(N-1)) scale that
-//! differs only on very short clips; see melSpectrogram.cpp.)
+//! CPU fallback are shape/dtype-compatible. Both per-feature stds use the unbiased
+//! N-1 divisor of HF ParakeetFeatureExtractor, so the two paths agree numerically.
 //!
 //! Caller must have already loaded the CuTe DSL gemm module (idempotent +
 //! thread-safe; initFbankResources does this).
