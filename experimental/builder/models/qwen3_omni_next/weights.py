@@ -47,11 +47,17 @@ _WRAPPERS = (
 _CODEC_STAGES: Dict[str, tempfile.TemporaryDirectory] = {}
 _CODEC_STAGE_LOCK = threading.Lock()
 
+# Release name first; some checkpoints ship the same payload as ``code2wav/``.
+# Also duplicated in tensorrt_edgellm's quantization/qwen3_omni.py and
+# scripts/export.py, which this tree does not import.
+VOCODER_DIR_ALIASES = ("codec_decode_online", "code2wav")
+
 
 def _codec_source(model_dir: str) -> str:
-    nested = os.path.join(model_dir, "codec_decode_online")
-    if os.path.isfile(os.path.join(nested, "model_weights.pt")):
-        return nested
+    for name in VOCODER_DIR_ALIASES:
+        nested = os.path.join(model_dir, name)
+        if os.path.isfile(os.path.join(nested, "model_weights.pt")):
+            return nested
     if os.path.isfile(os.path.join(model_dir, "model_weights.pt")):
         return model_dir
     return ""

@@ -851,3 +851,71 @@ def test_fuse_gdn_qkvzba_scales_unifies_group_amax():
 def test_fuse_gdn_qkvzba_scales_requires_nvfp4():
     with pytest.raises(ValueError, match="requires --quantization nvfp4"):
         build_quant_config("fp8", fuse_gdn_qkvzba_scales=True)
+
+
+def _write_vocoder(parent, name, payload="w", config=True):
+    """Create ``<parent>/<name>/`` with a Code2Wav payload."""
+    path = os.path.join(parent, name)
+    os.makedirs(path, exist_ok=True)
+    if config:
+        with open(os.path.join(path, "config.yaml"), "w") as f:
+            f.write("sample_rate: 24000\n")
+    with open(os.path.join(path, "model_weights.pt"), "w") as f:
+        f.write(payload)
+    return path
+
+
+def test_vocoder_dir_copied_into_quantized_root():
+    """``export_hf_checkpoint`` writes no sidecar directories.
+
+    Without this copy the exporter's Code2Wav stage aborts on a quantized root
+    that is otherwise complete, and a ``code2wav/`` source has to land under
+    the release name because that is where the exporter looks.
+    """
+    omni_mod = importlib.import_module(
+        "tensorrt_edgellm.quantization.qwen3_omni")
+    export_mod = importlib.import_module("tensorrt_edgellm.scripts.export")
+
+    # An aliased source is normalized to the release name.
+    with tempfile.TemporaryDirectory() as src, \
+            tempfile.TemporaryDirectory() as out:
+        _write_vocoder(src, "code2wav")
+        omni_mod._copy_vocoder_dir(src, out)
+        copied = os.path.join(out, "codec_decode_online")
+        assert sorted(
+            os.listdir(copied)) == ["config.yaml", "model_weights.pt"]
+        # The exporter finds either spelling.
+        assert export_mod._resolve_next_vocoder_dir(src) == os.path.join(
+            src, "code2wav")
+
+    # A truncated source is skipped here rather than failing at export.
+    with tempfile.TemporaryDirectory() as src, \
+            tempfile.TemporaryDirectory() as out:
+        _write_vocoder(src, "code2wav", config=False)
+        omni_mod._copy_vocoder_dir(src, out)
+        assert os.listdir(out) == []
+
+    # No vocoder at all: a no-op, so the unconditional call is safe for every
+    # non-Omni model that goes through quantize_and_export.
+    with tempfile.TemporaryDirectory() as src, \
+            tempfile.TemporaryDirectory() as out:
+        omni_mod._copy_vocoder_dir(src, out)
+        assert os.listdir(out) == []
+
+    # A leftover destination is replaced, not kept: it is either partial or
+    # stale from a run against a different model_dir.
+    with tempfile.TemporaryDirectory() as src, \
+            tempfile.TemporaryDirectory() as out:
+        _write_vocoder(src, "codec_decode_online", payload="new")
+        _write_vocoder(out, "codec_decode_online", payload="old")
+        omni_mod._copy_vocoder_dir(src, out)
+        with open(os.path.join(out, "codec_decode_online",
+                               "model_weights.pt")) as f:
+            assert f.read() == "new"
+
+    # Quantizing in place must not delete the source.
+    with tempfile.TemporaryDirectory() as same:
+        _write_vocoder(same, "codec_decode_online")
+        omni_mod._copy_vocoder_dir(same, same)
+        assert os.path.isfile(
+            os.path.join(same, "codec_decode_online", "model_weights.pt"))

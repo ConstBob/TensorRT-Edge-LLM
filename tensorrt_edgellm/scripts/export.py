@@ -2505,6 +2505,31 @@ def _export_rnnt_decoder(model_dir: str, out_dir: str, weights: dict,
 # Code2Wav export
 # ---------------------------------------------------------------------------
 
+# Release name first; some checkpoints ship the same payload as ``code2wav/``.
+# Duplicated in ``quantization/qwen3_omni.py`` and the builder's
+# ``models/qwen3_omni_next/weights.py`` -- the quantizer runs in its own venv
+# and does not import the exporter.
+_VOCODER_DIR_ALIASES = ("codec_decode_online", "code2wav")
+_VOCODER_FILES = ("config.yaml", "model_weights.pt")
+
+
+def _has_vocoder_payload(path: str) -> bool:
+    """True when *path* holds both Code2Wav files."""
+    return all(os.path.isfile(os.path.join(path, f)) for f in _VOCODER_FILES)
+
+
+def _resolve_next_vocoder_dir(model_dir: str) -> str:
+    """Return the first vocoder directory under *model_dir* with a payload.
+
+    Falls back to the release name so the caller's error message names the
+    expected location.
+    """
+    for name in _VOCODER_DIR_ALIASES:
+        cand = os.path.join(model_dir, name)
+        if _has_vocoder_payload(cand):
+            return cand
+    return os.path.join(model_dir, _VOCODER_DIR_ALIASES[0])
+
 
 def _export_code2wav(model_dir: str, c2w_out_dir: str, weights: dict,
                      config: dict, model_type: str,
@@ -2552,11 +2577,9 @@ def _export_code2wav(model_dir: str, c2w_out_dir: str, weights: dict,
         # checkpoint), containing ``config.yaml`` + ``model_weights.pt``.
         # Its architecture (SplitResidualVectorQuantizer + Llama-style
         # WindowLimitedTransformer) is incompatible with Qwen3-Omni's vocoder.
-        c2w_dir = os.environ.get(
-            "QWEN3_OMNI_NEXT_CODE2WAV_DIR") or os.path.join(
-                model_dir, "codec_decode_online")
-        if not (os.path.isfile(os.path.join(c2w_dir, "config.yaml"))
-                and os.path.isfile(os.path.join(c2w_dir, "model_weights.pt"))):
+        c2w_dir = (os.environ.get("QWEN3_OMNI_NEXT_CODE2WAV_DIR")
+                   or _resolve_next_vocoder_dir(model_dir))
+        if not _has_vocoder_payload(c2w_dir):
             logger.error(
                 "[Code2Wav] Qwen3-Next Omni vocoder expected config.yaml + "
                 "model_weights.pt under %r (override with the "
