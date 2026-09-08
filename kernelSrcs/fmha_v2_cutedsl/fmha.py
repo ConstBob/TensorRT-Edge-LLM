@@ -579,7 +579,7 @@ class FMHAV2Ampere:
         )
 
     @cute.jit
-    def __call_context_paged__(
+    def _launch_context_paged(
         self,
         q_tensor: cute.Tensor,
         kv_cache_pool: cute.Tensor,
@@ -587,6 +587,7 @@ class FMHAV2Ampere:
         o_tensor: cute.Tensor,
         cum_seqlen_q: cute.Tensor,
         cum_seqlen_k: cute.Tensor,
+        max_seqlen_q: Optional[cutlass.Int32],
         window_size_left: cutlass.Int32,
         attention_scale: cutlass.Float32,
         sm_count: cutlass.Int32,
@@ -611,13 +612,11 @@ class FMHAV2Ampere:
         ):
             raise TypeError("FMHA-v2 paged attention requires Float16 Q, K/V, and O")
         if cutlass.const_expr(
-            not self._is_causal
-            or self._packed_varlen
-            or 128 % self._n_block_size != 0
+            not self._is_causal or 128 % self._n_block_size != 0
         ):
             raise TypeError(
-                "FMHA-v2 paged attention requires causal, non-packed BSND "
-                "Q/O, a 128-token page, and Bc that divides 128"
+                "FMHA-v2 paged attention requires causal Q/O, a 128-token "
+                "page, and Bc that divides 128"
             )
         self._dtype = q_tensor.element_type
 
@@ -700,7 +699,16 @@ class FMHAV2Ampere:
             permutation_mnk=(self._num_threads // 32 * 16, 16, 16),
         )
 
-        if cutlass.const_expr(self._num_output_blocks == 2):
+        if cutlass.const_expr(self._packed_varlen):
+            grid_m = cute.ceil_div(max_seqlen_q, self._m_block_size)
+            if cutlass.const_expr(self._num_output_blocks == 2):
+                grid_m = grid_m * 2
+            grid_dim = (
+                grid_m,
+                cum_seqlen_q.shape[0] - 1,
+                cute.size(q_tensor.shape[1]),
+            )
+        elif cutlass.const_expr(self._num_output_blocks == 2):
             grid_dim = (
                 cute.ceil_div(q_tensor.shape[1], self._m_block_size) * 2,
                 cute.size(q_tensor.shape[2]),
@@ -735,7 +743,7 @@ class FMHAV2Ampere:
             softmax_scale_log2,
             kv_cache_pool.shape[1],
             runtime_window,
-            None,
+            max_seqlen_q,
             sQ_layout,
             sKV_layout,
             sV_layout,
@@ -748,6 +756,63 @@ class FMHAV2Ampere:
             grid=grid_dim,
             block=[self._num_threads, 1, 1],
             stream=stream,
+        )
+
+    @cute.jit
+    def __call_context_paged__(
+        self,
+        q_tensor: cute.Tensor,
+        kv_cache_pool: cute.Tensor,
+        kv_cache_page_list: cute.Tensor,
+        o_tensor: cute.Tensor,
+        cum_seqlen_q: cute.Tensor,
+        cum_seqlen_k: cute.Tensor,
+        window_size_left: cutlass.Int32,
+        attention_scale: cutlass.Float32,
+        sm_count: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self._launch_context_paged(
+            q_tensor,
+            kv_cache_pool,
+            kv_cache_page_list,
+            o_tensor,
+            cum_seqlen_q,
+            cum_seqlen_k,
+            None,
+            window_size_left,
+            attention_scale,
+            sm_count,
+            stream,
+        )
+
+    @cute.jit
+    def __call_context_paged_ragged__(
+        self,
+        q_tensor: cute.Tensor,
+        kv_cache_pool: cute.Tensor,
+        kv_cache_page_list: cute.Tensor,
+        o_tensor: cute.Tensor,
+        cum_seqlen_q: cute.Tensor,
+        cum_seqlen_k: cute.Tensor,
+        max_seqlen_q: cutlass.Int32,
+        window_size_left: cutlass.Int32,
+        attention_scale: cutlass.Float32,
+        sm_count: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self._launch_context_paged(
+            q_tensor,
+            kv_cache_pool,
+            kv_cache_page_list,
+            o_tensor,
+            cum_seqlen_q,
+            cum_seqlen_k,
+            max_seqlen_q,
+            window_size_left,
+            attention_scale,
+            sm_count,
+            stream,
         )
 
     @cute.jit
@@ -2578,6 +2643,35 @@ def _fmha_v2_reference(
     return reference
 
 
+def _fmha_v2_paged_ragged_reference(
+    q: cp.ndarray,
+    k: cp.ndarray,
+    v: cp.ndarray,
+    q_lengths: Tuple[int, ...],
+    kv_lengths: Tuple[int, ...],
+    softmax_scale: float,
+    *,
+    is_causal: bool,
+    window_size_left: int,
+) -> cp.ndarray:
+    """Reference packed paged-Q/O attention against dense per-batch K/V."""
+    reference = cp.zeros(q.shape, dtype=cp.float32)
+    q_start = 0
+    for batch_idx, (q_length, kv_length) in enumerate(zip(q_lengths, kv_lengths)):
+        q_end = q_start + q_length
+        batch_reference = _fmha_v2_reference(
+            q[None, q_start:q_end],
+            k[batch_idx:batch_idx + 1, :kv_length],
+            v[batch_idx:batch_idx + 1, :kv_length],
+            softmax_scale,
+            is_causal=is_causal,
+            window_size_left=window_size_left,
+        )
+        reference[q_start:q_end] = batch_reference[0]
+        q_start = q_end
+    return reference
+
+
 def _report_reference_error(tag: str, actual: cp.ndarray, reference: cp.ndarray):
     """Print and enforce the standalone FP16-vs-FP32 correctness gate."""
     error = cp.abs(actual.astype(cp.float32) - reference)
@@ -2612,6 +2706,9 @@ def run(
     vision_block: bool = False,
     fmha_v2_context: bool = False,
     paged_kv: bool = False,
+    paged_kv_ragged: bool = False,
+    paged_q_seqlens: Optional[Tuple[int, ...]] = None,
+    paged_kv_seqlens: Optional[Tuple[int, ...]] = None,
     fmha_v2_vit: bool = False,
     vit_seqlens: Optional[Tuple[int, ...]] = None,
     window_size_left: int = -1,
@@ -2640,10 +2737,31 @@ def run(
     """
     _tag = f"[{file_name}]"
 
-    if sum((fmha_v2_context, fmha_v2_vit, paged_kv)) > 1:
+    if sum((fmha_v2_context, fmha_v2_vit, paged_kv, paged_kv_ragged)) > 1:
         raise ValueError(
-            f"{_tag} --fmha_v2_context, --fmha_v2_vit, and --paged_kv "
+            f"{_tag} --fmha_v2_context, --fmha_v2_vit, --paged_kv, and "
+            "--paged_kv_ragged "
             "are mutually exclusive"
+        )
+    if paged_kv_ragged:
+        paged_kv = True
+    if paged_q_seqlens is not None and not paged_kv:
+        raise ValueError(f"{_tag} paged_q_seqlens requires --paged_kv or --paged_kv_ragged")
+    if paged_q_seqlens is not None and (
+        len(paged_q_seqlens) != batch_size
+        or any(length <= 0 or length > seqlen_q for length in paged_q_seqlens)
+    ):
+        raise ValueError(
+            f"{_tag} paged_q_seqlens must contain {batch_size} positive lengths no larger than seqlen_q"
+        )
+    if paged_kv_seqlens is not None and not paged_kv:
+        raise ValueError(f"{_tag} paged_kv_seqlens requires --paged_kv or --paged_kv_ragged")
+    if paged_kv_seqlens is not None and (
+        len(paged_kv_seqlens) != batch_size
+        or any(length <= 0 or length > seqlen_k for length in paged_kv_seqlens)
+    ):
+        raise ValueError(
+            f"{_tag} paged_kv_seqlens must contain {batch_size} positive lengths no larger than seqlen_k"
         )
     if fmha_v2_vit and is_causal:
         raise ValueError(f"{_tag} packed ViT mode is bidirectional; do not pass --is_causal")
@@ -2712,24 +2830,49 @@ def run(
 
     h_q = num_head
     h_kv = h_q // kv_group_size
+    q_lengths = paged_q_seqlens or (seqlen_q,) * batch_size
+    kv_lengths = paged_kv_seqlens or (seqlen_k,) * batch_size
+    total_q_seq_len = sum(q_lengths)
+    max_q_seq_len = max(q_lengths)
+    if paged_kv_ragged and not export_only:
+        print(
+            f"{_tag}   packed Q lengths={q_lengths}, packed KV lengths={kv_lengths}, "
+            f"total_q={total_q_seq_len}"
+        )
     if not export_only:
         cp.random.seed(20260723)
         print(f"{_tag}   CuPy random seed=20260723")
 
-    q_dyn, q_arr = _create_bsnd_tensor(
-        batch_size, seqlen_q, h_q, head_dim, dtype, fill_random=not export_only
-    )
+    if paged_kv_ragged:
+        q_dyn, q_arr = _create_shd_tensor(
+            total_q_seq_len, h_q, head_dim, dtype, fill_random=not export_only
+        )
+    else:
+        q_dyn, q_arr = _create_bsnd_tensor(
+            batch_size, seqlen_q, h_q, head_dim, dtype, fill_random=not export_only
+        )
     k_dyn, k_arr = _create_bsnd_tensor(
         batch_size, seqlen_k, h_kv, head_dim, dtype, fill_random=not export_only
     )
     v_dyn, v_arr = _create_bsnd_tensor(
         batch_size, seqlen_k, h_kv, head_dim, dtype, fill_random=not export_only
     )
-    o_dyn, o_arr = _create_bsnd_tensor(
-        batch_size, seqlen_q, h_q, head_dim, dtype, fill_random=False
-    )
-    cu_q_dyn, cu_q_arr = _create_cu_seqlens_tensor(batch_size, seqlen_q)
-    cu_k_dyn, cu_k_arr = _create_cu_seqlens_tensor(batch_size, seqlen_k)
+    if paged_kv_ragged:
+        o_dyn, o_arr = _create_shd_tensor(
+            total_q_seq_len, h_q, head_dim, dtype, fill_random=False
+        )
+    else:
+        o_dyn, o_arr = _create_bsnd_tensor(
+            batch_size, seqlen_q, h_q, head_dim, dtype, fill_random=False
+        )
+    if paged_q_seqlens is not None:
+        cu_q_dyn, cu_q_arr = _create_cu_seqlens_from_lengths(q_lengths)
+    else:
+        cu_q_dyn, cu_q_arr = _create_cu_seqlens_tensor(batch_size, seqlen_q)
+    if paged_kv_seqlens is not None:
+        cu_k_dyn, cu_k_arr = _create_cu_seqlens_from_lengths(kv_lengths)
+    else:
+        cu_k_dyn, cu_k_arr = _create_cu_seqlens_tensor(batch_size, seqlen_k)
     block_begin_dyn = None
     block_end_dyn = None
     if vision_block:
@@ -2742,7 +2885,7 @@ def run(
     page_list_arr = None
     if paged_kv:
         tokens_per_page = 128
-        max_pages_per_seq = (seqlen_k + tokens_per_page - 1) // tokens_per_page
+        max_pages_per_seq = (max(kv_lengths) + tokens_per_page - 1) // tokens_per_page
         physical_pages_per_batch = max_pages_per_seq + 1
         num_pages = batch_size * physical_pages_per_batch
         num_flat_pages = 2 * num_pages
@@ -2764,6 +2907,7 @@ def run(
         page_rng = np.random.default_rng(20260723)
         for batch_idx in range(batch_size):
             physical_base = batch_idx * physical_pages_per_batch
+            logical_pages = (kv_lengths[batch_idx] + tokens_per_page - 1) // tokens_per_page
             k_pages = (
                 physical_base
                 + 1
@@ -2774,7 +2918,9 @@ def run(
                 + 1
                 + page_rng.permutation(max_pages_per_seq)
             )
-            for logical_page in range(max_pages_per_seq):
+            page_list_host[batch_idx, 0].fill(physical_base)
+            page_list_host[batch_idx, 1].fill(num_pages + physical_base)
+            for logical_page in range(logical_pages):
                 # Independent K/V permutations exercise fragmented traversal
                 # while leaving physical_base poisoned.
                 k_page = int(k_pages[logical_page])
@@ -2784,7 +2930,7 @@ def run(
                     num_pages + v_page
                 )
                 token_begin = logical_page * tokens_per_page
-                token_end = min(token_begin + tokens_per_page, seqlen_k)
+                token_end = min(token_begin + tokens_per_page, kv_lengths[batch_idx])
                 live_tokens = token_end - token_begin
                 kv_pool_arr[k_page, :live_tokens, :, :] = k_arr[
                     batch_idx, token_begin:token_end, :, :
@@ -2811,7 +2957,7 @@ def run(
         num_threads=num_threads,
         is_causal=is_causal,
         use_sliding_window=window_size_left >= 0,
-        packed_varlen=fmha_v2_vit,
+        packed_varlen=fmha_v2_vit or paged_kv_ragged,
         skip_rescale=skip_rescale,
         hybrid_exp2=hybrid_exp2,
     )
@@ -2831,7 +2977,23 @@ def run(
 
     print(f"{_tag} Compiling kernel...")
     t0 = time.time()
-    if paged_kv:
+    if paged_kv_ragged:
+        compiled_fa2 = cute.compile(
+            fa2_fwd.__call_context_paged_ragged__,
+            q_dyn,
+            kv_pool_dyn,
+            page_list_dyn,
+            o_dyn,
+            cu_q_dyn,
+            cu_k_dyn,
+            cutlass.Int32(max_q_seq_len),
+            cutlass.Int32(max(window_size_left, 0)),
+            cutlass.Float32(softmax_scale),
+            cutlass.Int32(utils.HardwareInfo().get_device_multiprocessor_count()),
+            current_stream,
+            **compile_options,
+        )
+    elif paged_kv:
         compiled_fa2 = cute.compile(
             fa2_fwd.__call_context_paged__,
             q_dyn,
@@ -2934,7 +3096,21 @@ def run(
     # (compares against a FP32 BSHD reference); this CLI path only smoke-checks
     # that the launch is
     # well-formed when not exporting.
-    if paged_kv:
+    if paged_kv_ragged:
+        compiled_fa2(
+            q_dyn,
+            kv_pool_dyn,
+            page_list_dyn,
+            o_dyn,
+            cu_q_dyn,
+            cu_k_dyn,
+            cutlass.Int32(max_q_seq_len),
+            cutlass.Int32(max(window_size_left, 0)),
+            cutlass.Float32(softmax_scale),
+            cutlass.Int32(utils.HardwareInfo().get_device_multiprocessor_count()),
+            current_stream,
+        )
+    elif paged_kv:
         compiled_fa2(
             q_dyn,
             kv_pool_dyn,
@@ -2987,15 +3163,22 @@ def run(
     cp.cuda.Device().synchronize()
 
     if not skip_ref_check and (paged_kv or fmha_v2_context) and not vision_block:
-        reference = _fmha_v2_reference(
-            q_arr,
-            k_arr,
-            v_arr,
-            softmax_scale,
-            is_causal=is_causal,
-            window_size_left=window_size_left,
+        reference = (
+            _fmha_v2_paged_ragged_reference(
+                q_arr, k_arr, v_arr, q_lengths, kv_lengths, softmax_scale,
+                is_causal=is_causal, window_size_left=window_size_left,
+            )
+            if paged_kv_ragged
+            else _fmha_v2_reference(
+                q_arr, k_arr, v_arr, softmax_scale,
+                is_causal=is_causal, window_size_left=window_size_left,
+            )
         )
-        _report_reference_error(_tag, o_arr, reference)
+        _report_reference_error(
+            _tag,
+            o_arr,
+            reference,
+        )
     elif not skip_ref_check and fmha_v2_vit:
         reference = cp.zeros(o_vit_arr.shape, dtype=cp.float32)
         start = 0
@@ -3023,20 +3206,36 @@ def run(
 
     def generate_tensors():
         if paged_kv:
-            q_w, _ = _create_bsnd_tensor(
-                batch_size, seqlen_q, h_q, head_dim, dtype, fill_random=True
-            )
+            if paged_kv_ragged:
+                q_w, _ = _create_shd_tensor(
+                    total_q_seq_len, h_q, head_dim, dtype, fill_random=True
+                )
+            else:
+                q_w, _ = _create_bsnd_tensor(
+                    batch_size, seqlen_q, h_q, head_dim, dtype, fill_random=True
+                )
             k_w, k_w_arr = _create_bsnd_tensor(
                 batch_size, seqlen_k, h_kv, head_dim, dtype, fill_random=True
             )
             v_w, v_w_arr = _create_bsnd_tensor(
                 batch_size, seqlen_k, h_kv, head_dim, dtype, fill_random=True
             )
-            o_w, _ = _create_bsnd_tensor(
-                batch_size, seqlen_q, h_q, head_dim, dtype, fill_random=False
-            )
-            cu_q_w, _ = _create_cu_seqlens_tensor(batch_size, seqlen_q)
-            cu_k_w, _ = _create_cu_seqlens_tensor(batch_size, seqlen_k)
+            if paged_kv_ragged:
+                o_w, _ = _create_shd_tensor(
+                    total_q_seq_len, h_q, head_dim, dtype, fill_random=False
+                )
+            else:
+                o_w, _ = _create_bsnd_tensor(
+                    batch_size, seqlen_q, h_q, head_dim, dtype, fill_random=False
+                )
+            if paged_q_seqlens is not None:
+                cu_q_w, _ = _create_cu_seqlens_from_lengths(q_lengths)
+            else:
+                cu_q_w, _ = _create_cu_seqlens_tensor(batch_size, seqlen_q)
+            if paged_kv_seqlens is not None:
+                cu_k_w, _ = _create_cu_seqlens_from_lengths(kv_lengths)
+            else:
+                cu_k_w, _ = _create_cu_seqlens_tensor(batch_size, seqlen_k)
             kv_pool_w, kv_pool_w_arr = _create_paged_kv_pool_tensor(
                 num_flat_pages,
                 tokens_per_page,
@@ -3047,7 +3246,8 @@ def run(
             kv_pool_w_arr[:num_pages].fill(cp.float16(-127.0))
             kv_pool_w_arr[num_pages:].fill(cp.float16(109.0))
             for batch_idx in range(batch_size):
-                for logical_page in range(max_pages_per_seq):
+                logical_pages = (kv_lengths[batch_idx] + tokens_per_page - 1) // tokens_per_page
+                for logical_page in range(logical_pages):
                     k_page = int(
                         page_list_host[batch_idx, 0, logical_page]
                     )
@@ -3056,7 +3256,7 @@ def run(
                         - num_pages
                     )
                     token_begin = logical_page * tokens_per_page
-                    token_end = min(token_begin + tokens_per_page, seqlen_k)
+                    token_end = min(token_begin + tokens_per_page, kv_lengths[batch_idx])
                     live_tokens = token_end - token_begin
                     kv_pool_w_arr[k_page, :live_tokens, :, :] = k_w_arr[
                         batch_idx, token_begin:token_end, :, :
@@ -3065,6 +3265,20 @@ def run(
                         num_pages + v_page, :live_tokens, :, :
                     ] = v_w_arr[batch_idx, token_begin:token_end, :, :]
             page_list_w = _wrap_page_list_tensor(cp.asarray(page_list_host))
+            if paged_kv_ragged:
+                return testing.JitArguments(
+                    q_w,
+                    kv_pool_w,
+                    page_list_w,
+                    o_w,
+                    cu_q_w,
+                    cu_k_w,
+                    cutlass.Int32(max_q_seq_len),
+                    cutlass.Int32(max(window_size_left, 0)),
+                    cutlass.Float32(softmax_scale),
+                    cutlass.Int32(utils.HardwareInfo().get_device_multiprocessor_count()),
+                    current_stream,
+                )
             return testing.JitArguments(
                 q_w,
                 kv_pool_w,
@@ -3197,9 +3411,8 @@ def run(
 
     # FMHA forward FLOPs: 4 * B * H * Sq * Sk * D (Q@K^T + P@V, fp32 acc).
     causal_factor = 0.5 if is_causal else 1.0
-    flops = (
-        4.0 * batch_size * h_q * seqlen_q * seqlen_k * head_dim * causal_factor
-    )
+    q_tokens_for_flops = total_q_seq_len if paged_kv_ragged else batch_size * seqlen_q
+    flops = 4.0 * q_tokens_for_flops * h_q * seqlen_k * head_dim * causal_factor
     tflops = flops / (avg_time_us * 1e-6) / 1e12
     print(f"{_tag} avg_time_us: {avg_time_us:.2f}  |  {tflops:.2f} TFLOPS ({dtype})")
     return avg_time_us
@@ -3248,6 +3461,29 @@ def _parse_args(argv=None):
         help="Run/export FP16 FMHA-v2 directly against a 128-token paged NHD KV cache.",
     )
     p.add_argument(
+        "--paged_kv_ragged",
+        action="store_true",
+        help="Export native paged FMHA-v2 with packed [total_q, H, D] Q/O.",
+    )
+    p.add_argument(
+        "--benchmark_paged_kv_ragged",
+        action="store_true",
+        help="Benchmark only native ragged paged FMHA-v2 with packed [total_q, H, D] Q/O. "
+        "Skips the reference check and reports average kernel latency.",
+    )
+    p.add_argument(
+        "--paged_q_seqlens",
+        type=str,
+        default=None,
+        help="Comma-separated packed Q lengths; requires --paged_kv_ragged.",
+    )
+    p.add_argument(
+        "--paged_kv_seqlens",
+        type=str,
+        default=None,
+        help="Comma-separated logical KV lengths; requires --paged_kv or --paged_kv_ragged.",
+    )
+    p.add_argument(
         "--fmha_v2_vit",
         action="store_true",
         help="Export packed-varlen bidirectional ViT FMHA with the optimized-compatible ABI.",
@@ -3286,9 +3522,18 @@ def _parse_args(argv=None):
 
 def main():
     args = _parsed_args
+    if args.benchmark_paged_kv_ragged and (args.paged_kv or args.paged_kv_ragged or args.export_only):
+        raise ValueError("--benchmark_paged_kv_ragged cannot be combined with --paged_kv, "
+                         "--paged_kv_ragged, or --export_only")
     vit_seqlens = None
+    paged_q_seqlens = None
+    paged_kv_seqlens = None
     if args.vit_seqlens is not None:
         vit_seqlens = tuple(int(value) for value in args.vit_seqlens.split(","))
+    if args.paged_q_seqlens is not None:
+        paged_q_seqlens = tuple(int(value) for value in args.paged_q_seqlens.split(","))
+    if args.paged_kv_seqlens is not None:
+        paged_kv_seqlens = tuple(int(value) for value in args.paged_kv_seqlens.split(","))
     run(
         dtype=args.dtype,
         batch_size=args.batch_size,
@@ -3305,6 +3550,9 @@ def main():
         vision_block=args.vision_block,
         fmha_v2_context=args.fmha_v2_context,
         paged_kv=args.paged_kv,
+        paged_kv_ragged=args.paged_kv_ragged or args.benchmark_paged_kv_ragged,
+        paged_q_seqlens=paged_q_seqlens,
+        paged_kv_seqlens=paged_kv_seqlens,
         fmha_v2_vit=args.fmha_v2_vit,
         vit_seqlens=vit_seqlens,
         window_size_left=args.window_size_left,
@@ -3312,7 +3560,7 @@ def main():
         hybrid_exp2=args.hybrid_exp2,
         warmup_iterations=args.warmup_iterations,
         iterations=args.iterations,
-        skip_ref_check=args.skip_ref_check,
+        skip_ref_check=args.skip_ref_check or args.benchmark_paged_kv_ragged,
         use_cold_l2=args.use_cold_l2,
         export_only=args.export_only,
         output_dir=args.output_dir,

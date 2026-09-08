@@ -59,6 +59,16 @@ _FMHA_V2_PAGED_VARIANTS = {
     "fmha_v2_d256_sw_paged",
     "fmha_v2_d512_sw_paged",
 }
+_FMHA_V2_RAGGED_PAGED_VARIANTS = {
+    "fmha_v2_d64_paged_ragged",
+    "fmha_v2_d128_paged_ragged",
+    "fmha_v2_d256_paged_ragged",
+    "fmha_v2_d512_paged_ragged",
+    "fmha_v2_d64_sw_paged_ragged",
+    "fmha_v2_d128_sw_paged_ragged",
+    "fmha_v2_d256_sw_paged_ragged",
+    "fmha_v2_d512_sw_paged_ragged",
+}
 _FMHA_V2_SPECIAL_VARIANTS = {
     "fmha_v2_d256_padding",
     "fmha_v2_vit_d64",
@@ -69,6 +79,7 @@ _FMHA_V2_SPECIAL_VARIANTS = {
     "fmha_v2_d512_bidirectional",
 }
 _FMHA_V2_VARIANTS = (_FMHA_V2_DENSE_VARIANTS | _FMHA_V2_PAGED_VARIANTS
+                     | _FMHA_V2_RAGGED_PAGED_VARIANTS
                      | _FMHA_V2_SPECIAL_VARIANTS)
 _LAYERNORM_SUPPORTED_SMS = [80, 86, 87, 90, 100, 101, 110, 120, 121]
 _LAYERNORM_HIDDEN_SIZES = {4096, 4097, 5120, 7168, 8192}
@@ -393,6 +404,33 @@ def test_fmha_v2_registry_is_complete_for_supported_sms(sm):
         "fmha_v2_d512_sw_paged",
     }
 
+    ragged_paged_variants = [
+        variant for variant in fmha_v2_variants
+        if variant.name in _FMHA_V2_RAGGED_PAGED_VARIANTS
+    ]
+    assert {variant.name
+            for variant in ragged_paged_variants
+            } == _FMHA_V2_RAGGED_PAGED_VARIANTS
+    assert all("--paged_kv_ragged" in variant.script_args
+               for variant in ragged_paged_variants)
+    assert all("--paged_kv" not in variant.script_args
+               for variant in ragged_paged_variants)
+    sliding_ragged_paged_variants = [
+        variant for variant in ragged_paged_variants
+        if "--window_size_left" in variant.script_args
+    ]
+    assert {variant.name
+            for variant in sliding_ragged_paged_variants} == {
+                "fmha_v2_d64_sw_paged_ragged",
+                "fmha_v2_d128_sw_paged_ragged",
+                "fmha_v2_d256_sw_paged_ragged",
+                "fmha_v2_d512_sw_paged_ragged",
+            }
+    assert all(
+        variant.script_args[variant.script_args.index("--window_size_left") +
+                            1] == "4096"
+        for variant in sliding_ragged_paged_variants)
+
     padding_variant = next(variant for variant in fmha_v2_variants
                            if variant.name == "fmha_v2_d256_padding")
     assert "--is_causal" not in padding_variant.script_args
@@ -437,6 +475,8 @@ def test_fmha_v2_d512_registry_uses_32x32_tiles_and_two_warps():
                 "fmha_v2_d512_sw",
                 "fmha_v2_d512_bidirectional",
                 "fmha_v2_d512_paged",
+                "fmha_v2_d512_paged_ragged",
+                "fmha_v2_d512_sw_paged_ragged",
                 "fmha_v2_d512_sw_paged",
             }
     assert all(variant.supported_sms == _FMHA_V2_SUPPORTED_SMS
