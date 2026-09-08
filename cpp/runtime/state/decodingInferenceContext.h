@@ -93,6 +93,62 @@ struct BatchResult
  * Holds request-local sequence metadata, sampling parameters, multimodal
  * embedding references, streaming state, and batch-eviction bookkeeping.
  */
+//! Everything a newly admitted sequence brings when it joins a batch that is already running.
+//!
+//! Only what is per-slot belongs here. Batch-wide settings -- sampling parameters, the LoRA
+//! adapter, numLogprobs -- live on the context itself, so an appended slot inherits them; whether
+//! the arriving request agrees with them is the scheduler's admission decision, made before a seed
+//! is ever built.
+struct SlotSeed
+{
+    std::string systemPrompt;
+
+    //! The prompt, already tokenized. Also seeds the slot's running token history, mirroring how a
+    //! batch built at request start begins each slot at its prompt.
+    std::vector<int32_t> promptTokenIds;
+
+    std::vector<std::string> stopStrings;
+
+    //! Sparse output-vocab bias for this slot; empty for none.
+    std::unordered_map<int32_t, float> logitBias;
+
+    //! Token delivery for this slot; null opts out of streaming.
+    std::shared_ptr<StreamChannel> channel;
+
+    //! Stable sampling seed for this logical request, already resolved through the request's
+    //! per-item and request-level fallbacks; the batch's per-slot seed table receives it verbatim.
+    uint64_t samplingSeed{kDefaultSamplingSeed};
+
+    //! The index results are filed under in completedBatches. Must be unique among live slots and
+    //! results already collected, or two sequences' outputs would land in one bucket.
+    int32_t originalIndex{};
+
+    //! Tokens before this offset already have KV state behind them (a context-cache prefix hit),
+    //! so the slot's working token history starts here; zero for a cold sequence. The full prompt
+    //! still lands in rawBatchedInputIds -- identity, hashing and result assembly need it.
+    int32_t prefillStart{};
+
+    //! Set by buildAdmissionIntent when the request must found its own batch (media under an
+    //! active visual-token pruner). reserveAdmission turns it into a transient refusal before any
+    //! seating, so the head waits rather than joining and silently skipping the pruner.
+    bool admissionRefusedFounderOnly{false};
+
+    //! @name Multimodal admission payload.
+    //! Encoder outputs staged by the runtime's admission preprocess, consumed by the seated
+    //! prefill within the same generation boundary. The tensor references point at the
+    //! multimodal runners' output buffers, which stay untouched until the next admission or
+    //! founding prefill -- the actor admits at most one request per boundary, so the seated
+    //! prefill is always the next consumer. The raw buffers travel too: the context cache
+    //! hashes them so a media prefix is distinguishable from a text prefix over the same ids.
+    //! @{
+    OptionalInputTensor visualEmbeddings;
+    OptionalInputTensor audioEmbeddings;
+    OptionalInputTensors deepstackFeatures;
+    std::vector<imageUtils::ImageData> imageBuffers;
+    std::vector<audioUtils::AudioData> audioBuffers;
+    //! @}
+};
+
 struct DecodingInferenceContext
 {
     std::vector<std::string> systemPrompts;               //!< System prompts for each sequence in batch
@@ -197,6 +253,44 @@ struct DecodingInferenceContext
      * @param loraName LoRA weights name used by this request
      * @param cudaStream CUDA stream for operations
      */
+    //! @brief Add one sequence to a batch that is already running. Returns the new slot's index.
+    //!
+    //! The reverse of eviction, and bound by the same invariant: every per-slot vector grows by
+    //! exactly one entry, so the batch stays rectangular and a later compaction moves every slot's
+    //! state together. Slots already in flight are not touched -- their tokens, progress and
+    //! delivery state stay where they are.
+    //!
+    //! Only for a running batch: the empty batch is built by initialize(), and the per-slot
+    //! logprobs capacity is inherited from an existing slot because sizing it needs deployment
+    //! knowledge the context does not hold.
+    //!
+    //! @throws std::runtime_error if the batch is empty, the prompt is empty, the original index is
+    //!         already taken, or the seed's channel is attached elsewhere. Nothing is modified on
+    //!         any throwing path.
+    int32_t appendSlot(SlotSeed seed);
+
+    //! @brief Exchange every piece of per-slot state between two slots. Self-inverse.
+    //!
+    //! The host half of running one resident slot through machinery that assumes it sits at index
+    //! zero: the paged kernels index the page table by batch position, and the prefill pipeline
+    //! reshapes every tensor to [activeBatchSize, ...] from slot zero up. Swapping a slot down,
+    //! running, and swapping back costs two exchanges of host bookkeeping and page ids -- the KV
+    //! itself never moves -- where widening the pass to reach a higher row would recompute every
+    //! slot below it.
+    //!
+    //! Self-inverse for the same reason KVPageTable::swapRows is: the restore is the same call, so
+    //! there is no saved copy to lose and no way to put things back wrongly.
+    //!
+    //! @throws std::runtime_error if either slot is out of range. A self-swap is a no-op.
+    void swapSlots(int32_t slotA, int32_t slotB);
+
+    //! @brief True when every per-slot vector has exactly activeBatchSize entries.
+    //!
+    //! The rectangularity that appendSlot() and eviction both preserve, stated once so call sites
+    //! can assert it instead of each auditing thirteen vectors. A vector missed by one of the two
+    //! paths shows up here as a loud failure rather than as another slot's tokens.
+    bool perSlotSizesConsistent() const noexcept;
+
     void initialize(int32_t batchSize, int32_t maxGenLength, rt::OptionalInputTensor const& visual,
         rt::OptionalInputTensors const& deepstackFeatures, std::string const& loraName, cudaStream_t cudaStream);
 

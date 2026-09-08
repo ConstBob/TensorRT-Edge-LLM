@@ -190,11 +190,42 @@ bool ManagedKVCacheRequest::beginBatchCompaction(
                                    "batch-compaction preparation");
 }
 
-bool ManagedKVCacheRequest::completeBatchCompaction()
+bool ManagedKVCacheRequest::completeBatchCompaction(std::vector<int32_t> const& keepMapping)
 {
     return hasContextReuse()
-        ? contextRequest().completeBatchCompaction()
+        ? contextRequest().completeBatchCompaction(keepMapping)
         : swaOperationSucceeded(mBoundedSwaPageManager->compactBatch(swaRequest()), "batch compaction");
+}
+
+ContextCacheRequest::AdmitSequenceStatus ManagedKVCacheRequest::admitSequence(std::vector<int32_t> const& tokenIds,
+    std::string const& loraWeightsName, DecodingKvHeadroom const& headroom, int32_t& prefillStart,
+    std::vector<int32_t> const& mediaTokenIds, std::vector<imageUtils::ImageData> const& imageBuffers,
+    std::vector<audioUtils::AudioData> const& audioBuffers)
+{
+    if (!hasContextReuse())
+    {
+        return ContextCacheRequest::AdmitSequenceStatus::kFailed;
+    }
+    return contextRequest().admitSequence(
+        tokenIds, loraWeightsName, headroom, prefillStart, mediaTokenIds, imageBuffers, audioBuffers);
+}
+
+bool ManagedKVCacheRequest::finalizeSequenceAdmission(
+    int32_t slot, int32_t const& lookaheadToken, int32_t fullInputLength)
+{
+    if (!hasContextReuse())
+    {
+        return false;
+    }
+    return contextRequest().finalizeSequenceAdmission(slot, lookaheadToken, fullInputLength);
+}
+
+void ManagedKVCacheRequest::retractSequenceAdmission()
+{
+    if (hasContextReuse())
+    {
+        contextRequest().retractSequenceAdmission();
+    }
 }
 
 bool ManagedKVCacheRequest::finish()

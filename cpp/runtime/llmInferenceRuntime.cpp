@@ -21,6 +21,7 @@
 #include "common/logger.h"
 #include "runtime/llmRankRuntime.h"
 #include "runtime/multiDevice/runtimeCoordinator.h"
+#include "runtime/runtimeStepper.h"
 
 #include <exception>
 #include <utility>
@@ -141,12 +142,22 @@ bool LLMInferenceRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
     }
 }
 
+bool LLMInferenceRuntime::supportsBoundaryScheduling() const noexcept
+{
+    return mCoordinator != nullptr && mCoordinator->supportsBoundaryScheduling();
+}
+
+int32_t LLMInferenceRuntime::worldSize() const noexcept
+{
+    return mCoordinator != nullptr ? mCoordinator->worldSize() : 1;
+}
+
 bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response,
-    cudaStream_t stream, bool outputThinkerEmbeddings)
+    cudaStream_t stream, bool outputThinkerEmbeddings, GenerationBoundaryHook const& boundaryHook)
 {
     ELLM_CHECK(mCoordinator != nullptr, "Runtime coordinator is not initialized.");
     bool const dispatched
-        = mCoordinator->dispatchRequest(request, getProfilingEnabled(), outputThinkerEmbeddings, stream);
+        = mCoordinator->dispatchRequest(request, getProfilingEnabled(), outputThinkerEmbeddings, stream, boundaryHook);
     bool const succeeded = dispatched && mCoordinator->localRanksSucceeded();
     response = LLMGenerationResponse{};
     if (mCoordinator->ownsGlobalRank(0))
@@ -154,6 +165,18 @@ bool LLMInferenceRuntime::handleRequest(LLMGenerationRequest const& request, LLM
         response = mCoordinator->takeRankResponse(0);
     }
     return succeeded;
+}
+
+bool LLMInferenceRuntime::supportsSteppedExecution() const noexcept
+{
+    return mCoordinator != nullptr && mCoordinator->supportsSteppedExecution();
+}
+
+std::unique_ptr<SteppedExecution> LLMInferenceRuntime::beginStepped(
+    LLMGenerationRequest const& request, cudaStream_t stream)
+{
+    ELLM_CHECK(mCoordinator != nullptr, "Runtime coordinator is not initialized.");
+    return mCoordinator->beginStepped(request, getProfilingEnabled(), stream);
 }
 
 std::vector<int32_t> LLMInferenceRuntime::countPromptTokens(LLMGenerationRequest const& request) const
@@ -235,6 +258,16 @@ std::vector<std::vector<int32_t>> const& LLMInferenceRuntime::getBaseModelInputT
 bool LLMInferenceRuntime::hasDraftModel() const
 {
     return rootRuntime().hasDraftModel();
+}
+
+bool LLMInferenceRuntime::supportsSeatedAdmission() const
+{
+    return rootRuntime().supportsSeatedAdmission();
+}
+
+int32_t LLMInferenceRuntime::maxBatchSize() const
+{
+    return rootRuntime().maxBatchSize();
 }
 
 bool LLMInferenceRuntime::ownsGlobalRank(int32_t globalRank) const noexcept

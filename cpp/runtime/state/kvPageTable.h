@@ -102,6 +102,20 @@ public:
     //! @throws std::runtime_error if `slot` or `logicalPage` is out of range
     void clearEntry(int32_t slot, int32_t logicalPage);
 
+    //! @brief Exchange the page lists of two slots. Self-inverse.
+    //!
+    //! Exists because the paged kernels use the batch index as the page-table row directly, so a
+    //! forward pass covering `n` slots only ever reads rows `[0, n)`. Running a pass for one slot
+    //! that lives further up the table therefore needs its row brought down, and put back after.
+    //! Being its own inverse is the point: the same call restores the table, with no copy of the
+    //! displaced row to keep and no way to restore it wrongly.
+    //!
+    //! Only page ids move. The KV itself is addressed by page number out of the shared pool, so
+    //! nothing is copied on the device -- a row is `2 * maxPagesPerSeq` int32s.
+    //!
+    //! @throws std::runtime_error if either slot is outside `[0, maxBatch)`
+    void swapRows(int32_t slotA, int32_t slotB);
+
     //! @brief Validate the host table: every K id is the sentinel or in `[0, numPages)`,
     //!        and every V id is derived from its K id. Dense rows reject live mappings after
     //!        a sentinel; sparse-window rows instead reject duplicate live K ids within a slot.

@@ -254,6 +254,43 @@ int32_t ContextCacheRequest::reuseTokenLength(int32_t slot) const noexcept
     return mPrefillStarts[static_cast<size_t>(slot)];
 }
 
+ContextCacheRequest::AdmitSequenceStatus ContextCacheRequest::admitSequence(std::vector<int32_t> const& tokenIds,
+    std::string const& loraWeightsName, DecodingKvHeadroom const& headroom, int32_t& prefillStart,
+    std::vector<int32_t> const& mediaTokenIds, std::vector<imageUtils::ImageData> const& imageBuffers,
+    std::vector<audioUtils::AudioData> const& audioBuffers)
+{
+    ContextCacheSequenceAdmission const admission
+        = makeContextCacheSequenceAdmission(tokenIds, loraWeightsName, mediaTokenIds, imageBuffers, audioBuffers);
+    ContextCacheCoordinator::AdmitSequenceResult result = mCoordinator.admitSequence(mRequest, admission, headroom);
+    if (result.status != ContextCacheCoordinatorStatus::kOk)
+    {
+        if (result.insufficientCapacity)
+        {
+            return AdmitSequenceStatus::kNoCapacity;
+        }
+        contextCacheOperationSucceeded(result.status, "sequence admission");
+        return AdmitSequenceStatus::kFailed;
+    }
+    mPrefillStarts.push_back(result.prefillStart);
+    prefillStart = result.prefillStart;
+    return AdmitSequenceStatus::kAdmitted;
+}
+
+void ContextCacheRequest::retractSequenceAdmission()
+{
+    ELLM_CHECK(!mPrefillStarts.empty(), "Context cache admission retraction without a recorded admission");
+    mCoordinator.retractSequenceAdmission(mRequest);
+    mPrefillStarts.pop_back();
+}
+
+bool ContextCacheRequest::finalizeSequenceAdmission(
+    int32_t slot, int32_t const& lookaheadToken, int32_t fullInputLength)
+{
+    return contextCacheOperationSucceeded(mCoordinator.finalizeSequenceAdmission(mRequest, slot,
+                                              ContextCacheSequenceAdvance{&lookaheadToken, 1, fullInputLength}),
+        "sequence-admission finalization");
+}
+
 bool ContextCacheRequest::publishHybridMtpEndpoint(
     int32_t slot, int32_t residentStateLength, Tensor const& baseHiddenStates, int32_t boundaryHiddenRow)
 {
@@ -344,9 +381,24 @@ bool ContextCacheRequest::completeDecodeStep(
     publishableCompletedSlots.reserve(static_cast<size_t>(context.activeBatchSize));
     for (int32_t slot = 0; slot < context.activeBatchSize; ++slot)
     {
+        size_t const previousTokenCount = tokenCountsBeforeDecode[static_cast<size_t>(slot)];
+        // A slot cancelled (or failed) at the top of this step is skipped by the decoder and
+        // appends nothing; that is a legal zero advance, not a broken step. Only a slot that was
+        // still live through the step must have produced its lookahead token.
+        if (context.finishedStates[slot] && context.tokenIds[slot].size() == previousTokenCount)
+        {
+            FinishReason const reason = context.slotStreams[slot].terminalReason;
+            ELLM_CHECK(reason == FinishReason::kCancelled || reason == FinishReason::kError,
+                "Managed context-cache decode: only a cancelled or failed slot may advance by zero tokens");
+            // The hold sentinel, not reconstructed arithmetic: a slot that failed before its
+            // admission was finalized (terminal from birth, kError) has no generate length the
+            // committed value could be rebuilt from, and the ledger holds the truth either way.
+            progress.push_back(
+                ContextCacheSequenceAdvance{nullptr, 0, ContextCacheSequenceAdvance::kHoldCommittedStateLength});
+            continue;
+        }
         ELLM_CHECK(!context.tokenIds[slot].empty() && context.currentGenerateLengths[slot] > 0,
             "Managed context-cache decode did not produce a sampled lookahead token");
-        size_t const previousTokenCount = tokenCountsBeforeDecode[static_cast<size_t>(slot)];
         ELLM_CHECK(context.tokenIds[slot].size() > previousTokenCount
                 && context.tokenIds[slot].size() - previousTokenCount
                     <= static_cast<size_t>(std::numeric_limits<int32_t>::max()),
@@ -383,9 +435,17 @@ bool ContextCacheRequest::beginBatchCompaction(
         "batch-compaction preparation");
 }
 
-bool ContextCacheRequest::completeBatchCompaction()
+bool ContextCacheRequest::completeBatchCompaction(std::vector<int32_t> const& keepMapping)
 {
-    return contextCacheOperationSucceeded(mCoordinator.compactBatch(mRequest), "batch compaction");
+    if (!contextCacheOperationSucceeded(mCoordinator.compactBatch(mRequest), "batch compaction"))
+    {
+        return false;
+    }
+    // The coordinator compacted its own per-sequence state; this runtime-side mirror of the
+    // reused-prefix lengths must move with it, or reuseTokenLength(slot) reads an evicted
+    // sequence's prefix after the first eviction.
+    rt::compactVector(keepMapping, mPrefillStarts);
+    return true;
 }
 
 bool ContextCacheRequest::finish()

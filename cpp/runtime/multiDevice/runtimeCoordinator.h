@@ -18,9 +18,11 @@
 #pragma once
 
 #include "runtime/config/deploymentConfig.h"
+#include "runtime/generationBoundary.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/modelArtifacts.h"
 #include "runtime/multiDevice/parallelConfig.h"
+#include "runtime/runtimeStepper.h"
 #include "runtime/state/contextCache/contextCacheConfig.h"
 
 #include <atomic>
@@ -45,6 +47,9 @@ class Tokenizer;
 
 namespace rt
 {
+
+class SteppedExecution;
+class SteppedRequest;
 
 class CollectiveGroup;
 class MultiDevicePluginResources;
@@ -82,8 +87,24 @@ public:
     RuntimeCoordinator& operator=(RuntimeCoordinator&&) = delete;
 
     bool captureDecodingCUDAGraph(cudaStream_t stream = nullptr);
+    //! True when this coordinator can host in-flight admission: the single-rank inline path, or
+    //! thread-launched tensor parallelism where the boundary-decision relay can cross ranks by
+    //! shared memory. MPI-launched ranks live in other processes and are not covered.
+    bool supportsBoundaryScheduling() const noexcept;
+
+    //! True when this coordinator can hand out stepped requests: inline single-rank execution in
+    //! this stage (the stepped multi-rank command stream arrives with a later change).
+    bool supportsSteppedExecution() const noexcept;
+
+    //! Open one request under the stepped control plane. Prepares request state, runs the
+    //! founding prefill, and returns the handle the scheduler drives tick by tick; null on the
+    //! refusals dispatchRequest would have reported as failure.
+    std::unique_ptr<SteppedExecution> beginStepped(
+        LLMGenerationRequest const& request, bool enableProfiling, cudaStream_t stream);
+
     bool dispatchRequest(LLMGenerationRequest const& request, bool enableProfiling,
-        bool outputThinkerEmbeddings = false, cudaStream_t stream = nullptr);
+        bool outputThinkerEmbeddings = false, cudaStream_t stream = nullptr,
+        GenerationBoundaryHook const& boundaryHook = {});
     bool genAndSaveSystemPromptKVCache(
         std::string const& prompt, std::string const& loraWeightsName, cudaStream_t stream = nullptr);
     void setVisualPrunerConfig(VisualPrunerConfig const& config);
@@ -95,6 +116,12 @@ public:
 
     bool ownsGlobalRank(int32_t globalRank) const noexcept;
     bool localRanksSucceeded() const noexcept;
+
+    //! @brief Ranks this plan spans. 1 for a single-device plan.
+    int32_t worldSize() const noexcept
+    {
+        return mWorldSize;
+    }
 
 private:
     using TokenBroadcastFn = std::function<bool(void* buffer, int32_t count, cudaStream_t stream)>;
@@ -114,6 +141,7 @@ private:
         std::vector<int32_t> statuses;
         std::vector<std::string> errors;
         std::vector<cudaStream_t> requestStreams;
+
         bool enableProfiling{false};
         bool outputThinkerEmbeddings{false};
     };
@@ -133,11 +161,12 @@ private:
     void recordWorkerFailure(int32_t rank, std::string message) noexcept;
     void publishWorkerCompletion() noexcept;
     void initializeWorkerTaskBuffers();
-    bool runInline(
-        LLMGenerationRequest const& request, bool enableProfiling, bool outputThinkerEmbeddings, cudaStream_t stream);
+    bool runInline(LLMGenerationRequest const& request, bool enableProfiling, bool outputThinkerEmbeddings,
+        cudaStream_t stream, GenerationBoundaryHook const& boundaryHook);
 
     std::unique_ptr<LLMRankRuntime> createRankRuntime(int32_t globalRank);
     LLMGenerationRequest prepareRequestState(LLMGenerationRequest const& request) const;
+
     void prepareRankRequests(LLMGenerationRequest const& request);
     CollectiveGroup const* collectiveGroup(ParallelType type) const noexcept;
     CollectiveGroup* collectiveGroup(ParallelType type) noexcept;

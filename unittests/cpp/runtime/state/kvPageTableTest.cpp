@@ -528,3 +528,132 @@ TEST(KVPageTableTest, UploadDirtyValidatesAndCopiesOnlyChangedEntries)
     EXPECT_EQ(table.lastUploadEntryCount(), 0U);
     EXPECT_EQ(table.lastUploadRangeCount(), 0U);
 }
+
+// swapRows exists because the paged kernels index the page table by batch index, so a pass covering
+// n slots reads only rows [0, n). Prefilling one slot that lives higher up needs its row brought
+// down and put back.
+
+TEST(KVPageTableTest, SwapRowsExchangesPageListsAndIsItsOwnInverse)
+{
+    constexpr int32_t maxBatch = 4;
+    constexpr int32_t maxPagesPerSeq = 4;
+    constexpr int32_t numPages = maxBatch * maxPagesPerSeq;
+
+    KVPageTable table(maxBatch, maxPagesPerSeq, numPages);
+    std::vector<int32_t> const rowZero{7, 5};
+    std::vector<int32_t> const rowThree{2, 11, 3};
+    table.setRow(0, rowZero.data(), static_cast<int32_t>(rowZero.size()));
+    table.setRow(3, rowThree.data(), static_cast<int32_t>(rowThree.size()));
+
+    table.swapRows(0, 3);
+    EXPECT_EQ(hostEntry(table, 0, 0, 0, maxPagesPerSeq), 2);
+    EXPECT_EQ(hostEntry(table, 0, 0, 1, maxPagesPerSeq), 11);
+    EXPECT_EQ(hostEntry(table, 0, 0, 2, maxPagesPerSeq), 3);
+    EXPECT_EQ(hostEntry(table, 3, 0, 0, maxPagesPerSeq), 7);
+    EXPECT_EQ(hostEntry(table, 3, 0, 1, maxPagesPerSeq), 5);
+
+    // The V half is derived from K, so it has to travel with it or a swapped slot would read
+    // another slot's values.
+    EXPECT_EQ(hostEntry(table, 0, 1, 0, maxPagesPerSeq), 2 + numPages);
+    EXPECT_EQ(hostEntry(table, 3, 1, 0, maxPagesPerSeq), 7 + numPages);
+
+    // Self-inverse: the same call restores the table, which is why no copy of the displaced row has
+    // to be kept across a prefill.
+    table.swapRows(0, 3);
+    EXPECT_EQ(hostEntry(table, 0, 0, 0, maxPagesPerSeq), 7);
+    EXPECT_EQ(hostEntry(table, 0, 0, 1, maxPagesPerSeq), 5);
+    EXPECT_EQ(hostEntry(table, 3, 0, 0, maxPagesPerSeq), 2);
+    EXPECT_EQ(hostEntry(table, 3, 0, 2, maxPagesPerSeq), 3);
+
+    std::string error;
+    EXPECT_TRUE(table.checkInvariants(error)) << error;
+}
+
+TEST(KVPageTableTest, SwapRowsLeavesUnrelatedRowsAndTheTrailingSentinelsAlone)
+{
+    constexpr int32_t maxBatch = 4;
+    constexpr int32_t maxPagesPerSeq = 4;
+    constexpr int32_t numPages = maxBatch * maxPagesPerSeq;
+
+    KVPageTable table(maxBatch, maxPagesPerSeq, numPages);
+    std::vector<int32_t> const rowOne{9};
+    table.setRow(0, rowOne.data(), 1);
+    std::vector<int32_t> const rowTwo{4, 6};
+    table.setRow(2, rowTwo.data(), 2);
+    std::vector<int32_t> const untouched{1, 8, 12};
+    table.setRow(1, untouched.data(), 3);
+
+    table.swapRows(0, 2);
+
+    // Row 1 is a bystander; a swap that moved more than two rows would corrupt a live slot.
+    EXPECT_EQ(hostEntry(table, 1, 0, 0, maxPagesPerSeq), 1);
+    EXPECT_EQ(hostEntry(table, 1, 0, 1, maxPagesPerSeq), 8);
+    EXPECT_EQ(hostEntry(table, 1, 0, 2, maxPagesPerSeq), 12);
+
+    // A shorter list leaves sentinels behind it, and those must move too -- otherwise the swapped-in
+    // row would appear to own pages left over from its predecessor.
+    EXPECT_EQ(hostEntry(table, 2, 0, 0, maxPagesPerSeq), 9);
+    EXPECT_EQ(hostEntry(table, 2, 0, 1, maxPagesPerSeq), -1);
+    EXPECT_EQ(hostEntry(table, 0, 0, 2, maxPagesPerSeq), -1);
+}
+
+TEST(KVPageTableTest, SwapRowsRejectsSlotsOutsideTheTableAndIgnoresASelfSwap)
+{
+    constexpr int32_t maxBatch = 2;
+    constexpr int32_t maxPagesPerSeq = 2;
+    KVPageTable table(maxBatch, maxPagesPerSeq, maxBatch * maxPagesPerSeq);
+    std::vector<int32_t> const row{1};
+    table.setRow(1, row.data(), 1);
+
+    EXPECT_THROW(table.swapRows(0, maxBatch), std::runtime_error);
+    EXPECT_THROW(table.swapRows(-1, 0), std::runtime_error);
+
+    table.swapRows(1, 1);
+    EXPECT_EQ(hostEntry(table, 1, 0, 0, maxPagesPerSeq), 1);
+}
+
+TEST(KVPageTableTest, SwapRowsRefusesASparseWindowTable)
+{
+    // Sparse-window rows carry per-slot page-set maps the row exchange does not move; a swap that
+    // only moved the flat rows would silently desynchronize them, so the table refuses.
+    KVPageTable table(/*maxBatch=*/2, /*maxPagesPerSeq=*/8, /*numPages=*/16, KVPageTable::Mode::kSparseWindow);
+    table.setEntry(/*slot=*/0, /*logicalPage=*/3, /*kPageId=*/1);
+    EXPECT_THROW(table.swapRows(0, 1), std::runtime_error);
+}
+
+TEST(KVPageTableTest, SwapRowsFeedsTheDirtyTrackingUploadDirtyReliesOn)
+{
+    constexpr int32_t maxBatch = 2;
+    constexpr int32_t maxPagesPerSeq = 2;
+    constexpr int32_t numPages = maxBatch * maxPagesPerSeq;
+    KVPageTable table(maxBatch, maxPagesPerSeq, numPages);
+    std::vector<int32_t> const row{3};
+    table.setRow(0, row.data(), 1);
+    table.upload(nullptr); // Clean slate: everything uploaded, nothing dirty.
+
+    table.swapRows(0, 1);
+    table.uploadDirty(nullptr);
+    // A swap tracked only at row granularity uploaded nothing here and left the device stale.
+    EXPECT_GT(table.lastUploadEntryCount(), 0U);
+
+    // Back-to-back swaps with no upload in between restore the uploaded image exactly, so the
+    // entry-level tracking knows there is nothing left to send.
+    table.swapRows(0, 1);
+    table.swapRows(0, 1);
+    table.uploadDirty(nullptr);
+    EXPECT_EQ(table.lastUploadEntryCount(), 0U);
+}
+
+TEST(KVPageTableTest, SwapRowsClearsTheIdentityClaim)
+{
+    constexpr int32_t maxBatch = 2;
+    constexpr int32_t maxPagesPerSeq = 2;
+    KVPageTable table(maxBatch, maxPagesPerSeq, maxBatch * maxPagesPerSeq);
+    table.setIdentity();
+    ASSERT_TRUE(table.isIdentity());
+
+    // Consumers that only accept an identity mapping must fail closed after any relocation, even
+    // one whose two rows happened to hold equivalent contents.
+    table.swapRows(0, 1);
+    EXPECT_FALSE(table.isIdentity());
+}

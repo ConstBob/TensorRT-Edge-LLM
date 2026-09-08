@@ -32,7 +32,9 @@
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/exec/tensorMap.h"
 #include "runtime/features/deepstackBinding.h"
+#include "runtime/generationBoundary.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/managedKVCacheRequest.h"
 #include "runtime/modelArtifacts.h"
 #include "runtime/multiDevice/parallelConfig.h"
 #include "runtime/preprocess/embeddingPreprocessor.h"
@@ -63,6 +65,7 @@ namespace rt
 {
 
 class ContextCacheCoordinator;
+class ContextCacheRequest;
 class ManagedKVCacheRequest;
 class BoundedSwaKVPageManager;
 
@@ -82,6 +85,9 @@ class BoundedSwaKVPageManager;
  * lifetime. handleRequest() defensively rejects accidental overlapping calls before mutating runtime state, but that
  * gate does not authorize concurrent use of this object.
  */
+class RuntimeStepper;
+class SteppedRequest;
+
 class LLMRankRuntime
 {
 public:
@@ -132,8 +138,220 @@ public:
      * handleRequest() is rejected before runtime or response state is mutated; this is not a general thread-safety
      * guarantee.
      */
+    //! One request's generation, advanced a step at a time.
+    //!
+    //! Exists because the decode loop carries state between steps: a thinking-done flag per slot,
+    //! several tokenizer ids, and a stop predicate that closes over them. While those were locals in
+    //! one long function, that state and the loop were forced to share a lifetime by construction.
+    //! As an object they still share one, but it is now the object's, and a caller can hold it
+    //! across steps instead of being obliged to run the loop to the end in a single call.
+    //!
+    //! The prefill preceding the first step also produces a token on most backbones, so a session is
+    //! primed once before it is stepped -- see primeFromPrefill().
+    class GenerationSession final : public GenerationBoundary
+    {
+        //! The stepped control plane's execution facade drives the session through the typed
+        //! stage methods and reads the context it wraps; nothing else reaches in.
+        friend class RuntimeStepper;
+        friend class SteppedRequest;
+
+    public:
+        GenerationSession(LLMRankRuntime& runtime, DecodingInferenceContext& context, DecodingStrategy& strategy,
+            ManagedKVCacheRequest* managedRequest, LLMGenerationRequest const& request,
+            DecodingKvHeadroom const& kvHeadroom, cudaStream_t stream, bool boundarySchedulingActive);
+
+        //! Clears the stop predicate the context holds, which closes over members of this object.
+        ~GenerationSession();
+
+        GenerationSession(GenerationSession const&) = delete;
+        GenerationSession& operator=(GenerationSession const&) = delete;
+
+        //! @brief Consume the token prefill produced, before any decode step runs.
+        //!
+        //! Prefill emits a token on every backbone except the diffusion one, and that token has to
+        //! travel the same cancel/decode/finalize/emit path a decode step would give it. Skipping
+        //! this drops the first token of every request.
+        bool primeFromPrefill();
+
+        //! @brief True once every slot has reached a terminal state, or none are left.
+        bool finished() const;
+
+        //! @brief Advance every live slot by one decode step.
+        bool advance();
+
+        //! @brief Join one new sequence to this running batch and prefill it, without touching the
+        //!        sequences in flight.
+        //!
+        //! Admission plus seating: the context grows a slot (appendSlot), the session's own
+        //! per-slot state grows with it, and prefillSlotInPlace runs the new slot's prompt as a
+        //! seated batch-1 pass. On a failed prefill the slot is marked terminal with kError so the
+        //! next eviction files its result; the batch's other sequences are unaffected either way.
+        //!
+        //! Whether the arriving request may share this batch at all (sampling parameters, adapter,
+        //! step budget) is BatchCompatibility's question, answered before a seed is built.
+        //!
+        //! @throws std::runtime_error for seeds appendSlot rejects, and for deployments
+        //!         prefillSlotInPlace refuses; nothing is modified on those paths.
+        AdmitDecision admitSequence(SlotSeed seed) override;
+
+        //! @brief Move out the results of finished sequences whose original index is >= @p firstIndex.
+        //!
+        //! Sequences admitted mid-flight carry indices above the founding request's range, so this
+        //! is how their results leave the batch without appearing in the founding caller's
+        //! response. Harvested at every boundary by whoever drives the loop.
+        std::unordered_map<int32_t, BatchResult> takeCompletedAtOrAbove(int32_t firstIndex) override;
+
+        AdmitDecision admitRequest(LLMGenerationRequest const& request, int32_t originalIndex) override;
+
+        LLMGenerationResponse materializeResult(
+            BatchResult const& result, std::vector<std::string> const& stopStrings) const override;
+
+        int32_t residentCount() const override
+        {
+            return mContext.activeBatchSize;
+        }
+
+    private:
+        //! The product of admission stage one, and the boundary between "nothing happened" and
+        //! "something must be unwound": validation, tokenization, and the encoder preprocess all
+        //! land here without touching resident state. Discarding an intent leaves the batch
+        //! byte-identical -- the staging buffers its seed references are overwrite-only admission
+        //! scratch, reused by the next admission.
+        struct AdmissionIntent
+        {
+            SlotSeed seed;
+        };
+
+        //! Stage one: validate the request shape and produce the intent (tokenize, or run the
+        //! encoder preprocess for media). Throws on requests the batch rejects outright; resident
+        //! state is untouched on every path.
+        AdmissionIntent buildAdmissionIntent(LLMGenerationRequest const& request, int32_t originalIndex);
+
+        //! Stage two: reserve what the sequence needs before it owns a slot -- the generate-budget
+        //! check, and under a context cache the page lease (setting the intent's prefillStart).
+        //! A refusal leaves the batch untouched; the lease is the one reservation, and its
+        //! rollback (retractSequenceAdmission) belongs to stage three's failure paths.
+        AdmitDecision reserveAdmission(AdmissionIntent& intent);
+
+        //! Stage three: seat and commit. appendSlot is the commit point -- before it, failure
+        //! retracts the lease and nothing was resident; from it on, every failure files as the
+        //! new slot's terminal kError result through the ordinary harvest, so the batch never
+        //! holds a half-admitted sequence.
+        AdmitDecision seatAdmission(AdmissionIntent intent);
+
+        //! What seatSlot leaves for prefillSeated: the committed slot plus everything the seated
+        //! prefill still needs from the seed. Valid until the next admission overwrites the
+        //! admission staging buffers the media references point into -- the seated prefill must
+        //! run before another admission's preprocess.
+        struct PendingSeat
+        {
+            int32_t slot{-1};
+            int32_t prefillStart{0};
+            int32_t rawInputLength{0};
+            bool hasMedia{false};
+            SlotSeed mediaPayload;
+        };
+
+        //! The first half of seating: appendSlot (the commit point) plus the slot's MRope cos/sin
+        //! row. Throws propagate after retracting a context-cache lease, exactly as seatAdmission
+        //! did. The stepped control plane calls this from admit(); the seated prefill becomes the
+        //! next prefill tick.
+        PendingSeat seatSlot(SlotSeed seed);
+
+        //! The second half: the seated batch-1 prefill, the context-cache ledger finalize, and the
+        //! lookahead-token pipeline. On failure the slot is terminal from birth, exactly as in the
+        //! fused path.
+        AdmitDecision prefillSeated(PendingSeat pending);
+
+        void updateThinkingDoneForToken(int32_t batchIdx, int32_t tokenId);
+        void updateThinkingDone();
+        void updateFinishStates();
+        bool performBatchEvictAndSnapshot();
+
+        LLMRankRuntime& mRuntime;
+        DecodingInferenceContext& mContext;
+        DecodingStrategy& mStrategy;
+        ManagedKVCacheRequest* mManagedRequest;
+        LLMGenerationRequest const& mRequest;
+        DecodingKvHeadroom const& mKvHeadroom;
+        cudaStream_t mStream;
+        //! True when a boundary hook drives this loop (in-flight batching). The cancellation
+        //! consensus must then run regardless of the founder's channels: an admitted slot's
+        //! channel lives only on rank zero, and this flag is the one signal every rank computes
+        //! identically.
+        bool mBoundarySchedulingActive;
+
+        int32_t mEndOfChannelId{};
+        int32_t mEndOfThinkId{};
+        int32_t mStartOfChannelId{};
+        int32_t mStartOfThinkId{};
+        int32_t mTrajFutureStartId{};
+        bool mIgnoreEos{};
+        bool mHasActionRequest{};
+    };
+
     bool handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream,
-        bool outputThinkerEmbeddings = false, TokenBroadcastFn tokenBroadcast = nullptr, int32_t parallelRank = -1);
+        bool outputThinkerEmbeddings = false, TokenBroadcastFn tokenBroadcast = nullptr, int32_t parallelRank = -1,
+        GenerationBoundaryHook const& boundaryHook = {});
+
+    //! Everything one request owns between beginGeneration and finishGeneration: the same state
+    //! handleRequest used to keep on its stack, packaged so a stepped control plane can hold a
+    //! request open across ticks. The founding request must outlive this object; member order is
+    //! load-bearing (the stream finalizer references the context and must be destroyed first).
+    struct SteppedGeneration
+    {
+        //! Releases the runtime's one-request-at-a-time latch, whatever path retires the request.
+        struct InProgressGuard
+        {
+            explicit InProgressGuard(std::atomic<bool>& active) noexcept
+                : mActive(active)
+            {
+            }
+
+            ~InProgressGuard() noexcept
+            {
+                mActive.store(false, std::memory_order_release);
+            }
+
+            std::atomic<bool>& mActive;
+        };
+
+        explicit SteppedGeneration(std::atomic<bool>& activeFlag) noexcept
+            : guard(activeFlag)
+        {
+        }
+
+        SteppedGeneration(SteppedGeneration const&) = delete;
+        SteppedGeneration& operator=(SteppedGeneration const&) = delete;
+
+        InProgressGuard guard;
+        DecodingInferenceContext context;
+        DecodingStrategy* strategy{nullptr};
+        std::optional<ManagedKVCacheRequest> managedKVCacheRequest;
+        DecodingKvHeadroom kvHeadroom{};
+        std::optional<StreamChannelFinalizer> streamFinalizer;
+        bool enableSpecDecode{false};
+        bool hasActionRequest{false};
+
+        ManagedKVCacheRequest* managedRequest() noexcept
+        {
+            return managedKVCacheRequest.has_value() ? &*managedKVCacheRequest : nullptr;
+        }
+    };
+
+    //! Everything handleRequest does before the generation loop: validation, context population,
+    //! the context-cache admit, prefill-execution setup, streaming setup, and the founding prefill
+    //! itself. Returns null on any refusal (the same conditions that returned false), and throws
+    //! where handleRequest threw. @p request must outlive the returned object.
+    std::unique_ptr<SteppedGeneration> beginGeneration(LLMGenerationRequest const& request,
+        LLMGenerationResponse& response, cudaStream_t stream, bool outputThinkerEmbeddings,
+        TokenBroadcastFn tokenBroadcast, int32_t parallelRank);
+
+    //! Everything handleRequest does after the loop: the drained-batch check, the context-cache
+    //! finish, metrics, and response assembly from whatever the loop's harvests left in
+    //! completedBatches.
+    bool finishGeneration(SteppedGeneration& generation, LLMGenerationRequest const& request,
+        LLMGenerationResponse& response, cudaStream_t stream);
 
     /*! \brief Return the input size for an explicit text token-count request. */
     std::vector<int32_t> countPromptTokens(LLMGenerationRequest const& request) const;
@@ -241,7 +459,46 @@ public:
         return mDecoderRegistry && mDecoderRegistry->hasSpeculativeDecoder();
     }
 
+    //! @brief Whether this deployment can take boundary admissions via prefillSlotInPlace.
+    //!
+    //! False for the static refusals prefillSlotInPlace would otherwise throw on mid-request:
+    //! draft (speculative) engines, diffusion backbones, and hybrid deployments whose Mamba
+    //! state is not relocatable between batch rows. Probed once at RequestEngine construction so
+    //! an unsupported deployment falls back to the blocking path instead of failing admissions.
+    bool supportsSeatedAdmission() const noexcept;
+
+    //! @brief The batch dimension the engine was built with: the physical bound on how many
+    //! sequences a batch can seat, and therefore on any scheduler's maxBatchSize.
+    int32_t maxBatchSize() const noexcept;
+
 private:
+    //! @brief Prefill one slot of a running batch without recomputing or disturbing the others.
+    //!
+    //! The paged kernels use the batch position as the page-table row, so a pass over n slots can
+    //! only reach rows [0, n) -- and prefill pads every row's query to the batch's longest prompt,
+    //! so widening the pass to reach a higher row would cost every resident a full prompt's worth
+    //! of compute per admission. Instead the slot is seated at index zero for the duration of one
+    //! batch-1 prefill: host bookkeeping, page-table rows and the device KV length are exchanged
+    //! with slot zero, the ordinary prefill machinery runs, and the same exchanges restore the
+    //! seating. The restores run on failure too, so a failed prefill leaves the batch intact.
+    //!
+    //! The kvcache_start_index binding reads the device KV lengths directly, so the seated slot
+    //! prefills from @p prefillStart down the ordinary chunked-prefill path; nothing about the
+    //! pass knows it is an admission. A non-zero start is a context-cache prefix hit: the
+    //! coordinator leased the slot's pages (shared prefix included) and bound its row before this
+    //! call, so the pass computes only the tail the cache did not cover.
+    //!
+    //! @throws std::runtime_error if the deployment carries a draft engine (draft-side state has
+    //!         no swap yet) or if @p prefillStart is non-zero without a context cache to have
+    //!         leased the pages behind it.
+    bool prefillSlotInPlace(DecodingInferenceContext& context, int32_t slot, int32_t prefillStart = 0,
+        SlotSeed const* mediaPayload = nullptr);
+
+    //! @brief Run one request's decode loop to completion.
+    bool runGenerationLoop(DecodingInferenceContext& context, DecodingStrategy& decodingStrategy,
+        ManagedKVCacheRequest* managedRequest, LLMGenerationRequest const& request,
+        DecodingKvHeadroom const& kvHeadroom, cudaStream_t stream, GenerationBoundaryHook const& boundaryHook);
+
     void initializeFromEngineDir(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap,
         std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream,
@@ -279,6 +536,14 @@ private:
     std::unique_ptr<SharedResources> mSharedResources; //!< KV caches / RoPE / LoRA / context memory
     //! Declared after SharedResources so SWA page ownership is released before the physical buffers.
     std::unique_ptr<BoundedSwaKVPageManager> mBoundedSwaKVPageManager;
+
+    //! Admission-scoped MRope staging ([1, maxKVCacheCapacity, rotaryDim]): the admission
+    //! preprocess writes here so the resident batch's rope rows stay intact until the seating
+    //! copies the row into place. Allocated on the first multimodal admission of an MRope
+    //! deployment; other deployments never pay for it.
+    Tensor mAdmissionMropeStage;
+    //! Row scratch for the seated prefill's MRope row exchange ([maxKVCacheCapacity, rotaryDim]).
+    Tensor mMropeRowSwapScratch;
     //! Declared after SharedResources so context-cache ownership is released before the physical buffers.
     std::unique_ptr<ContextCacheCoordinator> mContextCache;
     std::unique_ptr<PipelineIO> mPipelineIO; //!< Per-pipeline I/O tensors
@@ -401,8 +666,22 @@ private:
     //! Runs multimodal preprocessing when audio or vision inputs are present.
     //! For text-only requests on MRope-based multimodal models, restores text-only RoPE state
     //! and clears stale multimodal request state.
-    bool multiModalRuntimePreprocess(
-        LLMGenerationRequest const& request, DecodingInferenceContext& context, cudaStream_t stream);
+    //! @brief Stage a joining request's media through the full multimodal preprocess -- encoders,
+    //!        encoder-embedding cache, media-token expansion, MRope -- against a temporary batch-1
+    //!        context, leaving the resident batch untouched.
+    //!
+    //! On success the seed carries the expanded prompt tokens and references to the runners'
+    //! output embeddings; MRope cos/sin lands in mAdmissionMropeStage for the seating to copy
+    //! into the resident cache's new row.
+    //! @param request A single-sequence request (the joining head, already chat-formatted).
+    bool preprocessAdmissionMedia(LLMGenerationRequest const& request, SlotSeed& seed, cudaStream_t stream);
+
+    //! @param mropeCosSinOverride When set, MRope cos/sin output is written here instead of the
+    //!        batch-resident mPipelineIO->mropeCosSin. The admission preprocess uses this: it runs
+    //!        mid-generation against a temporary batch-1 context, and writing the resident cache
+    //!        would clobber the running batch's rows.
+    bool multiModalRuntimePreprocess(LLMGenerationRequest const& request, DecodingInferenceContext& context,
+        cudaStream_t stream, OptionalOutputTensor mropeCosSinOverride = std::nullopt);
 
     // Consume system prompt, produce the hash table of system prompt KVCache if kv cache reuse is enabled.
     //! @throws std::runtime_error if a CUDA operation fails
