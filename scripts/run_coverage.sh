@@ -20,6 +20,11 @@
 # Usage:
 #   ./scripts/run_coverage.sh [--trt-package-dir <path>] [--cuda-version <ver>]
 #                              [--build-dir <dir>] [--gtest-filter <filter>]
+#                              [--scope <cpp subdir>]
+#
+#   --scope reports on one subtree only, e.g. `--scope runtime`. It cuts report
+#   generation from minutes to seconds while iterating; header-inline code is
+#   undercounted, so drop it for a number worth quoting.
 #
 # Environment variables (alternative to flags):
 #   TRT_PACKAGE_DIR   Path to TensorRT package (required)
@@ -31,6 +36,7 @@
 #   - sonarqube-coverage.xml  (SonarQube generic coverage format)
 #   - coverage.xml            (Cobertura XML)
 #   - coverage.html           (HTML report for local viewing)
+#   - lcov.info               (LCOV, for editor gutter plugins)
 #
 # SonarQube picks up coverage from:
 #   sonar.coverageReportPaths=<build-dir>/sonarqube-coverage.xml
@@ -50,6 +56,7 @@ ENABLE_CUTE_DSL="${ENABLE_CUTE_DSL:-fmha}"
 CUTE_DSL_ARTIFACT_TAG="${CUTE_DSL_ARTIFACT_TAG:-}"
 GTEST_FILTER="${GTEST_FILTER:-*}"
 JOBS="$(nproc 2>/dev/null || echo 8)"
+SCOPE="${SCOPE:-}"
 
 # ---------------------------------------------------------------------------
 # Parse arguments
@@ -66,12 +73,26 @@ while [[ $# -gt 0 ]]; do
             GTEST_FILTER="$2"; shift 2 ;;
         --jobs|-j)
             JOBS="$2"; shift 2 ;;
+        --scope)
+            SCOPE="$2"; shift 2 ;;
         -h|--help)
-            head -28 "$0" | tail -20; exit 0 ;;
+            # Print the whole leading doc block rather than a fixed line range,
+            # which silently truncates whenever the block grows.
+            awk '/^# run_coverage.sh/,/^set -euo/' "$0" | grep '^#'; exit 0 ;;
         *)
             echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
+
+# Checked before anything is built: the object directory --scope resolves to does
+# not exist until after the build, and a typo should not cost a full build and
+# test run to discover.
+if [[ -n "${SCOPE}" ]]; then
+    if [[ ! -d "${PROJECT_ROOT}/cpp/${SCOPE#cpp/}" ]]; then
+        echo "ERROR: --scope ${SCOPE} is not a directory under cpp/" >&2
+        exit 1
+    fi
+fi
 
 if [[ -z "${TRT_PACKAGE_DIR}" ]]; then
     echo "ERROR: TRT_PACKAGE_DIR is not set." >&2
@@ -165,6 +186,36 @@ GCOVR_COMMON=(
     --gcov-ignore-parse-errors=all
 )
 
+# --scope narrows the report to one source subtree and, more importantly, points
+# gcovr at just that subtree's object directory. Nearly all of gcovr's runtime is
+# spent walking and parsing every .gcno/.gcda in the build; --filter alone does
+# not avoid that, because it only selects what reaches the report. Restricting
+# the search path takes a whole-project pass from minutes to seconds.
+#
+# The narrowed numbers match the full run exactly for .cpp files. They undercount
+# code that lives in headers, whose inline and template instantiations are also
+# compiled into translation units outside the scoped directory. Use it while
+# iterating on an area; drop it for a number worth quoting.
+if [[ -n "${SCOPE}" ]]; then
+    SCOPE="${SCOPE#cpp/}"
+    SCOPE="${SCOPE%/}"
+    GCOV_SEARCH_PATH="${BUILD_DIR}/cpp/CMakeFiles/edgellmCore.dir/${SCOPE}"
+    if [[ ! -d "${GCOV_SEARCH_PATH}" ]]; then
+        echo "ERROR: --scope ${SCOPE} has no object directory at ${GCOV_SEARCH_PATH}" >&2
+        exit 1
+    fi
+    GCOVR_COMMON=(
+        --root "${PROJECT_ROOT}"
+        --filter "${PROJECT_ROOT}/cpp/${SCOPE}/"
+        --exclude '.*\.cu$'
+        --gcov-executable gcov
+        --gcov-ignore-errors=no_working_dir_found
+        --gcov-ignore-parse-errors=all
+        "${GCOV_SEARCH_PATH}"
+    )
+    echo "==> Scoped to cpp/${SCOPE} (headers undercounted; see --scope notes)"
+fi
+
 echo "    Generating SonarQube generic coverage XML"
 gcovr "${GCOVR_COMMON[@]}" \
     --sonarqube "${BUILD_DIR}/sonarqube-coverage.xml"
@@ -178,9 +229,17 @@ echo "    Generating HTML report"
 gcovr "${GCOVR_COMMON[@]}" \
     --html-details "${BUILD_DIR}/coverage.html"
 
+# LCOV is what editor gutter plugins read (VS Code Coverage Gutters and
+# equivalents). Source paths are absolute, so the file is tied to the checkout
+# it was produced from; regenerate rather than copy it between machines.
+echo "    Generating LCOV info file"
+gcovr "${GCOVR_COMMON[@]}" \
+    --lcov "${BUILD_DIR}/lcov.info"
+
 echo "    SonarQube report : ${BUILD_DIR}/sonarqube-coverage.xml"
 echo "    Cobertura XML    : ${BUILD_DIR}/coverage.xml"
 echo "    HTML report      : ${BUILD_DIR}/coverage.html"
+echo "    LCOV info        : ${BUILD_DIR}/lcov.info"
 
 # ---------------------------------------------------------------------------
 # Summary

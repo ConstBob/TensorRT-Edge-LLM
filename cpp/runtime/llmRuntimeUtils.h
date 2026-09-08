@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <iosfwd>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <optional>
@@ -200,6 +201,7 @@ struct LLMGenerationRequest
 
     //! Number of top log-probabilities to return per generated token (0 = disabled, max = kMaxLogprobsK).
     //! Logprobs are computed as log(softmax(logits)) and returned in LLMGenerationResponse::logprobs.
+    //! Values above the maximum are clamped to it; values below zero are treated as disabled, like zero.
     int32_t numLogprobs{0};
 
     //! Per-slot streaming channels. Size 0 disables streaming globally.
@@ -272,6 +274,7 @@ enum class RopeType
     kMRope,        //!< MRope type used by Qwen2-VL
     kNoRope,       //!< No positional encoding (e.g., Nemotron-Nano)
     kYarn,         //!< YaRN NTK-by-parts scaling
+    kLlama3,       //!< Llama-3 wavelength-banded scaling
 };
 
 /*! \brief Long-Rope specific parameters */
@@ -283,6 +286,24 @@ struct LongRopeParams
 };
 
 /*! \brief YaRN specific parameters (NTK-by-parts interpolation) */
+//! Llama-3 rope scaling, which rescales the inverse frequencies by wavelength band rather than by position.
+//!
+//! Long-wavelength components are divided by `factor`, short-wavelength ones are left alone, and the band between
+//! is interpolated. The split is stated in units of the pre-scaling training length: a component is "long" when its
+//! wavelength exceeds `originalMaxPositionEmbeddings / lowFreqFactor`.
+//!
+//! This applies at every position, not only past the original context: the affected bands are chosen by wavelength,
+//! and a short sequence uses the same inverse frequencies as a long one.
+//! `collectRopeConfig` requires all four to be stated; the values below are the Llama-3.1 ones, kept only so a
+//! directly constructed instance is not left uninitialized.
+struct Llama3Params
+{
+    int32_t originalMaxPositionEmbeddings{-1}; //!< Pre-scaling training length; the wavelength reference
+    float factor{8.0F};                        //!< Divisor applied to the long-wavelength bands
+    float lowFreqFactor{1.0F};                 //!< Sets the wavelength above which a band is fully scaled
+    float highFreqFactor{4.0F};                //!< Sets the wavelength below which a band is untouched
+};
+
 struct YarnParams
 {
     int32_t originalMaxPositionEmbeddings{-1}; //!< Pre-YaRN training length; the interpolation reference
@@ -305,6 +326,7 @@ struct RopeConfig
     int32_t maxPositionEmbeddings{32768};     //!< Maximum position embeddings supported
     std::optional<LongRopeParams> longRope{}; //!< Long-Rope specific parameters
     std::optional<YarnParams> yarn{};         //!< YaRN specific parameters
+    std::optional<Llama3Params> llama3{};     //!< Llama-3 scaling parameters
 };
 
 /*! \brief Collect rope configuration from the model config
@@ -350,6 +372,10 @@ bool initializeNopeCosSinCache(rt::Tensor& cosSinCache, cudaStream_t stream) noe
  */
 bool initializeLongRopeCosSinCache(
     rt::Tensor& shortCosSinCache, rt::Tensor& longCosSinCache, RopeConfig const& config, cudaStream_t stream);
+
+//! Name the rope variant rather than its underlying integer, so assertion and log
+//! output identifies the type directly.
+std::ostream& operator<<(std::ostream& os, RopeType const& type);
 
 /*!
  * @brief Format rope configuration into string

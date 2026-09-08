@@ -31,6 +31,9 @@ bool loadAudioDataFromBytes(uint8_t const* bytes, size_t size, int32_t targetSam
     auto pcm = std::make_shared<audio::AudioPCM>();
     if (!audio::loadAudioBytes(bytes, size, targetSampleRate, *pcm))
     {
+        // Drop whatever `out` was carrying. A caller that reuses one AudioData across loads and misses the return
+        // value would otherwise hand the previous file's samples to the audio runner as if they were this one's.
+        out.pcm.reset();
         return false;
     }
     out.pcm = std::move(pcm);
@@ -43,6 +46,9 @@ bool loadAudioDataFromFile(std::filesystem::path const& path, int32_t targetSamp
     auto pcm = std::make_shared<audio::AudioPCM>();
     if (!audio::loadAudioFile(path, targetSampleRate, *pcm))
     {
+        // Drop whatever `out` was carrying. A caller that reuses one AudioData across loads and misses the return
+        // value would otherwise hand the previous file's samples to the audio runner as if they were this one's.
+        out.pcm.reset();
         return false;
     }
     out.pcm = std::move(pcm);

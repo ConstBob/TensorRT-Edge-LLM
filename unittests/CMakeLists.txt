@@ -140,7 +140,8 @@ edgellm_add_unit_test(
   cpp/runtime/config
   cpp/runtime/exec
   cpp/runtime/decoding
-  cpp/runtime/multiDevice)
+  cpp/runtime/multiDevice
+  cpp/runtime/weight)
 
 edgellm_add_unit_test(NAME unitTestRuntimeState DIRS cpp/runtime/state)
 
