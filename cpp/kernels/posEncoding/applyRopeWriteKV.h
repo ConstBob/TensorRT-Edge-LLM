@@ -170,11 +170,14 @@ void launchApplyRopeQOnlyTreeDecoding(
 //!             Pass nullptr for FP16 Q via qScratch.
 //! @param[in]  qScale       Q dequant scale (quant→orig). Only used when @p fp8QOut is non-null.
 //! @param[in]  qNormGamma   Optional FP16 device pointer [headDim] for per-head RMSNorm gamma applied to Q
-//!             BEFORE RoPE. When non-null, qk_norm is computed inside this kernel via warp-shuffle
-//!             reduction across the headDim/vec_size threads of blockDim.x.
+//!             BEFORE RoPE (or AFTER when @p qkNormPostRope is true). When non-null, qk_norm is computed
+//!             inside this kernel via warp-shuffle reduction across the headDim/vec_size threads of
+//!             blockDim.x.
 //! @param[in]  kNormGamma   Optional FP16 device pointer [headDim] for per-head RMSNorm gamma applied to K
-//!             BEFORE RoPE. Same conventions as @p qNormGamma. V is never RMSNormed.
+//!             with the same ordering as @p qNormGamma. V is never RMSNormed.
 //! @param[in]  rmsNormEps   Epsilon for the RMSNorm formula. Ignored when both gamma pointers are null.
+//! @param[in]  qkNormPostRope QK-norm order: false = norm then rotate (Qwen3 convention), true = rotate
+//!             then norm (HunYuan V1). Ignored when both gamma pointers are null.
 //! @param[in]  cuQSeqLens   Optional INT32 tensor [batchSize + 1] carrying actual cumulative Q lengths for
 //!             ragged prefill. Rows at or beyond the actual per-batch length have Q zeroed and skip all K/V writes.
 //! @param[in]  writeKVCache Whether to persist K/V through @p pageTable. Shared-KV consumers pass false because
@@ -187,7 +190,8 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
     float kScale, float vScale, cudaStream_t stream, int32_t const* pageTable, int32_t maxPagesPerSeq,
     void* kScratchOut = nullptr, void* vScratchOut = nullptr, void* fp8QOut = nullptr, float qScale = 1.0f,
     half const* qNormGamma = nullptr, half const* kNormGamma = nullptr, float rmsNormEps = 1e-6f,
-    rt::OptionalInputTensor cuQSeqLens = std::nullopt, bool writeKVCache = true, bool enablePdl = false);
+    bool qkNormPostRope = false, rt::OptionalInputTensor cuQSeqLens = std::nullopt, bool writeKVCache = true,
+    bool enablePdl = false);
 
 } // namespace kernel
 } // namespace trt_edgellm

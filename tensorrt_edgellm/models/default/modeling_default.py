@@ -278,6 +278,10 @@ class Attention(nn.Module):
         # default-free kwarg in the FX graph (torch.export strips default-matching kwargs).
         self._rms_norm_eps = float(
             config.rms_norm_eps) if config.has_qk_norm else 1e-6
+        # HunYuan V1 applies the per-head QK RMSNorm AFTER RoPE (gamma placement
+        # differs from the Qwen3 norm-then-rotate convention).
+        self._qk_norm_post_rope = int(
+            bool(getattr(config, "qk_norm_post_rope", False)))
 
         # Per-head q/k_norm gamma weights as plain list[float] (NOT tensors): the
         # attention_plugin custom-op needs literal List[float] kwargs at trace time.
@@ -368,6 +372,8 @@ class Attention(nn.Module):
             kwargs["k_norm_gamma"] = self._k_norm_gamma_list
             kwargs["rms_norm_eps"] = float(self._rms_norm_eps)
             kwargs["enable_qk_norm"] = 1
+            if self._qk_norm_post_rope:
+                kwargs["qk_norm_post_rope"] = 1
 
         attn_output, present_key_value = attention_plugin(
             qkv,

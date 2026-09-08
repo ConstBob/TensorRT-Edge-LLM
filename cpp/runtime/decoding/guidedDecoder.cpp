@@ -600,15 +600,26 @@ void GuidedDecoder::Impl::ensureCompiler()
         {
             int32_t const* const end = outputToFull + outputVocabSize;
             auto const* const it = std::find(outputToFull, end, static_cast<int32_t>(fullEosId));
-            ELLM_CHECK(it != end,
-                "EOS token missing from the engine's reduced vocabulary; the engine's vocab_map is inconsistent "
-                "with its tokenizer");
+            if (it == end)
+            {
+                // A stop token pruned from the reduced vocabulary can never be generated,
+                // so it is safe to drop from the grammar's stop set (models may declare
+                // several EOS ids, e.g. via generation_config.json). At least one EOS must
+                // survive — enforced below.
+                LOG_WARNING(
+                    "Guided decoding: EOS token %d is not in the engine's reduced vocabulary; skipping it in the "
+                    "grammar stop set.",
+                    static_cast<int32_t>(fullEosId));
+                continue;
+            }
             outputId = static_cast<int32_t>(it - outputToFull);
         }
         ELLM_CHECK(outputId >= 0 && outputId < outputVocabSize, "EOS token falls outside the output vocabulary");
         stopTokenIds.push_back(outputId);
     }
-    ELLM_CHECK(!stopTokenIds.empty(), "Guided decoding requires at least one EOS token");
+    ELLM_CHECK(!stopTokenIds.empty(),
+        "Guided decoding requires at least one EOS token inside the output vocabulary; the engine's vocab_map is "
+        "inconsistent with its tokenizer");
 
     // RAW: our tokenizer already resolves byte-level and byte-fallback pieces to raw bytes at
     // load time and discards the display form, so any other vocab type would decode twice.

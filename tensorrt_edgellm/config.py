@@ -86,6 +86,16 @@ QUANT_MIXED = "mixed_precision"
 # Default RoPE base frequency (used when config omits rope_theta)
 _DEFAULT_ROPE_THETA = 10000.0
 
+# Model families whose per-head QK RMSNorm runs AFTER RoPE (HunYuan V1);
+# the default (Qwen3 convention) normalizes before rotation.
+_QK_NORM_POST_ROPE_MODEL_TYPES = frozenset({"hunyuan_v1_dense"})
+
+# Model families that store the per-head QK norms under the HunYuan
+# ``query_layernorm`` / ``key_layernorm`` key names. Kept in sync with the
+# ``_hunyuan_key_remap`` dispatch in model.py — QK-norm detection must not
+# fire for families whose loader would not remap these keys onto q/k_norm.
+_QUERY_LAYERNORM_KEY_MODEL_TYPES = frozenset({"hunyuan_v1_dense"})
+
 # Layer-type labels
 LAYER_ATTN = "attention"
 LAYER_MAMBA = "mamba"
@@ -634,6 +644,10 @@ class ModelConfig:
     # Per-head RMSNorm after Q and K projections.
     # Auto-detected from checkpoint key names; not inferred from model_type.
     has_qk_norm: bool = False
+    # QK-norm order relative to RoPE. False (Qwen3 convention): norm then
+    # rotate. True (HunYuan V1): rotate then norm — gamma placement differs,
+    # so the attention plugin must apply the norm after rotation.
+    qk_norm_post_rope: bool = False
     # Per-head RMSNorm after V projection. Gemma4 stores this norm without
     # learned weights, so it is selected from config metadata instead of
     # checkpoint key names.
@@ -1049,8 +1063,9 @@ class ModelConfig:
 
         ``default_attention_scale`` is a required model-family callable
         accepting ``head_dim``. ``has_qk_norm`` is auto-detected by scanning
-        the safetensors key index for ``.q_norm.weight`` entries; no
-        model-type assumptions are made here.
+        the safetensors key index for ``.q_norm.weight`` entries; the HunYuan
+        ``.query_layernorm.weight`` spelling is honored only for model types
+        whose loader remaps it (see :func:`_detect_has_qk_norm`).
         """
         root, llm_dict = load_checkpoint_config_dicts(model_dir)
 
@@ -1096,7 +1111,7 @@ class ModelConfig:
                                      layer_types,
                                      model_dir=model_dir)
         gdn_cfg = _parse_gdn_cfg(llm_dict, layer_types)
-        has_qk_norm = _detect_has_qk_norm(model_dir)
+        has_qk_norm = _detect_has_qk_norm(model_dir, model_type)
         has_value_norm = _get_has_value_norm(llm_dict, model_type)
         default_attention_scale_value = float(
             default_attention_scale(head_dim))
@@ -1251,6 +1266,7 @@ class ModelConfig:
             sliding_rope_config=dual_rope_configs.get("sliding_rope_config"),
             full_rope_config=dual_rope_configs.get("full_rope_config"),
             has_qk_norm=has_qk_norm,
+            qk_norm_post_rope=(model_type in _QK_NORM_POST_ROPE_MODEL_TYPES),
             has_value_norm=has_value_norm,
             attention_bias=bool(llm_dict.get("attention_bias", False)),
             attention_scaling=attention_scaling,
@@ -2074,14 +2090,20 @@ def _get_partial_rotary_factor(llm_dict: Dict[str, Any]) -> float:
     return 1.0
 
 
-def _detect_has_qk_norm(model_dir: str) -> bool:
-    """Detect QK-norm by scanning checkpoint key names for ``.q_norm.weight``.
+def _detect_has_qk_norm(model_dir: str, model_type: str = "") -> bool:
+    """Detect QK-norm by scanning checkpoint key names.
 
-    This is model-agnostic: any architecture that stores per-head Q/K norms
-    as ``*.q_norm.weight`` buffers will be detected correctly.
+    ``*.q_norm.weight`` (Qwen3 convention) is model-agnostic. The HunYuan V1
+    ``*.query_layernorm.weight`` spelling is only honored for model families
+    whose loader remaps it onto ``q_norm`` (see ``_hunyuan_key_remap``);
+    other families using that key name for unrelated norms must not trip
+    the fused QK-norm path.
     """
-    return any(".q_norm.weight" in k
-               for k in _checkpoint_weight_keys(model_dir))
+    keys = _checkpoint_weight_keys(model_dir)
+    if any(".q_norm.weight" in k for k in keys):
+        return True
+    return (model_type in _QUERY_LAYERNORM_KEY_MODEL_TYPES
+            and any(".query_layernorm.weight" in k for k in keys))
 
 
 def _checkpoint_weight_keys(model_dir: str) -> List[str]:

@@ -890,6 +890,15 @@ PUBLIC_CHECKPOINTS_BY_HF_ID = {
     "Qwen/Qwen3.6-35B-A3B": {
         "torch": ("Qwen3.6-35B-A3B", ),
     },
+    "tencent/HY-MT1.5-7B": {
+        "torch": ("HY-MT1.5-7B", ),
+    },
+    "tencent/Hy-MT2-1.8B": {
+        "torch": ("Hy-MT2-1.8B", ),
+    },
+    "tencent/Hy-MT2-7B": {
+        "torch": ("Hy-MT2-7B", ),
+    },
     "Tengyunw/qwen3_8b_eagle3": {
         "torch": (
             "Qwen3/qwen3_8b_eagle3",

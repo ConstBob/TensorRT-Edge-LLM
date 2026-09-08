@@ -569,7 +569,8 @@ int32_t QsaAttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, Plugi
     kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor, rt::OptionalInputTensor{}, rt::OptionalInputTensor{},
         packedQKVTensor, qInputTensor, presentKVCacheTensor, 1.0F /* kScale */, 1.0F /* vScale */, stream, pageTable,
         maxPagesPerSeq, kInputTensor.rawPointer(), vInputTensor.rawPointer(), nullptr /* fp8QOut */, 1.0F /* qScale */,
-        qNormGammaDevicePtr, kNormGammaDevicePtr, mRmsNormEps, rt::OptionalInputTensor{cuQSeqLensTensor});
+        qNormGammaDevicePtr, kNormGammaDevicePtr, mRmsNormEps, false /* qkNormPostRope */,
+        rt::OptionalInputTensor{cuQSeqLensTensor});
 
     // ---- Stage 2: QSA indexer — per-query top-512 block selection expanded to the int32
     // token-index lists (padding rows all -1). ----
