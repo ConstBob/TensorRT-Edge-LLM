@@ -172,15 +172,7 @@ inline void writeTokenizerFiles(std::filesystem::path const& dir)
     std::ofstream(dir / "tokenizer_config.json")
         << R"JSON({"eos_token": {"content": "<eos>"}, "bos_token": {"content": "<bos>"}})JSON";
 
-    std::ofstream(dir / "processed_chat_template.json") << R"JSON({
-  "model_path": "unit",
-  "roles": {
-    "system": {"prefix": "", "suffix": ""},
-    "user": {"prefix": "", "suffix": ""},
-    "assistant": {"prefix": "", "suffix": ""}
-  },
-  "generation_prompt": ""
-})JSON";
+    std::ofstream(dir / "chat_template.jinja") << "{% for message in messages %}{{ message.content }}{% endfor %}";
 }
 
 //! Stage a single-engine deployment: its config under the name the runtime looks for, plus the tokenizer trio.

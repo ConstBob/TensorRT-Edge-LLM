@@ -158,7 +158,7 @@ $ONNX/
 │   ├── model.onnx + model.onnx.data
 │   ├── config.json                       # model: qwen3_omni_moe_text
 │   ├── embedding.safetensors
-│   ├── processed_chat_template.json
+│   ├── chat_template.jinja
 │   └── tokenizer files
 ├── llm/talker/                           # Talker MoE ONNX + sidecars
 │   ├── model.onnx + model.onnx.data

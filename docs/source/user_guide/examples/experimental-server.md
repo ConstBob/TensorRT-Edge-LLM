@@ -14,13 +14,14 @@ server dependencies in the same environment:
 
 ```bash
 cd /path/to/TensorRT-Edge-LLM
-pip install -e ".[server,server-tools,native-build]"
+pip install -e ".[server,builder,native-build]"
 ```
 
 For a prebuilt TensorRT Edge-LLM package that already contains the Python
-runtime extension, omit `native-build`. `server-tools` is required only for
-model-native tool chat templates; plain text and multimodal serving use the
-smaller `server` extra. None of these extras installs the PyTorch/ONNX exporter.
+runtime extension, omit `native-build`. A cache miss uses the builder extra to
+copy the model-provided Jinja into the runtime bundle. Pantor Inja loads that
+file directly in C++; serving a built bundle does not require Jinja2 or the
+PyTorch/ONNX exporter.
 
 ## Python API
 
@@ -206,6 +207,9 @@ The request contract includes sampling, stop strings, log probabilities,
 `logit_bias`, tools, `parallel_tool_calls`, thinking, structured output, and
 per-request speculative disablement. Unsupported fields such as penalties and
 seed are rejected rather than ignored. Only `n=1` is supported.
+Provider chat templating and the assistant generation prompt are enabled by
+default. Set `apply_chat_template=false` only for an already formatted prompt,
+or `add_generation_prompt=false` when continuing an existing assistant turn.
 
 ### Structured Output
 
@@ -260,6 +264,12 @@ the request sets `enable_thinking=true` or
 `chat_template_kwargs.enable_thinking=true`.
 Streaming responses emit indexed tool-call deltas as soon as each generated
 call is complete and end with `finish_reason="tool_calls"`.
+
+Qwen3.8's provider template accepts `reasoning_effort` values `xhigh` (the
+provider default), `medium`, and `low` when thinking is enabled. Edge-LLM
+passes the value through unchanged, so an unsupported value fails template
+rendering instead of being remapped. Because Edge-LLM defaults to non-thinking
+requests, set `enable_thinking=true` together with the desired effort.
 
 ### Image, Video, and Audio Input
 

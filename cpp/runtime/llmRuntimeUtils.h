@@ -51,8 +51,53 @@ struct Message
         std::string content; //!< Text content when content type is text. Image data will be stored in corresponding
                              //!< imageBuffers. For type "trajectory", data is stored in Request::pastTrajectory.
     };
-    std::string role;                     //!< Message role (system, user, assistant)
+    struct ToolCall
+    {
+        std::string id;               //!< Provider tool-call identifier
+        std::string type{"function"}; //!< Tool-call type
+        std::string name;             //!< Function name
+        std::string arguments;        //!< JSON object text or provider-native argument text
+        bool argumentsIsString{true}; //!< Preserve the provider's argument representation
+    };
+
+    std::string role;                     //!< Message role (system, user, assistant, tool)
     std::vector<MessageContent> contents; //!< Contents of the message
+    std::string reasoningContent;         //!< Optional reasoning for assistant history
+    bool hasReasoningContent{false};      //!< Distinguish an absent reasoning field from an empty one
+    std::vector<ToolCall> toolCalls;      //!< Optional assistant tool calls
+    bool hasToolCalls{false};             //!< Distinguish an absent tool_calls field from an empty one
+    std::string toolCallId;               //!< Tool call answered by a tool-role message
+    std::string name;                     //!< Optional participant or tool name
+    bool hasContent{true};                //!< Distinguish an absent content field from a null value
+    bool contentIsArray{false};           //!< Preserve the provider's string-vs-content-block contract
+    bool contentIsNull{false};            //!< Preserve a null content value for tool-only assistant turns
+};
+
+/*! \brief OpenAI-compatible function tool definition used by chat templates. */
+struct ToolDefinition
+{
+    std::string name;
+    std::string description;
+    std::string parameters{"{}"}; //!< JSON Schema object text
+    bool strict{false};
+    bool hasDescription{true}; //!< Preserve whether the provider supplied the optional field
+    bool hasParameters{true};  //!< Preserve whether the provider supplied the optional field
+    bool hasStrict{false};     //!< Preserve an explicitly supplied false value
+};
+
+/*! \brief Tool selection forwarded to provider chat templates. */
+struct ToolChoice
+{
+    enum class Mode : uint8_t
+    {
+        kNone,
+        kAuto,
+        kRequired,
+        kFunction,
+    };
+
+    Mode mode{Mode::kAuto};
+    std::string functionName;
 };
 
 // Streaming types (StreamChannel, StreamChunk, SlotStreamState, FinishReason,
@@ -200,6 +245,10 @@ struct LLMGenerationRequest
     bool addGenerationPrompt{true};
     // Whether to enable thinking mode for models that support it. Default is disabled.
     bool enableThinking{false};
+    std::string reasoningEffort;       //!< Optional model-native reasoning effort
+    std::vector<ToolDefinition> tools; //!< Tools available to this request batch
+    ToolChoice toolChoice;             //!< Requested tool selection mode
+    bool parallelToolCalls{true};      //!< Whether the model may emit parallel calls
     // Disable speculative decoding for this request when the loaded engine contract supports vanilla fallback.
     bool disableSpecDecode{false};
 
@@ -232,7 +281,7 @@ struct LLMGenerationRequest
     //! Ready endpoints to retain when the context cache is enabled.
     ContextCacheCommitPolicy contextCacheCommitPolicy{ContextCacheCommitPolicy::kIncludingGeneratedTokens};
 
-    //! Hybrid+MTP boundary-replay tail length carried into the context cache. Not consumed yet.
+    //! Hybrid+MTP boundary-replay tail length. Set to -1 to derive it with the native provider-template renderer.
     int32_t contextCacheReplayTailLength{0};
 
     //! Periodic recurrent-state capture interval (0 disables). Hybrid+MTP endpoint reuse requires this to be 0 so the

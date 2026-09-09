@@ -75,7 +75,8 @@ public:
     //! @{
     ContextCacheRequest::AdmitSequenceStatus admitSequence(std::vector<int32_t> const& tokenIds,
         std::string const& loraWeightsName, DecodingKvHeadroom const& headroom, int32_t& prefillStart,
-        std::vector<int32_t> const& mediaTokenIds = {}, std::vector<imageUtils::ImageData> const& imageBuffers = {},
+        cudaStream_t stream, std::vector<int32_t> const& mediaTokenIds = {},
+        std::vector<imageUtils::ImageData> const& imageBuffers = {},
         std::vector<audioUtils::AudioData> const& audioBuffers = {});
     bool finalizeSequenceAdmission(int32_t slot, int32_t const& lookaheadToken, int32_t fullInputLength);
     void retractSequenceAdmission();

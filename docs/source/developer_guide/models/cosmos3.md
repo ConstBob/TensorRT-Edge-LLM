@@ -20,7 +20,7 @@ onnx/
   und_prefill/ model.onnx config.json embed_tokens.safetensors
   gen/         model.onnx config.json
   vae_encoder/ model.onnx config.json
-  text_tokenizer/ tokenizer.json processed_chat_template.json ...
+  text_tokenizer/ tokenizer.json chat_template.jinja ...
 ```
 
 Each `config.json` is the component contract (optimization profile, tensor

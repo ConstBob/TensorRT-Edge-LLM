@@ -278,7 +278,7 @@ Omni-relevant flags: `--components LIST`
 ```
 $ONNX/
 ├── llm/thinker/            # model.onnx(+.data), config.json, embedding.safetensors,
-│                           # processed_chat_template.json, tokenizer files
+│                           # chat_template.jinja, tokenizer files
 ├── llm/talker/             # model.onnx(+.data), codec embedding + projection sidecars
 ├── llm/code_predictor/
 ├── audio/audio_encoder/

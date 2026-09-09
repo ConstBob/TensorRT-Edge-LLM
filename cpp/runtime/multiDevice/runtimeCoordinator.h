@@ -40,6 +40,11 @@
 
 namespace trt_edgellm
 {
+namespace chat_template
+{
+class ChatTemplate;
+}
+
 namespace tokenizer
 {
 class Tokenizer;
@@ -107,6 +112,9 @@ public:
         GenerationBoundaryHook const& boundaryHook = {});
     bool genAndSaveSystemPromptKVCache(
         std::string const& prompt, std::string const& loraWeightsName, cudaStream_t stream = nullptr);
+    //! Return the token count produced by the same preparation path used for inference.
+    //! Only text requests are supported.
+    std::vector<int32_t> countPromptTokens(LLMGenerationRequest const& request) const;
     void setVisualPrunerConfig(VisualPrunerConfig const& config);
 
     LLMGenerationResponse takeRankResponse(int32_t globalRank);
@@ -151,6 +159,7 @@ private:
     void initializeCollectiveResources();
     void initializeRankStreams();
     void initializeTokenizer();
+    void initializeChatTemplate();
     void initializeRankRuntimes();
     void initializeRequestSynchronization();
     void registerCollectiveGroup(MultiDevicePluginResources const& resources);
@@ -165,8 +174,16 @@ private:
         cudaStream_t stream, GenerationBoundaryHook const& boundaryHook);
 
     std::unique_ptr<LLMRankRuntime> createRankRuntime(int32_t globalRank);
+    //! Apply the model chat contract and tokenize each request exactly once.
     LLMGenerationRequest prepareRequestState(LLMGenerationRequest const& request) const;
-
+    //! Derive the unstable generation-prompt suffix for Hybrid+MTP context reuse.
+    //!
+    //! This deliberately renders a committed assistant probe in addition to
+    //! the already prepared generation prompt. Comparing those token streams
+    //! identifies the stable prefix that can remain cached. The method is used
+    //! only when the caller requests the -1 automatic-derivation sentinel.
+    int32_t deriveContextCacheReplayTailLength(
+        LLMGenerationRequest const& request, std::vector<int32_t> const& promptTokenIds) const;
     void prepareRankRequests(LLMGenerationRequest const& request);
     CollectiveGroup const* collectiveGroup(ParallelType type) const noexcept;
     CollectiveGroup* collectiveGroup(ParallelType type) noexcept;
@@ -190,6 +207,7 @@ private:
     bool mOwnsStreams{true};
     bool mInlineSingleRank{false};
     std::unique_ptr<tokenizer::Tokenizer> mTokenizer;
+    std::unique_ptr<chat_template::ChatTemplate> mChatTemplate;
     std::vector<std::unique_ptr<LLMRankRuntime>> mRuntimes;
     std::vector<TokenBroadcastFn> mTokenSyncFns;
 

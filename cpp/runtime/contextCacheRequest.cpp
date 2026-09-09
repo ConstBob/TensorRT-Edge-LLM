@@ -257,12 +257,12 @@ int32_t ContextCacheRequest::reuseTokenLength(int32_t slot) const noexcept
 }
 
 ContextCacheRequest::AdmitSequenceStatus ContextCacheRequest::admitSequence(std::vector<int32_t> const& tokenIds,
-    std::string const& loraWeightsName, DecodingKvHeadroom const& headroom, int32_t& prefillStart,
+    std::string const& loraWeightsName, DecodingKvHeadroom const& headroom, int32_t& prefillStart, cudaStream_t stream,
     std::vector<int32_t> const& mediaTokenIds, std::vector<imageUtils::ImageData> const& imageBuffers,
     std::vector<audioUtils::AudioData> const& audioBuffers)
 {
-    ContextCacheSequenceAdmission const admission
-        = makeContextCacheSequenceAdmission(tokenIds, loraWeightsName, mediaTokenIds, imageBuffers, audioBuffers);
+    ContextCacheSequenceAdmission const admission = makeContextCacheSequenceAdmission(
+        tokenIds, loraWeightsName, mediaTokenIds, imageBuffers, audioBuffers, stream);
     ContextCacheCoordinator::AdmitSequenceResult result = mCoordinator.admitSequence(mRequest, admission, headroom);
     if (result.status != ContextCacheCoordinatorStatus::kOk)
     {

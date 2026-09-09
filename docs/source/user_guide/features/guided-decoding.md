@@ -189,11 +189,10 @@ stretches may diverge. Chain geometries do not have this effect.
   the tokens following it in the same step. The reasoning block itself is unconstrained. A request
   whose reasoning never ends is therefore never constrained.
 
-  Whether a request starts inside a reasoning block is read from the rendered prompt, not from
-  `enable_thinking`. Where the prompt carries no marker at all, the chat template decides: a
-  template that writes the opening marker itself (Gemma's thinking prompt ends in
-  `<|channel>thought`) means the block was never opened, while one that leaves the model to emit
-  it (Qwen3's thinking prompt stops at `assistant`) means the model may still open one.
+  Whether a request starts inside a reasoning block is read from the rendered prompt. The most
+  recent reasoning marker is authoritative. If the prompt has no marker, `enable_thinking=false`
+  starts the constraint immediately, while `enable_thinking=true` leaves room for the model to
+  open a reasoning block. Models without reasoning-marker tokens are constrained immediately.
 - **Regex dialect**: XGrammar's regex, not PCRE. No lookaround and no backreferences.
 - **EBNF entry rule** must be named `root`.
 - **Guide size** is capped at 128 KB. Compilation is superlinear in guide size and runs before any GPU work.

@@ -383,6 +383,8 @@ class EngineClient:
         tools: Optional[Sequence[Dict[str, Any]]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         tool_config: Optional[ToolConfig] = None,
+        apply_chat_template: bool = True,
+        add_generation_prompt: bool = True,
     ) -> PreparedRequest:
         lease = await self._admission.reserve()
         try:
@@ -394,6 +396,8 @@ class EngineClient:
                     tools=tools,
                     tool_choice=tool_choice,
                     tool_config=tool_config,
+                    apply_chat_template=apply_chat_template,
+                    add_generation_prompt=add_generation_prompt,
                 ))
             return PreparedRequest(request=request, lease=lease)
         except BaseException:

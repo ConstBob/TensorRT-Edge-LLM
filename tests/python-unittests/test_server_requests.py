@@ -51,6 +51,7 @@ class _FakeLLM:
         self.close_count = 0
         self.last_audio_params = None
         self.last_sampling_params = None
+        self.last_request_options = None
         self.next_text = "answer"
         Path(self.model_dir).mkdir(parents=True)
         visual = Path(self.bundle_dir) / "visual"
@@ -81,9 +82,10 @@ class _FakeLLM:
         from experimental.server.runtime.engine_layout import inspect_bundle
         self.bundle_layout = inspect_bundle(self.bundle_dir)
 
-    def _make_generation_request(self, messages, params, **_kwargs):
+    def _make_generation_request(self, messages, params, **kwargs):
         self.prepared_messages = messages
         self.last_sampling_params = params
+        self.last_request_options = kwargs
         self.prepare_count += 1
         return object()
 
@@ -568,6 +570,55 @@ def test_chat_forwards_context_cache_request_policies(client_and_llm):
     assert response.status_code == 200, response.text
     assert not llm.last_sampling_params.reuse_context
     assert not llm.last_sampling_params.cache_generated_tokens
+
+
+def test_chat_template_is_default_on_and_request_configurable(client_and_llm):
+    client, llm = client_and_llm
+    body = {"messages": [{"role": "user", "content": "Hello"}]}
+
+    response = client.post("/v1/chat/completions", json=body)
+    assert response.status_code == 200, response.text
+    assert llm.last_request_options["apply_chat_template"] is True
+    assert llm.last_request_options["add_generation_prompt"] is True
+
+    body.update({
+        "apply_chat_template": False,
+        "add_generation_prompt": False,
+    })
+    response = client.post("/v1/chat/completions", json=body)
+    assert response.status_code == 200, response.text
+    assert llm.last_request_options["apply_chat_template"] is False
+    assert llm.last_request_options["add_generation_prompt"] is False
+
+
+def test_qwen38_reasoning_controls_reach_native_template(client_and_llm):
+    client, llm = client_and_llm
+    body = {
+        "messages": [{
+            "role": "user",
+            "content": "Solve 23 * 9."
+        }],
+        "enable_thinking": True,
+        "reasoning_effort": "low",
+    }
+
+    response = client.post("/v1/chat/completions", json=body)
+
+    assert response.status_code == 200, response.text
+    assert llm.last_sampling_params.enable_thinking is True
+    assert llm.last_sampling_params.reasoning_effort == "low"
+
+    body.pop("enable_thinking")
+    body.pop("reasoning_effort")
+    body["chat_template_kwargs"] = {
+        "enable_thinking": True,
+        "reasoning_effort": "medium",
+    }
+    response = client.post("/v1/chat/completions", json=body)
+
+    assert response.status_code == 200, response.text
+    assert llm.last_sampling_params.enable_thinking is True
+    assert llm.last_sampling_params.reasoning_effort == "medium"
 
 
 def test_openai_tools_and_reasoning_fields(client_and_llm):

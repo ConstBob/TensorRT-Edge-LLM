@@ -792,7 +792,7 @@ bool QwenViTRunner::preprocessSystemPrompt(std::string const& systemPrompt, toke
         return false;
     }
 
-    // systemPrompt is already formatted by tokenizer's applyChatTemplate
+    // systemPrompt is already formatted by the runtime-owned chat-template renderer.
     std::vector<int32_t> ids = tokenizer->encode(systemPrompt);
     if (ids.empty())
     {

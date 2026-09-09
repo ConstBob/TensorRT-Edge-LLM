@@ -220,7 +220,13 @@ def _has_talker(engine_dir: str) -> bool:
 
 def _assert_multimodal_prompt_contract(engine_dir: str,
                                        responses: List[dict]) -> None:
-    template_path = os.path.join(engine_dir, "processed_chat_template.json")
+    template_paths = (os.path.join(engine_dir, "chat_template.jinja"),
+                      os.path.join(engine_dir, "chat_template.model"))
+    placeholders = {
+        "image": ("<|image_pad|>", "<image>", "<|image_1|>"),
+        "audio": ("<|audio_pad|>", "<so_embedding>", "<|audio_1|>"),
+        "video": ("<|video_pad|>", "<video>"),
+    }
     media_types = {"image", "audio", "video"}
     for response in responses:
         present_types = {
@@ -231,19 +237,14 @@ def _assert_multimodal_prompt_contract(engine_dir: str,
         }
         if not present_types:
             continue
-        if not os.path.isfile(template_path):
-            pytest.fail("multimodal runtime has no processed chat template")
-        with open(template_path, encoding="utf-8") as stream:
-            content_types = json.load(stream).get("content_types", {})
+        if not any(os.path.isfile(path) for path in template_paths):
+            pytest.fail("multimodal runtime has no provider chat template")
         formatted = response.get("formatted_complete_request", "")
         for media_type in present_types:
-            placeholder = content_types.get(media_type, {}).get("format")
-            if not placeholder:
-                pytest.fail(f"multimodal chat template has no {media_type} "
-                            "placeholder")
-            if placeholder not in formatted:
+            expected = placeholders[media_type]
+            if not any(placeholder in formatted for placeholder in expected):
                 pytest.fail(f"formatted request dropped the {media_type} "
-                            f"placeholder {placeholder!r}")
+                            f"placeholder; expected one of {expected!r}")
 
 
 def _assert_runtime_contract(config: TestConfig, engine_dir: str,

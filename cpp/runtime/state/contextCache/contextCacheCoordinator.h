@@ -69,7 +69,7 @@ struct ContextCacheBatchAdmission
     DecodingTokenStateContract tokenStateContract{DecodingTokenStateContract::kCommittedPlusLookahead};
     ContextCacheLookupPolicy lookupPolicy{ContextCacheLookupPolicy::kUseCache};
     ContextCacheCommitPolicy commitPolicy{ContextCacheCommitPolicy::kIncludingGeneratedTokens};
-    //! Carried-through Hybrid+MTP replay tail length. Not consumed by this stage.
+    //! Hybrid+MTP replay tail length derived before cache admission.
     int32_t replayTailLength{0};
 };
 

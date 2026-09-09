@@ -127,6 +127,7 @@ edgellm_add_unit_test(
   DIRS
   cpp/common
   cpp/tokenizer
+  cpp/chatTemplate
   cpp/profiling
   cpp/builder
   cpp/sampler

@@ -23,7 +23,7 @@ Do not duplicate that table here.
 | Config key | `model_type: nemotron_h`
 | Transformers modeling | https://github.com/huggingface/transformers/blob/main/src/transformers/models/nemotron_h/modeling_nemotron_h.py[modeling_nemotron_h.py]
 | Edge-LLM handler | link:../../../../tensorrt_edgellm/models/nemotron_h/modeling_nemotron_h.py[Nemotron-H causal LM]
-| Chat template | link:../../../../tensorrt_edgellm/chat_templates/nemotron_nano_v2.json[nemotron_nano_v2.json]
+| Chat template | Provider `chat_template.jinja` from the checkpoint
 |===
 
 == Edge-LLM Integration Notes
@@ -33,8 +33,8 @@ Do not duplicate that table here.
   state-space and attention/KV-cache component docs.
 * INT4 support is constrained by group-size and checkpoint weight dimensions;
   the user-facing support matrix records the precision status.
-* Nemotron template handling is explicit for the 9B Nano v2 checkpoint and
-  should remain an export option rather than hidden family logic.
+* Nemotron prompt semantics come from the checkpoint's provider Jinja and are
+  not duplicated in Edge-LLM.
 * Any routed-expert or state-space variant should link to the reusable
   link:../../components/moe/[MoE] and link:../../components/state_space/[state-space]
   component contracts.
@@ -47,7 +47,7 @@ Do not duplicate that table here.
 | link:../../../../tensorrt_edgellm/__init__.py[__init__.py] | Registers `nemotron_h` with `NemotronHCausalLM`.
 | link:../../../../tensorrt_edgellm/models/nemotron_h/modeling_nemotron_h.py[modeling_nemotron_h.py] | Nemotron-H hybrid decoder export implementation.
 | link:../../../../tensorrt_edgellm/models/ops.py[ops.py] | State-space, attention, quantization, and MoE custom-op stubs.
-| link:../../../../tensorrt_edgellm/chat_templates/nemotron_nano_v2.json[nemotron_nano_v2.json] | Explicit chat template for Nano v2 export.
+| link:../../../../cpp/chatTemplate/[chatTemplate] | Native provider-Jinja renderer.
 | link:../../../../cpp/runtime/[runtime] | Runtime engine loading, prefill/decode execution, KV/state cache handling.
 |===
 

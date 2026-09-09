@@ -181,7 +181,8 @@ std::unique_ptr<SteppedExecution> LLMInferenceRuntime::beginStepped(
 
 std::vector<int32_t> LLMInferenceRuntime::countPromptTokens(LLMGenerationRequest const& request) const
 {
-    return rootRuntime().countPromptTokens(request);
+    ELLM_CHECK(mCoordinator != nullptr, "Runtime coordinator is not initialized.");
+    return mCoordinator->countPromptTokens(request);
 }
 
 bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(

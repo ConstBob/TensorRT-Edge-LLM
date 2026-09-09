@@ -38,19 +38,6 @@ enum class AddedTokenSource
     kTokenizerConfig,
 };
 
-void writeChatTemplate(std::filesystem::path const& dir)
-{
-    std::ofstream(dir / "processed_chat_template.json") << R"JSON({
-  "model_path": "unit",
-  "roles": {
-    "system": {"prefix": "", "suffix": ""},
-    "user": {"prefix": "", "suffix": ""},
-    "assistant": {"prefix": "", "suffix": ""}
-  },
-  "generation_prompt": ""
-})JSON";
-}
-
 std::filesystem::path writeTokenizer(
     std::string const& name, bool alsoInVocab, AddedTokenSource source = AddedTokenSource::kTokenizerJson)
 {
@@ -90,7 +77,6 @@ std::filesystem::path writeTokenizer(
 })JSON";
     }
     configFile << "}";
-    writeChatTemplate(dir);
     return dir;
 }
 
@@ -120,7 +106,6 @@ std::filesystem::path writeConfiguredSentinelTokenizer()
   "pad_token": {"content": "<pad>"},
   "unk_token": {"content": "<unk>"}
 })JSON";
-    writeChatTemplate(dir);
     return dir;
 }
 

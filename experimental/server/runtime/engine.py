@@ -49,8 +49,6 @@ from typing import (TYPE_CHECKING, Any, Dict, Iterator, List, Mapping,
 from ..config import ContextCacheConfig
 from ..parsing.tool_calling import (ToolConfig, parse_assistant_output,
                                     validate_tool_request)
-from ..parsing.tool_chat_template import (ToolChatTemplateFormatter,
-                                          needs_tool_chat_template)
 from .engine_layout import BundleLayout, EngineType, inspect_bundle
 
 logger = logging.getLogger("edgellm.server")
@@ -84,6 +82,7 @@ class SamplingParams:
     top_k: int = 50
     max_tokens: int = 2048
     enable_thinking: bool = False
+    reasoning_effort: str = ""
     disable_spec_decode: bool = False
     num_logprobs: int = 0
     stop: List[str] = field(default_factory=list)
@@ -824,8 +823,6 @@ class LLM:
         self._max_kv_cache_capacity = max_kv_cache_capacity
         self._context_cache_config = ContextCacheConfig.parse(
             context_cache_config)
-        self._tool_template_formatter: Optional[
-            ToolChatTemplateFormatter] = None
         self._admission_sem = threading.Semaphore(1)
         self._infer_lock = threading.Lock()
         self._close_lock = threading.Lock()
@@ -970,26 +967,6 @@ class LLM:
                                 self._model_dir)
         logger.info("Omni audio output ready.")
 
-    def _tool_template_dirs(self) -> List[str]:
-        return [self._model_dir]
-
-    def _get_tool_template_formatter(self) -> ToolChatTemplateFormatter:
-        if self._tool_template_formatter is None:
-            self._tool_template_formatter = ToolChatTemplateFormatter(
-                self._tool_template_dirs())
-        return self._tool_template_formatter
-
-    def _tool_choice_for_template(
-            self, tool_config: ToolConfig) -> Union[str, Dict[str, Any]]:
-        if tool_config.forced_name:
-            return {
-                "type": "function",
-                "function": {
-                    "name": tool_config.forced_name
-                },
-            }
-        return tool_config.tool_choice
-
     def _visual_config(self) -> dict:
         """Read the model-specific visual component configuration once."""
         cached = getattr(self, "_visual_config_cache", None)
@@ -1099,66 +1076,12 @@ class LLM:
     def _prepare_messages_for_runtime(
         self,
         messages: List[Dict[str, Any]],
-        *,
-        tools: Optional[Sequence[Dict[str, Any]]] = None,
-        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
-        tool_config: Optional[ToolConfig] = None,
-        enable_thinking: bool = False,
-        derive_replay_tail: bool = False,
     ):
-        """Prepare messages for the C++ runtime.
-
-        Returns the replay-tail length alongside the prepared messages. It is
-        non-zero only when the caller asked for it, which is what lets a
-        Hybrid+MTP checkpoint be reused across turns.
-        """
-        tool_config = tool_config or validate_tool_request(
-            messages, tools, tool_choice)
-        template_tools = (tool_config.tools
-                          if tool_config.tool_choice != "none" else [])
+        """Preserve structured messages for the model-owned C++ renderer."""
         image_buffers = _load_image_buffers(self._rt, messages,
                                             self._video_model_family,
                                             self._video_frame_limits)
-
-        if needs_tool_chat_template(messages, template_tools,
-                                    tool_config.tool_choice):
-            template_tool_choice = None
-            if tool_config.tool_choice != "none":
-                template_tool_choice = self._tool_choice_for_template(
-                    tool_config)
-            formatter = self._get_tool_template_formatter()
-            replay_tail_length = 0
-            if derive_replay_tail:
-                # Derive the multi-turn replay tail from the tokenized template
-                # so a Hybrid+MTP checkpoint can be reused across turns.
-                prompt, replay_tail_length = formatter.format_with_replay_tail(
-                    messages,
-                    tools=template_tools,
-                    tool_choice=template_tool_choice,
-                    parallel_tool_calls=tool_config.parallel_tool_calls,
-                    enable_thinking=enable_thinking,
-                )
-            else:
-                prompt = formatter.format(
-                    messages,
-                    tools=template_tools,
-                    tool_choice=template_tool_choice,
-                    parallel_tool_calls=tool_config.parallel_tool_calls,
-                    add_generation_prompt=True,
-                    enable_thinking=enable_thinking,
-                )
-            cpp_messages = _convert_messages_to_cpp(
-                self._rt,
-                [{
-                    "role": "user",
-                    "content": prompt,
-                }],
-            )
-            return (cpp_messages, image_buffers, False, False,
-                    replay_tail_length)
-
-        cpp_messages = _convert_messages_to_cpp(self._rt, messages)
-        return cpp_messages, image_buffers, True, True, 0
+        return _convert_messages_to_cpp(self._rt, messages), image_buffers
 
     def _make_generation_request(
         self,
@@ -1168,6 +1091,8 @@ class LLM:
         tools: Optional[Sequence[Dict[str, Any]]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         tool_config: Optional[ToolConfig] = None,
+        apply_chat_template: bool = True,
+        add_generation_prompt: bool = True,
         stream_channel: Optional[Any] = None,
     ):
         normalized_logit_bias = _normalize_logit_bias(params.logit_bias)
@@ -1176,22 +1101,15 @@ class LLM:
         # The replay tail only matters for a prefill-state-only commit against a
         # draft model with reuse enabled: that is the deployment whose
         # checkpoint must land on a turn boundary the next render reproduces.
-        # The server tests build bare objects that skip __init__, so read the
-        # config defensively and let the `and` chain short-circuit before it
-        # reaches the attributes only a constructed LLM has.
+        # A negative value asks the native renderer/tokenizer to derive it.
         cache_config = getattr(self, "_context_cache_config", None)
         derive_replay_tail = (cache_config is not None and cache_config.enabled
                               and not params.cache_generated_tokens
-                              and self.has_draft_model)
-        (cpp_messages, image_buffers, apply_template, add_prompt,
-         replay_tail_length) = (self._prepare_messages_for_runtime(
-             messages,
-             tools=tool_config.tools,
-             tool_choice=tool_config.tool_choice,
-             tool_config=tool_config,
-             enable_thinking=params.enable_thinking,
-             derive_replay_tail=derive_replay_tail,
-         ))
+                              and self.has_draft_model and apply_chat_template
+                              and add_generation_prompt)
+        replay_tail_length = -1 if derive_replay_tail else 0
+        cpp_messages, image_buffers = self._prepare_messages_for_runtime(
+            messages)
 
         audio_buffers = _load_audio_buffers(self._rt, messages)
 
@@ -1212,9 +1130,14 @@ class LLM:
         request.top_p = params.top_p
         request.top_k = params.top_k
         request.max_generate_length = params.max_tokens
-        request.apply_chat_template = apply_template
-        request.add_generation_prompt = add_prompt
+        request.apply_chat_template = apply_chat_template
+        request.add_generation_prompt = add_generation_prompt
         request.enable_thinking = params.enable_thinking
+        request.reasoning_effort = params.reasoning_effort
+        request.tools = _convert_tools_to_cpp(self._rt, tool_config)
+        request.tool_choice = _convert_tool_choice_to_cpp(
+            self._rt, tool_config)
+        request.parallel_tool_calls = tool_config.parallel_tool_calls
         request.disable_spec_decode = params.disable_spec_decode
         request.num_logprobs = params.num_logprobs
         _set_context_cache_request_policies(self._rt, request, params)
@@ -1970,10 +1893,55 @@ def _convert_messages_to_cpp(rt_module, messages: List[Dict[str, Any]]):
     for msg in messages:
         cpp_msg = rt_module.Message()
         cpp_msg.role = msg["role"]
-        content = msg["content"]
+        reasoning_key = ("reasoning_content" if "reasoning_content" in msg else
+                         "reasoning" if "reasoning" in msg else None)
+        cpp_msg.has_reasoning_content = reasoning_key is not None
+        cpp_msg.reasoning_content = (str(msg.get(reasoning_key) or "")
+                                     if reasoning_key else "")
+        cpp_msg.tool_call_id = str(msg.get("tool_call_id") or "")
+        cpp_msg.name = str(msg.get("name") or "")
+        cpp_msg.has_content = "content" in msg
+        cpp_msg.content_is_array = isinstance(msg.get("content"), list)
+        cpp_msg.content_is_null = cpp_msg.has_content and msg["content"] is None
+
+        raw_tool_calls = msg.get("tool_calls") or []
+        if msg.get("function_call") and not raw_tool_calls:
+            raw_tool_calls = [{
+                "type": "function",
+                "function": msg["function_call"],
+            }]
+        # vLLM drops an empty tool_calls field so provider templates keep the
+        # ordinary assistant-message path.
+        cpp_msg.has_tool_calls = bool(raw_tool_calls)
+        cpp_tool_calls = []
+        for raw_call in raw_tool_calls:
+            function = raw_call.get("function", raw_call)
+            call = rt_module.MessageToolCall()
+            call.id = str(raw_call.get("id") or "")
+            call.type = str(raw_call.get("type") or "function")
+            call.name = str(function.get("name") or "")
+            arguments = function.get("arguments", {})
+            arguments_is_string = isinstance(arguments, str)
+            if arguments_is_string:
+                try:
+                    json.loads(arguments) if arguments else {}
+                except json.JSONDecodeError as error:
+                    raise ValueError(
+                        f"Invalid JSON in assistant tool-call arguments: "
+                        f"{error.msg}") from error
+            call.arguments_is_string = arguments_is_string
+            call.arguments = (arguments if arguments_is_string else json.dumps(
+                arguments, ensure_ascii=False, separators=(",", ":")))
+            cpp_tool_calls.append(call)
+        cpp_msg.tool_calls = cpp_tool_calls
+
+        content = msg.get("content")
         contents_list = []
         if isinstance(content, str):
             contents_list.append(rt_module.MessageContent("text", content))
+        elif content is not None and not isinstance(content, list):
+            raise ValueError(
+                "Message content must be a string, an array, or null")
         elif isinstance(content, list):
             for item in content:
                 if isinstance(item, str):
@@ -1981,7 +1949,7 @@ def _convert_messages_to_cpp(rt_module, messages: List[Dict[str, Any]]):
                         "text", item))
                 elif isinstance(item, dict):
                     ct = item.get("type", "text")
-                    if ct == "text":
+                    if ct in ("text", "input_text"):
                         contents_list.append(
                             rt_module.MessageContent(
                                 "text",
@@ -2008,9 +1976,47 @@ def _convert_messages_to_cpp(rt_module, messages: List[Dict[str, Any]]):
                             rt_module.MessageContent("audio", ""))
                     else:
                         raise ValueError(f"Unsupported content type: {ct}")
+                else:
+                    raise ValueError(
+                        "Message content array items must be strings or objects"
+                    )
         cpp_msg.contents = contents_list
         cpp_messages.append(cpp_msg)
     return cpp_messages
+
+
+def _convert_tools_to_cpp(rt_module, tool_config: ToolConfig):
+    """Convert validated OpenAI function tools to the native render contract."""
+    if tool_config.tool_choice == "none":
+        return []
+    result = []
+    for raw_tool in tool_config.tools:
+        function = raw_tool["function"]
+        tool = rt_module.ToolDefinition()
+        tool.name = function["name"]
+        tool.description = function.get("description", "")
+        tool.has_description = "description" in function
+        tool.parameters = json.dumps(function.get("parameters", {}),
+                                     ensure_ascii=False,
+                                     separators=(",", ":"))
+        tool.has_parameters = "parameters" in function
+        tool.strict = bool(function.get("strict", False))
+        tool.has_strict = "strict" in function
+        result.append(tool)
+    return result
+
+
+def _convert_tool_choice_to_cpp(rt_module, tool_config: ToolConfig):
+    choice = rt_module.ToolChoice()
+    modes = {
+        "none": rt_module.ToolChoiceMode.NONE,
+        "auto": rt_module.ToolChoiceMode.AUTO,
+        "required": rt_module.ToolChoiceMode.REQUIRED,
+        "function": rt_module.ToolChoiceMode.FUNCTION,
+    }
+    choice.mode = modes[tool_config.tool_choice]
+    choice.function_name = tool_config.forced_name or ""
+    return choice
 
 
 def _load_image_buffers(rt_module,

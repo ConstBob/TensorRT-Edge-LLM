@@ -233,6 +233,15 @@ set_target_properties(edgellmKernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 edgellm_set_hidden_visibility(edgellmKernels)
 
 file(GLOB_RECURSE TOKENIZER_CPP_SRCS "tokenizer/*.cpp")
+file(GLOB_RECURSE CHAT_TEMPLATE_CPP_SRCS "chatTemplate/*.cpp")
+
+add_library(edgellmChatTemplate STATIC ${CHAT_TEMPLATE_CPP_SRCS})
+target_include_directories(
+  edgellmChatTemplate PRIVATE ${COMMON_INCLUDE_DIRS}
+                              ${CMAKE_SOURCE_DIR}/3rdParty/inja/include)
+set_target_properties(edgellmChatTemplate PROPERTIES POSITION_INDEPENDENT_CODE
+                                                     ON)
+edgellm_set_hidden_visibility(edgellmChatTemplate)
 
 add_library(
   edgellmCore STATIC
@@ -252,7 +261,7 @@ if(ENABLE_CUTEDSL_MODULE_TEST_HOOK)
   target_compile_definitions(edgellmCore
                              PRIVATE ENABLE_CUTEDSL_MODULE_TEST_HOOK)
 endif()
-target_link_libraries(edgellmCore PRIVATE ${CMAKE_DL_LIBS})
+target_link_libraries(edgellmCore PRIVATE ${CMAKE_DL_LIBS} edgellmChatTemplate)
 # Guided decoding: XGrammar is referenced only from
 # runtime/decoding/guidedDecoder.cpp; PUBLIC so downstream executables that link
 # edgellmCore statically also pull in the archive.

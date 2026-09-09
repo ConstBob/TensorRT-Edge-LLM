@@ -16,6 +16,7 @@
  */
 
 #include "runtime/llmRankRuntime.h"
+#include "chatTemplate/chatTemplate.h"
 #include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
@@ -73,26 +74,6 @@ constexpr int32_t kDecodeProfile{1};
 
 namespace rt
 {
-
-std::vector<int32_t> LLMRankRuntime::countPromptTokens(LLMGenerationRequest const& request) const
-{
-    std::vector<int32_t> counts;
-    counts.reserve(request.requests.size());
-    for (auto const& item : request.requests)
-    {
-        ELLM_CHECK(item.imageBuffers.empty() && item.audioBuffers.empty() && !item.pastTrajectory.has_value(),
-            "Prompt token counting is only available for text requests");
-
-        LLMGenerationRequest::FormattedRequest formatted;
-        ELLM_CHECK(mTokenizer->applyChatTemplate(
-                       item, formatted, request.applyChatTemplate, request.addGenerationPrompt, request.enableThinking),
-            "Failed to apply chat template while counting prompt tokens");
-        auto const tokenIds = mTokenizer->encode(formatted.formattedCompleteRequest, false);
-        ELLM_CHECK(!tokenIds.empty(), "Failed to tokenize prompt while counting prompt tokens");
-        counts.push_back(static_cast<int32_t>(tokenIds.size()));
-    }
-    return counts;
-}
 
 namespace
 {
@@ -177,20 +158,22 @@ void validateMtpTreeMetadataBindings(DeploymentConfig const& deployment, EngineE
 LLMRankRuntime::LLMRankRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
     std::unordered_map<std::string, std::string> const& loraWeightsMap,
     std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream, ParallelMapping const& mapping,
-    tokenizer::Tokenizer& tokenizer, ContextCacheConfig const& contextCacheConfig, std::string const& checkpointDir,
+    tokenizer::Tokenizer& tokenizer, chat_template::ChatTemplate const& chatTemplate,
+    ContextCacheConfig const& contextCacheConfig, std::string const& checkpointDir,
     std::string const& draftCheckpointDir)
 {
     initializeFromEngineDir(engineDir, multimodalEngineDir, loraWeightsMap, draftingConfig, stream, mapping, tokenizer,
-        contextCacheConfig, checkpointDir, draftCheckpointDir);
+        chatTemplate, contextCacheConfig, checkpointDir, draftCheckpointDir);
 }
 
 LLMRankRuntime::LLMRankRuntime(ModelArtifacts&& artifacts, std::string const& engineDir,
     std::string const& multimodalEngineDir, std::unordered_map<std::string, std::string> const& loraWeightsMap,
     std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream, ParallelMapping const& mapping,
-    tokenizer::Tokenizer& tokenizer, ContextCacheConfig const& contextCacheConfig)
+    tokenizer::Tokenizer& tokenizer, chat_template::ChatTemplate const& chatTemplate,
+    ContextCacheConfig const& contextCacheConfig)
 {
     initializeCommon(std::move(artifacts), engineDir, multimodalEngineDir, loraWeightsMap, draftingConfig, stream,
-        mapping, tokenizer, contextCacheConfig);
+        mapping, tokenizer, chatTemplate, contextCacheConfig);
 }
 
 LLMRankRuntime::~LLMRankRuntime()
@@ -210,7 +193,8 @@ LLMRankRuntime::~LLMRankRuntime()
 void LLMRankRuntime::initializeFromEngineDir(std::string const& engineDir, std::string const& multimodalEngineDir,
     std::unordered_map<std::string, std::string> const& loraWeightsMap,
     std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream, ParallelMapping const& mapping,
-    tokenizer::Tokenizer& tokenizer, ContextCacheConfig const& contextCacheConfig, std::string const& checkpointDir,
+    tokenizer::Tokenizer& tokenizer, chat_template::ChatTemplate const& chatTemplate,
+    ContextCacheConfig const& contextCacheConfig, std::string const& checkpointDir,
     std::string const& draftCheckpointDir)
 {
     int32_t const tensorParallelSize = mapping.tensorParallelSize;
@@ -328,19 +312,21 @@ void LLMRankRuntime::initializeFromEngineDir(std::string const& engineDir, std::
     }
 
     initializeCommon(std::move(artifacts), engineDir, multimodalEngineDir, loraWeightsMap, draftingConfig, stream,
-        mapping, tokenizer, contextCacheConfig);
+        mapping, tokenizer, chatTemplate, contextCacheConfig);
 }
 
 void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string const& engineDir,
     std::string const& multimodalEngineDir, std::unordered_map<std::string, std::string> const& loraWeightsMap,
     std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream, ParallelMapping const& mapping,
-    tokenizer::Tokenizer& tokenizer, ContextCacheConfig const& contextCacheConfig)
+    tokenizer::Tokenizer& tokenizer, chat_template::ChatTemplate const& chatTemplate,
+    ContextCacheConfig const& contextCacheConfig)
 {
     ELLM_CHECK(artifacts.baseExecutor != nullptr, "Model artifacts require a base engine executor.");
     validateDsparkTreeMetadataBindings(artifacts.deployment, *artifacts.baseExecutor);
 
     mMapping = mapping;
     mTokenizer = &tokenizer;
+    mChatTemplate = &chatTemplate;
     ELLM_CHECK(mMapping.tensorParallelSize > 0, "tensorParallelSize must be positive");
     ELLM_CHECK(mMapping.tensorParallelRank >= 0 && mMapping.tensorParallelRank < mMapping.tensorParallelSize,
         "tensorParallelRank must be in [0, tensorParallelSize)");
@@ -1252,7 +1238,7 @@ AdmitDecision LLMRankRuntime::GenerationSession::reserveAdmission(AdmissionInten
         }
         int32_t prefillStart = 0;
         switch (mManagedRequest->admitSequence(seed.promptTokenIds, mContext.loraWeightsName, mKvHeadroom, prefillStart,
-            mediaTokenIds, seed.imageBuffers, seed.audioBuffers))
+            mStream, mediaTokenIds, seed.imageBuffers, seed.audioBuffers))
         {
         case ContextCacheRequest::AdmitSequenceStatus::kAdmitted: seed.prefillStart = prefillStart; break;
         case ContextCacheRequest::AdmitSequenceStatus::kNoCapacity: return AdmitDecision::kNoCapacity;
@@ -1444,8 +1430,7 @@ LLMRankRuntime::GenerationSession::AdmissionIntent LLMRankRuntime::GenerationSes
         single.addGenerationPrompt = request.addGenerationPrompt;
         single.enableThinking = request.enableThinking;
         LLMGenerationRequest::FormattedRequest formatted;
-        ELLM_CHECK(mRuntime.mTokenizer->applyChatTemplate(
-                       item, formatted, request.applyChatTemplate, request.addGenerationPrompt, request.enableThinking),
+        ELLM_CHECK(mRuntime.mChatTemplate->apply(item, formatted, chat_template::ChatTemplate::optionsFrom(request)),
             "admitRequest: chat template failed.");
         single.formattedRequests = {formatted};
         seed.systemPrompt = formatted.formattedSystemPrompt;
@@ -1462,8 +1447,7 @@ LLMRankRuntime::GenerationSession::AdmissionIntent LLMRankRuntime::GenerationSes
     else
     {
         LLMGenerationRequest::FormattedRequest formatted;
-        ELLM_CHECK(mRuntime.mTokenizer->applyChatTemplate(
-                       item, formatted, request.applyChatTemplate, request.addGenerationPrompt, request.enableThinking),
+        ELLM_CHECK(mRuntime.mChatTemplate->apply(item, formatted, chat_template::ChatTemplate::optionsFrom(request)),
             "admitRequest: chat template failed.");
         seed.promptTokenIds = mRuntime.mTokenizer->encode(formatted.formattedCompleteRequest, false);
         seed.systemPrompt = formatted.formattedSystemPrompt;
@@ -2027,14 +2011,13 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
     context.hasGuidedDecoding = false;
     if (hasGuidedDecoding(request))
     {
-        // Seeded from the prompt rather than from `enableThinking`: the chat template decides
-        // whether the block is open, already closed, or absent, and only the prompt shows which.
-        bool const templateOpensBlock = reasoningBlockOpenedByTemplate(*mTokenizer);
+        // Explicit prompt markers are authoritative. If none is present, thinking mode decides
+        // whether the model may still open a reasoning block before the grammar applies.
         context.guidedReasoningEnded.assign(static_cast<size_t>(activeBatchSize), 0);
         for (int32_t i = 0; i < activeBatchSize; ++i)
         {
             context.guidedReasoningEnded[i] = static_cast<int8_t>(reasoningClosedInPrompt(
-                context.rawBatchedInputIds[i], reasoningStartIds, reasoningEndIds, templateOpensBlock));
+                context.rawBatchedInputIds[i], reasoningStartIds, reasoningEndIds, request.enableThinking));
         }
 
         mGuidedDecoder.reset();
@@ -2951,7 +2934,7 @@ bool LLMRankRuntime::runHybridMtpPrefill(
     // The generation-prompt tail is volatile when the chat template appends tokens that the next turn's render of the
     // same history does not reproduce (for example Qwen3's `<think>\n\n</think>\n\n` under enable_thinking=false).
     // Those tokens must not enter the published checkpoint, so the prefill splits into a stable predecessor chunk plus
-    // a replayed tail. The tail length is measured server-side (tool_chat_template.format_with_replay_tail).
+    // a replayed tail. The shared native chat-template renderer computes the tail before dispatching to ranks.
     bool const hasVolatileTail = replayTailLength > 0 && suffixLenOrig > replayTailLength;
 
     // Cold sequence with a volatile generation-prompt tail: publish the checkpoint at the STABLE boundary

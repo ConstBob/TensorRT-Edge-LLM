@@ -73,8 +73,8 @@ public:
     //! Join one more text-only sequence to this live request: lookup, lease, and row binding.
     //! On kAdmitted, @p prefillStart receives the reused prefix length the seated prefill skips.
     AdmitSequenceStatus admitSequence(std::vector<int32_t> const& tokenIds, std::string const& loraWeightsName,
-        DecodingKvHeadroom const& headroom, int32_t& prefillStart, std::vector<int32_t> const& mediaTokenIds = {},
-        std::vector<imageUtils::ImageData> const& imageBuffers = {},
+        DecodingKvHeadroom const& headroom, int32_t& prefillStart, cudaStream_t stream,
+        std::vector<int32_t> const& mediaTokenIds = {}, std::vector<imageUtils::ImageData> const& imageBuffers = {},
         std::vector<audioUtils::AudioData> const& audioBuffers = {});
 
     //! Record the seated prefill's lookahead token so the slot's ledger matches its pages, and
