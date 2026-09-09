@@ -446,6 +446,30 @@ def _int4_awq_modelopt_wars():
             _uehf._export_fused_experts = _orig_export_fused_uehf
 
 
+@contextmanager
+def _zero_centered_norm_war():
+    """Teach ModelOpt that ``Qwen3OmniNextRMSNorm`` scales by ``1 + weight``.
+
+    AWQ export folds ``pre_quant_scale`` into the preceding norm.  ModelOpt
+    implements both fold formulas but picks the ``(1 + w) * s - 1`` one from a
+    hardcoded class-name allowlist that this norm is not on, so it falls back to
+    ``w * s`` and the realised gain is off by ``s - 1`` on every channel.
+    """
+    import modelopt.torch.export.quant_utils as _quant_utils
+
+    _orig_plus_one = _quant_utils._layernorm_uses_weight_plus_one
+
+    def _patched_plus_one(module):
+        return (type(module).__name__ == "Qwen3OmniNextRMSNorm"
+                or _orig_plus_one(module))
+
+    _quant_utils._layernorm_uses_weight_plus_one = _patched_plus_one
+    try:
+        yield
+    finally:
+        _quant_utils._layernorm_uses_weight_plus_one = _orig_plus_one
+
+
 def _maybe_int4_awq_wars(quantization: str):
     """Return the INT4 AWQ WAR context manager, or a nullcontext for NVFP4."""
     return _int4_awq_modelopt_wars(
@@ -1756,7 +1780,8 @@ def quantize_and_export_omni(
               "(Talker layers calibration did not populate)")
 
     os.makedirs(output_dir, exist_ok=True)
-    with torch.inference_mode():
+    with _maybe_int4_awq_wars(quantization), _zero_centered_norm_war(), \
+            torch.inference_mode():
         export_hf_checkpoint(model,
                              export_dir=output_dir,
                              extra_state_dict=mtp_state_dict)
