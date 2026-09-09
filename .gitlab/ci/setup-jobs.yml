@@ -35,6 +35,7 @@ delete_l0_storage:
   dependencies: []
   script:
     - python3 .gitlab/ci/scripts/ci_storage.py delete-storage
+    - EDGELLM_COMPILER_CACHE=AUTO sh .gitlab/ci/scripts/ci_ccache.sh delete-mr || true
   resource_group: "$L0_STORAGE_RESOURCE_GROUP"
   environment:
     name: "$L0_ENVIRONMENT_NAME"
@@ -72,3 +73,21 @@ l1_cache_cleanup:
     - echo "Pipeline end time:$(date)"
   extends: .l1_rules
   interruptible: true
+
+
+prune_ci_ccache:
+  stage: setup
+  tags: [a30-edgellm-nvks]
+  image: "$L0_STORAGE_IMAGE"
+  variables:
+    CI_CCACHE_SHARD: "native-x86_64"
+  rules:
+    - if: $EDGE_LLM_SKIP_TESTS == "true"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH =~ /^release\//
+  script:
+    - sh .gitlab/ci/scripts/ci_ccache.sh prune-ci
+  interruptible: true
+  allow_failure: true

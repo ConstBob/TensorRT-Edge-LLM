@@ -96,6 +96,7 @@ build-sonar:
     paths:
       - "${SONAR_USER_HOME}/cache"
   script:
+    - !reference [.ci_ccache_setup, script]
     - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install gcovr" -- pip3 install gcovr
     - >-
       sh .gitlab/ci/scripts/ci_run.sh "$CI_JOB_PHASE_TIMEOUT_SECONDS"

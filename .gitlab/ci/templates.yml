@@ -127,6 +127,14 @@
   after_script:
     - sh "$CI_PROJECT_DIR/.gitlab/ci/scripts/record_runner_usage.sh" || true
 
+.report_compiler_cache:
+  after_script:
+    - sh "$CI_PROJECT_DIR/.gitlab/ci/scripts/ci_ccache.sh" report-from-env "${CI_CCACHE_ENV_FILE:-}" || true
+
+.ci_ccache_setup:
+  script:
+    - source "$CI_PROJECT_DIR/.gitlab/ci/scripts/ci_ccache_setup.sh" native
+
 .gitlab_junit_report:
   artifacts:
     when: always
@@ -280,6 +288,7 @@
   variables:
     L0_JOB_WRITES_ENGINES: "1"
   script:
+    - !reference [.ci_ccache_setup, script]
     - echo "Pipeline start time:$(date)"
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
     - mkdir -p $TEST_LOG_DIR $ENGINE_DIR "$CI_PROJECT_DIR/.ci-reports"
@@ -394,6 +403,7 @@
     - .ci_test_submodules
     - .gitlab_junit_report
   script:
+    - !reference [.ci_ccache_setup, script]
     - echo "Pipeline start time:$(date)"
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
     - mkdir -p $TEST_LOG_DIR "$CI_PROJECT_DIR/.ci-reports"
