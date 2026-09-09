@@ -98,6 +98,7 @@ wheel_python_base:
     key: "wheel-compiler-$BUILD_GROUP"
     paths: [venv/wheel-compiler-cache/]
   script:
+    - source .gitlab/ci/scripts/ci_ccache_setup.sh wheel
     - sh .gitlab/ci/scripts/wheel_ci.sh ci-build-payload
   timeout: 2h
   artifacts:

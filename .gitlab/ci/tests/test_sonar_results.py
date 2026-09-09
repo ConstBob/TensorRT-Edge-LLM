@@ -25,6 +25,14 @@ import urllib.parse
 import pytest
 import yaml
 
+
+class _GitLabLoader(yaml.SafeLoader):
+    pass
+
+
+_GitLabLoader.add_constructor(
+    "!reference", lambda loader, node: loader.construct_sequence(node))
+
 G_REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 G_SCRIPT = G_REPO_ROOT / ".gitlab" / "ci" / "scripts" / "sonar_results.py"
 G_SCAN_SCRIPT = (G_REPO_ROOT / ".gitlab" / "ci" / "scripts" /
@@ -269,16 +277,18 @@ def test_sonar_scan_rejects_invalid_server_configuration():
 
 
 def test_sonar_build_only_allows_temporary_dependency_failures():
-    sonar_jobs = yaml.safe_load((G_REPO_ROOT / ".gitlab" / "ci" /
-                                 "sonar-jobs.yml").read_text(encoding="utf-8"))
+    sonar_jobs = yaml.load((G_REPO_ROOT / ".gitlab" / "ci" /
+                            "sonar-jobs.yml").read_text(encoding="utf-8"),
+                           Loader=_GitLabLoader)
 
     assert sonar_jobs["build-sonar"]["allow_failure"] == {"exit_codes": 75}
     assert sonar_jobs["build-sonar"]["artifacts"]["when"] == "always"
 
 
 def test_sonar_pipeline_preserves_results_handoff_contract():
-    sonar_jobs = yaml.safe_load((G_REPO_ROOT / ".gitlab" / "ci" /
-                                 "sonar-jobs.yml").read_text(encoding="utf-8"))
+    sonar_jobs = yaml.load((G_REPO_ROOT / ".gitlab" / "ci" /
+                            "sonar-jobs.yml").read_text(encoding="utf-8"),
+                           Loader=_GitLabLoader)
     properties = dict(
         line.split("=", 1)
         for line in (G_REPO_ROOT / "sonar-project.properties").read_text(

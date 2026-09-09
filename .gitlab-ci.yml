@@ -47,6 +47,14 @@ variables:
   CI_DOWNLOAD_TIMEOUT_SECONDS: "300"
   CI_GIT_TIMEOUT_SECONDS: "300"
   EDGE_LLM_PIPELINE_NAME: ""
+  EDGE_LLM_CI_CACHE_ROOT: "/scratch.edge_llm_cache/gitlab-ci-cache"
+  EDGELLM_COMPILER_CACHE: "OFF"
+  EDGELLM_CCACHE_MODE: "normal"
+  EDGELLM_CCACHE_EPOCH: "1"
+  CI_CCACHE_ENV_FILE: "$CI_PROJECT_DIR/.ci-ccache.env"
+  CCACHE_DIR: "$CI_PROJECT_DIR/.cache/ccache"
+  CI_CCACHE_MAX_SIZE: "2G"
+  CI_CCACHE_SHARED_MAX_SIZE: "5Gi"
 
 default:
   interruptible: true
@@ -56,6 +64,7 @@ default:
     paths:
       - .ci-telemetry-artifact/
   after_script:
+    - !reference [.report_compiler_cache, after_script]
     - !reference [.cleanup_engine_storage, after_script]
     - !reference [.record_runner_usage, after_script]
 
