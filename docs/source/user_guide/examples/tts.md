@@ -59,7 +59,7 @@ $MODEL_ROOT/onnx/
 │   ├── text_embedding.safetensors         # TTS-only (no Thinker)
 │   ├── text_projection.safetensors
 │   ├── tokenizer_config.json
-│   ├── processed_chat_template.json
+│   ├── chat_template.model
 │   └── tokenizer files
 ├── code_predictor/
 │   ├── model.onnx + model.onnx.data       # CodePredictor ONNX

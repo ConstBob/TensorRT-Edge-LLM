@@ -2353,31 +2353,6 @@ class TestConfig:
 
         return test_case_path
 
-    def get_chat_template_file(self) -> Optional[str]:
-        """
-        Get custom chat template file path for models that require it.
-
-        Returns:
-            Path to chat template JSON file, or None if no custom template for this model
-        """
-        try:
-            from tensorrt_edgellm.chat_templates import get_template_path
-        except ImportError:
-            return None
-
-        MODEL_TO_TEMPLATE = {
-            "NVIDIA-Nemotron-Nano-9B-v2": "nemotron_nano_v2",
-            "NVIDIA-Nemotron-Nano-9B-v2-FP8": "nemotron_nano_v2",
-            "NVIDIA-Nemotron-Nano-9B-v2-NVFP4": "nemotron_nano_v2",
-            "Qwen3-TTS-12Hz-0.6B-CustomVoice": "qwen3tts",
-            "Qwen3-TTS-12Hz-1.7B-CustomVoice": "qwen3tts",
-        }
-
-        template_id = MODEL_TO_TEMPLATE.get(self.model_name)
-        if template_id:
-            return get_template_path(template_id)
-        return None
-
     def get_output_json_file(self) -> str:
         """
         Get output JSON file path.

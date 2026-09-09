@@ -66,14 +66,14 @@ def test_server_dependencies_exclude_export_and_native_build_toolchains():
     assert not server & {
         "torch",
         "transformers",
+        "jinja2",
         "onnx",
         "onnxscript",
         "onnx-graphsurgeon",
         "safetensors",
         "pybind11",
     }
-    assert server_tools == {"transformers", "jinja2"}
-    assert "torch" not in server_tools
+    assert server_tools == {"transformers"}
     assert native_build == {"pybind11"}
     assert export <= tools
 

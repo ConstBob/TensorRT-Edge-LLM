@@ -73,7 +73,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     guided_decoding: Optional[Dict[str, Any]] = None
     modalities: Optional[List[Literal["text", "audio"]]] = None
     audio: Optional[ChatAudioConfig] = None
+    apply_chat_template: StrictBool = True
+    add_generation_prompt: StrictBool = True
     enable_thinking: bool = False
+    reasoning_effort: Optional[str] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
     disable_spec_decode: bool = False
     reuse_context: StrictBool = True
@@ -102,7 +105,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.top_logprobs is not None and not self.logprobs:
             raise ValueError("top_logprobs requires logprobs=true")
         if self.chat_template_kwargs is not None:
-            extra = set(self.chat_template_kwargs) - {"enable_thinking"}
+            extra = set(self.chat_template_kwargs) - {
+                "enable_thinking", "reasoning_effort"
+            }
             if extra:
                 raise ValueError("unsupported chat_template_kwargs: " +
                                  ", ".join(sorted(extra)))
@@ -112,6 +117,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     "chat_template_kwargs.enable_thinking must be a bool")
             if value is not None:
                 self.enable_thinking = value
+            effort = self.chat_template_kwargs.get("reasoning_effort")
+            if effort is not None and not isinstance(effort, str):
+                raise ValueError(
+                    "chat_template_kwargs.reasoning_effort must be a string")
+            if effort is not None:
+                self.reasoning_effort = effort
         wants_audio = bool(self.modalities and "audio" in self.modalities)
         if wants_audio != (self.audio is not None):
             raise ValueError(

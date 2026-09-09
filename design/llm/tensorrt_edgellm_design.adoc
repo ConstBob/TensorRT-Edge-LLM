@@ -38,7 +38,7 @@ Key design principles:
 * ``tensorrt_edgellm/__init__.py`` — public API surface
 * ``tensorrt_edgellm/config.py`` — ModelConfig, QuantConfig
 * ``tensorrt_edgellm/model.py`` — AutoModel factory and register_model
-* ``tensorrt_edgellm/chat_template.py`` — Chat template extraction (Jinja -> JSON)
+* ``tensorrt_edgellm/chat_template.py`` — provider Jinja template materialization
 * ``tensorrt_edgellm/checkpoint/loader.py`` — weight loading, BF16->FP16 cast, fused split
 * ``tensorrt_edgellm/checkpoint/checkpoint_utils.py`` — config loading, runtime artifact writing
 * ``tensorrt_edgellm/models/default/modeling_default.py`` — attention-only CausalLM
@@ -65,7 +65,7 @@ Key design principles:
 tensorrt_edgellm/
 ├── config.py              # ModelConfig (HF config → flat dataclass)
 ├── model.py               # AutoModel factory (dispatches on model_type)
-├── chat_template.py       # Chat template extraction (Jinja → JSON)
+├── chat_template.py       # Verbatim provider Jinja materialization
 ├── checkpoint/
 │   ├── checkpoint_utils.py  # Config loading, runtime artifact writing
 │   └── loader.py            # Weight loading (fused split, BF16→FP16 cast)
@@ -401,15 +401,16 @@ def build_qwen3_vl_visual(cfg, weights, dtype=torch.float16):
 
 == Chat Template Handling
 
-``process_chat_template()`` extracts the chat template from the HF tokenizer's Jinja template and converts it to a JSON format for the C++ runtime.
+``write_chat_template()`` copies the checkpoint's provider Jinja verbatim for the C++ chat renderer.
 
-=== Hardcoded templates
+=== Provider-owned Jinja
 
-Some models require hardcoded templates:
-
-* **Phi-4 Multimodal** — ``phi4mm.json`` (always)
-* **Nemotron-H** — ``nemotron_nano_v2.json`` (only when the tokenizer has ``<SPECIAL_10>`` as a single token, i.e. Nemotron-Nano-9B-v2; Nemotron-3-Nano-4B uses standard ``<|im_start|>`` tokens and falls through to Jinja)
-* **Qwen3-ASR** — ``qwen3asr.json`` (the ASR tokenizer has no ``chat_template`` attribute)
+The provider template is loaded from ``chat_template.jinja`` or the
+``chat_template`` field in tokenizer/processor metadata. Edge-LLM does not
+maintain model-family rewrites of provider Jinja. Supported checkpoints provide
+one default template containing any tool behavior; named template sets fail
+explicitly. Models without provider Jinja use an explicit model-specific native
+renderer.
 
 == ONNX Export (``onnx/export.py``)
 

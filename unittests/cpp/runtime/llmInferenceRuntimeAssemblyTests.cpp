@@ -56,6 +56,16 @@ TEST_F(RuntimeAssemblyTest, AssemblesWithoutAnyEngineFileOnDisk)
     EXPECT_STREQ(runtime.getSpeculativeDecodingStrategyName(), "vanilla");
 }
 
+TEST_F(RuntimeAssemblyTest, CountsThePromptThroughInferencePreparationWithoutMutatingTheRequest)
+{
+    auto artifacts = makeVanillaArtifacts(mModelDir, makeEngine(), mStream);
+    auto runtime = makeRuntime(std::move(artifacts));
+
+    auto const request = makeGreedyRequest("aa", /*maxGenerateLength=*/1);
+    EXPECT_EQ(runtime.countPromptTokens(request), (std::vector<int32_t>{2}));
+    EXPECT_TRUE(request.formattedRequests.empty());
+}
+
 // Given an executor that reports how much scratch memory it needs
 // When the runtime is assembled
 // Then it asks that executor, and hands back a buffer at least that large

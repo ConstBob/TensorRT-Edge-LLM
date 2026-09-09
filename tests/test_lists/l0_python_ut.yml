@@ -191,16 +191,14 @@ tests:
   - tests/python-unittests/test_gemma4_audio_attention_plugin.py::test_batch
   - tests/python-unittests/test_gemma4_audio_attention_plugin.py::test_ragged_padding_poison
 
-  # Hardcoded chat template JSON contracts
-  - tests/python-unittests/test_chat_template_json.py::test_qwen3_omni_media_wrapped_with_boundary_tokens
-  - tests/python-unittests/test_chat_template_json.py::test_qwen3asr_audio_wrapped_with_boundary_tokens
+  # Provider Jinja chat-template contract
+  - tests/python-unittests/test_chat_template_extraction.py
 
   # Experimental checkpoint-direct server
   - tests/python-unittests/test_server_config.py
   - tests/python-unittests/test_server_model_cache.py
   - tests/python-unittests/test_server_requests.py
   - tests/python-unittests/test_server_runtime.py
-  - tests/python-unittests/test_tool_chat_template.py
   - tests/python-unittests/test_tool_calling.py
   - tests/python-unittests/test_anthropic_compat.py
   - tests/python-unittests/test_experimental_server_audio.py

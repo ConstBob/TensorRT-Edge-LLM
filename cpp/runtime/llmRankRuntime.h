@@ -61,6 +61,11 @@
 
 namespace trt_edgellm
 {
+namespace chat_template
+{
+class ChatTemplate;
+}
+
 namespace rt
 {
 
@@ -103,13 +108,15 @@ public:
     LLMRankRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap,
         std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream,
-        ParallelMapping const& mapping, tokenizer::Tokenizer& tokenizer, ContextCacheConfig const& contextCacheConfig,
+        ParallelMapping const& mapping, tokenizer::Tokenizer& tokenizer,
+        chat_template::ChatTemplate const& chatTemplate, ContextCacheConfig const& contextCacheConfig,
         std::string const& checkpointDir, std::string const& draftCheckpointDir);
 
     LLMRankRuntime(ModelArtifacts&& artifacts, std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap,
         std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream,
-        ParallelMapping const& mapping, tokenizer::Tokenizer& tokenizer, ContextCacheConfig const& contextCacheConfig);
+        ParallelMapping const& mapping, tokenizer::Tokenizer& tokenizer,
+        chat_template::ChatTemplate const& chatTemplate, ContextCacheConfig const& contextCacheConfig);
 
     //! @brief Destructor
     ~LLMRankRuntime();
@@ -353,9 +360,6 @@ public:
     bool finishGeneration(SteppedGeneration& generation, LLMGenerationRequest const& request,
         LLMGenerationResponse& response, cudaStream_t stream);
 
-    /*! \brief Return the input size for an explicit text token-count request. */
-    std::vector<int32_t> countPromptTokens(LLMGenerationRequest const& request) const;
-
     /*!
      * @brief Generate and save system prompt KV cache (public API matching standard runtime signature)
      * @param prompt The system prompt to generate the KVCache
@@ -502,13 +506,15 @@ private:
     void initializeFromEngineDir(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap,
         std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream,
-        ParallelMapping const& mapping, tokenizer::Tokenizer& tokenizer, ContextCacheConfig const& contextCacheConfig,
+        ParallelMapping const& mapping, tokenizer::Tokenizer& tokenizer,
+        chat_template::ChatTemplate const& chatTemplate, ContextCacheConfig const& contextCacheConfig,
         std::string const& checkpointDir, std::string const& draftCheckpointDir);
 
     void initializeCommon(ModelArtifacts&& artifacts, std::string const& engineDir,
         std::string const& multimodalEngineDir, std::unordered_map<std::string, std::string> const& loraWeightsMap,
         std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream,
-        ParallelMapping const& mapping, tokenizer::Tokenizer& tokenizer, ContextCacheConfig const& contextCacheConfig);
+        ParallelMapping const& mapping, tokenizer::Tokenizer& tokenizer,
+        chat_template::ChatTemplate const& chatTemplate, ContextCacheConfig const& contextCacheConfig);
 
     //! @brief Capture a CUDA graph on the base executor for the default (no-adapter)
     //! state, then one additional graph per registered LoRA adapter. Returns the
@@ -573,7 +579,8 @@ private:
     std::unique_ptr<MultimodalRunner> mAudioRunner{nullptr};       //!< Audio multimodal runner (optional)
     std::unique_ptr<Alpamayo1ActionRunner> mActionRunner{nullptr}; //!< Action/diffusion head runner (optional)
     std::unique_ptr<ActionKvBatchCollector> mActionKvBatchCollector;
-    tokenizer::Tokenizer* mTokenizer{nullptr}; //!< Shared tokenizer owned by RuntimeCoordinator
+    tokenizer::Tokenizer* mTokenizer{nullptr};                 //!< Shared tokenizer owned by RuntimeCoordinator
+    chat_template::ChatTemplate const* mChatTemplate{nullptr}; //!< Shared renderer owned by RuntimeCoordinator
 
     //! Grammar-constrained decoding state; inert unless a request asks for it.
     GuidedDecoder mGuidedDecoder;

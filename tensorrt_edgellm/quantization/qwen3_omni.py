@@ -977,8 +977,7 @@ def quantize_qwen3_omni(
         warnings.warn(f"AutoProcessor save failed ({error}); relying on raw "
                       "processor-file copies.")
     for fname in ("preprocessor_config.json", "processor_config.json",
-                  "video_preprocessor_config.json", "chat_template.json",
-                  "chat_template.jinja"):
+                  "video_preprocessor_config.json", "chat_template.jinja"):
         src = os.path.join(model_dir, fname)
         if os.path.isfile(src):
             shutil.copy2(src, os.path.join(output_dir, fname))

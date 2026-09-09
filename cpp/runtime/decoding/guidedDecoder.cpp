@@ -93,15 +93,8 @@ std::vector<int32_t> reasoningEndMarkers(Tokenizer const& tokenizer)
         static_cast<int32_t>(tokenizer.getTokenId("</think>"))};
 }
 
-bool reasoningBlockOpenedByTemplate(Tokenizer const& tokenizer)
-{
-    auto const& thinkingPrompt = tokenizer.getGenerationPromptThinking();
-    return thinkingPrompt.find("<|channel>") != std::string::npos
-        || thinkingPrompt.find("<think>") != std::string::npos;
-}
-
 bool reasoningClosedInPrompt(std::vector<int32_t> const& promptTokens, std::vector<int32_t> const& startMarkers,
-    std::vector<int32_t> const& endMarkers, bool templateOpensBlock) noexcept
+    std::vector<int32_t> const& endMarkers, bool thinkingEnabled) noexcept
 {
     auto const present = [](std::vector<int32_t> const& markers) {
         return std::any_of(markers.begin(), markers.end(), [](int32_t id) { return id >= 0; });
@@ -125,9 +118,9 @@ bool reasoningClosedInPrompt(std::vector<int32_t> const& promptTokens, std::vect
             return false;
         }
     }
-    // No marker at all: a template that writes the opening one leaves none behind only when the
-    // block was never opened; where the model writes it instead, absence proves nothing.
-    return templateOpensBlock;
+    // No marker at all: with thinking disabled the grammar starts immediately. With thinking
+    // enabled, the model may still emit the opening marker even when the template does not.
+    return !thinkingEnabled;
 }
 
 void applyGuidedDecodingMask(GuidedDecoder& decoder, DecodingInferenceContext& context, Tensor& logits,

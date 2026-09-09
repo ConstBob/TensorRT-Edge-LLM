@@ -28,8 +28,8 @@ Do not duplicate that table here.
 
 == Edge-LLM Integration Notes
 
-* The model uses a dedicated `phi4mm.json` chat-template artifact, so template
-  changes should be reviewed with export/runtime placeholder handling.
+* The C++ runtime renders the checkpoint's provider Jinja directly, including
+  its multimodal placeholders.
 * Visual features enter through the multimodal embedding path; decoder-side
   attention, KV cache, FFN, and residual contracts remain shared.
 * Keep long-RoPE and multimodal-position behavior linked to the positional
@@ -42,7 +42,7 @@ Do not duplicate that table here.
 | Path | Detail
 | link:../../../../tensorrt_edgellm/models/phi4mm/modeling_phi4mm_visual.py[modeling_phi4mm_visual.py] | Phi-4 multimodal visual encoder export wrapper.
 | link:../../../../tensorrt_edgellm/models/phi4mm/modeling_phi4mm_text.py[modeling_phi4mm_text.py] | Phi-4 multimodal text wrapper.
-| link:../../../../tensorrt_edgellm/chat_templates/phi4mm.json[phi4mm.json] | Explicit chat template used during export.
+| link:../../../../cpp/chatTemplate/[chatTemplate] | Native provider-Jinja renderer.
 | link:../../../../cpp/multimodal/common/multimodalRunner.h[multimodalRunner.h] | Generic multimodal runtime dispatch.
 |===
 

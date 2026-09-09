@@ -1,141 +1,40 @@
 = Tokenizer Model-Format Support
 {nbsp}
-:description: Model-family token-format support rules for the tokenizer subsystem
+:description: Model-family tokenizer and prompt-format support rules
 
-== Overview
+== Support Rules
 
-This document covers how tokenizer source formats, chat-template
-conventions, and stop-token semantics are adapted for C++ runtime use.
-The generic tokenizer lifecycle is documented in link:README.adoc[README.adoc].
-
-== Model Applicability
-
-[cols="1,2,2,2", options="header"]
+[cols="1,2,2", options="header"]
 |===
-| Family | Source tokenizer characteristics | Export/runtime adaptation | Chat-template / stop-token notes
+| Family type | Tokenizer adaptation | Prompt contract
 
-| Generic HuggingFace BPE families
-| Standard tokenizer artifacts with metadata already present.
-| Save tokenizer directly; runtime consumes `tokenizer.json` and `tokenizer_config.json`.
-| Chat template usually auto-extracted; EOS comes from tokenizer config.
+| HuggingFace-compatible
+| Preserve `tokenizer.json` and tokenizer metadata.
+| Copy the provider `chat_template.jinja` and named Jinja templates verbatim.
+Pantor Inja parses them directly when the runtime loads the model.
 
-| SentencePiece-based families
-| Whitespace semantics expressed through source tokenizer marker pieces or equivalent conventions.
-| Export produces HuggingFace-compatible artifacts; runtime consumes exported pieces with existing primitives.
-| Turn formatting is driven by tokenizer metadata or an explicit checked-in template.
+| Converted tokenizer
+| Export a runtime-compatible tokenizer while preserving special-token IDs and whitespace semantics.
+| Preserve and apply the source checkpoint's Jinja template.
 
-| Explicit-template families
-| Tokenizer may not expose a valid HuggingFace `chat_template`.
-| Export saves tokenizer artifacts normally and uses a checked-in template file.
-| Runtime depends on `processed_chat_template.json` rather than reconstructing template logic.
+| No provider Jinja
+| Preserve or generate the tokenizer normally.
+| Select an explicit `chat_template.model` manual renderer; never infer role prefixes.
+
+| Provider raw processor
+| Preserve the provider tokenizer and identify its processor class.
+| Apply its explicit content-normalization contract before the provider Jinja;
+reject unsupported content.
 |===
 
-== Architecture
+== Adding a Family
 
-Tokenizer compatibility spans four layers:
+1. Verify tokenizer encode/decode parity against the provider checkpoint.
+2. Inspect the provider Jinja and all supported `apply_chat_template` inputs.
+3. Add an explicit native renderer only when the model has no Jinja contract.
+4. Compare complete formatted strings for system, multi-turn, media,
+   reasoning, tools, tool results, and generation prompts.
+5. Run end-to-end inference after prompt parity succeeds.
 
-[mermaid]
-----
-flowchart TD
-    subgraph "Layer 1: Source Assets"
-        SA[tokenizer source assets / tokenizer.json / special tokens]
-    end
-    subgraph "Layer 2: Exported Artifacts"
-        EA[HuggingFace-style tokenizer.json + tokenizer_config.json]
-    end
-    subgraph "Layer 3: Chat Template"
-        CT[processed_chat_template.json]
-    end
-    subgraph "Layer 4: Stop-Token Semantics"
-        ST[EOS / end-of-turn behavior]
-    end
-    SA --> EA
-    EA --> CT
-    CT --> ST
-----
-
-Each family must be checked across all four layers, not only raw subword
-segmentation. Preferred support strategy:
-
-1. Reuse `save_pretrained(...)` output when it matches the runtime contract.
-2. Add a Python export adapter for proprietary or incomplete assets.
-3. Add a runtime tokenizer primitive only when `tokenizer.json` contains
-   an operation not representable by existing primitives.
-4. Add an explicit checked-in chat template only when extraction is unreliable.
-
-== Design
-
-=== Generic HuggingFace/BPE Families
-
-Load tokenizer, save to export directory, derive a processed chat template
-from metadata, and let runtime consume artifacts unchanged.
-
-=== SentencePiece and Whitespace-Sensitive Families
-
-The runtime must preserve whitespace behavior, special tokens, and
-multimodal sentinels exactly as exported. Export remains responsible for
-producing a runtime-compatible artifact set; runtime pretokenizer and
-token-encoder primitives should stay generic.
-
-=== Explicit Chat-Template Families
-
-For families with a usable tokenizer but no safe prompt-wrapper
-extraction, export persists an explicit `processed_chat_template.json` and
-treats it as part of the model contract.
-
-=== Adding a New Model Token Format
-
-[mermaid]
-----
-flowchart TD
-    START[New model family] --> HF{Can save_pretrained output be used directly?}
-    HF -->|Yes| SAVE[Export tokenizer directly]
-    HF -->|No| ADAPT[Add Python tokenizer adapter]
-    SAVE --> TPL{Tokenizer exposes valid chat template?}
-    ADAPT --> TPL
-    TPL -->|Yes| AUTO[Generate processed_chat_template.json]
-    TPL -->|No| EXPL[Use checked-in explicit template]
-    AUTO --> RT{Existing runtime primitives sufficient?}
-    EXPL --> RT
-    RT -->|Yes| DONE[Run parity and inference validation]
-    RT -->|No| PRIM[Add runtime pretokenizer/token-encoder support]
-    PRIM --> DONE
-----
-
-== Code Touchpoints
-
-[cols="2,3", options="header"]
-|===
-| File | Responsibilities
-
-| `tensorrt_edgellm/chat_template.py`
-| Chat-template extraction, template validation, and processed-template generation.
-
-| `experimental/server/parsing/tool_chat_template.py`
-| Tool-aware server request formatting for agentic workloads.
-
-| `tensorrt_edgellm/chat_templates/`
-| Checked-in prompt-template data for families where auto-extraction is unreliable.
-
-| `tensorrt_edgellm/checkpoint/checkpoint_utils.py`
-| Runtime sidecar writing and tokenizer artifact preservation during export.
-
-| `tensorrt_edgellm/scripts/export.py`
-| Export entry point that writes tokenizer artifacts and processed chat templates.
-
-| `cpp/builder/llmBuilder.cpp`
-| Engine-builder copy policy for tokenizer runtime artifacts.
-
-| `cpp/tokenizer/tokenizer.{h,cpp}`
-| Runtime interpretation of exported tokenizer formats.
-
-| `cpp/tokenizer/preTokenizer.{h,cpp}`
-| Shared primitives for token-boundary behavior.
-|===
-
-== Testing
-
-- Source tokenizer versus exported tokenizer ID parity.
-- Chat-formatted prompt parity between Python export and C++ runtime.
-- Special-token preservation for role markers, multimodal sentinels, and EOS markers.
-- Deterministic short-generation comparison against a trusted reference.
+Edge-LLM does not own model-family Jinja copies. Template updates arrive with
+the checkpoint and are preserved during export.

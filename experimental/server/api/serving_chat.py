@@ -272,6 +272,7 @@ class OpenAIServingChat:
             top_k=1 if greedy else request.top_k,
             max_tokens=request.effective_max_tokens,
             enable_thinking=request.enable_thinking,
+            reasoning_effort=request.reasoning_effort or "",
             disable_spec_decode=request.disable_spec_decode,
             num_logprobs=num_logprobs,
             stop=request.stop_strings,
@@ -417,6 +418,8 @@ class OpenAIServingChat:
                 tools=prepared.tool_config.tools,
                 tool_choice=prepared.tool_config.tool_choice,
                 tool_config=prepared.tool_config,
+                apply_chat_template=request.apply_chat_template,
+                add_generation_prompt=request.add_generation_prompt,
             )
             return engine_request
         except (KeyError, TypeError, ValueError) as exc:

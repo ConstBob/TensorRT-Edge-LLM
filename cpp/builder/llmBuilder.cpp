@@ -1999,8 +1999,7 @@ bool LLMBuilder::copyTokenizerFiles()
         return true;
     }
 
-    std::vector<std::string> tokenizerFiles
-        = {"tokenizer_config.json", "tokenizer.json", "processed_chat_template.json"};
+    std::vector<std::string> const tokenizerFiles = {"tokenizer_config.json", "tokenizer.json"};
     bool allSuccess = true;
 
     for (auto const& filename : tokenizerFiles)
@@ -2016,6 +2015,87 @@ bool LLMBuilder::copyTokenizerFiles()
         {
             LOG_WARNING("Failed to copy tokenizer file %s", filename.c_str());
             allSuccess = false;
+        }
+    }
+
+    auto const providerTemplate = mOnnxDir / "chat_template.jinja";
+    auto const manualTemplate = mOnnxDir / "chat_template.model";
+    auto const processorTemplate = mOnnxDir / "chat_template.processor";
+    auto const namedTemplateDir = mOnnxDir / "additional_chat_templates";
+    auto removeTemplateArtifact = [&allSuccess](std::filesystem::path const& path) {
+        std::error_code error;
+        std::filesystem::remove_all(path, error);
+        if (error)
+        {
+            LOG_ERROR("Failed to remove stale chat-template artifact %s: %s", path.c_str(), error.message().c_str());
+            allSuccess = false;
+        }
+    };
+
+    // The only named-template checkpoints in the available test inventory are
+    // CohereForAI/aya-23-8B and CohereForAI/aya-23-35B, whose architecture is
+    // unsupported. Supported models provide one template containing any tool
+    // rendering behavior.
+    if (std::filesystem::exists(namedTemplateDir))
+    {
+        LOG_ERROR("Named provider chat templates are unsupported: %s", namedTemplateDir.c_str());
+        return false;
+    }
+
+    bool const hasProviderTemplate = std::filesystem::is_regular_file(providerTemplate);
+    bool const hasManualTemplate = std::filesystem::is_regular_file(manualTemplate);
+    bool const hasProcessorTemplate = std::filesystem::is_regular_file(processorTemplate);
+    if (std::filesystem::exists(processorTemplate) && !hasProcessorTemplate)
+    {
+        LOG_ERROR("Expected %s to be a regular file", processorTemplate.c_str());
+        return false;
+    }
+    if (hasProviderTemplate == hasManualTemplate)
+    {
+        LOG_ERROR("Expected either provider Jinja or chat_template.model in %s, but not both", mOnnxDir.c_str());
+        return false;
+    }
+    if (hasProcessorTemplate && !hasProviderTemplate)
+    {
+        LOG_ERROR("%s requires a provider Jinja template", processorTemplate.c_str());
+        return false;
+    }
+
+    removeTemplateArtifact(mEngineDir / namedTemplateDir.filename());
+    if (hasManualTemplate)
+    {
+        // Native markers are emitted only for Alpamayo-R1 and the Qwen3
+        // ASR/TTS families, whose prompt contracts need runtime model data.
+        removeTemplateArtifact(mEngineDir / providerTemplate.filename());
+        removeTemplateArtifact(mEngineDir / processorTemplate.filename());
+        if (!file_io::copyFile(manualTemplate.string(), (mEngineDir / manualTemplate.filename()).string()))
+        {
+            LOG_ERROR("Failed to copy %s", manualTemplate.c_str());
+            allSuccess = false;
+        }
+    }
+    else
+    {
+        removeTemplateArtifact(mEngineDir / manualTemplate.filename());
+        if (!file_io::copyFile(providerTemplate.string(), (mEngineDir / providerTemplate.filename()).string()))
+        {
+            LOG_ERROR("Failed to copy %s", providerTemplate.c_str());
+            allSuccess = false;
+        }
+
+        // microsoft/Phi-4-multimodal-instruct and OpenGVLab/InternVL use an
+        // explicit raw-message processor before their provider Jinja.
+        if (hasProcessorTemplate)
+        {
+            if (!file_io::copyFile(processorTemplate.string(), (mEngineDir / processorTemplate.filename()).string()))
+            {
+                LOG_ERROR("Failed to copy %s", processorTemplate.c_str());
+                allSuccess = false;
+            }
+        }
+        else
+        {
+            removeTemplateArtifact(mEngineDir / processorTemplate.filename());
         }
     }
 

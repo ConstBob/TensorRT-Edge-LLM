@@ -755,6 +755,14 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readwrite("type", &Message::MessageContent::type)
         .def_readwrite("content", &Message::MessageContent::content);
 
+    py::class_<Message::ToolCall>(m, "MessageToolCall")
+        .def(py::init<>())
+        .def_readwrite("id", &Message::ToolCall::id)
+        .def_readwrite("type", &Message::ToolCall::type)
+        .def_readwrite("name", &Message::ToolCall::name)
+        .def_readwrite("arguments", &Message::ToolCall::arguments)
+        .def_readwrite("arguments_is_string", &Message::ToolCall::argumentsIsString);
+
     py::class_<Message>(m, "Message")
         .def(py::init<>())
         .def(py::init([](std::string const& role, std::vector<Message::MessageContent> const& contents) {
@@ -765,7 +773,37 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         }),
             py::arg("role"), py::arg("contents"))
         .def_readwrite("role", &Message::role)
-        .def_readwrite("contents", &Message::contents);
+        .def_readwrite("contents", &Message::contents)
+        .def_readwrite("reasoning_content", &Message::reasoningContent)
+        .def_readwrite("has_reasoning_content", &Message::hasReasoningContent)
+        .def_readwrite("tool_calls", &Message::toolCalls)
+        .def_readwrite("has_tool_calls", &Message::hasToolCalls)
+        .def_readwrite("tool_call_id", &Message::toolCallId)
+        .def_readwrite("name", &Message::name)
+        .def_readwrite("has_content", &Message::hasContent)
+        .def_readwrite("content_is_array", &Message::contentIsArray)
+        .def_readwrite("content_is_null", &Message::contentIsNull);
+
+    py::class_<ToolDefinition>(m, "ToolDefinition")
+        .def(py::init<>())
+        .def_readwrite("name", &ToolDefinition::name)
+        .def_readwrite("description", &ToolDefinition::description)
+        .def_readwrite("parameters", &ToolDefinition::parameters)
+        .def_readwrite("strict", &ToolDefinition::strict)
+        .def_readwrite("has_description", &ToolDefinition::hasDescription)
+        .def_readwrite("has_parameters", &ToolDefinition::hasParameters)
+        .def_readwrite("has_strict", &ToolDefinition::hasStrict);
+
+    py::enum_<ToolChoice::Mode>(m, "ToolChoiceMode")
+        .value("NONE", ToolChoice::Mode::kNone)
+        .value("AUTO", ToolChoice::Mode::kAuto)
+        .value("REQUIRED", ToolChoice::Mode::kRequired)
+        .value("FUNCTION", ToolChoice::Mode::kFunction);
+
+    py::class_<ToolChoice>(m, "ToolChoice")
+        .def(py::init<>())
+        .def_readwrite("mode", &ToolChoice::mode)
+        .def_readwrite("function_name", &ToolChoice::functionName);
 
     m.def(
         "create_text_message",
@@ -945,6 +983,10 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readwrite("apply_chat_template", &LLMGenerationRequest::applyChatTemplate)
         .def_readwrite("add_generation_prompt", &LLMGenerationRequest::addGenerationPrompt)
         .def_readwrite("enable_thinking", &LLMGenerationRequest::enableThinking)
+        .def_readwrite("reasoning_effort", &LLMGenerationRequest::reasoningEffort)
+        .def_readwrite("tools", &LLMGenerationRequest::tools)
+        .def_readwrite("tool_choice", &LLMGenerationRequest::toolChoice)
+        .def_readwrite("parallel_tool_calls", &LLMGenerationRequest::parallelToolCalls)
         .def_readwrite("disable_spec_decode", &LLMGenerationRequest::disableSpecDecode)
         .def_readwrite("recurrent_capture_interval", &LLMGenerationRequest::recurrentCaptureInterval)
         .def_readwrite("stream_channels", &LLMGenerationRequest::streamChannels)

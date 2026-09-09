@@ -160,6 +160,13 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
     mTokenizer = std::make_unique<tokenizer::Tokenizer>();
     bool const tokenizerLoaded = mTokenizer->loadFromHF(tokenizerPath);
     ELLM_CHECK(tokenizerLoaded, "Failed to load tokenizer from: " + tokenizerPath.string());
+    auto const specialToken = [this](tokenizer::Rank id) {
+        return id >= 0 ? mTokenizer->idToPiece(id, /*skipSpecialTokens=*/false) : std::string{};
+    };
+    mChatTemplate = std::make_unique<chat_template::ChatTemplate>();
+    ELLM_CHECK(
+        mChatTemplate->load(tokenizerPath, specialToken(mTokenizer->getBosId()), specialToken(mTokenizer->getEosId())),
+        "Failed to load chat template from: " + tokenizerPath.string());
 
     bool const configValid = validateAndFillConfig(talkerEngineDir);
     ELLM_CHECK(configValid, "Failed to validate and fill config");
@@ -1911,8 +1918,9 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
                 llmReq.messages.push_back(msg);
             }
             LLMGenerationRequest::FormattedRequest formatted;
-            if (!mTokenizer->applyChatTemplate(llmReq, formatted, /*applyChatTemplate=*/true,
-                    /*addGenerationPrompt=*/false, /*enableThinking=*/false))
+            chat_template::ChatTemplate::Options options;
+            options.addGenerationPrompt = false;
+            if (!mChatTemplate->apply(llmReq, formatted, options))
             {
                 LOG_ERROR("Chat template failed for batch %d", b);
                 return false;
@@ -2005,8 +2013,11 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
         LLMGenerationRequest::Request llmReq;
         llmReq.messages = requests[b].messages;
         LLMGenerationRequest::FormattedRequest formatted;
-        if (!mTokenizer->applyChatTemplate(llmReq, formatted, requests[b].applyChatTemplate,
-                requests[b].addGenerationPrompt, requests[b].enableThinking))
+        chat_template::ChatTemplate::Options options;
+        options.applyTemplate = requests[b].applyChatTemplate;
+        options.addGenerationPrompt = requests[b].addGenerationPrompt;
+        options.enableThinking = requests[b].enableThinking;
+        if (!mChatTemplate->apply(llmReq, formatted, options))
         {
             LOG_ERROR("Chat template failed for batch %d", b);
             return false;

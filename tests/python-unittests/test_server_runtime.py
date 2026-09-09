@@ -25,8 +25,9 @@ from experimental.server.api.errors import (ServerOverloadedError,
                                             ServerUnavailableError)
 from experimental.server.config import ContextCacheConfig
 from experimental.server.runtime.engine import (
-    LLM, SamplingParams, _native_context_cache_config,
-    _resolve_spec_decode_runtime_options, _set_context_cache_request_policies)
+    LLM, SamplingParams, _convert_messages_to_cpp,
+    _native_context_cache_config, _resolve_spec_decode_runtime_options,
+    _set_context_cache_request_policies)
 from experimental.server.runtime.engine_client import (_AdmissionController,
                                                        _iterate_sync)
 from experimental.server.runtime.engine_layout import EngineType
@@ -158,6 +159,120 @@ def _bare_llm(runtime):
     llm._close_lock = threading.Lock()
     llm._closed = False
     return llm
+
+
+class _NativeMessageValue:
+
+    def __init__(self, *values):
+        self.values = values
+
+
+def _message_runtime():
+    return SimpleNamespace(Message=_NativeMessageValue,
+                           MessageContent=_NativeMessageValue,
+                           MessageToolCall=_NativeMessageValue)
+
+
+def test_message_conversion_preserves_string_tool_call_arguments():
+    messages = _convert_messages_to_cpp(
+        _message_runtime(),
+        [{
+            "role":
+            "assistant",
+            "content":
+            None,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "arguments": '{"city":"Paris"}',
+                },
+            }],
+        }],
+    )
+
+    assert messages[0].has_tool_calls
+    assert messages[0].has_content
+    assert messages[0].content_is_null
+    assert messages[0].tool_calls[0].arguments_is_string
+    assert messages[0].tool_calls[0].arguments == '{"city":"Paris"}'
+
+
+def test_message_conversion_preserves_absent_content_and_object_arguments():
+    messages = _convert_messages_to_cpp(
+        _message_runtime(),
+        [{
+            "role":
+            "assistant",
+            "tool_calls": [{
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "arguments": {
+                        "city": "Paris"
+                    },
+                },
+            }],
+        }],
+    )
+
+    assert not messages[0].has_content
+    assert not messages[0].content_is_null
+    assert not messages[0].tool_calls[0].arguments_is_string
+    assert messages[0].tool_calls[0].arguments == '{"city":"Paris"}'
+
+
+def test_message_conversion_ignores_empty_tool_calls():
+    messages = _convert_messages_to_cpp(
+        _message_runtime(),
+        [{
+            "role": "assistant",
+            "content": "done",
+            "tool_calls": []
+        }],
+    )
+
+    assert not messages[0].has_tool_calls
+    assert messages[0].tool_calls == []
+
+
+def test_message_conversion_rejects_invalid_tool_call_json():
+    with pytest.raises(ValueError,
+                       match="Invalid JSON in assistant tool-call arguments"):
+        _convert_messages_to_cpp(
+            _message_runtime(),
+            [{
+                "role":
+                "assistant",
+                "content":
+                None,
+                "tool_calls": [{
+                    "function": {
+                        "name": "weather",
+                        "arguments": "{invalid",
+                    },
+                }],
+            }],
+        )
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    (({
+        "text": "not a content part"
+    }, "must be a string, an array, or null"),
+     ([7], "must be strings or objects")),
+)
+def test_message_conversion_rejects_non_openai_content_shape(content, message):
+    with pytest.raises(ValueError, match=message):
+        _convert_messages_to_cpp(
+            _message_runtime(),
+            [{
+                "role": "user",
+                "content": content
+            }],
+        )
 
 
 def test_runtime_requests_are_serialized():
@@ -547,6 +662,56 @@ def test_context_cache_request_policies(reuse_context, cache_generated_tokens,
 
     assert request.context_cache_lookup_policy == expected_lookup
     assert request.context_cache_commit_policy == expected_commit
+
+
+def test_native_chat_template_derives_hybrid_mtp_replay_tail(monkeypatch):
+    from experimental.server.runtime import engine as engine_module
+
+    class NativeValue:
+
+        def __init__(self, **values):
+            self.__dict__.update(values)
+
+    runtime_module = SimpleNamespace(
+        LLMGenerationRequest=NativeValue,
+        Request=NativeValue,
+        ToolChoice=NativeValue,
+        ToolChoiceMode=SimpleNamespace(NONE="none",
+                                       AUTO="auto",
+                                       REQUIRED="required",
+                                       FUNCTION="function"),
+        ContextCacheLookupPolicy=SimpleNamespace(USE_CACHE="use",
+                                                 BYPASS="bypass"),
+        ContextCacheCommitPolicy=SimpleNamespace(
+            INCLUDING_GENERATED_TOKENS="all", PREFILL_STATE_ONLY="prefill"),
+    )
+    llm = _bare_llm(SimpleNamespace(has_draft_model=lambda: True))
+    llm._rt = runtime_module
+    llm._context_cache_config = ContextCacheConfig(enabled=True)
+    llm._prepare_messages_for_runtime = lambda _messages: ([], [])
+    monkeypatch.setattr(engine_module, "_load_audio_buffers",
+                        lambda *_args: [])
+
+    request = llm._make_generation_request(
+        [{
+            "role": "user",
+            "content": "hello"
+        }],
+        SamplingParams(cache_generated_tokens=False),
+    )
+    assert request.apply_chat_template is True
+    assert request.add_generation_prompt is True
+    assert request.context_cache_replay_tail_length == -1
+
+    raw_request = llm._make_generation_request(
+        [{
+            "role": "user",
+            "content": "hello"
+        }],
+        SamplingParams(cache_generated_tokens=False),
+        apply_chat_template=False,
+    )
+    assert raw_request.context_cache_replay_tail_length == 0
 
 
 @pytest.mark.parametrize("engine_type",

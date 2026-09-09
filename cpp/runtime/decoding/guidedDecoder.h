@@ -239,15 +239,6 @@ std::vector<int32_t> reasoningStartMarkers(Tokenizer const& tokenizer);
 std::vector<int32_t> reasoningEndMarkers(Tokenizer const& tokenizer);
 
 /*!
- * @brief Whether the chat template opens the reasoning block itself.
- *
- * Some templates append the opening marker as part of the thinking generation prompt, others
- * leave the model to emit it. Only in the first case does an absent marker prove the block was
- * never opened.
- */
-bool reasoningBlockOpenedByTemplate(Tokenizer const& tokenizer);
-
-/*!
  * @brief Whether the prompt leaves the reasoning block closed, i.e. whether guided decoding
  *        may constrain from the very first generated token.
  *
@@ -257,12 +248,12 @@ bool reasoningBlockOpenedByTemplate(Tokenizer const& tokenizer);
  * @param startMarkers Ids opening a reasoning block; entries below zero are absent from the
  *                     tokenizer and ignored
  * @param endMarkers   Ids closing one, same convention
- * @param templateOpensBlock From \ref reasoningBlockOpenedByTemplate. Decides the case where the
- *                     prompt carries no marker at all: with such a template that means the block
- *                     was never opened, otherwise the model may still open one
+ * @param thinkingEnabled Whether the request allows a reasoning phase. When the prompt carries no
+ *                        marker, a disabled reasoning phase is closed while an enabled phase may
+ *                        still be opened by the model.
  */
 bool reasoningClosedInPrompt(std::vector<int32_t> const& promptTokens, std::vector<int32_t> const& startMarkers,
-    std::vector<int32_t> const& endMarkers, bool templateOpensBlock) noexcept;
+    std::vector<int32_t> const& endMarkers, bool thinkingEnabled) noexcept;
 
 /*!
  * @brief Constrain one step's logits to the grammar-legal tokens.

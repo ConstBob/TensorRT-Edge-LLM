@@ -46,6 +46,7 @@
 #include "common/logger.h"
 #include "runtime/cosmos3Runtime.h"
 
+#include "chatTemplate/chatTemplate.h"
 #include "common/checkMacros.h"
 #include "common/safetensorsUtils.h"
 #include "common/tensor.h"
@@ -560,7 +561,11 @@ int main(int argc, char** argv)
         }
         tokenizer::Tokenizer tok;
         ELLM_CHECK(tok.loadFromHF(tokDir), "Failed to load tokenizer from " + tokDir.string());
-        ELLM_CHECK(tok.loadChatTemplate(tokDir / "processed_chat_template.json"),
+        auto const specialToken = [&tok](tokenizer::Rank id) {
+            return id >= 0 ? tok.idToPiece(id, /*skipSpecialTokens=*/false) : std::string{};
+        };
+        chat_template::ChatTemplate chatTemplate;
+        ELLM_CHECK(chatTemplate.load(tokDir, specialToken(tok.getBosId()), specialToken(tok.getEosId())),
             "Failed to load chat template from " + tokDir.string());
         std::vector<std::vector<tokenizer::Rank>> ids;
         ids.reserve(args.prompts.size());
@@ -578,8 +583,9 @@ int main(int argc, char** argv)
             message.contents.push_back({"text", instruction});
             request.messages.push_back(std::move(message));
             rt::LLMGenerationRequest::FormattedRequest formatted;
-            ELLM_CHECK(tok.applyChatTemplate(request, formatted, /*applyChatTemplate=*/true,
-                           /*addGenerationPrompt=*/true, /*enableThinking=*/true),
+            chat_template::ChatTemplate::Options options;
+            options.enableThinking = true;
+            ELLM_CHECK(chatTemplate.apply(request, formatted, options),
                 "Failed to apply the chat template to prompt: " + prompt);
             ids.push_back(tok.encode(formatted.formattedCompleteRequest, /*addBos=*/false, /*addEos=*/false));
             ELLM_CHECK(!ids.back().empty(), "Prompt tokenized to zero tokens: " + prompt);
@@ -640,8 +646,9 @@ int main(int argc, char** argv)
             umsg.contents.push_back({"text", std::string{}});
             ureq.messages.push_back(std::move(umsg));
             rt::LLMGenerationRequest::FormattedRequest uformatted;
-            ELLM_CHECK(tok.applyChatTemplate(ureq, uformatted, /*applyChatTemplate=*/true,
-                           /*addGenerationPrompt=*/true, /*enableThinking=*/true),
+            chat_template::ChatTemplate::Options options;
+            options.enableThinking = true;
+            ELLM_CHECK(chatTemplate.apply(ureq, uformatted, options),
                 "Failed to apply the chat template to the unconditional (empty) prompt");
             std::vector<tokenizer::Rank> uids
                 = tok.encode(uformatted.formattedCompleteRequest, /*addBos=*/false, /*addEos=*/false);

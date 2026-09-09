@@ -47,9 +47,6 @@ RUNTIME_TOKENIZER_FILENAMES: Tuple[str, ...] = (
     "tokenizer_config.json",
     "tokenizer.model",
     "special_tokens_map.json",
-    "processed_chat_template.json",
-    "chat_template.jinja",
-    "chat_template.json",
 )
 
 
@@ -1049,7 +1046,7 @@ def write_runtime_artifacts(model: "CausalLM",
                             reduced_vocab_dir: str = "",
                             config_filename: str = "config.json",
                             write_shared_artifacts: bool = True) -> None:
-    """Write the runtime config, ``embedding.safetensors``, tokenizer copies, chat template.
+    """Write runtime config and the shared model-input artifacts.
 
     ``config_filename`` selects the filename for the runtime config. Use
     the default ``"config.json"`` for single-device exports, or
@@ -1063,8 +1060,7 @@ def write_runtime_artifacts(model: "CausalLM",
 
     from tensorrt_edgellm._safetensors_io import save_file
 
-    from ..chat_template import (process_chat_template,
-                                 write_fallback_processed_chat_template)
+    from ..chat_template import write_chat_template
 
     os.makedirs(out_dir, exist_ok=True)
 
@@ -1131,16 +1127,13 @@ def write_runtime_artifacts(model: "CausalLM",
     if not write_shared_artifacts:
         return
 
-    # EAGLE3 draft models don't need embedding.safetensors — the C++ runtime
-    # uses the base model's shared embedding table (the builder already skips
-    # copying for draft models).
-    if (model.config.is_eagle3_draft or model.config.is_mtp_draft
-            or model.config.is_gemma4_mtp_draft):
-        kind = ("EAGLE3 draft"
-                if model.config.is_eagle3_draft else "Gemma4 MTP draft"
-                if model.config.is_gemma4_mtp_draft else "MTP draft")
+    engine_role = _determine_engine_role(model.config)
+
+    # Every speculative draft shares the base model's embedding table.
+    if engine_role == "draft":
+        kind = _determine_spec_decode_type(model.config)
         logger.info(
-            "%s: skipping embedding.safetensors (uses base model embedding)",
+            "%s draft: skipping embedding.safetensors (uses base model embedding)",
             kind)
     else:
         embed = getattr(model, "embed_tokens", None)
@@ -1196,7 +1189,7 @@ def write_runtime_artifacts(model: "CausalLM",
 
     # Alpamayo-R1: tokenizer lives in the VLM checkpoint, not in model_dir.
     # Build it first so that tokenizer files exist before the copy loop
-    # (which is a no-op for Alpamayo) and before process_chat_template.
+    # (which is a no-op for Alpamayo) and before write_chat_template.
     if root_cfg.get("model_type") == "alpamayo_r1":
         _build_alpamayo_tokenizer(root_cfg, out_dir)
 
@@ -1236,8 +1229,5 @@ def write_runtime_artifacts(model: "CausalLM",
     from ..vocab_reduction.onnx_export import copy_reduced_vocab_artifacts
     copy_reduced_vocab_artifacts(model, out_dir, reduced_vocab_dir)
 
-    template_dst = os.path.join(out_dir, "processed_chat_template.json")
-    if not os.path.exists(template_dst) and model_dir:
-        process_chat_template(model_dir, out_dir)
-    if not os.path.exists(template_dst):
-        write_fallback_processed_chat_template(model_dir, out_dir)
+    if engine_role != "draft":
+        write_chat_template(model_dir, out_dir)

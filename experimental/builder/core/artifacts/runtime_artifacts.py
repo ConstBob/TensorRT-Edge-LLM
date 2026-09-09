@@ -20,10 +20,11 @@ import os
 import shutil
 from typing import Any, Dict
 
+from tensorrt_edgellm.chat_template import write_chat_template
+
 from .. import contracts
 from ..config import DeviceConfig
 from ..weights import Weights
-from .chat_template import write_processed_chat_template
 from .embeddings import (copy_vocab_artifacts, externalizes_embedding,
                          externalizes_ple, write_embedding,
                          write_ple_embedding)
@@ -231,8 +232,7 @@ def write_runtime_artifacts(cfg: DeviceConfig,
     try:
         copy_tokenizer_artifacts(runtime_model_dir, output_dir)
         write_tokenizer_json_if_missing(runtime_model_dir, output_dir)
-        write_processed_chat_template(runtime_model_dir, output_dir,
-                                      tokenizer_module)
+        write_chat_template(runtime_model_dir, output_dir)
         if tokenizer_module is not None and hasattr(tokenizer_module,
                                                     "patch_runtime_artifacts"):
             tokenizer_module.patch_runtime_artifacts(output_dir, args)

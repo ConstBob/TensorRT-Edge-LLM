@@ -385,9 +385,9 @@ TEST_F(ApplyTokenBitmaskTest, HandlesVocabularyNotAlignedToWordBoundary)
 
 // ---------------------------------------------------------------- reasoning gate seed
 
-//! The chat template, not the request flag, decides where the reasoning block stands, and the
-//! prompt is the only place that shows it. Cases are named after the template shapes in use.
-TEST(GuidedDecodingReasoningGateTest, SeedsFromThePromptRatherThanARequestFlag)
+//! Prompt markers are authoritative. The request's thinking mode only resolves a prompt with no
+//! marker, where the model may still open a reasoning block before the grammar starts.
+TEST(GuidedDecodingReasoningGateTest, SeedsFromPromptMarkersAndThinkingMode)
 {
     constexpr int32_t kSTART_THINK = 100;
     constexpr int32_t kEND_THINK = 101;
@@ -399,33 +399,29 @@ TEST(GuidedDecodingReasoningGateTest, SeedsFromThePromptRatherThanARequestFlag)
 
     // Template opened and closed the block: constrain from the first generated token. The end
     // marker is never generated, so a gate waiting for one would never open.
-    EXPECT_TRUE(
-        rt::reasoningClosedInPrompt({kTEXT, kSTART_THINK, kEND_THINK}, starts, ends, /*templateOpensBlock=*/false));
+    EXPECT_TRUE(rt::reasoningClosedInPrompt({kTEXT, kSTART_THINK, kEND_THINK}, starts, ends, /*thinkingEnabled=*/true));
 
     // Template left the block open: the model is mid-reasoning.
-    EXPECT_FALSE(rt::reasoningClosedInPrompt({kTEXT, kSTART_THINK}, starts, ends, /*templateOpensBlock=*/false));
-    EXPECT_FALSE(rt::reasoningClosedInPrompt({kTEXT, kSTART_CHANNEL}, starts, ends, /*templateOpensBlock=*/false));
+    EXPECT_FALSE(rt::reasoningClosedInPrompt({kTEXT, kSTART_THINK}, starts, ends, /*thinkingEnabled=*/false));
+    EXPECT_FALSE(rt::reasoningClosedInPrompt({kTEXT, kSTART_CHANNEL}, starts, ends, /*thinkingEnabled=*/false));
 
-    // Template omitted the block. What that means depends on who writes the opening marker:
-    // where the model does, absence proves nothing and the block must be treated as open; where
-    // the template does, absence proves the block was never opened. Reading the second case as
-    // open leaves such a model permanently mid-thought and silently unconstrained.
-    EXPECT_FALSE(rt::reasoningClosedInPrompt({kTEXT, kTEXT}, starts, ends, /*templateOpensBlock=*/false));
-    EXPECT_TRUE(rt::reasoningClosedInPrompt({kTEXT, kTEXT}, starts, ends, /*templateOpensBlock=*/true));
+    // With no marker, disabled thinking starts the grammar immediately. Enabled thinking waits
+    // because a model-native reasoning block may still begin with the first generated token.
+    EXPECT_TRUE(rt::reasoningClosedInPrompt({kTEXT, kTEXT}, starts, ends, /*thinkingEnabled=*/false));
+    EXPECT_FALSE(rt::reasoningClosedInPrompt({kTEXT, kTEXT}, starts, ends, /*thinkingEnabled=*/true));
 
-    // A template that opens the block still yields to what the prompt actually shows.
-    EXPECT_FALSE(rt::reasoningClosedInPrompt({kTEXT, kSTART_CHANNEL}, starts, ends, /*templateOpensBlock=*/true));
-    EXPECT_TRUE(rt::reasoningClosedInPrompt({kSTART_CHANNEL, kEND_CHANNEL}, starts, ends, /*templateOpensBlock=*/true));
+    // Explicit markers override the request mode.
+    EXPECT_FALSE(rt::reasoningClosedInPrompt({kTEXT, kSTART_CHANNEL}, starts, ends, /*thinkingEnabled=*/false));
+    EXPECT_TRUE(rt::reasoningClosedInPrompt({kSTART_CHANNEL, kEND_CHANNEL}, starts, ends, /*thinkingEnabled=*/true));
 
     // Only the most recent marker counts; an earlier turn's block must not leak.
     EXPECT_TRUE(rt::reasoningClosedInPrompt(
-        {kSTART_THINK, kEND_THINK, kTEXT, kSTART_THINK, kEND_THINK}, starts, ends, /*templateOpensBlock=*/false));
+        {kSTART_THINK, kEND_THINK, kTEXT, kSTART_THINK, kEND_THINK}, starts, ends, /*thinkingEnabled=*/true));
     EXPECT_FALSE(rt::reasoningClosedInPrompt(
-        {kSTART_THINK, kEND_THINK, kTEXT, kSTART_THINK}, starts, ends, /*templateOpensBlock=*/false));
+        {kSTART_THINK, kEND_THINK, kTEXT, kSTART_THINK}, starts, ends, /*thinkingEnabled=*/false));
 
     // Marker families are independent: a channel block closes on the channel end marker.
-    EXPECT_TRUE(
-        rt::reasoningClosedInPrompt({kSTART_CHANNEL, kEND_CHANNEL}, starts, ends, /*templateOpensBlock=*/false));
+    EXPECT_TRUE(rt::reasoningClosedInPrompt({kSTART_CHANNEL, kEND_CHANNEL}, starts, ends, /*thinkingEnabled=*/true));
 }
 
 //! A model with no reasoning markers has no reasoning phase, so it must not sit behind a gate
@@ -433,12 +429,12 @@ TEST(GuidedDecodingReasoningGateTest, SeedsFromThePromptRatherThanARequestFlag)
 TEST(GuidedDecodingReasoningGateTest, ModelWithoutMarkersIsNeverGated)
 {
     std::vector<int32_t> const absent{-1, -1};
-    EXPECT_TRUE(rt::reasoningClosedInPrompt({7, 8, 9}, absent, absent, /*templateOpensBlock=*/false));
-    EXPECT_TRUE(rt::reasoningClosedInPrompt({}, absent, absent, /*templateOpensBlock=*/false));
+    EXPECT_TRUE(rt::reasoningClosedInPrompt({7, 8, 9}, absent, absent, /*thinkingEnabled=*/true));
+    EXPECT_TRUE(rt::reasoningClosedInPrompt({}, absent, absent, /*thinkingEnabled=*/false));
 
     // -1 must not match a padding or placeholder id that happens to be negative.
-    EXPECT_TRUE(rt::reasoningClosedInPrompt({-1, 7}, absent, absent, /*templateOpensBlock=*/false));
-    EXPECT_FALSE(rt::reasoningClosedInPrompt({-1, 7}, {-1, 100}, {-1, 101}, /*templateOpensBlock=*/false));
+    EXPECT_TRUE(rt::reasoningClosedInPrompt({-1, 7}, absent, absent, /*thinkingEnabled=*/true));
+    EXPECT_FALSE(rt::reasoningClosedInPrompt({-1, 7}, {-1, 100}, {-1, 101}, /*thinkingEnabled=*/true));
 }
 
 // ---------------------------------------------------------------- GuidedDecoder lifecycle
@@ -463,14 +459,8 @@ protected:
   }, "merges": []},
   "added_tokens": [{"id": 10, "content": "<eos>"}, {"id": 11, "content": "</think>"}],
   "pre_tokenizer": {"type": "Split", "pattern": {"String": ""}}
-})JSON";
+        })JSON";
         std::ofstream(mDir / "tokenizer_config.json") << R"JSON({"eos_token": {"content": "<eos>"}})JSON";
-        std::ofstream(mDir / "processed_chat_template.json") << R"JSON({
-  "model_path": "unit",
-  "roles": {"system": {"prefix": "", "suffix": ""}, "user": {"prefix": "", "suffix": ""},
-            "assistant": {"prefix": "", "suffix": ""}},
-  "generation_prompt": ""
-})JSON";
         ASSERT_TRUE(mTokenizer.loadFromHF(mDir));
     }
 

@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "chatTemplate/chatTemplate.h"
 #include "common/tensor.h"
 #include "kernels/talkerMLPKernels/talkerMLPKernels.h"
 #include "profiling/metrics.h"
@@ -896,7 +897,8 @@ private:
     int32_t mNumRvqLayers{talker_constants::kDefaultNumRvqLayers};
     int32_t mNumCodesPerFrame{talker_constants::kDefaultNumRvqLayers + 1};
 
-    std::unique_ptr<tokenizer::Tokenizer> mTokenizer; //!< Tokenizer for text-to-token-ID conversion
+    std::unique_ptr<tokenizer::Tokenizer> mTokenizer;           //!< Tokenizer for text-to-token-ID conversion
+    std::unique_ptr<chat_template::ChatTemplate> mChatTemplate; //!< Model-owned prompt renderer
 
     // Talker engine — migrated to EngineExecutor + supporting state
     LLMEngineConfig mTalkerLLMConfig;                  //!< Talker LLM configuration (parsed from config.json)

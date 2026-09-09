@@ -1,129 +1,59 @@
 = Tokenizer Architecture
 {nbsp}
-:description: Tokenizer subsystem architecture across Python export, chat-template processing, and C++ runtime encode/decode
+:description: Tokenizer and chat-rendering runtime boundaries
 
 == Overview
 
-The tokenizer subsystem spans Python export and C++ runtime. It owns the
-runtime artifact contract, load/encode/decode lifecycle, and the boundary
-between generic tokenizer logic and model-family adapters.
+The tokenizer converts text to token IDs and token IDs back to text. Prompt
+rendering is a separate model contract owned by `ChatTemplate`.
 
-The design rule is: *adapt model-family token formats during export so
-the C++ runtime consumes one stable HuggingFace-style artifact contract*.
-Family token semantics are documented in link:model_formats.adoc[model_formats.adoc].
+== Runtime Artifacts
 
-== Model Applicability
+`tokenizer.json`:: Vocabulary, merges, normalization, pretokenization, and
+special-token data consumed by `Tokenizer::loadFromHF(...)`.
 
-[cols="1,2", options="header"]
-|===
-| Model Family | Tokenizer Path
+`tokenizer_config.json`:: Tokenizer metadata and special-token declarations.
 
-| Generic HuggingFace BPE families
-| Standard `save_pretrained` export; runtime consumes artifacts unchanged.
+`chat_template.jinja`:: Verbatim model-owned prompt program.
 
-| SentencePiece-based families
-| Export preserves whitespace semantics in HuggingFace-compatible artifacts.
+`chat_template.processor`:: Explicit provider raw-processor contract for a
+checkpoint whose Jinja expects preprocessed message content.
 
-| Explicit-template families such as Phi-4 multimodal
-| Tokenizer is saved normally; a checked-in template replaces unreliable auto-extraction.
-|===
+`chat_template.model`:: Explicit model-specific manual renderer selection for
+a family that does not provide Jinja semantics.
 
 == Architecture
 
 [mermaid]
 ----
 flowchart LR
-    SRC[Source checkpoint assets] --> EXP[Python export adapters]
-    EXP --> TJ[tokenizer.json]
-    EXP --> TC[tokenizer_config.json]
-    EXP --> CT[processed_chat_template.json]
-    TJ --> RT[C++ Tokenizer::loadFromHF]
-    TC --> RT
-    CT --> RT
+    REQ[Structured messages, media, reasoning, tools] --> CT[C++ ChatTemplate / Pantor Inja]
+    CT --> TXT[Formatted prompt]
+    TJ[tokenizer.json] --> TOK[C++ Tokenizer]
+    TC[tokenizer_config.json] --> TOK
+    TXT --> TOK
+    TOK --> IDS[Token IDs]
 ----
 
-=== SentencePiece Background
+The server forwards the structured request to C++; it does not preformat tool
+messages in Python. The provider template defines role ordering, any system
+text, media placeholders, reasoning markers, tool syntax, and generation
+prompts. `Tokenizer` never interprets those semantics.
 
-Many LLM tokenizers are trained with SentencePiece, which serializes a
-vocabulary and normalization rules as a binary `.model` file. HuggingFace
-Fast tokenizer format (`tokenizer.json`) can represent the runtime
-tokenization contract in portable JSON. During export, Edge-LLM adapts
-supported source formats so the C++ runtime has one artifact contract.
-The original `.model` file may be copied as a source sidecar, but the
-engine builder and runtime do not currently consume it.
+== Export
 
-=== Runtime Artifact Contract
+Export preserves tokenizer artifacts and copies the provider's default Jinja
+template verbatim. If it is embedded in `processor_config.json` or
+`tokenizer_config.json`, export materializes the same string as
+`chat_template.jinja`. The C++ runtime passes that file directly to Pantor
+Inja. Named template sets and unsupported syntax fail explicitly.
 
-`tokenizer.json`:: Primary tokenizer definition consumed by runtime:
-pre-tokenizer configuration, model vocabulary/merges, and added tokens.
+== Encode and Decode
 
-`tokenizer_config.json`:: Special-token IDs, max length, and the original
-chat-template string when present.
-
-`processed_chat_template.json`:: Runtime-friendly chat template with
-role prefixes/suffixes, generation prompt, and optional default system prompt.
-
-Export may also preserve source tokenizer sidecars such as `tokenizer.model`
-or `special_tokens_map.json` for provenance or compatibility with Python
-tooling. They are not part of the current engine-builder copy set or C++
-runtime load path.
-
-== Design
-
-=== Python Export Flow
-
-Export starts from `tensorrt-edgellm-export` / `tensorrt_edgellm/scripts/export.py`.
-The generic path saves the HuggingFace tokenizer directly and derives a
-processed chat template from metadata. Adapter paths convert incompatible
-layouts into the same HuggingFace-style artifact set and persist an explicit
-chat template when auto-extraction is unreliable.
-
-=== C++ Runtime Flow
-
-==== Initialization
-
-`Tokenizer::loadFromHF(...)` loads `tokenizer.json`, reads special-token
-metadata, constructs the pretokenizer/token-encoder pipeline, loads
-`processed_chat_template.json`, and fails fast on malformed or missing
-artifacts.
-
-==== Encode Path
-
-[mermaid]
-----
-flowchart TD
-    TXT[Formatted prompt text] --> PART[Partition special tokens]
-    PART --> PRE[Pretokenizer sequence]
-    PRE --> ENC[TokenEncoder]
-    ENC --> IDS[Token IDs]
-----
-
-Encoding performs optional BOS insertion, longest-match special-token
-partitioning, pretokenization, vocabulary lookup, and optional EOS insertion.
-
-==== Decode Path
-
-Decode maps token IDs back to pieces via the reverse vocabulary,
-optionally skips special tokens, and concatenates pieces into text.
-Whitespace-sensitive families depend on exported token pieces preserving the
-same spacing behavior as the source tokenizer.
-
-==== Chat Template Application
-
-Before encoding, runtime applies `processed_chat_template.json`: each
-role contributes a prefix/suffix pair, optional content-type format
-strings handle multimodal content, and a generation prompt cues assistant
-output.
-
-=== Core Runtime Components
-
-==== Pretokenizer
-Splits text partitions through supported primitives such as `Sequence` and
-`RegexSplit`.
-
-==== Token Encoder
-Owns vocabulary lookup and reverse decode mapping. Source formats that
-require special handling are converted during export.
+Encoding partitions special tokens, applies the configured pretokenizer and
+token encoder, and resolves vocabulary IDs. Decode performs the reverse mapping
+and preserves streaming UTF-8 behavior. These paths operate only on formatted
+text and have no model-specific chat logic.
 
 == Code Touchpoints
 
@@ -131,37 +61,20 @@ require special handling are converted during export.
 |===
 | File | Responsibilities
 
-| `tensorrt_edgellm/chat_template.py`
-| Chat-template extraction, template validation, and processed-template generation.
-
-| `experimental/server/parsing/tool_chat_template.py`
-| Tool-aware server request formatting for agentic workloads.
-
-| `tensorrt_edgellm/chat_templates/`
-| Checked-in explicit chat-template data for incompatible families.
-
-| `tensorrt_edgellm/checkpoint/checkpoint_utils.py`
-| Checkpoint/config loading helpers and runtime sidecar writing used by export.
-
-| `tensorrt_edgellm/scripts/export.py`
-| Export entry point that writes tokenizer artifacts and processed chat templates.
-
-| `cpp/builder/llmBuilder.cpp`
-| Engine-builder copy policy for tokenizer runtime artifacts.
+| `cpp/chatTemplate/chatTemplate.{h,cpp}`
+| Structured request context, explicit raw-processor contracts, and Pantor
+Inja rendering.
 
 | `cpp/tokenizer/tokenizer.{h,cpp}`
-| Runtime load, special-token partitioning, encode/decode, and chat-template application.
+| Tokenizer loading, encoding, decoding, and special tokens.
 
-| `cpp/tokenizer/preTokenizer.{h,cpp}`
-| Sequence and regex-split pretokenizer primitives.
-
-| `cpp/tokenizer/tokenEncoder.{h,cpp}`
-| Vocabulary encode/decode.
+| `tensorrt_edgellm/chat_template.py`
+| Strict provider-template extraction and explicit native contract selection.
 |===
 
 == Testing
 
-- Exported tokenizer versus source tokenizer encode parity.
-- Chat-template parity between Python export and C++ formatted text.
-- Round-trip decode sanity for whitespace/control-token-sensitive families.
-- Deterministic first-token generation on a short prompt before deeper runtime debugging.
+- Provider `apply_chat_template(..., tokenize=False)` versus C++ output.
+- Text, multimodal, reasoning, tool-call, and tool-result scenarios.
+- Source tokenizer versus exported tokenizer ID parity.
+- Deterministic inference sanity after prompt and tokenizer parity pass.
