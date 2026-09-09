@@ -90,6 +90,7 @@ wheel_python_base:
   needs:
     - job: wheel_packaging_precheck
       artifacts: true
+    - job: build_ci_dependency_images
     - job: build_cutedsl_docker_matrix
       artifacts: true
   cache:
@@ -107,7 +108,7 @@ wheel_python_base:
   stage: wheel-assemble
   extends: [.wheel_rules]
   tags: [cpu-general-k8s]
-  image: $WHEEL_IMAGE_UBUNTU2404_CU13
+  image: $CI_DEPENDENCY_WHEEL_UBUNTU2404_IMAGE
   interruptible: true
   script:
     - sh .gitlab/ci/scripts/wheel_ci.sh ci-assemble

@@ -1,0 +1,61 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE} AS common
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential \
+        ccache \
+        curl \
+        git \
+        software-properties-common \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM common AS pipeline
+RUN --mount=type=bind,source=tests/requirements.txt,target=/tmp/tests-requirements.txt,readonly \
+    --mount=type=bind,source=examples/accuracy/requirements.txt,target=/tmp/accuracy-requirements.txt,readonly \
+    pip3 install \
+        -r /tmp/tests-requirements.txt \
+        -r /tmp/accuracy-requirements.txt \
+        gcovr \
+        pybind11==2.13.6 \
+        pycuda \
+    && mkdir -p /opt/edgellm-ci \
+    && printf '%s\n' pipeline > /opt/edgellm-ci/profile \
+    && sha256sum \
+        /tmp/tests-requirements.txt \
+        /tmp/accuracy-requirements.txt \
+        > /opt/edgellm-ci/pipeline.sha256
+
+FROM common AS export
+RUN --mount=type=bind,source=pyproject.toml,target=/tmp/pyproject.toml,readonly \
+    --mount=type=bind,source=tests/requirements.txt,target=/tmp/tests-requirements.txt,readonly \
+    python3 -c 'import pathlib, tomllib; data = tomllib.loads(pathlib.Path("/tmp/pyproject.toml").read_text()); pathlib.Path("/tmp/tools-requirements.txt").write_text("\n".join(data["project"]["optional-dependencies"]["tools"]) + "\n")' \
+    && pip3 install \
+        build \
+        -r /tmp/tools-requirements.txt \
+        -r /tmp/tests-requirements.txt \
+    && mkdir -p /opt/edgellm-ci \
+    && printf '%s\n' export > /opt/edgellm-ci/profile \
+    && sha256sum \
+        /tmp/pyproject.toml \
+        /tmp/tests-requirements.txt \
+        > /opt/edgellm-ci/export.sha256
+
+FROM common AS wheel
+RUN add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        python3.10 python3.10-dev python3.10-venv \
+        python3.11 python3.11-dev python3.11-venv \
+        python3.12 python3.12-dev python3.12-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /opt/edgellm-ci \
+    && printf '%s\n' wheel > /opt/edgellm-ci/profile \
+    && : > /opt/edgellm-ci/wheel.sha256

@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+.dependency_image_rules:
+  rules:
+    - if: $L1 == "true"
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $L0_STABILITY == "true"
+    - if: $EDGE_LLM_SKIP_TESTS == "true"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH =~ /^release\//
+
+build_ci_dependency_images:
+  stage: setup
+  extends: .dependency_image_rules
+  tags: [cpu-general-k8s]
+  image:
+    name: "moby/buildkit:rootless"
+    entrypoint: [""]
+  variables:
+    BUILDKITD_FLAGS: "--oci-worker-no-process-sandbox"
+  parallel:
+    matrix:
+      - CI_DEPENDENCY_PROFILE: "pipeline"
+        CI_DEPENDENCY_BASE_IMAGE: "$WHEEL_BASE_IMAGE_UBUNTU2404_CU13"
+        CI_DEPENDENCY_OUTPUT_IMAGE: "$CI_DEPENDENCY_PIPELINE_IMAGE"
+        CI_DEPENDENCY_CACHE_FAMILY: "pipeline-ubuntu2404-cu13"
+      - CI_DEPENDENCY_PROFILE: "export"
+        CI_DEPENDENCY_BASE_IMAGE: "$WHEEL_BASE_IMAGE_UBUNTU2404_CU13"
+        CI_DEPENDENCY_OUTPUT_IMAGE: "$CI_DEPENDENCY_EXPORT_IMAGE"
+        CI_DEPENDENCY_CACHE_FAMILY: "export-ubuntu2404-cu13"
+      - CI_DEPENDENCY_PROFILE: "wheel"
+        CI_DEPENDENCY_BASE_IMAGE: "$WHEEL_BASE_IMAGE_UBUNTU2204_CU13"
+        CI_DEPENDENCY_OUTPUT_IMAGE: "$CI_DEPENDENCY_WHEEL_UBUNTU2204_IMAGE"
+        CI_DEPENDENCY_CACHE_FAMILY: "wheel-ubuntu2204-cu13"
+      - CI_DEPENDENCY_PROFILE: "wheel"
+        CI_DEPENDENCY_BASE_IMAGE: "$WHEEL_BASE_IMAGE_UBUNTU2404_CU13"
+        CI_DEPENDENCY_OUTPUT_IMAGE: "$CI_DEPENDENCY_WHEEL_UBUNTU2404_IMAGE"
+        CI_DEPENDENCY_CACHE_FAMILY: "wheel-ubuntu2404-cu13"
+  script:
+    - sh .gitlab/ci/scripts/build_dependency_image.sh

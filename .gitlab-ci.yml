@@ -16,8 +16,15 @@ variables:
   TRT10_X86_VERSION: "10.16.0.72"
   TRT10_THOR_VERSION: "10.16.0.72"
   TRT11_VERSION: "11.0.0.114"
-  WHEEL_IMAGE_UBUNTU2204_CU13: "artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:main-native-x86_64-ubuntu22.04-cuda13.0"
-  WHEEL_IMAGE_UBUNTU2404_CU13: "artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:main-native-x86_64-ubuntu24.04-cuda13.2"
+  WHEEL_BASE_IMAGE_UBUNTU2204_CU13: "artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:main-native-x86_64-ubuntu22.04-cuda13.0"
+  WHEEL_BASE_IMAGE_UBUNTU2404_CU13: "artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:main-native-x86_64-ubuntu24.04-cuda13.2"
+  CI_DEPENDENCY_IMAGE_TAG: "0.0.0-$CI_PIPELINE_ID"
+  CI_DEPENDENCY_PIPELINE_IMAGE: "$CI_REGISTRY_IMAGE/ci-dependency/pipeline:$CI_DEPENDENCY_IMAGE_TAG"
+  CI_DEPENDENCY_EXPORT_IMAGE: "$CI_REGISTRY_IMAGE/ci-dependency/export:$CI_DEPENDENCY_IMAGE_TAG"
+  CI_DEPENDENCY_WHEEL_UBUNTU2204_IMAGE: "$CI_REGISTRY_IMAGE/ci-dependency/wheel-ubuntu2204:$CI_DEPENDENCY_IMAGE_TAG"
+  CI_DEPENDENCY_WHEEL_UBUNTU2404_IMAGE: "$CI_REGISTRY_IMAGE/ci-dependency/wheel-ubuntu2404:$CI_DEPENDENCY_IMAGE_TAG"
+  WHEEL_IMAGE_UBUNTU2204_CU13: "$CI_DEPENDENCY_WHEEL_UBUNTU2204_IMAGE"
+  WHEEL_IMAGE_UBUNTU2404_CU13: "$CI_DEPENDENCY_WHEEL_UBUNTU2404_IMAGE"
   WHEEL_IMAGE_JETPACK70: "urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:main-cross-aarch64-ubuntu24.04-cuda13.2"
   WHEEL_IMAGE_JETPACK71: "urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:main-cross-aarch64-ubuntu24.04-cuda13.2"
   WHEEL_IMAGE_JETPACK72: "urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:main-cross-aarch64-ubuntu24.04-cuda13.2"
@@ -107,6 +114,7 @@ workflow:
 include:
   - local: '.gitlab/ci/templates.yml'
   - local: '.gitlab/ci/precheck-jobs.yml'
+  - local: '.gitlab/ci/dependency-image-jobs.yml'
   - local: '.gitlab/ci/setup-jobs.yml'
   - local: '.gitlab/ci/cutedsl-jobs.yml'
   - local: '.gitlab/ci/wheel-jobs.yml'
