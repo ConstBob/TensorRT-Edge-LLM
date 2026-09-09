@@ -2653,7 +2653,7 @@ bool LLMRankRuntime::multiModalRuntimePreprocess(LLMGenerationRequest const& req
                     {
                         auto const* rawPtr = reinterpret_cast<char const*>(audio.pcm->samples.data());
                         size_t const rawBytes = audio.pcm->samples.size() * sizeof(float);
-                        audioHashes.push_back(hashOpaqueIdentity(std::string_view(rawPtr, rawBytes)));
+                        audioHashes.push_back(hashOpaqueIdentity(std::string_view(rawPtr, rawBytes), stream, false));
                     }
                     else
                     {
@@ -2757,7 +2757,7 @@ bool LLMRankRuntime::multiModalRuntimePreprocess(LLMGenerationRequest const& req
                     {
                         auto const* rawPtr = reinterpret_cast<char const*>(img.buffer->dataPointer<unsigned char>());
                         size_t const rawBytes = static_cast<size_t>(img.addressedBytes());
-                        imageHashes.push_back(hashOpaqueIdentity(std::string_view(rawPtr, rawBytes)));
+                        imageHashes.push_back(hashOpaqueIdentity(std::string_view(rawPtr, rawBytes), stream, false));
                     }
                     else
                     {
