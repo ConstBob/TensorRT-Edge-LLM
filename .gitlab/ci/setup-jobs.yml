@@ -4,6 +4,8 @@
 
 init_l0_storage:
   stage: setup
+  needs:
+    - job: build_ci_dependency_images
   script:
     - python3 .gitlab/ci/scripts/ci_storage.py prepare-storage
   resource_group: "$L0_STORAGE_RESOURCE_GROUP"

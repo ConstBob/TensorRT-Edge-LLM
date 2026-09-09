@@ -32,7 +32,7 @@ l0_checkpoint_export:
       artifacts: false
   variables:
     CUDA_VERSION: "13.2"
-    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: "$CI_DEPENDENCY_EXPORT_IMAGE"
     PRIORITY: l0_checkpoint_export
     ONNX_REUSE: "$L0_ONNX_REUSE"
   tags:
@@ -53,7 +53,7 @@ l0_checkpoint_export_ampere:
       artifacts: false
   variables:
     CUDA_VERSION: "13.2"
-    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: "$CI_DEPENDENCY_EXPORT_IMAGE"
     PRIORITY: l0_checkpoint_export_ampere
     ONNX_REUSE: "$L0_ONNX_REUSE"
   tags:
@@ -77,7 +77,7 @@ l0_checkpoint_export_a30_trtrtx:
       artifacts: false
   variables:
     CUDA_VERSION: "13.2"
-    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: "$CI_DEPENDENCY_EXPORT_IMAGE"
     PRIORITY: l0_checkpoint_export_a30_trtrtx
     ONNX_REUSE: "$L0_ONNX_REUSE"
   tags:
@@ -99,7 +99,7 @@ l0_a30:
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: "$CI_DEPENDENCY_PIPELINE_IMAGE"
     PRIORITY: l0_pipeline_a30
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/a30.csv"
@@ -146,7 +146,7 @@ l0_nemo_eval_a30:
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: "$CI_DEPENDENCY_PIPELINE_IMAGE"
     PRIORITY: l0_nemo_eval_qwen2_5_0_5b
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
   tags:
@@ -171,7 +171,7 @@ l0_a30_trt11:
     CUDA_VERSION: "13.2"
     TRT_VERSION: "$TRT11_VERSION"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: "$CI_DEPENDENCY_PIPELINE_IMAGE"
     PRIORITY: l0_hlapi_a30
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/a30_trt11.csv"
@@ -197,7 +197,7 @@ l0_builder_a30:
     CUDA_VERSION: "13.2"
     TRT_VERSION: "$TRT11_VERSION"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: "$CI_DEPENDENCY_PIPELINE_IMAGE"
     PRIORITY: l0_builder_a30
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/a30_trt11.csv"
@@ -244,7 +244,7 @@ l0_rtx3090:
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: "$CI_DEPENDENCY_PIPELINE_IMAGE"
     PRIORITY: l0_pipeline_rtx3090
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/rtx3090.csv"
@@ -296,7 +296,7 @@ l0_b100:
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: "$CI_DEPENDENCY_PIPELINE_IMAGE"
     PRIORITY: l0_pipeline_b100
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/b100.csv"
@@ -322,7 +322,7 @@ l0_rtx5090:
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: "$CI_DEPENDENCY_PIPELINE_IMAGE"
     PRIORITY: l0_pipeline_rtx5090
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/rtx5090.csv"
@@ -346,7 +346,7 @@ l0_nemo_eval_rtx5090:
   variables:
     CUDA_VERSION: "13.2"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: "$CI_DEPENDENCY_PIPELINE_IMAGE"
     PRIORITY: l0_nemo_eval_nemotron_3_nano_4b
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
   tags:
@@ -368,7 +368,7 @@ quantization_sanity:
     - a30-edgellm-nvks
   variables:
     CUDA_VERSION: "13.2"
-    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: "$CI_DEPENDENCY_PIPELINE_IMAGE"
   image: "$IMAGE"
   script:
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
@@ -397,7 +397,7 @@ l0_unit_tests_x86:
   variables:
     CUDA_VERSION: "13.2"
     TRT_VERSION: "$TRT10_X86_VERSION"
-    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: "$CI_DEPENDENCY_PIPELINE_IMAGE"
     PRIORITY: l0_python_ut
     TRT_CUDA_VERSION: "13.2"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
@@ -426,7 +426,7 @@ l0_unit_tests_x86_trt11:
     CUDA_VERSION: "13.2"
     TRT_VERSION: "$TRT11_VERSION"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: "$CI_DEPENDENCY_PIPELINE_IMAGE"
     PRIORITY: l0_python_ut
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
   parallel:
@@ -455,7 +455,7 @@ l0_unit_tests_x86_5090_b100:
   variables:
     CUDA_VERSION: "13.2"
     TRT_VERSION: "$TRT10_X86_VERSION"
-    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: "$CI_DEPENDENCY_PIPELINE_IMAGE"
     PRIORITY: l0_python_ut
     TRT_CUDA_VERSION: "13.2"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
@@ -485,7 +485,7 @@ l0_unit_tests_x86_trt11_5090_b100:
     CUDA_VERSION: "13.2"
     TRT_VERSION: "$TRT11_VERSION"
     TRT_CUDA_VERSION: "13.2"
-    IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    IMAGE: "$CI_DEPENDENCY_PIPELINE_IMAGE"
     PRIORITY: l0_python_ut
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
   parallel:
