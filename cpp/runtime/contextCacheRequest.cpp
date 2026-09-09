@@ -62,7 +62,7 @@ bool isMediaToken(int32_t tokenId, std::vector<int32_t> const& mediaTokenIds)
 
 std::vector<Hash128> buildPerPositionMediaHash(std::vector<int32_t> const& tokenIds,
     std::vector<int32_t> const& mediaTokenIds, std::vector<imageUtils::ImageData> const& imageBuffers,
-    std::vector<audioUtils::AudioData> const& audioBuffers)
+    std::vector<audioUtils::AudioData> const& audioBuffers, cudaStream_t stream)
 {
     if (mediaTokenIds.empty())
     {
@@ -75,7 +75,7 @@ std::vector<Hash128> buildPerPositionMediaHash(std::vector<int32_t> const& token
     {
         std::string_view const bytes(
             reinterpret_cast<char const*>(image.data()), static_cast<size_t>(image.addressedBytes()));
-        imageHashes.push_back(hashOpaqueIdentity(bytes));
+        imageHashes.push_back(hashOpaqueIdentity(bytes, stream, false));
     }
 
     std::vector<Hash128> audioHashes;
@@ -86,7 +86,7 @@ std::vector<Hash128> buildPerPositionMediaHash(std::vector<int32_t> const& token
         {
             size_t const totalBytes = audio.pcm->samples.size() * sizeof(float);
             std::string_view const bytes(reinterpret_cast<char const*>(audio.pcm->samples.data()), totalBytes);
-            audioHashes.push_back(hashOpaqueIdentity(bytes));
+            audioHashes.push_back(hashOpaqueIdentity(bytes, stream, false));
         }
         else
         {
@@ -170,7 +170,8 @@ std::vector<Hash128> buildPerPositionMediaHash(std::vector<int32_t> const& token
 
 ContextCacheSequenceAdmission makeContextCacheSequenceAdmission(std::vector<int32_t> const& tokenIds,
     std::string const& loraWeightsName, std::vector<int32_t> const& mediaTokenIds,
-    std::vector<imageUtils::ImageData> const& imageBuffers, std::vector<audioUtils::AudioData> const& audioBuffers)
+    std::vector<imageUtils::ImageData> const& imageBuffers, std::vector<audioUtils::AudioData> const& audioBuffers,
+    cudaStream_t stream)
 {
     ContextCacheSequenceAdmission admission;
     admission.tokenIds = tokenIds;
@@ -180,7 +181,8 @@ ContextCacheSequenceAdmission makeContextCacheSequenceAdmission(std::vector<int3
         AdapterKey const adapter{hashOpaqueIdentity(loraWeightsName), 0};
         admission.keyExtras.adapter = adapter;
     }
-    admission.perPositionMediaHash = buildPerPositionMediaHash(tokenIds, mediaTokenIds, imageBuffers, audioBuffers);
+    admission.perPositionMediaHash
+        = buildPerPositionMediaHash(tokenIds, mediaTokenIds, imageBuffers, audioBuffers, stream);
     return admission;
 }
 
@@ -223,7 +225,7 @@ std::optional<ContextCacheRequest> ContextCacheRequest::begin(ContextCacheCoordi
         std::vector<audioUtils::AudioData> const& audio
             = (seqIdx < request.requests.size()) ? request.requests[seqIdx].audioBuffers : kEmptyAudioBuffers;
         admission.sequences.push_back(makeContextCacheSequenceAdmission(context.rawBatchedInputIds[seqIdx],
-            context.loraWeightsName, usesCache ? mediaTokenIds : kEmptyMediaTokenIds, images, audio));
+            context.loraWeightsName, usesCache ? mediaTokenIds : kEmptyMediaTokenIds, images, audio, context.stream));
     }
 
     ContextCacheCoordinator::BeginRequestResult admitted
