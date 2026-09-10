@@ -154,7 +154,13 @@ void checkTexturePlane(cudaTextureObject_t const texture, std::string const& pla
             + " but the frame needs " + std::to_string(width) + "x" + std::to_string(height) + ".");
     // tex2D reads one layer of a plain 2D array; a layered, 3D or cubemap array samples elsewhere.
     ELLM_CHECK(extent.depth == 0, what + "shall be a plain 2D array, not layered or 3D.");
-    ELLM_CHECK(flags == 0, what + "shall be a plain 2D array, without layered, cubemap or surface flags.");
+    // A hardware decoder sets this flag on the surfaces it writes, and it constrains the allocation rather than
+    // how tex2D reads the array. cuda.h names the bit CUDA_ARRAY3D_VIDEO_ENCODE_DECODE from CUDA 12 on; the
+    // runtime API and the CUDA 11.4 headers report it without a name.
+    constexpr unsigned int kArrayVideoEncodeDecode = 0x100U;
+    ELLM_CHECK((flags & ~kArrayVideoEncodeDecode) == 0,
+        what + "shall be a plain 2D array, without layered, cubemap or surface flags; cudaArrayGetInfo reports flags "
+            + std::to_string(flags) + ".");
 
     cudaTextureDesc sampler{};
     CUDA_CHECK(cudaGetTextureObjectTextureDesc(&sampler, texture));

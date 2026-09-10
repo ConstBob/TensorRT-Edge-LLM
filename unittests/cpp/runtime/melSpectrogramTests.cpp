@@ -38,9 +38,11 @@
 #include <cstdint>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace trt_edgellm;
@@ -52,6 +54,14 @@ namespace
 
 constexpr int32_t kSampleRate{16000};
 
+//! Copy `samples` into a host tensor that the PCM owns.
+void attachSamples(AudioPCM& pcm, std::vector<float> const& samples)
+{
+    pcm.samples = std::make_shared<Tensor>(
+        Coords{static_cast<int64_t>(samples.size())}, DeviceType::kCPU, nvinfer1::DataType::kFLOAT);
+    std::copy(samples.begin(), samples.end(), pcm.samples->dataPointer<float>());
+}
+
 //! One second of a pure tone at `frequencyHz`, which is what the mel axis
 //! assertions below locate.
 AudioPCM makeTone(float frequencyHz, int32_t samples, int32_t sampleRate = kSampleRate)
@@ -59,12 +69,13 @@ AudioPCM makeTone(float frequencyHz, int32_t samples, int32_t sampleRate = kSamp
     AudioPCM pcm;
     pcm.sampleRate = sampleRate;
     pcm.numChannels = 1;
-    pcm.samples.resize(static_cast<size_t>(samples));
+    std::vector<float> tone(static_cast<size_t>(samples));
     for (int32_t i = 0; i < samples; ++i)
     {
-        pcm.samples[static_cast<size_t>(i)] = std::sin(
+        tone[static_cast<size_t>(i)] = std::sin(
             2.0F * static_cast<float>(M_PI) * frequencyHz * static_cast<float>(i) / static_cast<float>(sampleRate));
     }
+    attachSamples(pcm, tone);
     return pcm;
 }
 
@@ -453,7 +464,7 @@ TEST_F(MelExtractionTest, WhisperNormalizationNeverLetsTheOutputRangeExceedTwo)
     AudioPCM silence;
     silence.sampleRate = kSampleRate;
     silence.numChannels = 1;
-    silence.samples.assign(kSampleRate, 0.0F);
+    attachSamples(silence, std::vector<float>(static_cast<size_t>(kSampleRate), 0.0F));
 
     for (auto const& [label, pcm] : {std::pair{"tone", makeTone(1000.0F, kSampleRate)}, std::pair{"silence", silence}})
     {
@@ -498,7 +509,7 @@ TEST_F(MelExtractionTest, WhisperNormalizationLeavesSilenceWithNoRangeAtAll)
     AudioPCM silence;
     silence.sampleRate = kSampleRate;
     silence.numChannels = 1;
-    silence.samples.assign(kSampleRate, 0.0F);
+    attachSamples(silence, std::vector<float>(static_cast<size_t>(kSampleRate), 0.0F));
 
     Tensor mel;
     ASSERT_TRUE(extractor.extract(silence, mel));
@@ -691,7 +702,7 @@ protected:
         mGoldens = loadGoldens();
         mPcm.sampleRate = kSampleRate;
         mPcm.numChannels = 1;
-        mPcm.samples = makeWaveform(kWaveformSamples);
+        attachSamples(mPcm, makeWaveform(kWaveformSamples));
     }
 
     //! Compare `mel` against the named golden element for element. The

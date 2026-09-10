@@ -47,6 +47,13 @@ namespace
 
 constexpr int32_t kSampleRate{16000};
 
+//! The decoded samples as a vector, the shape the expectations below compare against.
+std::vector<float> samplesOf(audio::AudioPCM const& pcm)
+{
+    float const* const data = pcm.samples->dataPointer<float>();
+    return {data, data + pcm.numSamples()};
+}
+
 void appendBytes(std::vector<uint8_t>& out, void const* data, size_t size)
 {
     auto const* first = static_cast<uint8_t const*>(data);
@@ -146,13 +153,14 @@ TEST_F(AudioLoaderTest, DecodesMonoPcmIntoTheDocumentedFloatRange)
     ASSERT_TRUE(audio::loadAudioBytes(wav.data(), wav.size(), kSampleRate, pcm));
 
     EXPECT_EQ(pcm.sampleRate, kSampleRate);
-    ASSERT_EQ(pcm.samples.size(), static_cast<size_t>(kSamples));
-    for (size_t i = 0; i < pcm.samples.size(); ++i)
+    ASSERT_EQ(pcm.numSamples(), kSamples);
+    auto const samples = samplesOf(pcm);
+    for (size_t i = 0; i < samples.size(); ++i)
     {
-        EXPECT_NEAR(pcm.samples[i], static_cast<float>(encoded[i]) / 32768.0F, 1e-4) << "sample " << i;
+        EXPECT_NEAR(samples[i], static_cast<float>(encoded[i]) / 32768.0F, 1e-4) << "sample " << i;
     }
-    EXPECT_TRUE(std::all_of(
-        pcm.samples.begin(), pcm.samples.end(), [](float value) { return value >= -1.0F && value <= 1.0F; }));
+    EXPECT_TRUE(
+        std::all_of(samples.begin(), samples.end(), [](float value) { return value >= -1.0F && value <= 1.0F; }));
 }
 
 // The header promises mono output regardless of the input's channel count, and
@@ -178,12 +186,13 @@ TEST_F(AudioLoaderTest, MixesMultipleChannelsDownToTheirAverage)
 
     EXPECT_EQ(pcm.numChannels, 1);
     // One sample per frame, not per channel.
-    ASSERT_EQ(pcm.samples.size(), static_cast<size_t>(kFrames));
+    ASSERT_EQ(pcm.numSamples(), kFrames);
 
     float const expected = (static_cast<float>(kLeft) + static_cast<float>(kRight)) / 2.0F / 32768.0F;
-    for (size_t i = 0; i < pcm.samples.size(); ++i)
+    auto const samples = samplesOf(pcm);
+    for (size_t i = 0; i < samples.size(); ++i)
     {
-        EXPECT_NEAR(pcm.samples[i], expected, 1e-3) << "frame " << i;
+        EXPECT_NEAR(samples[i], expected, 1e-3) << "frame " << i;
     }
 }
 
@@ -204,7 +213,7 @@ TEST_F(AudioLoaderTest, ResamplesToTheRateTheCallerAskedFor)
     // 0.1 s of audio at twice the rate is twice as many samples. The tolerance
     // covers the resampler's filter delay, not the ratio itself.
     auto const expectedFrames = static_cast<double>(kSourceFrames) * kSampleRate / kSourceRate;
-    EXPECT_NEAR(static_cast<double>(pcm.samples.size()), expectedFrames, expectedFrames * 0.05);
+    EXPECT_NEAR(static_cast<double>(pcm.numSamples()), expectedFrames, expectedFrames * 0.05);
 }
 
 // Requesting the rate the file already carries must not resample it: that is
@@ -218,7 +227,7 @@ TEST_F(AudioLoaderTest, LeavesTheFrameCountAloneWhenTheRateAlreadyMatches)
     audio::AudioPCM pcm;
     ASSERT_TRUE(audio::loadAudioBytes(wav.data(), wav.size(), kSampleRate, pcm));
 
-    EXPECT_EQ(pcm.samples.size(), static_cast<size_t>(kFrames));
+    EXPECT_EQ(pcm.numSamples(), kFrames);
 }
 
 // Bytes that are not a container the decoder recognizes have to be reported as
@@ -253,7 +262,7 @@ TEST_F(AudioLoaderTest, LoadingFromAFileMatchesLoadingTheSameBytes)
     ASSERT_TRUE(audio::loadAudioFile(path, kSampleRate, fromFile));
 
     EXPECT_EQ(fromFile.sampleRate, fromBytes.sampleRate);
-    EXPECT_EQ(fromFile.samples, fromBytes.samples);
+    EXPECT_EQ(samplesOf(fromFile), samplesOf(fromBytes));
 }
 
 TEST_F(AudioLoaderTest, ReportsFailureForAMissingFile)
@@ -275,12 +284,12 @@ TEST_F(AudioLoaderTest, AudioDataCarriesThePcmAndTheRateItWasDecodedAt)
     ASSERT_NE(fromBytes.pcm, nullptr);
     EXPECT_EQ(fromBytes.sampleRate, kSampleRate);
     EXPECT_EQ(fromBytes.pcm->sampleRate, kSampleRate);
-    EXPECT_FALSE(fromBytes.pcm->samples.empty());
+    EXPECT_GT(fromBytes.pcm->numSamples(), 0);
 
     audioUtils::AudioData fromFile;
     ASSERT_TRUE(audioUtils::loadAudioDataFromFile(path, kSampleRate, fromFile));
     ASSERT_NE(fromFile.pcm, nullptr);
-    EXPECT_EQ(fromFile.pcm->samples, fromBytes.pcm->samples);
+    EXPECT_EQ(samplesOf(*fromFile.pcm), samplesOf(*fromBytes.pcm));
 }
 
 // A failed decode must leave the container without PCM attached rather than
@@ -303,7 +312,7 @@ TEST_F(AudioLoaderTest, DecodingFailureClearsAPreviouslyLoadedResult)
     audioUtils::AudioData data;
     ASSERT_TRUE(audioUtils::loadAudioDataFromBytes(wav.data(), wav.size(), kSampleRate, data));
     ASSERT_NE(data.pcm, nullptr);
-    ASSERT_FALSE(data.pcm->samples.empty());
+    ASSERT_GT(data.pcm->numSamples(), 0);
 
     std::vector<uint8_t> const notAudio(64, 0x00);
     EXPECT_FALSE(audioUtils::loadAudioDataFromBytes(notAudio.data(), notAudio.size(), kSampleRate, data));
@@ -352,11 +361,12 @@ TEST_F(AudioLoaderTest, DecodesTheFlacContainerTheHeaderAdvertises)
     ASSERT_TRUE(audio::loadAudioFile(flac, kSampleRate, pcm));
 
     constexpr size_t kFlacFrames{56080};
-    EXPECT_EQ(pcm.samples.size(), kFlacFrames);
+    EXPECT_EQ(static_cast<size_t>(pcm.numSamples()), kFlacFrames);
     EXPECT_EQ(pcm.sampleRate, kSampleRate);
     EXPECT_EQ(pcm.numChannels, 1);
 
-    auto const [quietest, loudest] = std::minmax_element(pcm.samples.begin(), pcm.samples.end());
+    auto const samples = samplesOf(pcm);
+    auto const [quietest, loudest] = std::minmax_element(samples.begin(), samples.end());
     EXPECT_GE(*quietest, -1.0F);
     EXPECT_LE(*loudest, 1.0F);
     // Speech, so it must not have decoded to silence -- the only other way to
@@ -383,7 +393,7 @@ TEST_F(AudioLoaderTest, ResamplesFlacToTheRateTheCallerAskedFor)
 
     EXPECT_EQ(pcm.sampleRate, kHalfRate);
     constexpr double kExpectedFrames{56080.0 / 2.0};
-    EXPECT_NEAR(static_cast<double>(pcm.samples.size()), kExpectedFrames, kExpectedFrames * 0.05);
+    EXPECT_NEAR(static_cast<double>(pcm.numSamples()), kExpectedFrames, kExpectedFrames * 0.05);
 }
 
 } // namespace

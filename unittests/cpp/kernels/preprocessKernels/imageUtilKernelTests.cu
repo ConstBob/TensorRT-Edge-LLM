@@ -2101,6 +2101,77 @@ TEST(FusedPreprocessNv12Bl, RejectsWrongChannelDescription)
         std::runtime_error);
 }
 
+//! Allocate a plane whose array carries `flags`, the way a hardware decoder's frames arrive, and wrap a
+//! texture object around it. The runtime API forwards flags it has no name for.
+cudaError_t MakeFlaggedTexturePlane(
+    TexturePlane& plane, int64_t const width, int64_t const height, int32_t const chromaBits, unsigned int const flags)
+{
+    cudaChannelFormatDesc const channel = cudaCreateChannelDesc(8, chromaBits, 0, 0, cudaChannelFormatKindUnsigned);
+    cudaError_t const allocated
+        = cudaMallocArray(&plane.array, &channel, static_cast<size_t>(width), static_cast<size_t>(height), flags);
+    if (allocated != cudaSuccess)
+    {
+        (void) cudaGetLastError();
+        return allocated;
+    }
+
+    cudaResourceDesc resource{};
+    resource.resType = cudaResourceTypeArray;
+    resource.res.array.array = plane.array;
+    cudaTextureDesc description{};
+    description.addressMode[0] = cudaAddressModeClamp;
+    description.addressMode[1] = cudaAddressModeClamp;
+    description.filterMode = cudaFilterModePoint;
+    description.readMode = cudaReadModeElementType;
+
+    cudaError_t const status = cudaCreateTextureObject(&plane.texture, &resource, &description, nullptr);
+    if (status != cudaSuccess)
+    {
+        (void) cudaGetLastError();
+    }
+    return status;
+}
+
+// NvBufSurface and NVDEC allocate their frames for the video engines, so every real block-linear
+// frame arrives carrying that allocation flag on both planes. cuda.h names the bit
+// CUDA_ARRAY3D_VIDEO_ENCODE_DECODE; the runtime API does not.
+TEST(FusedPreprocessNv12Bl, AcceptsVideoEncodeDecodeArrays)
+{
+    constexpr unsigned int kVideoEncodeDecode = 0x100U;
+    int64_t const height = 48, width = 64;
+
+    TexturePlane luma;
+    TexturePlane chroma;
+    CUDA_CHECK(MakeFlaggedTexturePlane(luma, width, height, 0, kVideoEncodeDecode));
+    CUDA_CHECK(MakeFlaggedTexturePlane(chroma, (width + 1) / 2, (height + 1) / 2, 8, kVideoEncodeDecode));
+
+    EXPECT_NO_THROW(rt::imageUtils::wrapImageTexture(luma.texture, chroma.texture,
+        rt::imageUtils::ColorStandard::kBt709, rt::imageUtils::ColorRange::kLimited, width, height));
+}
+
+// A surface-loadable array still backs a texture object, but it is not the plain 2D array the plane
+// check admits, so the flag it carries has to stay rejected and be named in the error.
+TEST(FusedPreprocessNv12Bl, RejectsSurfaceLoadStoreArrays)
+{
+    int64_t const height = 48, width = 64;
+
+    TexturePlane luma;
+    TexturePlane chroma;
+    CUDA_CHECK(MakeFlaggedTexturePlane(luma, width, height, 0, cudaArraySurfaceLoadStore));
+    CUDA_CHECK(MakeFlaggedTexturePlane(chroma, (width + 1) / 2, (height + 1) / 2, 8, 0));
+
+    try
+    {
+        rt::imageUtils::wrapImageTexture(luma.texture, chroma.texture, rt::imageUtils::ColorStandard::kBt709,
+            rt::imageUtils::ColorRange::kLimited, width, height);
+        FAIL() << "a surface load/store array wrapped as a texture plane";
+    }
+    catch (std::runtime_error const& e)
+    {
+        EXPECT_NE(std::string(e.what()).find("flags 2"), std::string::npos) << e.what();
+    }
+}
+
 // Colour metadata has no default that is right: kUnspecified is the value-initialised state, and
 // guessing a standard silently shifts every colour in the frame.
 TEST(FusedPreprocessNv12Bl, RejectsUnspecifiedColourMetadata)
