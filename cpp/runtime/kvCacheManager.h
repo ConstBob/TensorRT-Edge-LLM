@@ -46,6 +46,21 @@ struct KVLayerConfig
     }
 };
 
+enum class KVCacheStorageKind : uint8_t
+{
+    kFull,
+    kReducedSwa,
+};
+
+struct KVLayerStorageMetadata
+{
+    KVCacheStorageKind kind{};
+    int32_t physicalPages{};
+    int32_t logicalPagesPerSequence{};
+    int32_t numKVHeads{};
+    int32_t headDim{};
+};
+
 //! Per-layer KV cache manager that supports heterogeneous head configurations across layers.
 //! Each attention layer gets its own independently-sized page pool with shape
 //! [2, numPages_i, kTOKENS_PER_PAGE, numKVHeads_i, headDim_i], where the K/V split is outermost.
@@ -162,6 +177,9 @@ public:
     //! @param attnLayerIdx The index of the attention layer.
     //! @return The KVLayerConfig for this layer.
     KVLayerConfig const& getLayerConfig(int32_t attnLayerIdx) const noexcept;
+
+    //! Describe the physical pool and logical sequence geometry used by one attention layer.
+    KVLayerStorageMetadata getLayerStorageMetadata(int32_t attnLayerIdx) const noexcept;
 
     //! @brief Get the number of attention layers
     //! @return Number of attention layers

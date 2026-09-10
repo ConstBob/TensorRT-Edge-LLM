@@ -73,7 +73,7 @@ public:
     //! Join one more text-only sequence to this live request: lookup, lease, and row binding.
     //! On kAdmitted, @p prefillStart receives the reused prefix length the seated prefill skips.
     AdmitSequenceStatus admitSequence(std::vector<int32_t> const& tokenIds, std::string const& loraWeightsName,
-        DecodingKvHeadroom const& headroom, int32_t& prefillStart, cudaStream_t stream,
+        DecodingKvHeadroom const& headroom, int32_t& prefillStart, ResidentRef resident, cudaStream_t stream,
         std::vector<int32_t> const& mediaTokenIds = {}, std::vector<imageUtils::ImageData> const& imageBuffers = {},
         std::vector<audioUtils::AudioData> const& audioBuffers = {});
 
@@ -83,7 +83,7 @@ public:
 
     //! Undo the most recent admitSequence before its slot ever joined the runtime batch: the
     //! recovery path for a seating that threw between lease and slot append.
-    void retractSequenceAdmission();
+    bool retractSequenceAdmission() noexcept;
 
     //! Publish one Hybrid+MTP checkpoint at the stable predecessor boundary. Forwards to the coordinator's dedicated
     //! MTP publication entrypoint; the runtime drives this after the folded draft prefill materialized boundary state.

@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "runtime/exec/scheduledStep.h"
 #include "runtime/llmRankRuntime.h"
 
 #include <cstdint>
@@ -30,23 +31,6 @@ namespace trt_edgellm
 {
 namespace rt
 {
-
-//! A resident's stable identity under the stepped control plane, allocated once at admission and
-//! unchanged for the whole residency. `slot` names a handle in the stepper's pool -- not the dense
-//! execution row, which is runtime-private and may move under compaction without the scheduler
-//! ever knowing. `epoch` increments when a released handle is reused, so a stale ref can never
-//! silently address the handle's next owner. (Field name matches the ragged runtime's resident
-//! identity in scheduledStep.h so the two planes converge on one vocabulary.)
-struct ResidentRef
-{
-    int32_t slot{-1};
-    uint64_t epoch{0};
-
-    bool operator==(ResidentRef const& other) const noexcept
-    {
-        return slot == other.slot && epoch == other.epoch;
-    }
-};
 
 //! Everything validation, tokenization, and the encoder preprocess produce. Building one touches
 //! no resident state; discarding one leaves the batch byte-identical.
@@ -75,10 +59,9 @@ struct AdmissionResult
 };
 
 //! The immutable input to one executed step: which residents participate, materialized by the
-//! caller. V0 runs a single cohort, so a decode view is "every live resident" and a prefill view
-//! is the one newly admitted ref; the types exist so the executed set is an explicit input rather
-//! than stepper-internal knowledge, and so B=1/B=N views can later replace row-seating without an
-//! API change.
+//! caller. The prefill-first scheduler runs a single cohort, so a decode view is "every live resident" and a prefill
+//! view is the one newly admitted ref; the types exist so the executed set is an explicit input rather than
+//! stepper-internal knowledge, and so B=1/B=N views can evolve without an API change.
 struct ImmutablePrefillBatch
 {
     ResidentRef target;
@@ -100,14 +83,21 @@ struct TokenDelta
 struct StepResult
 {
     bool ok{false};
+    SequenceWork work{SequenceWork::kContext};
+    //! Runtime-assigned identity of the ScheduledStep whose effects this result commits.
+    StepId stepId{0};
+    //! Exact ordered logical/physical cohort executed by this step.
+    std::vector<SequenceIdentity> participants;
+    //! Pointer-free logical execution plan used for cross-rank shape/state consensus.
+    std::vector<ScheduledSequenceDescriptor> execution;
     //! Tokens produced this step, per participating resident (absent for a resident that
     //! produced none).
     std::vector<std::pair<ResidentRef, TokenDelta>> deltas;
     //! Residents that reached a terminal state and were evicted this step, with the finished
-    //! sequence snapshot; their handles are released (and their refs invalidated) as part of this
+    //! sequence snapshot; their physical resident slots are released (and their refs invalidated) as part of this
     //! commit unit. A seat that failed its seated prefill surfaces here on the step whose eviction
     //! files it, not before. Dense-row compaction is runtime-private and never reported: refs are
-    //! stable handles, so the caller's table needs no re-keying.
+    //! stable resident identities, so the caller's table needs no re-keying.
     std::vector<std::pair<ResidentRef, BatchResult>> finished;
     //! True when this step published context-cache prefix blocks (cache visibility commits with
     //! the step that produced it, never ahead of it).
@@ -125,7 +115,7 @@ struct StepResult
 class RuntimeStepper
 {
 public:
-    //! Adopts the session's current residents: each live slot gets a fresh ref.
+    //! Adopts the session's canonical resident identities.
     explicit RuntimeStepper(LLMRankRuntime::GenerationSession& session);
 
     RuntimeStepper(RuntimeStepper const&) = delete;
@@ -141,7 +131,7 @@ public:
     //! when nothing is pending -- the founding prefill of the wrapped session.
     StepResult prefill(ImmutablePrefillBatch const& batch);
 
-    //! One decode step over the live batch. batch.residents must name every live resident: V0
+    //! One decode step over the live batch. batch.residents must name every live resident: this stage
     //! runs a single cohort, and the view exists so the executed set is an explicit input.
     StepResult decode(ImmutableDecodeBatch const& batch);
 
@@ -153,19 +143,9 @@ private:
     //! the tokens a resident holds beyond its reported watermark.
     void finalizeResult(StepResult& result);
 
-    //! Hand out the lowest free handle (deterministic across ranks: every rank performs the same
-    //! acquire/release sequence, so every rank derives identical refs). The first acquire on a
-    //! fresh stepper is always {0, 0}, which is what lets a multi-rank session name the founder
-    //! without a cross-rank exchange.
-    ResidentRef acquireHandle();
-    void releaseHandle(ResidentRef ref);
-
     LLMRankRuntime::GenerationSession& mSession;
-    //! originalIndex -> stable handle for every live resident.
+    //! originalIndex -> canonical physical resident identity for every live sequence.
     std::unordered_map<int32_t, ResidentRef> mRefs;
-    //! The handle pool: per-handle reuse epochs and a LIFO free list.
-    std::vector<uint64_t> mHandleEpochs;
-    std::vector<int32_t> mFreeHandles;
     //! originalIndex -> how many of the resident's tokens have been reported through deltas. The
     //! founding baseline excludes tokens the founding prefill already produced inside
     //! beginGeneration, so the founding prefill tick reports them as its delta.
@@ -197,7 +177,7 @@ public:
     //! tokenization, encoder preprocess) plus the seat commit. The request itself is the
     //! cross-rank payload -- every rank rebuilds the intent deterministically, exactly the
     //! property the boundary relay relied on. The seated prefill is the next prefill tick.
-    virtual AdmissionResult admit(LLMGenerationRequest const& request, int32_t originalIndex) = 0;
+    virtual AdmissionResult admit(LLMGenerationRequest const& request, int32_t originalIndex, RequestId requestId) = 0;
 
     virtual StepResult prefill(ImmutablePrefillBatch const& batch) = 0;
     virtual StepResult decode(ImmutableDecodeBatch const& batch) = 0;
@@ -208,6 +188,9 @@ public:
 
     //! Everything handleRequest did after the loop. Call once, when no residents remain.
     virtual bool finish(LLMGenerationResponse& response) = 0;
+
+    //! Abandon an incomplete session and release all runtime-owned request state.
+    virtual void abort() noexcept = 0;
 };
 
 //! One request held open under the stepped control plane: the prepared request, the runtime-side
@@ -222,7 +205,8 @@ public:
     //! made handleRequest return false; throws where it threw. @p prepared is the coordinator's
     //! prepared request state and is owned here because the session references it across ticks.
     static std::unique_ptr<SteppedRequest> begin(LLMRankRuntime& runtime, LLMGenerationRequest prepared,
-        cudaStream_t stream, LLMRankRuntime::TokenBroadcastFn tokenBroadcast = nullptr, int32_t parallelRank = -1);
+        RequestId requestId, cudaStream_t stream, LLMRankRuntime::TokenBroadcastFn tokenBroadcast = nullptr,
+        int32_t parallelRank = -1);
 
     RuntimeStepper& stepper() noexcept
     {
@@ -230,16 +214,17 @@ public:
     }
 
     std::vector<ResidentRef> residents() const override;
-    AdmissionResult admit(LLMGenerationRequest const& request, int32_t originalIndex) override;
+    AdmissionResult admit(LLMGenerationRequest const& request, int32_t originalIndex, RequestId requestId) override;
     StepResult prefill(ImmutablePrefillBatch const& batch) override;
     StepResult decode(ImmutableDecodeBatch const& batch) override;
     LLMGenerationResponse materialize(
         BatchResult const& result, std::vector<std::string> const& stopStrings) const override;
     bool finish(LLMGenerationResponse& response) override;
+    void abort() noexcept override;
 
     //! Stage-one intent building for a joiner (validation, tokenization, encoder preprocess),
     //! against this request's live session. Throws for requests the batch rejects outright.
-    AdmissionIntent buildIntent(LLMGenerationRequest const& request, int32_t originalIndex);
+    AdmissionIntent buildIntent(LLMGenerationRequest const& request, int32_t originalIndex, RequestId requestId);
 
     ~SteppedRequest() override;
 

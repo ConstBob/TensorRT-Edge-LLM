@@ -22,6 +22,7 @@
 #include "common/logger.h"
 #include "common/mathUtils.h"
 #include "common/safetensorsUtils.h"
+#include "kernels/contextAttentionKernels/utilKernels.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/gdnKernels/gdnTreeChunkKernels.h"
 #include "kernels/speculative/ddtreeKernels.h"
@@ -125,9 +126,6 @@ DSparkDecoder::DSparkDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
     mVerifyLen = deployment.specConfig->verifySize;
     mProposalLen = mUseTree ? draftCfg.specDraftBlockSize : mVerifyLen - 1;
     mCurrentProposalLen = mProposalLen;
-    // sample_from_anchor selects the block layout. When set, the anchor slot is itself a
-    // proposal and the block is exactly mProposalLen wide. When clear, slot 0 is the bonus
-    // token, proposals start at slot 1 and the block carries one extra mask slot.
     mDraftSlotOffset = draftCfg.dsparkSampleFromAnchor ? 0 : 1;
     mDraftBlockLen = mProposalLen + mDraftSlotOffset;
     mCurrentVerifyLen = mVerifyLen;
@@ -182,6 +180,13 @@ DSparkDecoder::DSparkDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
     mDraftDeltaLenCommit
         = Tensor({maxBatch}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "DSpark::draftDeltaLenCommit");
     mDraftDeltaLens = Tensor({maxBatch}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "DSpark::draftDeltaLens");
+    int64_t const maxDeltaTokens = static_cast<int64_t>(maxBatch) * maxSeqForDraft;
+    mDraftDeltaRopeCosSin = Tensor({maxDeltaTokens, draftCfg.rotaryDim}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT,
+        "DSpark::draftDeltaRopeCosSin");
+    mDraftDeltaPositions
+        = Tensor({maxDeltaTokens}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "DSpark::draftDeltaPositions");
+    mDraftDeltaTokenToSequence
+        = Tensor({maxDeltaTokens}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "DSpark::draftDeltaTokenToSequence");
 
     mDraftTensorMap.set(binding_names::kInputsEmbeds, mDraftInputsEmbeds);
     mDraftTensorMap.set(binding_names::kDFlashTargetHiddenConcat, mDraftTargetHidden);
@@ -189,8 +194,18 @@ DSparkDecoder::DSparkDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
     mDraftTensorMap.set(binding_names::kDSparkHiddenStates, mDraftHiddenStates);
     mDraftTensorMap.set(binding_names::kAttentionMask, mDraftPackedAttentionMask);
     mDraftTensorMap.set(binding_names::kAttentionPosId, mDraftAttentionPosId);
-    mDraftTensorMap.set(binding_names::kContextLengths, mDraftContextLengths);
-    mDraftTensorMap.set(binding_names::kDFlashDeltaLengths, mDraftDeltaLens);
+    mDraftTensorMap.set(binding_names::kDFlashDeltaRopeCosSin, mDraftDeltaRopeCosSin);
+    mDraftTensorMap.set(binding_names::kDFlashDeltaPositions, mDraftDeltaPositions);
+    mDraftTensorMap.set(binding_names::kDFlashDeltaTokenToSequence, mDraftDeltaTokenToSequence);
+    auto& io = mRuntime.base.pipelineIO;
+    mDraftTensorMap.set(binding_names::kPositions, io.positions);
+    mDraftTensorMap.set(binding_names::kQueryStartOffsets, io.queryStartOffsets);
+    mDraftTensorMap.set(binding_names::kQueryLengths, io.queryLengths);
+    mDraftTensorMap.set(binding_names::kPastLengths, io.pastLengths);
+    mDraftTensorMap.set(binding_names::kAttentionSequenceLengths, io.attentionSequenceLengths);
+    mDraftTensorMap.set(binding_names::kStateIndices, io.stateIndices);
+    mDraftTensorMap.set(binding_names::kExecutionPhaseMarker, io.executionPhaseMarker);
+    mDraftTensorMap.set(binding_names::kContextSequenceCountCarrier, io.contextSequenceCountCarrier);
 
     // KV cache bindings: bind to draft cache manager's combined KV cache (index 1). DSpark
     // uses the same cached-draft path as DFlash, so the engine expects the paged-pool view
@@ -211,21 +226,8 @@ DSparkDecoder::DSparkDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
         }
     }
 
-    mDraftTensorMap.set(binding_names::kKVCacheStartIndex, mDraftCacheManager.getKVCacheLengths());
-
-    // The draft target update and proposal attention share the managed draft page table.
-    mDraftTensorMap.set(binding_names::kKVPageTable, mRuntime.base.sharedResources.kvPageTables[1]->kernelView());
-
-    if (draftCfg.ropeConfig.type == RopeType::kMRope)
-    {
-        mDraftTensorMap.set(binding_names::kRopeCosSin, mRuntime.base.pipelineIO.mropeCosSin);
-    }
-    else
-    {
-        mDraftTensorMap.set(binding_names::kRopeCosSin,
-            mRuntime.base.sharedResources.ropePool.getOrCreate(
-                draftCfg.ropeConfig, draftCfg.rotaryDim, baseCfg.maxKVCacheCapacity, nullptr));
-    }
+    mDraftTensorMap.set(binding_names::kKVPageTable, io.raggedKVPageTable);
+    mDraftTensorMap.set(binding_names::kRopeCosSin, io.raggedRopeCosSin);
 
     mDraftExternalWeightManager = std::move(draftWeights);
     mDraftExternalWeightManager.registerTensorMapEntries(mDraftTensorMap);
@@ -535,7 +537,8 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
 
     if (context.generationRound == 0)
     {
-        sourceSeqLen = mRuntime.base.pipelineIO.baseHiddenStates.getShape()[1];
+        sourceSeqLen
+            = *std::max_element(context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.end());
         maxDeltaLen = 0;
         for (int32_t b = 0; b < activeBatchSize; ++b)
         {
@@ -580,8 +583,16 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
     Tensor const& draftCacheLengths = mDraftCacheManager.getKVCacheLengths();
     kernel::launchDFlashPrepareProposalInputs(draftCacheLengths.dataPointer<int32_t>(),
         mDraftDeltaLens.dataPointer<int32_t>(), blockLen, mDraftPackedAttentionMask.dataPointer<int32_t>(),
-        mDraftAttentionPosId.dataPointer<int32_t>(), mDraftContextLengths.dataPointer<int32_t>(), mCausalProposalMask,
-        activeBatchSize, context.stream);
+        mDraftAttentionPosId.dataPointer<int32_t>(), mDraftContextLengths.dataPointer<int32_t>(),
+        mRuntime.base.pipelineIO.positions.dataPointer<int32_t>(),
+        mRuntime.base.pipelineIO.queryStartOffsets.dataPointer<int32_t>(),
+        mRuntime.base.pipelineIO.queryLengths.dataPointer<int32_t>(),
+        mRuntime.base.pipelineIO.pastLengths.dataPointer<int32_t>(),
+        mRuntime.base.pipelineIO.attentionSequenceLengths.dataPointer<int32_t>(),
+        mRuntime.base.pipelineIO.stateIndices.dataPointer<int32_t>(), mCausalProposalMask, activeBatchSize,
+        context.stream);
+    prepareDraftRaggedBindings(
+        activeBatchSize, blockLen, static_cast<int32_t>(maxDeltaLen), context.stream, &context.residentRefs);
 
     check::check(mDraftOutputLogits.reshape({activeBatchSize, blockLen, mDraftVocabSize}), "Tensor reshape failed");
     check::check(mDraftHiddenStates.reshape({activeBatchSize, blockLen, mDraftHiddenSize}), "Tensor reshape failed");
@@ -589,17 +600,19 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
     int32_t const draftKVCapacity = mRuntime.deployment.draft->maxKVCacheCapacity;
     InferenceDims const draftDims{
         /*.batch=*/activeBatchSize,
-        /*.seqLen=*/blockLen,
+        /*.seqLen=*/activeBatchSize * blockLen,
         /*.kvLen=*/draftKVCapacity,
-        /*.selectLen=*/static_cast<int64_t>(maxDeltaLen),
-        /*.attnMaskSeqLen=*/blockLen,
+        /*.selectLen=*/static_cast<int64_t>(activeBatchSize) * maxDeltaLen,
+        /*.attnMaskSeqLen=*/activeBatchSize * blockLen,
         /*.ropeBatch=*/1,
         /*.packedMaskLen=*/static_cast<int64_t>(pmLen),
         /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/activeBatchSize,
-        /*.specVerifyPhaseLen=*/0,
+        /*.executionPhaseLen=*/static_cast<int64_t>(ExecutionPhase::kSpecDraftProposal),
         /*.skipSoftmaxScaleLen=*/0,
         /*.swaKVCacheModeLen=*/0,
+        /*.queryOffsetLen=*/activeBatchSize + 1,
+        /*.contextSequenceCount=*/0,
     };
 
     cudaGetLastError();
@@ -775,16 +788,16 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
             kernel::dsparkComputeConfidenceAndSPSProposalLengths(mDraftHiddenStates, mMarkovW1, mConfidenceWeight,
                 mConfidenceBias, mLastAcceptedTokens, mDraftTokenIds, mConfidenceScores, mProposalLengths,
                 activeBatchSize, proposalLen, mDraftHiddenSize, mMarkovRank, mConfidenceHeadWithMarkov,
-                mConfidenceThreshold, mMinScheduledProposalLen, mMaxScheduledProposalLen, context.stream,
-                mDraftBlockLen, mDraftSlotOffset);
+                mConfidenceThreshold, mMinScheduledProposalLen, mMaxScheduledProposalLen, context.stream, blockLen,
+                mDraftSlotOffset);
         }
         else
         {
             kernel::dsparkComputeConfidenceAndProposalLengths(mDraftHiddenStates, mMarkovW1, mConfidenceWeight,
                 mConfidenceBias, mLastAcceptedTokens, mDraftTokenIds, mConfidenceScores, mProposalLengths,
                 activeBatchSize, proposalLen, mDraftHiddenSize, mMarkovRank, mConfidenceHeadWithMarkov,
-                mConfidenceThreshold, mMinScheduledProposalLen, mMaxScheduledProposalLen, context.stream,
-                mDraftBlockLen, mDraftSlotOffset);
+                mConfidenceThreshold, mMinScheduledProposalLen, mMaxScheduledProposalLen, context.stream, blockLen,
+                mDraftSlotOffset);
         }
 
         check::check(mHostProposalLengths.reshape({activeBatchSize}), "Tensor reshape failed");
@@ -817,7 +830,7 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
             check::check(mConfidenceScores.reshape({activeBatchSize, proposalLen}), "Tensor reshape failed");
             kernel::dsparkComputeConfidenceScores(mDraftHiddenStates, mMarkovW1, mConfidenceWeight, mConfidenceBias,
                 mLastAcceptedTokens, mDraftTokenIds, mConfidenceScores, activeBatchSize, proposalLen, mDraftHiddenSize,
-                mMarkovRank, mConfidenceHeadWithMarkov, context.stream, mDraftBlockLen, mDraftSlotOffset);
+                mMarkovRank, mConfidenceHeadWithMarkov, context.stream, blockLen, mDraftSlotOffset);
         }
         if (!buildTreeVerifyInputs(activeBatchSize, context.stream, mUseTreeScheduler))
         {
@@ -888,6 +901,48 @@ bool DSparkDecoder::buildTreeVerifyInputs(int32_t activeBatchSize, cudaStream_t 
     return true;
 }
 
+void DSparkDecoder::prepareDraftRaggedBindings(int32_t activeBatchSize, int32_t executionWidth, int32_t deltaWidth,
+    cudaStream_t stream, std::vector<ResidentRef> const* residentRefs)
+{
+    auto& io = mRuntime.base.pipelineIO;
+    auto const& cfg = *mRuntime.deployment.draft;
+    int32_t const proposalTokens = activeBatchSize * executionWidth;
+    int32_t const deltaTokens = activeBatchSize * deltaWidth;
+
+    check::check(mDraftInputsEmbeds.reshape({proposalTokens, mDraftHiddenSize}), "Tensor reshape failed");
+    check::check(mDraftOutputLogits.reshape({proposalTokens, mDraftVocabSize}), "Tensor reshape failed");
+    check::check(mDraftHiddenStates.reshape({proposalTokens, mDraftHiddenSize}), "Tensor reshape failed");
+    check::check(mDraftPackedAttentionMask.reshape({proposalTokens, static_cast<int64_t>(divUp(executionWidth, 32))}),
+        "Tensor reshape failed");
+    check::check(mDraftAttentionPosId.reshape({proposalTokens}), "Tensor reshape failed");
+    check::check(io.positions.reshape({proposalTokens}), "Tensor reshape failed");
+    check::check(io.queryStartOffsets.reshape({activeBatchSize + 1}), "Tensor reshape failed");
+    check::check(io.queryLengths.reshape({activeBatchSize}), "Tensor reshape failed");
+    check::check(io.pastLengths.reshape({activeBatchSize}), "Tensor reshape failed");
+    check::check(io.attentionSequenceLengths.reshape({activeBatchSize}), "Tensor reshape failed");
+    check::check(io.contextSequenceCountCarrier.reshape({0}), "Tensor reshape failed");
+    io.uploadStateIndices(residentRefs, activeBatchSize, stream);
+    prepareRaggedKVPageTable(io, *mRuntime.base.sharedResources.kvPageTables[1], activeBatchSize, stream);
+    prepareRaggedRope(io, mRuntime.base.sharedResources, cfg, proposalTokens, activeBatchSize, stream);
+
+    check::check(mDraftDeltaPositions.reshape({deltaTokens}), "Tensor reshape failed");
+    check::check(mDraftDeltaTokenToSequence.reshape({deltaTokens}), "Tensor reshape failed");
+    check::check(mDraftDeltaRopeCosSin.reshape({deltaTokens, cfg.rotaryDim}), "Tensor reshape failed");
+    kernel::launchDFlashPrepareDeltaMetadata(mDraftCacheManager.getKVCacheLengths().dataPointer<int32_t>(),
+        mDraftDeltaLens.dataPointer<int32_t>(), deltaWidth, mDraftDeltaPositions.dataPointer<int32_t>(),
+        mDraftDeltaTokenToSequence.dataPointer<int32_t>(), activeBatchSize, stream);
+    Tensor const& ropeSource = cfg.ropeConfig.type == RopeType::kMRope
+        ? io.mropeCosSin
+        : mRuntime.base.sharedResources.ropePool.getOrCreate(
+              cfg.ropeConfig, cfg.rotaryDim, cfg.maxKVCacheCapacity, stream);
+    int32_t const sourceRows = cfg.ropeConfig.type == RopeType::kMRope ? cfg.recurrentPoolRows : 1;
+    kernel::launchDFlashGatherDeltaRope(ropeSource.dataPointer<float>(), mDraftDeltaRopeCosSin.dataPointer<float>(),
+        mDraftDeltaPositions.dataPointer<int32_t>(), mDraftDeltaTokenToSequence.dataPointer<int32_t>(),
+        sourceRows == 1 ? nullptr : io.stateIndices.dataPointer<int32_t>(), deltaTokens, activeBatchSize, sourceRows,
+        cfg.maxKVCacheCapacity, cfg.rotaryDim, stream);
+    check::check(mDraftTargetHidden.reshape({deltaTokens, mBaseOutputHiddenDim}), "Tensor reshape failed");
+}
+
 bool DSparkDecoder::runBaseVerification(DecodingInferenceContext& context)
 {
     TIME_STAGE(metrics::StageNames::kSPEC_DECODE_BASE_VERIFICATION, context.stream);
@@ -935,6 +990,27 @@ bool DSparkDecoder::runBaseVerification(DecodingInferenceContext& context)
             mRuntime.base.pipelineIO.specDecodePositionIds.dataPointer<int32_t>(),
             mRuntime.base.pipelineIO.selectTokenIndices.dataPointer<int64_t>(),
             mRuntime.base.pipelineIO.contextLengths.dataPointer<int32_t>(), activeBatchSize, context.stream);
+    }
+    Tensor const* validCounts = mUseTree ? &mValidCounts : nullptr;
+    decoder_utils::prepareSpecRaggedBindings(mRuntime, mRuntime.deployment.base, 0,
+        mRuntime.base.pipelineIO.specDecodePositionIds, mRuntime.base.cacheManager.getKVCacheLengths(), validCounts,
+        mRuntime.base.pipelineIO.selectTokenIndices, activeBatchSize * verifyLen, &context.residentRefs,
+        activeBatchSize, verifyLen, mRuntime.deployment.base.specVerifyDims(activeBatchSize, verifyLen),
+        context.stream);
+    check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape(
+                     {activeBatchSize * verifyLen, mRuntime.deployment.base.hiddenSize}),
+        "Tensor reshape failed");
+    check::check(
+        mRuntime.base.pipelineIO.specDecodePositionIds.reshape({activeBatchSize * verifyLen}), "Tensor reshape failed");
+    check::check(mRuntime.base.pipelineIO.packedAttentionMask.reshape(
+                     {activeBatchSize * verifyLen, static_cast<int64_t>(divUp(verifyLen, 32))}),
+        "Tensor reshape failed");
+    if (mUseTree)
+    {
+        check::check(
+            mRuntime.base.pipelineIO.specTreeParentIds.reshape({activeBatchSize * verifyLen}), "Tensor reshape failed");
+        check::check(
+            mRuntime.base.pipelineIO.specTreeDepths.reshape({activeBatchSize * verifyLen}), "Tensor reshape failed");
     }
 
     if (mRuntime.preprocess.deepstack)
@@ -1092,7 +1168,8 @@ bool DSparkDecoder::runBaseVerification(DecodingInferenceContext& context)
         "Tensor reshape failed");
     mLastBaseVerifyHiddenStride = verifyLen;
 
-    mRuntime.base.cacheManager.getMambaCacheManager().scatterAcceptedLinearStates(mAcceptLength, context.stream);
+    mRuntime.base.cacheManager.getMambaCacheManager().scatterAcceptedLinearStates(
+        mAcceptLength, mRuntime.base.pipelineIO.stateIndices, context.stream);
 
     if (context.numLogprobs > 0)
     {
@@ -1142,8 +1219,9 @@ void DSparkDecoder::commitAcceptedTreePath(
     // Branching-tree accept can skip nodes, so commit compacts accepted KV rows using accepted verify indices.
     for (auto const& group : kvHeadDimGroups)
     {
-        kernel::eagleBaseCommitKVCache(mAcceptedTokenIndices, mAcceptLength, kvCacheLengths, group.deviceLayerInfos,
-            group.numLayers, group.headDim, group.maxKVHeads, activeBatchSize, maxAcceptLength, kvCacheType,
+        kernel::eagleBaseCommitKVCache(mAcceptedTokenIndices, mAcceptLength, kvCacheLengths,
+            mRuntime.base.pipelineIO.stateIndices, group.deviceLayerInfos, group.numLayers, group.headDim,
+            group.maxKVHeads, activeBatchSize, mRuntime.deployment.base.recurrentPoolRows, maxAcceptLength, kvCacheType,
             context.stream, basePageTablePtr, baseNumPages, baseMaxPagesPerSeq);
     }
     kernel::eagleBaseAssembleHiddenState(
@@ -1155,11 +1233,13 @@ void DSparkDecoder::commitAcceptedTreePath(
         // while the chunk-form tree kernel covers the verify size.
         if (mambaMgr.recurrentUsesReplay() || kernel::gdnTreeChunkVerifyEnabled(verifySize))
         {
-            mambaMgr.replayCommitAcceptedTreeStates(mAcceptedTokenIndices, mAcceptLength, context.stream);
+            mambaMgr.replayCommitAcceptedTreeStates(
+                mAcceptedTokenIndices, mAcceptLength, mRuntime.base.pipelineIO.stateIndices, context.stream);
         }
         else
         {
-            mambaMgr.scatterAcceptedTreeStates(mAcceptedTokenIndices, mAcceptLength, context.stream);
+            mambaMgr.scatterAcceptedTreeStates(
+                mAcceptedTokenIndices, mAcceptLength, mRuntime.base.pipelineIO.stateIndices, context.stream);
         }
     }
 
@@ -1234,21 +1314,29 @@ bool DSparkDecoder::captureCudaGraphs(cudaStream_t stream)
             kernel::launchDFlashPrepareProposalInputs(draftCacheLengths.dataPointer<int32_t>(),
                 mDraftDeltaLens.dataPointer<int32_t>(), blockLen, mDraftPackedAttentionMask.dataPointer<int32_t>(),
                 mDraftAttentionPosId.dataPointer<int32_t>(), mDraftContextLengths.dataPointer<int32_t>(),
-                mCausalProposalMask, batchSize, stream);
+                mRuntime.base.pipelineIO.positions.dataPointer<int32_t>(),
+                mRuntime.base.pipelineIO.queryStartOffsets.dataPointer<int32_t>(),
+                mRuntime.base.pipelineIO.queryLengths.dataPointer<int32_t>(),
+                mRuntime.base.pipelineIO.pastLengths.dataPointer<int32_t>(),
+                mRuntime.base.pipelineIO.attentionSequenceLengths.dataPointer<int32_t>(),
+                mRuntime.base.pipelineIO.stateIndices.dataPointer<int32_t>(), mCausalProposalMask, batchSize, stream);
+            prepareDraftRaggedBindings(batchSize, blockLen, simDeltaLen, stream);
 
             InferenceDims const draftDims{
                 /*.batch=*/batchSize,
-                /*.seqLen=*/blockLen,
+                /*.seqLen=*/batchSize * blockLen,
                 /*.kvLen=*/draftKVCapacity,
-                /*.selectLen=*/static_cast<int64_t>(simDeltaLen),
-                /*.attnMaskSeqLen=*/blockLen,
+                /*.selectLen=*/static_cast<int64_t>(batchSize) * simDeltaLen,
+                /*.attnMaskSeqLen=*/batchSize * blockLen,
                 /*.ropeBatch=*/1,
                 /*.packedMaskLen=*/static_cast<int64_t>(draftPmLen),
                 /*.contextMaskSelectorLen=*/0,
                 /*.startIndexLen=*/batchSize,
-                /*.specVerifyPhaseLen=*/0,
+                /*.executionPhaseLen=*/static_cast<int64_t>(ExecutionPhase::kSpecDraftProposal),
                 /*.skipSoftmaxScaleLen=*/0,
                 /*.swaKVCacheModeLen=*/0,
+                /*.queryOffsetLen=*/batchSize + 1,
+                /*.contextSequenceCount=*/0,
             };
 
             if (mDraftExecutor->prepare(kDecodeProfile, draftDims, mDraftTensorMap, stream))
@@ -1301,6 +1389,20 @@ bool DSparkDecoder::captureCudaGraphs(cudaStream_t stream)
                     mRuntime.base.pipelineIO.contextLengths.dataPointer<int32_t>(), batchSize, stream);
             }
 
+            Tensor const* validCounts = mUseTree ? &mValidCounts : nullptr;
+            decoder_utils::prepareSpecRaggedBindings(mRuntime, mRuntime.deployment.base, 0,
+                mRuntime.base.pipelineIO.specDecodePositionIds, mRuntime.base.cacheManager.getKVCacheLengths(),
+                validCounts, mRuntime.base.pipelineIO.selectTokenIndices, selectTokenSize, nullptr, batchSize,
+                simVerifyLen, mRuntime.deployment.base.specVerifyDims(batchSize, simVerifyLen), stream);
+            check::check(
+                mRuntime.base.pipelineIO.inputsEmbeds.reshape({selectTokenSize, mRuntime.deployment.base.hiddenSize}),
+                "Tensor reshape failed");
+            check::check(
+                mRuntime.base.pipelineIO.specDecodePositionIds.reshape({selectTokenSize}), "Tensor reshape failed");
+            check::check(mRuntime.base.pipelineIO.packedAttentionMask.reshape(
+                             {selectTokenSize, static_cast<int64_t>(divUp(simVerifyLen, 32))}),
+                "Tensor reshape failed");
+
             if (mRuntime.preprocess.deepstack)
             {
                 mRuntime.preprocess.deepstack->useZeroTarget(mRuntime.base.tensorMap);
@@ -1337,16 +1439,18 @@ bool DSparkDecoder::hasSystemPromptKVCache(SystemPromptCacheKey const& key) cons
     return mSystemPromptKVCacheDraft.find(key) != mSystemPromptKVCacheDraft.end();
 }
 
-void DSparkDecoder::restoreSystemPromptKVCache(SystemPromptCacheKey const& key, int32_t batchIdx, cudaStream_t stream)
+void DSparkDecoder::restoreSystemPromptKVCache(
+    SystemPromptCacheKey const& key, int32_t residentSlot, cudaStream_t stream)
 {
     check::check(mSystemPromptKVCacheDraft.count(key) > 0, "DSpark system prompt cache missing for draft model");
-    mDraftCacheManager.restoreKVCache(mSystemPromptKVCacheDraft[key].kvCacheLayers, batchIdx, stream);
+    mDraftCacheManager.restoreKVCache(mSystemPromptKVCacheDraft[key].kvCacheLayers, residentSlot, stream);
 }
 
 bool DSparkDecoder::runSystemPromptPrefill(DecodingInferenceContext& context)
 {
     int32_t const activeBatchSize = context.activeBatchSize;
-    int64_t const prefillLen = mRuntime.base.pipelineIO.baseHiddenStates.getShape()[1];
+    int64_t const prefillLen
+        = *std::max_element(context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.end());
     int32_t const blockLen = mDraftBlockLen;
 
     check::check(mRuntime.preprocess.idsInput.reshape({activeBatchSize, blockLen}), "Tensor reshape failed");
@@ -1389,14 +1493,24 @@ bool DSparkDecoder::runSystemPromptPrefill(DecodingInferenceContext& context)
     Tensor const& draftCacheLengths = mDraftCacheManager.getKVCacheLengths();
     kernel::launchDFlashPrepareProposalInputs(draftCacheLengths.dataPointer<int32_t>(),
         mDraftDeltaLens.dataPointer<int32_t>(), blockLen, mDraftPackedAttentionMask.dataPointer<int32_t>(),
-        mDraftAttentionPosId.dataPointer<int32_t>(), mDraftContextLengths.dataPointer<int32_t>(), mCausalProposalMask,
-        activeBatchSize, context.stream);
+        mDraftAttentionPosId.dataPointer<int32_t>(), mDraftContextLengths.dataPointer<int32_t>(),
+        mRuntime.base.pipelineIO.positions.dataPointer<int32_t>(),
+        mRuntime.base.pipelineIO.queryStartOffsets.dataPointer<int32_t>(),
+        mRuntime.base.pipelineIO.queryLengths.dataPointer<int32_t>(),
+        mRuntime.base.pipelineIO.pastLengths.dataPointer<int32_t>(),
+        mRuntime.base.pipelineIO.attentionSequenceLengths.dataPointer<int32_t>(),
+        mRuntime.base.pipelineIO.stateIndices.dataPointer<int32_t>(), mCausalProposalMask, activeBatchSize,
+        context.stream);
+    prepareDraftRaggedBindings(
+        activeBatchSize, blockLen, static_cast<int32_t>(prefillLen), context.stream, &context.residentRefs);
 
     check::check(mDraftOutputLogits.reshape({activeBatchSize, blockLen, mDraftVocabSize}), "Tensor reshape failed");
     check::check(mDraftHiddenStates.reshape({activeBatchSize, blockLen, mDraftHiddenSize}), "Tensor reshape failed");
+
     int32_t const draftKVCapacity = mRuntime.deployment.draft->maxKVCacheCapacity;
-    InferenceDims const draftDims{activeBatchSize, blockLen, draftKVCapacity, prefillLen, blockLen, 1,
-        static_cast<int64_t>(pmLen), 0, activeBatchSize, 0, 0, 0};
+    InferenceDims const draftDims{activeBatchSize, activeBatchSize * blockLen, draftKVCapacity,
+        activeBatchSize * prefillLen, activeBatchSize * blockLen, 1, static_cast<int64_t>(pmLen), 0, activeBatchSize,
+        static_cast<int64_t>(ExecutionPhase::kSpecDraftProposal), 0, 0, activeBatchSize + 1, 0};
 
     cudaGetLastError();
     bool ok = mDraftExecutor->prepare(kPrefillProfile, draftDims, mDraftTensorMap, context.stream);
@@ -1468,21 +1582,11 @@ void DSparkDecoder::onBatchEvict(std::vector<int32_t> const& batchMapping, int32
     compactHostTensor(mHostAcceptLengths);
 
     auto compactDeviceTensor = [&](Tensor& tensor) {
-        if (tensor.isEmpty() || tensor.getShape().getNumDims() == 0 || tensor.getShape()[0] != oldActiveBatch
-            || newActiveBatch == 0)
+        if (tensor.isEmpty() || newActiveBatch == 0)
         {
             return;
         }
-        Coords const oldShape = tensor.getShape();
-        kernel::compactTensorBatch(tensor, deviceBatchMapping, tensor, oldActiveBatch, newActiveBatch, stream);
-        std::vector<int64_t> newShape;
-        newShape.reserve(oldShape.getNumDims());
-        newShape.push_back(newActiveBatch);
-        for (int32_t dim = 1; dim < oldShape.getNumDims(); ++dim)
-        {
-            newShape.push_back(oldShape[dim]);
-        }
-        check::check(tensor.reshape(newShape), "Tensor reshape failed");
+        kernel::compactExecutionTensorBatch(tensor, deviceBatchMapping, oldActiveBatch, newActiveBatch, stream);
     };
     compactDeviceTensor(mRuntime.base.pipelineIO.baseHiddenStates);
     if (mCommonStateTracker.draftPrefillOutputsPending())
@@ -1501,13 +1605,18 @@ void DSparkDecoder::onBatchEvict(std::vector<int32_t> const& batchMapping, int32
         compactDeviceTensor(mTreeTokenIds);
         compactDeviceTensor(mRuntime.base.pipelineIO.specTreeDepths);
         compactDeviceTensor(mRuntime.base.pipelineIO.specTreeParentIds);
+        compactDeviceTensor(mTreeNodeScores);
         compactDeviceTensor(mValidCounts);
         compactDeviceTensor(mVerifyTreeMask);
         compactDeviceTensor(mRuntime.preprocess.idsInput);
         compactDeviceTensor(mRuntime.base.pipelineIO.specDecodePositionIds);
         compactDeviceTensor(mRuntime.base.pipelineIO.packedAttentionMask);
         compactDeviceTensor(mRuntime.base.pipelineIO.contextLengths);
-        compactDeviceTensor(mRuntime.base.pipelineIO.selectTokenIndices);
+        if (mUseTree)
+        {
+            kernel::compactExecutionRowIndices(mRuntime.base.pipelineIO.selectTokenIndices, deviceBatchMapping,
+                oldActiveBatch, newActiveBatch, mCurrentVerifyLen, stream);
+        }
     }
     else
     {

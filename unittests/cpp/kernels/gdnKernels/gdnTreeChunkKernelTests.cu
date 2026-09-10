@@ -536,6 +536,8 @@ INSTANTIATE_TEST_SUITE_P(NodeCounts, GdnTreeChunkVerifyTest, ::testing::Values(4
 TEST(GdnTreeChunkReplayTest, VerifyThenReplayMatchesReference)
 {
     constexpr int32_t kNumLayers = 2;
+    constexpr int32_t kStatePoolRows = 4;
+    constexpr int32_t kResidentSlot = 2;
     ChunkProblem probs[kNumLayers];
     float const scale = 1.f / std::sqrt(static_cast<float>(kDk));
 
@@ -552,8 +554,11 @@ TEST(GdnTreeChunkReplayTest, VerifyThenReplayMatchesReference)
         p.generate(/*seed=*/777 + layer);
         devs[layer].run(p, scale, /*useL2Norm=*/true);
 
-        // Persistent recurrent state starts at h0 and is committed in place.
-        persistent[layer] = uploadVec(probs[layer].h0);
+        size_t const rowElements = probs[layer].h0.size();
+        std::vector<float> statePool(static_cast<size_t>(kStatePoolRows) * rowElements, -17.F);
+        std::copy(probs[layer].h0.begin(), probs[layer].h0.end(),
+            statePool.begin() + static_cast<size_t>(kResidentSlot) * rowElements);
+        persistent[layer] = uploadVec(statePool);
     }
 
     // Accepted path: a root-to-leaf chain in layer 0's tree (trees differ per
@@ -580,6 +585,8 @@ TEST(GdnTreeChunkReplayTest, VerifyThenReplayMatchesReference)
     int32_t* dIndices = uploadVec(hostIndices);
     std::vector<int32_t> const hostLens{acceptLen};
     int32_t* dLens = uploadVec(hostLens);
+    std::vector<int32_t> const hostStateIndices{kResidentSlot};
+    int32_t* dStateIndices = uploadVec(hostStateIndices);
 
     std::vector<MtpLayerInfo> infos(kNumLayers);
     for (int32_t layer = 0; layer < kNumLayers; ++layer)
@@ -591,8 +598,9 @@ TEST(GdnTreeChunkReplayTest, VerifyThenReplayMatchesReference)
     }
     MtpLayerInfo* dInfos = uploadVec(infos);
 
-    ASSERT_EQ(gdnTreeReplayCommitBatched(dInfos, kNumLayers, stashRowBytes(2, 4), dIndices, dLens, /*batch=*/1,
-                  kGDN_TREE_CHUNK_MAX_ACCEPT, probs[0].numNodes, /*h=*/2, /*hv=*/4, nullptr),
+    ASSERT_EQ(
+        gdnTreeReplayCommitBatched(dInfos, kNumLayers, stashRowBytes(2, 4), dIndices, dLens, dStateIndices,
+            /*batch=*/1, kStatePoolRows, kGDN_TREE_CHUNK_MAX_ACCEPT, probs[0].numNodes, /*h=*/2, /*hv=*/4, nullptr),
         cudaSuccess);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
@@ -600,17 +608,29 @@ TEST(GdnTreeChunkReplayTest, VerifyThenReplayMatchesReference)
     for (int32_t layer = 0; layer < kNumLayers; ++layer)
     {
         std::vector<double> const ref = referenceReplayState(probs[layer], scale, true, path);
-        std::vector<float> const out = downloadVec(persistent[layer], ref.size());
+        std::vector<float> const out = downloadVec(persistent[layer], static_cast<size_t>(kStatePoolRows) * ref.size());
         for (size_t i = 0; i < ref.size(); ++i)
         {
             // The replay chain is fp32 with an fp16 v; the stash k/g/beta are
             // fp32 rounded once.
-            expectClose(out[i], ref[i], 2e-3, 2e-3, "layer " + std::to_string(layer) + " elem " + std::to_string(i));
+            expectClose(out[static_cast<size_t>(kResidentSlot) * ref.size() + i], ref[i], 2e-3, 2e-3,
+                "layer " + std::to_string(layer) + " elem " + std::to_string(i));
+        }
+        for (int32_t slot = 0; slot < kStatePoolRows; ++slot)
+        {
+            if (slot == kResidentSlot)
+            {
+                continue;
+            }
+            auto const begin = out.begin() + static_cast<size_t>(slot) * ref.size();
+            EXPECT_TRUE(std::all_of(begin, begin + ref.size(), [](float value) { return value == -17.F; }))
+                << "Unselected resident slot changed: layer=" << layer << " slot=" << slot;
         }
         cudaFree(persistent[layer]);
     }
     cudaFree(dIndices);
     cudaFree(dLens);
+    cudaFree(dStateIndices);
     cudaFree(dInfos);
 }
 
@@ -633,6 +653,8 @@ TEST(GdnTreeChunkReplayTest, ZeroAcceptLengthLeavesStateUnchanged)
     int32_t* dIndices = uploadVec(hostIndices);
     std::vector<int32_t> const hostLens{0};
     int32_t* dLens = uploadVec(hostLens);
+    std::vector<int32_t> const hostStateIndices{0};
+    int32_t* dStateIndices = uploadVec(hostStateIndices);
 
     std::vector<MtpLayerInfo> infos(1);
     infos[0].recurrentDst = persistent;
@@ -641,8 +663,8 @@ TEST(GdnTreeChunkReplayTest, ZeroAcceptLengthLeavesStateUnchanged)
     infos[0].convSrc = nullptr;
     MtpLayerInfo* dInfos = uploadVec(infos);
 
-    ASSERT_EQ(gdnTreeReplayCommitBatched(dInfos, 1, stashRowBytes(2, 4), dIndices, dLens, 1, kGDN_TREE_CHUNK_MAX_ACCEPT,
-                  p.numNodes, 2, 4, nullptr),
+    ASSERT_EQ(gdnTreeReplayCommitBatched(dInfos, 1, stashRowBytes(2, 4), dIndices, dLens, dStateIndices, 1,
+                  /*residentPoolRows=*/1, kGDN_TREE_CHUNK_MAX_ACCEPT, p.numNodes, 2, 4, nullptr),
         cudaSuccess);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
@@ -655,5 +677,66 @@ TEST(GdnTreeChunkReplayTest, ZeroAcceptLengthLeavesStateUnchanged)
     cudaFree(persistent);
     cudaFree(dIndices);
     cudaFree(dLens);
+    cudaFree(dStateIndices);
     cudaFree(dInfos);
+}
+
+TEST(GdnTreeChunkReplayTest, InvalidAcceptedPathLeavesPersistentStateUnchanged)
+{
+    ChunkProblem p{};
+    p.batch = 1;
+    p.numNodes = 16;
+    p.h = 2;
+    p.hv = 4;
+    p.addInvalidNode = false;
+    p.generate(/*seed=*/5150);
+
+    float const scale = 1.f / std::sqrt(static_cast<float>(kDk));
+    DeviceRun dev;
+    dev.run(p, scale, true);
+
+    struct InvalidPath
+    {
+        int32_t acceptLength;
+        int32_t acceptedNode;
+        int32_t declaredNumNodes;
+    };
+    std::vector<InvalidPath> const invalidPaths{
+        {kGDN_TREE_CHUNK_MAX_ACCEPT + 1, 0, p.numNodes},
+        // Node 15 exists in the allocated stash, but is outside the declared [0, 15) tree. This
+        // validates the declared node domain without relying on an out-of-bounds device read.
+        {1, p.numNodes - 1, p.numNodes - 1},
+    };
+
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    for (auto const& invalid : invalidPaths)
+    {
+        float* persistent = uploadVec(p.h0);
+        std::vector<int32_t> hostIndices(kGDN_TREE_CHUNK_MAX_ACCEPT, 0);
+        hostIndices[0] = invalid.acceptedNode;
+        int32_t* dIndices = uploadVec(hostIndices);
+        int32_t* dLens = uploadVec(std::vector<int32_t>{invalid.acceptLength});
+        int32_t* dStateIndices = uploadVec(std::vector<int32_t>{0});
+        std::vector<MtpLayerInfo> infos(1);
+        infos[0].recurrentDst = persistent;
+        infos[0].recurrentSrc = dev.dStash;
+        MtpLayerInfo* dInfos = uploadVec(infos);
+
+        ASSERT_EQ(gdnTreeReplayCommitBatched(dInfos, 1, stashRowBytes(2, 4), dIndices, dLens, dStateIndices, 1,
+                      /*residentPoolRows=*/1, kGDN_TREE_CHUNK_MAX_ACCEPT, invalid.declaredNumNodes, 2, 4, stream),
+            cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+        std::vector<float> const out = downloadVec(persistent, p.h0.size());
+        EXPECT_EQ(out, p.h0) << "malformed accepted path committed persistent state: length=" << invalid.acceptLength
+                             << " node=" << invalid.acceptedNode << " numNodes=" << invalid.declaredNumNodes;
+        cudaFree(persistent);
+        cudaFree(dIndices);
+        cudaFree(dLens);
+        cudaFree(dStateIndices);
+        cudaFree(dInfos);
+    }
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 }

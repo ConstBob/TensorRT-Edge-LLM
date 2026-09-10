@@ -76,6 +76,143 @@ TEST(LLMBuilderConfigTest, PoolPagesRoundTripThroughJson)
     EXPECT_EQ(parsed.resolvedKVPoolPages(), 9);
 }
 
+TEST(LLMBuilderConfigTest, RaggedBackendIsTheOnlySerializedRaggedContract)
+{
+    LLMBuilderConfig config = makeConfig();
+    config.maxInputLen = 128;
+    config.maxBatchSize = 2;
+
+    Json const json = config.toJson();
+    EXPECT_EQ(json.at("ragged_backend"), "entry_padded_compatibility");
+    for (char const* field : {"max_num_sequences", "max_query_length", "max_physical_tokens", "recurrent_pool_rows",
+             "mixed_step_supported", "indexed_recurrent_state_supported", "indexed_conv_state_supported",
+             "token_padding_supported", "multimodal_input_supported", "token_aligned_rope_supported",
+             "token_aligned_deepstack_supported", "token_aligned_vision_mask_supported"})
+    {
+        EXPECT_FALSE(json.contains(field)) << field;
+    }
+
+    LLMBuilderConfig const parsed = LLMBuilderConfig::fromJson(json);
+    EXPECT_EQ(parsed.raggedBackend, config.raggedBackend);
+}
+
+TEST(LLMBuilderConfigTest, RaggedPhysicalCapacityRejectsCheckedProductOverflow)
+{
+    LLMBuilderConfig config;
+    config.maxBatchSize = std::numeric_limits<int32_t>::max();
+    config.maxInputLen = 2;
+    config.maxKVCacheCapacity = 2;
+
+    EXPECT_THROW(config.resolvedMaxPhysicalTokens(), std::runtime_error);
+}
+
+TEST(LLMBuilderConfigTest, DraftRoleResolvesTreeSizedRaggedCapacity)
+{
+    LLMBuilderConfig config = makeConfig();
+    config.maxInputLen = 8;
+    config.maxDraftTreeSize = 16;
+    config.specDraft = true;
+
+    EXPECT_EQ(config.resolvedMaxQueryLength(), 16);
+    EXPECT_EQ(config.resolvedMaxPhysicalTokens(), 32);
+    EXPECT_EQ(config.raggedMultiTokenGenerationProfileRange(config.resolvedRoleQueryLength()).max.physicalTokens, 32);
+}
+
+TEST(LLMBuilderConfigTest, BaseRoleResolvesVerifyTreeSizedRaggedCapacity)
+{
+    LLMBuilderConfig config = makeConfig();
+    config.maxInputLen = 8;
+    config.maxVerifyTreeSize = 24;
+    config.specBase = true;
+
+    EXPECT_EQ(config.resolvedMaxQueryLength(), 24);
+    EXPECT_EQ(config.resolvedMaxPhysicalTokens(), 48);
+}
+
+TEST(LLMBuilderConfigTest, RoleProfileDoesNotExpandToLargerPrefillWidth)
+{
+    LLMBuilderConfig config = makeConfig();
+    config.maxInputLen = 128;
+    config.maxDraftTreeSize = 16;
+    config.specDraft = true;
+
+    EXPECT_EQ(config.resolvedRoleQueryLength(), 16);
+    EXPECT_EQ(config.resolvedMaxQueryLength(), 128);
+    EXPECT_EQ(config.raggedMultiTokenGenerationProfileRange(config.resolvedRoleQueryLength()).max.physicalTokens, 32);
+    EXPECT_EQ(config.resolvedMaxPhysicalTokens(), 256);
+}
+
+TEST(LLMBuilderConfigTest, ModelRoleOverrideResolvesCanvasSizedRaggedCapacity)
+{
+    LLMBuilderConfig config = makeConfig();
+    config.maxInputLen = 8;
+    config.maxQueryLength = 32;
+
+    EXPECT_EQ(config.resolvedMaxQueryLength(), 32);
+    EXPECT_EQ(config.resolvedMaxPhysicalTokens(), 64);
+    EXPECT_EQ(config.raggedMultiTokenGenerationProfileRange(config.resolvedRoleQueryLength()).max.physicalTokens, 64);
+}
+
+TEST(LLMBuilderConfigTest, RoleAwareRaggedCapacityRejectsCheckedProductOverflow)
+{
+    LLMBuilderConfig config = makeConfig();
+    config.maxBatchSize = std::numeric_limits<int32_t>::max();
+    config.maxInputLen = 1;
+    config.maxQueryLength = 2;
+
+    EXPECT_THROW(config.resolvedMaxPhysicalTokens(), std::runtime_error);
+}
+
+TEST(LLMBuilderConfigTest, RaggedPrefillAndDecodeProfileRangesCoverEveryBindingClass)
+{
+    LLMBuilderConfig config = makeConfig();
+    config.maxInputLen = 128;
+
+    RaggedProfileRange const prefill = config.raggedPrefillProfileRange();
+    EXPECT_EQ(prefill.min.numSequences, 1);
+    EXPECT_EQ(prefill.min.physicalTokens, 1);
+    EXPECT_EQ(prefill.min.queryOffsets, 2);
+    EXPECT_EQ(prefill.min.logitsRows, 1);
+    EXPECT_EQ(prefill.opt.numSequences, 2);
+    EXPECT_EQ(prefill.opt.physicalTokens, 128);
+    EXPECT_EQ(prefill.opt.queryOffsets, 3);
+    EXPECT_EQ(prefill.opt.logitsRows, 2);
+    EXPECT_EQ(prefill.max.numSequences, 2);
+    EXPECT_EQ(prefill.max.physicalTokens, 256);
+    EXPECT_EQ(prefill.max.queryOffsets, 3);
+    EXPECT_EQ(prefill.max.logitsRows, 2);
+
+    RaggedProfileRange const decode = config.raggedDecodeProfileRange();
+    EXPECT_EQ(decode.min.physicalTokens, 1);
+    EXPECT_EQ(decode.opt.physicalTokens, 2);
+    EXPECT_EQ(decode.max.physicalTokens, 2);
+    EXPECT_EQ(decode.max.numSequences, 2);
+    EXPECT_EQ(decode.max.queryOffsets, 3);
+    EXPECT_EQ(decode.max.logitsRows, 2);
+}
+
+TEST(LLMBuilderConfigTest, RaggedMultiTokenGenerationProfileCoversWholeBatchTree)
+{
+    LLMBuilderConfig config = makeConfig();
+
+    RaggedProfileRange const generation = config.raggedMultiTokenGenerationProfileRange(60);
+    EXPECT_EQ(generation.min.physicalTokens, 1);
+    EXPECT_EQ(generation.opt.physicalTokens, 120);
+    EXPECT_EQ(generation.max.physicalTokens, 120);
+    EXPECT_EQ(generation.max.numSequences, 2);
+    EXPECT_EQ(generation.max.queryOffsets, 3);
+    EXPECT_EQ(generation.max.logitsRows, 120);
+}
+
+TEST(LLMBuilderConfigTest, RaggedMultiTokenGenerationProfileRejectsInvalidCapacity)
+{
+    LLMBuilderConfig config = makeConfig();
+
+    EXPECT_THROW(config.raggedMultiTokenGenerationProfileRange(0), std::runtime_error);
+    config.maxBatchSize = std::numeric_limits<int32_t>::max();
+    EXPECT_THROW(config.raggedMultiTokenGenerationProfileRange(2), std::runtime_error);
+}
+
 TEST(LLMBuilderConfigTest, PoolPagesRejectDerivedVIdOverflow)
 {
     LLMBuilderConfig config = makeConfig();

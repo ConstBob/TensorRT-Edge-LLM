@@ -153,6 +153,7 @@ inline Json makeTinyVanillaConfig()
     builder["max_kv_pool_pages"] = 4;
     builder["max_lora_rank"] = 0;
     builder["spec_base"] = false;
+    builder["ragged_backend"] = "entry_padded_compatibility";
     config["builder_config"] = builder;
     return config;
 }
@@ -301,12 +302,16 @@ protected:
     {
         using ::testing::_;
         using ::testing::Return;
+        using ::testing::StrEq;
 
         auto engine = std::make_unique<::testing::NiceMock<MockEngineExecutor>>();
         ON_CALL(*engine, getRequiredContextMemorySize()).WillByDefault(Return(kContextMemoryBytes));
         ON_CALL(*engine, setContextMemory(_)).WillByDefault(Return(true));
         ON_CALL(*engine, hasIOTensor(_)).WillByDefault(Return(false));
         ON_CALL(*engine, getBindingDataType(_)).WillByDefault(Return(nvinfer1::DataType::kHALF));
+        ON_CALL(*engine, hasIOTensor(StrEq(binding_names::kContextSequenceCountCarrier))).WillByDefault(Return(true));
+        ON_CALL(*engine, getBindingDataType(StrEq(binding_names::kContextSequenceCountCarrier)))
+            .WillByDefault(Return(nvinfer1::DataType::kINT32));
         ON_CALL(*engine, captureGraph(_)).WillByDefault(Return(false));
         // The logits binding is only reachable through the tensor map the runtime hands to prepare().
         ON_CALL(*engine, prepare(_, _, _, _))
@@ -525,12 +530,7 @@ protected:
         return ModelDirTest::makeRuntime(std::move(artifacts), drafting());
     }
 
-    //! A draft engine that records the per-slot draft-cache offsets each prepare() hands it.
-    //!
-    //! `kvcache_start_index` on the draft map is the draft cache's own per-slot length vector, which is exactly what
-    //! the decoder's onBatchEvict is responsible for moving. Reading it is the only way a substitute engine can see
-    //! that state at all: nothing writes recognizable bytes into a mocked KV cache, so its *contents* stay zero
-    //! whether or not they were compacted.
+    //! A draft engine that records the active sequence-to-resident-slot mapping for each prepare().
     std::unique_ptr<::testing::NiceMock<MockEngineExecutor>> makeRecordingDraftEngine()
     {
         auto engine = makeEngine();
@@ -538,54 +538,38 @@ protected:
             .WillByDefault(
                 [this](int32_t, rt::InferenceDims const& dims, rt::TensorMap const& map, cudaStream_t stream) {
                     mLogits = map.get(binding_names::kLogits);
-                    auto offsets = readInt32Binding(map, binding_names::kKVCacheStartIndex, dims.batch, stream);
-                    if (!offsets.empty())
+                    auto stateIndices = readInt32Binding(map, binding_names::kStateIndices, dims.batch, stream);
+                    if (!stateIndices.empty())
                     {
-                        mDraftCacheOffsets.push_back(std::move(offsets));
+                        mDraftStateIndices.push_back(std::move(stateIndices));
                     }
                     return true;
                 });
         return engine;
     }
 
-    //! The claim the round-count expectations cannot make: the survivor is decoding against **its own** draft cache.
-    //!
-    //! Counting forwards and reading the output text both miss this. The substitute engine returns the same logits
-    //! whatever it was handed, and the real base engine re-verifies every proposal, so a survivor left pointing at
-    //! the evicted slot's draft state still produces valid text -- it only loses acceptance rate. What separates the
-    //! two cases is the offset the draft engine is given for row 0 on the first round after the eviction.
-    void expectDraftStateFollowedTheSurvivor(int32_t verifyWindow)
+    //! Verify logical batch compaction preserves the survivor's resident state row.
+    void expectDraftStateFollowedTheSurvivor()
     {
         size_t compacted = 0;
-        while (compacted < mDraftCacheOffsets.size() && mDraftCacheOffsets[compacted].size() != 1U)
+        while (compacted < mDraftStateIndices.size() && mDraftStateIndices[compacted].size() != 1U)
         {
             ++compacted;
         }
-        ASSERT_LT(compacted, mDraftCacheOffsets.size()) << "the draft engine never ran on the compacted batch";
+        ASSERT_LT(compacted, mDraftStateIndices.size()) << "the draft engine never ran on the compacted batch";
         ASSERT_GT(compacted, 0U) << "the draft engine never ran on the full batch";
 
-        auto const& paired = mDraftCacheOffsets[compacted - 1];
+        auto const& paired = mDraftStateIndices[compacted - 1];
         ASSERT_EQ(paired.size(), 2U);
-        // Both guards keep the comparison from holding for the wrong reason. The offsets have to differ at all, and
-        // they have to differ by more than a round commits -- otherwise the survivor could reach its own offset
-        // from the evicted slot's in the round between the two observations, and either state would pass.
-        ASSERT_GT(paired[1], paired[0]) << "the two slots' draft caches were indistinguishable";
-        ASSERT_GT(paired[1] - paired[0], verifyWindow) << "one round could bridge the gap between the two slots";
-
-        // A sequence's draft cache only grows, so the survivor's offset can be at or past where it last was. What
-        // it cannot be is behind: that is the evicted slot's shorter history showing through.
-        EXPECT_GE(mDraftCacheOffsets[compacted][0], paired[1])
-            << "the survivor moved to engine row 0 but its draft cache did not follow: row 0 is addressing the "
-               "evicted slot's state";
+        ASSERT_NE(paired[0], paired[1]);
+        EXPECT_EQ(mDraftStateIndices[compacted][0], paired[1])
+            << "logical compaction changed the survivor's resident state row";
     }
 
-    //! One token per character in this tokenizer, so these two prompts put the slots at draft-cache offsets 15
-    //! apart -- comfortably more than the tokens any one round commits, which is what makes the assertion below
-    //! able to tell the survivor's own state from the evicted slot's.
     static constexpr char const* kShortPrompt{"a"};
     static constexpr char const* kLongPrompt{"aaaaaaaaaaaaaaaa"};
 
-    std::vector<std::vector<int32_t>> mDraftCacheOffsets;
+    std::vector<std::vector<int32_t>> mDraftStateIndices;
 
     //! Nothing on disk is an engine, and the pair still assembles into the strategy the base config names.
     //!
@@ -671,7 +655,7 @@ protected:
     //!
     //! Given a batch of two, holding different-length prompts, whose first slot stops on the first verification
     //! When the remaining rounds run
-    //! Then the survivor decodes on from engine row 0 against its own draft cache, not the evicted slot's
+    //! Then the survivor keeps its resident state row while occupying active row 0
     void expectSurvivorKeepsDecodingAfterCompaction(int32_t verifyWindow)
     {
         using ::testing::_;
@@ -693,8 +677,6 @@ protected:
 
         auto runtime = makeRuntime(std::move(artifacts));
 
-        // Different prompt lengths, so the two slots occupy different draft-cache offsets and the assertion below
-        // can tell "kept its own state" from "inherited the evicted slot's".
         auto request = makeGreedyRequest(kShortPrompt, maxGenerateLength);
         request.requests.push_back(makeGreedyRequest(kLongPrompt, maxGenerateLength).requests.front());
         rt::LLMGenerationResponse response;
@@ -708,7 +690,7 @@ protected:
         EXPECT_EQ(response.finishReasons[1], rt::FinishReason::kLength);
         EXPECT_EQ(response.outputIds[1].size(), static_cast<size_t>(maxGenerateLength));
 
-        expectDraftStateFollowedTheSurvivor(verifyWindow);
+        expectDraftStateFollowedTheSurvivor();
     }
 };
 

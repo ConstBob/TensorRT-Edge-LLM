@@ -35,6 +35,7 @@ from experimental.builder.models.dspark import artifacts as dspark_artifacts
 from experimental.builder.models.dspark import configuration as dspark_config
 from experimental.builder.models.nemotron_h import weights as nemotron_weights
 from experimental.builder.ops.functional import recurrent
+from experimental.builder.ops.ragged import RaggedDecoderInputs
 from experimental.builder.weight_packing import nvfp4 as direct_nvfp4
 
 direct_attention = importlib.import_module(
@@ -285,27 +286,31 @@ def test_dspark_direct_sidecar_rejects_unscaled_packed_markov_w2(tmp_path):
 def test_direct_attention_emits_sink_and_contiguous_swa_contract(monkeypatch):
     captured = {}
 
-    class Output:
-
-        def reshape(self, shape):
-            captured["reshape"] = shape
-            return "attention"
-
     def fake_operation(name, inputs, output_count, **attributes):
         captured.update(name=name,
                         inputs=inputs,
                         output_count=output_count,
                         attributes=attributes)
-        return Output(), "present"
+        return "attention", "present"
 
     monkeypatch.setattr(direct_attention, "operation", fake_operation)
+    ragged = RaggedDecoderInputs(
+        positions="positions",
+        query_start_offsets="query_offsets",
+        query_lengths="lengths",
+        past_lengths="cache_start",
+        attention_sequence_lengths="attention_lengths",
+        state_indices="state_indices",
+        logits_indices="logits_indices",
+        execution_phase_marker="phase",
+        context_sequence_count_carrier="context_count",
+        kv_page_table="page_table",
+    )
     result = direct_attention.attention(
         "qkv",
         "past",
-        "lengths",
         "rope",
-        "cache_start",
-        "page_table",
+        ragged,
         32,
         2,
         128,
@@ -319,7 +324,8 @@ def test_direct_attention_emits_sink_and_contiguous_swa_contract(monkeypatch):
     assert result == ("attention", "present")
     assert captured["inputs"] == [
         "qkv", "past", "lengths", "rope", "cache_start", "page_table", "mask",
-        "positions", "sinks"
+        "positions", "sinks", "query_offsets", "attention_lengths", "phase",
+        "context_count"
     ]
     assert captured["attributes"]["enable_tree_attention"] == 1
     assert captured["attributes"]["enable_attention_sink"] == 1
@@ -337,18 +343,29 @@ def test_update_ssm_state_emits_tree_replay(monkeypatch):
                         attributes=attributes)
         return tuple(range(output_count))
 
-    monkeypatch.setattr(recurrent, "supports_operation_attribute",
-                        lambda name, attribute: True)
     monkeypatch.setattr(recurrent, "operation", fake_operation)
-    tensors = list(range(13))
+    tensors = list(range(15))
+    ragged = RaggedDecoderInputs(
+        positions=None,
+        query_start_offsets=tensors[9],
+        query_lengths=tensors[8],
+        past_lengths=None,
+        attention_sequence_lengths=None,
+        state_indices=tensors[10],
+        logits_indices=None,
+        execution_phase_marker=tensors[11],
+        context_sequence_count_carrier=tensors[12],
+        kv_page_table=None,
+    )
 
-    result = recurrent.update_ssm_state(*tensors[:10],
+    result = recurrent.update_ssm_state(*tensors[:8],
+                                        ragged,
                                         2688,
                                         128,
                                         42,
                                         8,
-                                        spec_metadata=tensors[10:13],
-                                        use_ddtree=True,
+                                        tree_parent_ids=tensors[13],
+                                        tree_depths=tensors[14],
                                         use_intermediate=True)
 
     assert result == tuple(range(6))

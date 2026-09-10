@@ -253,7 +253,8 @@ def test_dflash_base_exports_tree_metadata_for_linear_and_branching_modes():
     config = SimpleNamespace(dflash_base=False,
                              dflash_tree_base=False,
                              jetspec_tree_base=False,
-                             mtp_tree_base=False)
+                             mtp_tree_base=False,
+                             dflash_version=DFlashVersion.V2)
     config.dflash_base = True
 
     assert _is_spec_tree_base_export(config)
@@ -348,11 +349,18 @@ def test_dflash2_model_exports_selector_inputs_for_runtime(tmp_path):
         "spec_proposal_support_ids", "spec_proposal_unary_values",
         "spec_proposal_projected_hidden"
     ]
-    block_dim = spec.dynamic_shapes[0][1]
-    assert block_dim.min == 2
-    assert block_dim.max == 16
-    assert spec.dynamic_shapes[7][1] == block_dim
-    assert spec.dynamic_shapes[8][1] == block_dim
+    assert "context_lengths" not in spec.input_names
+    assert "kvcache_start_index" not in spec.input_names
+    assert "dflash_delta_lengths" not in spec.input_names
+    assert {
+        "query_start_offsets", "query_lengths", "past_lengths",
+        "attention_sequence_lengths", "state_indices",
+        "execution_phase_marker", "context_sequence_count_carrier",
+        "dflash_delta_positions", "dflash_delta_token_to_sequence"
+    } <= set(spec.input_names)
+    token_dim = spec.dynamic_shapes[0][0]
+    assert token_dim.min == 2
+    assert token_dim.max == 8_388_608
 
 
 def test_dflash2_official_export_writes_runtime_selector_sidecar(tmp_path):
@@ -395,8 +403,14 @@ def test_dflash2_onnx_leaves_candidate_selection_to_runtime(tmp_path):
     onnx.checker.check_model(str(output_path))
     graph = onnx.load(str(output_path), load_external_data=False)
     inputs = {value.name: value for value in graph.graph.input}
-    block_dim = inputs["inputs_embeds"].type.tensor_type.shape.dim[1]
-    assert block_dim.dim_param
+    input_shape = inputs["inputs_embeds"].type.tensor_type.shape.dim
+    assert len(input_shape) == 2
+    assert input_shape[0].dim_param
+    assert "context_lengths" not in inputs
+    assert "kvcache_start_index" not in inputs
+    assert "dflash_delta_lengths" not in inputs
+    assert "query_start_offsets" in inputs
+    assert "dflash_delta_token_to_sequence" in inputs
     assert "spec_proposal_uniforms" not in inputs
     assert all(node.op_type != "DFlash2CandidateSelectorPlugin"
                for node in graph.graph.node)

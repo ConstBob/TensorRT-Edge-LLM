@@ -78,6 +78,8 @@ bool isCachedBlockDraftDraft(LLMEngineConfig const& config) noexcept
 namespace
 {
 
+constexpr char kObsoleteGenericTokenOwnerBinding[] = "token_to_sequence";
+
 //! Helper: read a required field or throw.
 template <typename T>
 T getRequired(Json const& json, char const* key)
@@ -578,6 +580,11 @@ void parseCoreFields(Json const& configJson, LLMEngineConfig& cfg)
             + " (must be a non-negative int32 value)");
     cfg.numSwaPages = static_cast<int32_t>(numSwaPages);
 
+    std::string const backend = getRequired<std::string>(bc, "ragged_backend");
+    ELLM_CHECK(backend == "entry_padded_compatibility",
+        "parseEngineConfig: unsupported ragged backend '" + backend + "'; rebuild with entry_padded_compatibility.");
+    cfg.raggedBackend = RaggedBackendKind::kEntryPaddedCompatibility;
+
     // RoPE configuration (top-level, derived from full config).
     cfg.ropeConfig = collectRopeConfig(configJson);
 
@@ -608,6 +615,17 @@ void parseCoreFields(Json const& configJson, LLMEngineConfig& cfg)
     ELLM_CHECK(cfg.maxSupportedInputLength <= cfg.maxKVCacheCapacity,
         "parseEngineConfig: max_input_len (" + std::to_string(cfg.maxSupportedInputLength)
             + ") cannot be greater than max_kv_cache_capacity (" + std::to_string(cfg.maxKVCacheCapacity) + ")");
+}
+
+void finalizeRaggedCapacities(LLMEngineConfig& cfg, int32_t roleQueryLength, char const* parserName)
+{
+    requirePositive(roleQueryLength, "role query length");
+    cfg.maxNumSequences = cfg.maxSupportedBatchSize;
+    cfg.recurrentPoolRows = cfg.maxSupportedBatchSize;
+    cfg.maxQueryLength = std::max(cfg.maxSupportedInputLength, roleQueryLength);
+    ELLM_CHECK(cfg.maxNumSequences <= std::numeric_limits<int32_t>::max() / cfg.maxQueryLength,
+        std::string(parserName) + ": ragged physical-token capacity exceeds int32.");
+    cfg.maxPhysicalTokens = cfg.maxNumSequences * cfg.maxQueryLength;
 }
 
 //! Populate `cfg.layerTypes` and `cfg.kvLayerConfigs` from the canonical
@@ -948,6 +966,15 @@ LLMEngineConfig parseEngineConfig(
         }
     }
 
+    if (cfg.isDiffusionBackbone)
+    {
+        finalizeRaggedCapacities(cfg, cfg.diffusionCanvasLength, "parseEngineConfig");
+    }
+    else
+    {
+        finalizeRaggedCapacities(cfg, cfg.isSpecDecodeBase ? cfg.maxVerifyTreeSize : 1, "parseEngineConfig");
+    }
+
     // Populate per-layer type routing from canonical fields or scalar fallback.
     populateLayerTypes(configJson, cfg);
     validateKVLayerCapacities(configJson, cfg);
@@ -1053,6 +1080,14 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
     // from `DeploymentConfig::specDecode`.
     cfg.maxDraftTreeSize = getRequired<int32_t>(bc, "max_draft_tree_size");
     requirePositive(cfg.maxDraftTreeSize, "max_draft_tree_size");
+    int32_t draftQueryLength = cfg.maxDraftTreeSize;
+    if (cfg.specDecodeType == SpecDecodeMode::kDSpark && !cfg.dsparkSampleFromAnchor)
+    {
+        ELLM_CHECK(draftQueryLength < std::numeric_limits<int32_t>::max(),
+            "parseDraftEngineConfig: DSpark non-anchor query width exceeds int32.");
+        ++draftQueryLength;
+    }
+    finalizeRaggedCapacities(cfg, draftQueryLength, "parseDraftEngineConfig");
 
     // Hidden dim the draft engine's `hidden_states_input` binding expects. The
     // python export writes this as `base.hidden_size * 3` for EAGLE-3 (multi-layer
@@ -1175,14 +1210,8 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
     return ss.str();
 }
 
-// ---------------------------------------------------------------------------
-// InferenceDims recipe methods
-//
-// Tier-1 #7 (C++20 designated initializers) is DEFERRED: the repo compiles
-// with -std=c++17 -Werror, which rejects designated initializers even as a
-// GNU extension. Keep the `/*.field=*/value` comment style until the repo's
-// CXX_STANDARD is bumped.
-// ---------------------------------------------------------------------------
+// C++17 requires positional aggregate initialization; field labels keep each
+// dimension recipe auditable when InferenceDims changes.
 
 bool LLMEngineConfig::supportsBoundedSwaKVCache() const
 {
@@ -1231,38 +1260,36 @@ std::array<int32_t, 3> LLMEngineConfig::getKVPoolPageProfileForLayer(KVLayerConf
     return {smallerPages, smallerPages, std::max(boundedPages, kvPoolPages)};
 }
 
-InferenceDims LLMEngineConfig::prefillDims(int64_t batch, int64_t seqLen, bool kvCacheAllEmpty) const
+InferenceDims LLMEngineConfig::prefillDims(int64_t batch, int64_t seqLen, ExecutionPhase phase) const
 {
-    // seqLen drives the inputs_embeds / KV-write length only.
-    //
-    // attnMaskSeqLen and packedMaskLen are pinned to 1 (NOT derived from seqLen):
-    // the SpecDecode base/draft attention plugin treats a `[B, 1, 1]` mask as a
-    // signal to use standard causal attention and ignores the buffer contents,
-    // which matches the dummy-mask binding from the pre-refactor runtime. A
-    // larger attention shape would be interpreted as a proposal-attention mask
-    // and read uninitialized buffer bits, producing garbage outputs.
-    //
+    ELLM_CHECK(isDiffusionBackbone ? phase == ExecutionPhase::kDiffusionCommit
+                                   : phase == ExecutionPhase::kContextPrefill || phase == ExecutionPhase::kContextChunk,
+        "Prefill dimensions require a context-prefill, context-chunk, or diffusion-commit phase");
     // startIndexLen=0 is the autoregressive plugin-path sentinel for "initial
     // prefill of an empty KV cache"; chunked prefill uses [batch].
     // DiffusionGemma keeps kvcache_start_index materialized and uses
     // context_mask_selector's shape sentinel to switch attention mask modes.
-    int64_t const startIndexLen = (kvCacheAllEmpty && !isDiffusionBackbone) ? 0 : batch;
+    int64_t const startIndexLen = phase == ExecutionPhase::kContextPrefill ? 0 : batch;
     // Keep KV cache binding shape at physical capacity for CUDA graph stability.
-    // Logical work length is carried by context_lengths + kvcache_start_index.
+    // Logical work length is carried by query_lengths and past_lengths.
     int64_t const kvLen = maxKVCacheCapacity;
+    int64_t const physicalTokens = batch * seqLen;
+    int64_t const logits = batch;
     return InferenceDims{
         /*.batch=*/batch,
-        /*.seqLen=*/seqLen,
+        /*.seqLen=*/physicalTokens,
         /*.kvLen=*/kvLen,
-        /*.selectLen=*/1,
-        /*.attnMaskSeqLen=*/1,
+        /*.selectLen=*/logits,
+        /*.attnMaskSeqLen=*/physicalTokens,
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/1,
         /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/startIndexLen,
-        /*.specVerifyPhaseLen=*/0,
+        /*.executionPhaseLen=*/static_cast<int64_t>(phase),
         /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
         /*.swaKVCacheModeLen=*/getSwaKVCacheModeInputLength(),
+        /*.queryOffsetLen=*/batch + 1,
+        /*.contextSequenceCount=*/isDiffusionBackbone ? 0 : batch,
     };
 }
 
@@ -1270,53 +1297,61 @@ InferenceDims LLMEngineConfig::decodeDims(int64_t batch) const
 {
     return InferenceDims{
         /*.batch=*/batch,
-        /*.seqLen=*/1,
+        /*.seqLen=*/batch,
         /*.kvLen=*/maxKVCacheCapacity,
-        /*.selectLen=*/1,
-        /*.attnMaskSeqLen=*/1,
+        /*.selectLen=*/batch,
+        /*.attnMaskSeqLen=*/batch,
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/1,
         /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/batch,
-        /*.specVerifyPhaseLen=*/0,
+        /*.executionPhaseLen=*/static_cast<int64_t>(ExecutionPhase::kAutoregressiveDecode),
         /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
         /*.swaKVCacheModeLen=*/getSwaKVCacheModeInputLength(),
+        /*.queryOffsetLen=*/batch + 1,
+        /*.contextSequenceCount=*/0,
     };
 }
 
 InferenceDims LLMEngineConfig::denoiseDims(int64_t batch, int64_t canvasLen) const
 {
+    int64_t const physicalTokens = batch * canvasLen;
     return InferenceDims{
         /*.batch=*/batch,
-        /*.seqLen=*/canvasLen,
+        /*.seqLen=*/physicalTokens,
         /*.kvLen=*/maxKVCacheCapacity,
-        /*.selectLen=*/canvasLen,
-        /*.attnMaskSeqLen=*/1,
+        /*.selectLen=*/physicalTokens,
+        /*.attnMaskSeqLen=*/physicalTokens,
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/1,
         /*.contextMaskSelectorLen=*/batch,
         /*.startIndexLen=*/batch,
-        /*.specVerifyPhaseLen=*/0,
+        /*.executionPhaseLen=*/static_cast<int64_t>(ExecutionPhase::kDiffusionDenoise),
         /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
         /*.swaKVCacheModeLen=*/getSwaKVCacheModeInputLength(),
+        /*.queryOffsetLen=*/batch + 1,
+        /*.contextSequenceCount=*/0,
     };
 }
 
 InferenceDims LLMEngineConfig::diffusionCommitDims(int64_t batch, int64_t commitLen) const
 {
+    int64_t const physicalTokens = batch * commitLen;
     return InferenceDims{
         /*.batch=*/batch,
-        /*.seqLen=*/commitLen,
+        /*.seqLen=*/physicalTokens,
         /*.kvLen=*/maxKVCacheCapacity,
-        /*.selectLen=*/commitLen,
-        /*.attnMaskSeqLen=*/1,
+        /*.selectLen=*/physicalTokens,
+        /*.attnMaskSeqLen=*/physicalTokens,
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/1,
         /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/batch,
-        /*.specVerifyPhaseLen=*/0,
+        /*.executionPhaseLen=*/static_cast<int64_t>(ExecutionPhase::kDiffusionCommit),
         /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
         /*.swaKVCacheModeLen=*/getSwaKVCacheModeInputLength(),
+        /*.queryOffsetLen=*/batch + 1,
+        /*.contextSequenceCount=*/0,
     };
 }
 
@@ -1327,17 +1362,19 @@ InferenceDims LLMEngineConfig::specVerifyDims(int64_t batch, int64_t verifySize)
     // This is the only recipe where selectLen != 1.
     return InferenceDims{
         /*.batch=*/batch,
-        /*.seqLen=*/verifySize,
+        /*.seqLen=*/batch * verifySize,
         /*.kvLen=*/maxKVCacheCapacity,
-        /*.selectLen=*/verifySize,
-        /*.attnMaskSeqLen=*/verifySize,
+        /*.selectLen=*/batch * verifySize,
+        /*.attnMaskSeqLen=*/batch * verifySize,
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/static_cast<int64_t>(divUp(verifySize, 32)),
         /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/batch,
-        /*.specVerifyPhaseLen=*/1,
+        /*.executionPhaseLen=*/static_cast<int64_t>(ExecutionPhase::kSpecTargetVerify),
         /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
         /*.swaKVCacheModeLen=*/getSwaKVCacheModeInputLength(),
+        /*.queryOffsetLen=*/batch + 1,
+        /*.contextSequenceCount=*/0,
     };
 }
 
@@ -1350,17 +1387,19 @@ InferenceDims LLMEngineConfig::proposalDims(int64_t batch, int64_t proposalSize,
     // [batch, draftTopK]).
     return InferenceDims{
         /*.batch=*/batch,
-        /*.seqLen=*/proposalSize,
+        /*.seqLen=*/batch * proposalSize,
         /*.kvLen=*/maxKVCacheCapacity,
-        /*.selectLen=*/draftTopK,
-        /*.attnMaskSeqLen=*/proposalSize,
+        /*.selectLen=*/batch * draftTopK,
+        /*.attnMaskSeqLen=*/batch * proposalSize,
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/static_cast<int64_t>(divUp(proposalSize, 32)),
         /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/batch,
-        /*.specVerifyPhaseLen=*/0,
+        /*.executionPhaseLen=*/static_cast<int64_t>(ExecutionPhase::kSpecDraftProposal),
         /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
         /*.swaKVCacheModeLen=*/getSwaKVCacheModeInputLength(),
+        /*.queryOffsetLen=*/batch + 1,
+        /*.contextSequenceCount=*/0,
     };
 }
 
@@ -1372,17 +1411,21 @@ InferenceDims LLMEngineConfig::acceptDims(int64_t batch, int64_t acceptLen) cons
     // acceptLen fans out to: seqLen, attnMaskSeqLen, and packedMaskLen.
     return InferenceDims{
         /*.batch=*/batch,
-        /*.seqLen=*/acceptLen,
+        /*.seqLen=*/batch * acceptLen,
         /*.kvLen=*/maxKVCacheCapacity,
-        /*.selectLen=*/1,
-        /*.attnMaskSeqLen=*/acceptLen,
+        /*.selectLen=*/batch,
+        /*.attnMaskSeqLen=*/batch * acceptLen,
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/static_cast<int64_t>(divUp(acceptLen, 32)),
         /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/batch,
-        /*.specVerifyPhaseLen=*/0,
+        /*.executionPhaseLen=*/
+        static_cast<int64_t>(
+            acceptLen == 1 ? ExecutionPhase::kAutoregressiveDecode : ExecutionPhase::kSpecDraftProposal),
         /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
         /*.swaKVCacheModeLen=*/getSwaKVCacheModeInputLength(),
+        /*.queryOffsetLen=*/batch + 1,
+        /*.contextSequenceCount=*/0,
     };
 }
 
@@ -1436,6 +1479,17 @@ void validatePagedKVBindings(LLMEngineConfig const& config, EngineExecutor const
 
 namespace
 {
+
+void validateContextSequenceCountCarrierBinding(EngineExecutor const& executor, char const* engineLabel)
+{
+    char const* const bindingName = binding_names::kContextSequenceCountCarrier;
+    ELLM_CHECK(executor.hasIOTensor(bindingName),
+        std::string("Missing ragged context-count carrier (") + engineLabel + "): expected '" + bindingName
+            + "'. Re-export the ONNX model and rebuild the engine.");
+    ELLM_CHECK(executor.getBindingDataType(bindingName) == nvinfer1::DataType::kINT32,
+        std::string("Ragged context-count carrier (") + engineLabel + ") must have INT32 dtype. Re-export the ONNX "
+            "model and rebuild the engine.");
+}
 
 //! Validate the current mutable page-table engine ABI.
 void validatePageTableBinding(
@@ -1508,6 +1562,10 @@ void validateSwaModeBinding(LLMEngineConfig const& config, EngineExecutor const&
 
 void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& executor, char const* engineLabel)
 {
+    ELLM_CHECK(!executor.hasIOTensor(kObsoleteGenericTokenOwnerBinding),
+        std::string("Engine (") + engineLabel + ") contains the removed MR1 prototype binding '"
+            + kObsoleteGenericTokenOwnerBinding + "'. Re-export and rebuild the engine.");
+    validateContextSequenceCountCarrierBinding(executor, engineLabel);
     validatePagedKVBindings(config, executor, engineLabel);
     validatePageTableBinding(config, executor, engineLabel, binding_names::kKVPageTable);
     if (config.supportsBoundedSwaKVCache())
@@ -1525,14 +1583,22 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
         // Validate required bindings exist and have correct dtype.
         LOG_INFO("%s draft engine (%s): validating cached-path bindings.", modeName, engineLabel);
 
-        // Required cached-path bindings (fail if missing → old explicit DFlash engine)
+        // Required unified cached-path bindings.
         static char const* const kRequiredCommonBindings[] = {
             binding_names::kInputsEmbeds,
             binding_names::kDFlashTargetHiddenConcat,
-            binding_names::kContextLengths,
-            binding_names::kKVCacheStartIndex,
-            binding_names::kDFlashDeltaLengths,
             binding_names::kRopeCosSin,
+            binding_names::kPositions,
+            binding_names::kQueryStartOffsets,
+            binding_names::kQueryLengths,
+            binding_names::kPastLengths,
+            binding_names::kAttentionSequenceLengths,
+            binding_names::kStateIndices,
+            binding_names::kExecutionPhaseMarker,
+            binding_names::kKVPageTable,
+            binding_names::kDFlashDeltaRopeCosSin,
+            binding_names::kDFlashDeltaPositions,
+            binding_names::kDFlashDeltaTokenToSequence,
             binding_names::kAttentionMask,
             binding_names::kAttentionPosId,
         };
@@ -1600,7 +1666,14 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
             binding_names::kBaseModelHiddenStates,
             binding_names::kLogits,
             binding_names::kOutputHiddenStates,
-            binding_names::kContextLengths,
+            binding_names::kPositions,
+            binding_names::kQueryStartOffsets,
+            binding_names::kQueryLengths,
+            binding_names::kPastLengths,
+            binding_names::kAttentionSequenceLengths,
+            binding_names::kStateIndices,
+            binding_names::kExecutionPhaseMarker,
+            binding_names::kKVPageTable,
         };
         for (auto const* name : kRequiredBindings)
         {
@@ -1676,8 +1749,8 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
 
     if (isDSparkDraftConfig(config))
     {
-        // DSpark cached draft engines reuse the DFlash cached-draft target-hidden
-        // and delta-length binding names, plus a DSpark-specific hidden-state output.
+        // DSpark cached draft engines reuse the DFlash target-hidden/delta portals
+        // and add a DSpark-specific hidden-state output.
         LOG_INFO("DSpark draft engine (%s): validating cached-path bindings.", engineLabel);
 
         static char const* const kRequiredBindings[] = {
@@ -1685,10 +1758,18 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
             binding_names::kDFlashTargetHiddenConcat,
             binding_names::kLogits,
             binding_names::kDSparkHiddenStates,
-            binding_names::kContextLengths,
-            binding_names::kKVCacheStartIndex,
-            binding_names::kDFlashDeltaLengths,
             binding_names::kRopeCosSin,
+            binding_names::kPositions,
+            binding_names::kQueryStartOffsets,
+            binding_names::kQueryLengths,
+            binding_names::kPastLengths,
+            binding_names::kAttentionSequenceLengths,
+            binding_names::kStateIndices,
+            binding_names::kExecutionPhaseMarker,
+            binding_names::kKVPageTable,
+            binding_names::kDFlashDeltaRopeCosSin,
+            binding_names::kDFlashDeltaPositions,
+            binding_names::kDFlashDeltaTokenToSequence,
             binding_names::kAttentionMask,
             binding_names::kAttentionPosId,
         };
@@ -1760,14 +1841,15 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
             && (config.specDecodeType == SpecDecodeMode::kMTP || isCachedBlockDraftMode(config.specDecodeType)
                 || config.specDecodeType == SpecDecodeMode::kDSpark))
         {
-            ELLM_CHECK(executor.hasIOTensor(binding_names::kSpecVerifyPhaseMarker),
+            ELLM_CHECK(executor.hasIOTensor(binding_names::kExecutionPhaseMarker),
                 std::string("Missing spec-verify phase marker binding (") + engineLabel + "): expected '"
-                    + binding_names::kSpecVerifyPhaseMarker + "'. Re-export the hybrid speculative base engine.");
-            auto const markerEngineDtype = executor.getBindingDataType(binding_names::kSpecVerifyPhaseMarker);
+                    + binding_names::kExecutionPhaseMarker
+                    + "'. Re-export the hybrid MTP/cached block-draft base engine.");
+            auto const markerEngineDtype = executor.getBindingDataType(binding_names::kExecutionPhaseMarker);
             ELLM_CHECK(markerEngineDtype == nvinfer1::DataType::kINT32,
                 std::string("Spec-verify phase marker dtype mismatch (") + engineLabel + "): engine reports "
-                    + getDataTypeString(markerEngineDtype) + " for binding '" + binding_names::kSpecVerifyPhaseMarker
-                    + "'. Re-export the hybrid speculative base engine.");
+                    + getDataTypeString(markerEngineDtype) + " for binding '" + binding_names::kExecutionPhaseMarker
+                    + "'. Re-export the hybrid MTP/cached block-draft base engine.");
         }
     }
 }
@@ -1789,9 +1871,11 @@ InferenceDims LLMEngineConfig::resetDims() const
         /*.packedMaskLen=*/1,
         /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/1,
-        /*.specVerifyPhaseLen=*/0,
+        /*.executionPhaseLen=*/static_cast<int64_t>(ExecutionPhase::kAutoregressiveDecode),
         /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
         /*.swaKVCacheModeLen=*/getSwaKVCacheModeInputLength(),
+        /*.queryOffsetLen=*/2,
+        /*.contextSequenceCount=*/0,
     };
 }
 

@@ -62,13 +62,19 @@ HybridCacheManager::Config makeCacheConfig(int32_t windowSize)
         /*.useBoundedSwaKVCache=*/true,
     };
     MambaCacheManager::Config mambaConfig{
-        /*.numRecurrentLayers=*/0,
+        /*.numRecurrentLayers=*/1,
         /*.maxBatchSize=*/kMAX_BATCH,
+        /*.recurrentStateNumHeads=*/1,
+        /*.recurrentStateHeadDim=*/2,
+        /*.recurrentStateSize=*/3,
+        /*.convDim=*/4,
+        /*.convKernel=*/2,
     };
     return HybridCacheManager::Config{
         /*.layerTypes=*/{
             HybridCacheManager::LayerType::kAttention,
             HybridCacheManager::LayerType::kAttention,
+            HybridCacheManager::LayerType::kMamba,
         },
         /*.kvConfig=*/std::move(kvConfig),
         /*.mambaConfig=*/std::move(mambaConfig),
@@ -87,6 +93,16 @@ std::vector<int32_t> mappedLogicalPages(KVPageTable const& table, int32_t slot)
         }
     }
     return pages;
+}
+
+std::vector<uint8_t> copyResidentBytes(Tensor const& tensor, int32_t slot, cudaStream_t stream)
+{
+    size_t const slotBytes = static_cast<size_t>(tensor.getShape().volume() / kMAX_BATCH) * sizeof(half);
+    std::vector<uint8_t> result(slotBytes);
+    auto const* source = static_cast<uint8_t const*>(tensor.rawPointer()) + static_cast<size_t>(slot) * slotBytes;
+    EXPECT_EQ(cudaMemcpyAsync(result.data(), source, slotBytes, cudaMemcpyDeviceToHost, stream), cudaSuccess);
+    EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    return result;
 }
 
 class BoundedSwaKVPageManagerTest : public ::testing::Test
@@ -134,7 +150,8 @@ protected:
         mCache.reset();
     }
 
-    BoundedSwaKVPageManager::RequestHandle begin(std::vector<int32_t> const& inputLengths)
+    BoundedSwaKVPageManager::RequestHandle begin(
+        std::vector<int32_t> const& inputLengths, std::vector<ResidentRef> residents = {})
     {
         Tensor reuseLengths({static_cast<int64_t>(inputLengths.size())}, rt::DeviceType::kCPU, DataType::kINT32,
             "swaManagerTestReuseLengths");
@@ -142,8 +159,14 @@ protected:
         mCache->resetForNewSequences(reuseLengths, mStream);
         EXPECT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
 
-        BoundedSwaKVPageManager::BeginRequestResult admitted
-            = mManager->beginRequest(static_cast<int32_t>(inputLengths.size()), mStream);
+        if (residents.empty())
+        {
+            for (int32_t slot = 0; slot < static_cast<int32_t>(inputLengths.size()); ++slot)
+            {
+                residents.push_back(ResidentRef{slot, 1});
+            }
+        }
+        BoundedSwaKVPageManager::BeginRequestResult admitted = mManager->beginRequest(residents, mStream);
         EXPECT_EQ(admitted.status, SwaKVCacheStatus::kOk);
         EXPECT_TRUE(admitted.request.has_value());
         return std::move(*admitted.request);
@@ -171,12 +194,12 @@ TEST_F(BoundedSwaKVPageManagerTest, AdmissionIsAtomicAndReturnsPrivatePages)
     int32_t const pagesPerSequence = mManager->privatePagesPerSequence();
     EXPECT_EQ(totalPages, kMAX_BATCH * pagesPerSequence);
 
-    EXPECT_THROW((void) mManager->beginRequest(kMAX_BATCH + 1, mStream), std::runtime_error);
+    EXPECT_THROW((void) mManager->beginRequest(std::vector<ResidentRef>(kMAX_BATCH + 1), mStream), std::runtime_error);
     EXPECT_EQ(mManager->freePageCount(), totalPages);
 
     BoundedSwaKVPageManager::RequestHandle request = begin(std::vector<int32_t>(kMAX_BATCH, 1));
     EXPECT_EQ(mManager->freePageCount(), 0);
-    BoundedSwaKVPageManager::BeginRequestResult concurrent = mManager->beginRequest(1, mStream);
+    BoundedSwaKVPageManager::BeginRequestResult concurrent = mManager->beginRequest({ResidentRef{0, 1}}, mStream);
     EXPECT_EQ(concurrent.status, SwaKVCacheStatus::kRequestFailed);
     EXPECT_FALSE(concurrent.request.has_value());
     EXPECT_EQ(mManager->freePageCount(), 0);
@@ -267,28 +290,60 @@ TEST_F(BoundedSwaKVPageManagerTest, DecodeRotationUsesConstantDirtyPatchesAndRec
     EXPECT_EQ(mManager->finish(request), SwaKVCacheStatus::kOk);
 }
 
-TEST_F(BoundedSwaKVPageManagerTest, CompactionMovesSparseRowsAndReleasesDroppedState)
+TEST_F(BoundedSwaKVPageManagerTest, CompactionPreservesResidentRowsAndReleasesDroppedState)
 {
     std::vector<int32_t> const inputLengths{3 * kTOKENS_PER_PAGE, 3 * kTOKENS_PER_PAGE + 1, 3 * kTOKENS_PER_PAGE + 2};
     BoundedSwaKVPageManager::RequestHandle request = begin(inputLengths);
     completePrefill(request, inputLengths);
 
     int32_t const rowWidth = mSwaPageTable->maxPagesPerSeq();
+    std::vector<int32_t> const oldBaseRow0(mBasePageTable->hostRow(0), mBasePageTable->hostRow(0) + rowWidth);
+    std::vector<int32_t> const oldBaseRow2(mBasePageTable->hostRow(2), mBasePageTable->hostRow(2) + rowWidth);
     std::vector<int32_t> const oldRow0(mSwaPageTable->hostRow(0), mSwaPageTable->hostRow(0) + rowWidth);
     std::vector<int32_t> const oldRow1(mSwaPageTable->hostRow(1), mSwaPageTable->hostRow(1) + rowWidth);
     std::vector<int32_t> const oldRow2(mSwaPageTable->hostRow(2), mSwaPageTable->hostRow(2) + rowWidth);
+    Tensor& recurrent = mCache->getMambaCacheManager().getRecurrentState(0);
+    Tensor& convolution = mCache->getMambaCacheManager().getConvState(0);
+    size_t const recurrentSlotBytes = static_cast<size_t>(recurrent.getShape().volume() / kMAX_BATCH) * sizeof(half);
+    size_t const convolutionSlotBytes
+        = static_cast<size_t>(convolution.getShape().volume() / kMAX_BATCH) * sizeof(half);
+    for (int32_t slot = 0; slot < kMAX_BATCH; ++slot)
+    {
+        EXPECT_EQ(cudaMemsetAsync(static_cast<uint8_t*>(recurrent.rawPointer()) + slot * recurrentSlotBytes,
+                      0x11 * (slot + 1), recurrentSlotBytes, mStream),
+            cudaSuccess);
+        EXPECT_EQ(cudaMemsetAsync(static_cast<uint8_t*>(convolution.rawPointer()) + slot * convolutionSlotBytes,
+                      0x11 * (slot + 1), convolutionSlotBytes, mStream),
+            cudaSuccess);
+    }
+    std::vector<uint8_t> const recurrent0 = copyResidentBytes(recurrent, 0, mStream);
+    std::vector<uint8_t> const recurrent2 = copyResidentBytes(recurrent, 2, mStream);
+    std::vector<uint8_t> const convolution0 = copyResidentBytes(convolution, 0, mStream);
+    std::vector<uint8_t> const convolution2 = copyResidentBytes(convolution, 2, mStream);
     Tensor deviceMapping({kMAX_BATCH}, rt::DeviceType::kGPU, DataType::kINT32, "swaManagerTestBatchMapping");
 
     ASSERT_EQ(mManager->beginBatchCompaction(request, {0, -1, 1}, 2, deviceMapping), SwaKVCacheStatus::kOk);
     ASSERT_EQ(mManager->compactBatch(request), SwaKVCacheStatus::kOk);
 
     EXPECT_TRUE(std::equal(oldRow0.begin(), oldRow0.end(), mSwaPageTable->hostRow(0)));
-    EXPECT_TRUE(std::equal(oldRow2.begin(), oldRow2.end(), mSwaPageTable->hostRow(1)));
-    EXPECT_TRUE(std::all_of(mSwaPageTable->hostRow(2), mSwaPageTable->hostRow(2) + rowWidth,
+    EXPECT_TRUE(std::equal(oldRow2.begin(), oldRow2.end(), mSwaPageTable->hostRow(2)));
+    EXPECT_TRUE(std::equal(oldBaseRow0.begin(), oldBaseRow0.end(), mBasePageTable->hostRow(0)));
+    EXPECT_TRUE(std::equal(oldBaseRow2.begin(), oldBaseRow2.end(), mBasePageTable->hostRow(2)));
+    EXPECT_TRUE(std::all_of(mBasePageTable->hostRow(1), mBasePageTable->hostRow(1) + rowWidth,
         [](int32_t page) { return page == kUNUSED_PAGE_ENTRY; }));
-    EXPECT_FALSE(std::equal(oldRow1.begin(), oldRow1.end(), mSwaPageTable->hostRow(1)));
+    EXPECT_TRUE(std::all_of(mSwaPageTable->hostRow(1), mSwaPageTable->hostRow(1) + rowWidth,
+        [](int32_t page) { return page == kUNUSED_PAGE_ENTRY; }));
+    EXPECT_FALSE(std::equal(oldRow1.begin(), oldRow1.end(), mSwaPageTable->hostRow(2)));
     EXPECT_EQ(mManager->state(request, 0).exactResidentTokenCount, inputLengths[0]);
     EXPECT_EQ(mManager->state(request, 1).exactResidentTokenCount, inputLengths[2]);
+    EXPECT_EQ(mManager->state(request, 0).resident.slot, 0);
+    EXPECT_EQ(mManager->state(request, 1).resident.slot, 2);
+    EXPECT_EQ(copyResidentBytes(recurrent, 0, mStream), recurrent0);
+    EXPECT_EQ(copyResidentBytes(recurrent, 2, mStream), recurrent2);
+    EXPECT_EQ(copyResidentBytes(convolution, 0, mStream), convolution0);
+    EXPECT_EQ(copyResidentBytes(convolution, 2, mStream), convolution2);
+    EXPECT_EQ(copyResidentBytes(recurrent, 1, mStream), std::vector<uint8_t>(recurrentSlotBytes, 0));
+    EXPECT_EQ(copyResidentBytes(convolution, 1, mStream), std::vector<uint8_t>(convolutionSlotBytes, 0));
     EXPECT_EQ(mManager->freePageCount(), mManager->privatePagesPerSequence());
 
     ASSERT_EQ(mManager->prepareDecodeStep(request), SwaKVCacheStatus::kOk);
@@ -297,7 +352,7 @@ TEST_F(BoundedSwaKVPageManagerTest, CompactionMovesSparseRowsAndReleasesDroppedS
     EXPECT_EQ(mManager->state(request, 0).exactResidentTokenCount, inputLengths[0] + 1);
     EXPECT_EQ(mManager->state(request, 1).exactResidentTokenCount, inputLengths[2] + 1);
     EXPECT_EQ(mappedLogicalPages(*mSwaPageTable, 0), std::vector<int32_t>({2, 3}));
-    EXPECT_EQ(mappedLogicalPages(*mSwaPageTable, 1), std::vector<int32_t>({2, 3}));
+    EXPECT_EQ(mappedLogicalPages(*mSwaPageTable, 2), std::vector<int32_t>({2, 3}));
 
     EXPECT_EQ(mManager->finish(request), SwaKVCacheStatus::kOk);
     EXPECT_EQ(mManager->freePageCount(), mSwaPageTable->numPages());
@@ -319,7 +374,7 @@ TEST_F(BoundedSwaKVPageManagerTest, FailedSynchronizationQuarantinesPagesUntilSh
 
     EXPECT_EQ(synchronizeCalls, 1);
     EXPECT_LT(mManager->freePageCount(), totalPages);
-    BoundedSwaKVPageManager::BeginRequestResult poisoned = mManager->beginRequest(1, mStream);
+    BoundedSwaKVPageManager::BeginRequestResult poisoned = mManager->beginRequest({ResidentRef{0, 1}}, mStream);
     EXPECT_EQ(poisoned.status, SwaKVCacheStatus::kPoisoned);
     EXPECT_FALSE(poisoned.request.has_value());
     EXPECT_EQ(mManager->shutdown(), SwaKVCacheStatus::kOk);

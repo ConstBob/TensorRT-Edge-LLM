@@ -17,7 +17,9 @@
 
 #pragma once
 
+#include "runtime/exec/raggedBatchBuilder.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/state/residentSlotPool.h"
 #include "runtime/streaming.h"
 
 #include <cstdint>
@@ -156,6 +158,16 @@ struct DecodingInferenceContext
     std::vector<std::vector<int32_t>> tokenIds;           //!< Token IDs for each sequence: [batch_size][seq_length]
     std::vector<int32_t> currentGenerateLengths;          //!< Current generation length for each sequence
     std::vector<int32_t> effectivePrefillLengths;         //!< Prefill length after system prompt cache reuse
+    std::vector<int32_t> prefillStartLengths;             //!< Persistent frontier captured at prefill invocation entry
+    std::vector<int32_t> committedLengths;                //!< Per-sequence persistent state length before next step
+    std::vector<RequestId> requestIds;                    //!< Stable identities assigned by the blocking adapter
+    std::vector<ResidentRef> residentRefs;                //!< Current resident state rows and epochs
+    ResidentSlotPool residentSlots;                       //!< Bounded ownership and epoch validation for resident rows
+    StepId nextStepId{1};                                 //!< Monotonic execution-step identity
+    ScheduledStep scheduledStep;                          //!< Owned logical-step descriptor snapshot
+    std::optional<RaggedBatchBuilder> raggedBatchBuilder; //!< Configured once and reused for ordinary execution
+    std::vector<CompletionSequence> completionSequences;  //!< Preallocated completion validation scratch
+    RaggedExecutionBatch raggedExecutionBatch;            //!< Reused execution metadata and identity snapshot
     //! Per-slot prompt tokens removed by visual-token pruning (empty when pruning is off —
     //! treat a missing entry as 0).
     std::vector<int32_t> prunedPrefillTokens;
@@ -253,7 +265,7 @@ struct DecodingInferenceContext
      * @param loraName LoRA weights name used by this request
      * @param cudaStream CUDA stream for operations
      */
-    //! @brief Add one sequence to a batch that is already running. Returns the new slot's index.
+    //! @brief Add one sequence to a batch that is already running. Returns the new execution-row index.
     //!
     //! The reverse of eviction, and bound by the same invariant: every per-slot vector grows by
     //! exactly one entry, so the batch stays rectangular and a later compaction moves every slot's
@@ -264,25 +276,24 @@ struct DecodingInferenceContext
     //! logprobs capacity is inherited from an existing slot because sizing it needs deployment
     //! knowledge the context does not hold.
     //!
-    //! @throws std::runtime_error if the batch is empty, the prompt is empty, the original index is
-    //!         already taken, or the seed's channel is attached elsewhere. Nothing is modified on
-    //!         any throwing path.
-    int32_t appendSlot(SlotSeed seed);
+    //! @param identity Stable request identity and an already-acquired physical resident row.
+    //! @throws std::runtime_error if the batch is empty, the prompt is empty, either identity is
+    //!         invalid or already live, or the seed's channel is attached elsewhere. Nothing is
+    //!         modified on any throwing path; the caller retains ownership of @p identity.resident.
+    int32_t appendSlot(SlotSeed seed, SequenceIdentity identity);
 
-    //! @brief Exchange every piece of per-slot state between two slots. Self-inverse.
+    //! @brief Exchange the transient execution-row view of two logical sequences. Self-inverse.
     //!
-    //! The host half of running one resident slot through machinery that assumes it sits at index
-    //! zero: the paged kernels index the page table by batch position, and the prefill pipeline
-    //! reshapes every tensor to [activeBatchSize, ...] from slot zero up. Swapping a slot down,
-    //! running, and swapping back costs two exchanges of host bookkeeping and page ids -- the KV
-    //! itself never moves -- where widening the pass to reach a higher row would recompute every
-    //! slot below it.
-    //!
-    //! Self-inverse for the same reason KVPageTable::swapRows is: the restore is the same call, so
-    //! there is no saved copy to lose and no way to put things back wrongly.
+    //! This is used to present one admitted sequence as execution row zero for a batch-one prefill.
+    //! ResidentRef travels with the logical sequence, so ragged state_indices still name its stable
+    //! physical KV/recurrent row; no resident state or page-table row is exchanged.
     //!
     //! @throws std::runtime_error if either slot is out of range. A self-swap is a no-op.
-    void swapSlots(int32_t slotA, int32_t slotB);
+    void swapExecutionRows(int32_t rowA, int32_t rowB);
+
+    //! Restore a previously validated execution-row exchange during stack unwinding. The caller
+    //! must pass the same rows accepted by swapExecutionRows before changing activeBatchSize.
+    void restoreExecutionRows(int32_t rowA, int32_t rowB) noexcept;
 
     //! @brief True when every per-slot vector has exactly activeBatchSize entries.
     //!
@@ -292,7 +303,10 @@ struct DecodingInferenceContext
     bool perSlotSizesConsistent() const noexcept;
 
     void initialize(int32_t batchSize, int32_t maxGenLength, rt::OptionalInputTensor const& visual,
-        rt::OptionalInputTensors const& deepstackFeatures, std::string const& loraName, cudaStream_t cudaStream);
+        rt::OptionalInputTensors const& deepstackFeatures, std::string const& loraName, cudaStream_t cudaStream,
+        int32_t residentCapacity = 0);
+
+    void initializeRaggedScratch(RaggedEngineContract const& contract);
 
     //! ctor / move ops / dtor are out-of-line (defined in the .cpp) because @ref
     //! layerDebugger is a ``unique_ptr`` to the incomplete type ``LayerDebugger``:

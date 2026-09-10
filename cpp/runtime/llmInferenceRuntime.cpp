@@ -173,10 +173,11 @@ bool LLMInferenceRuntime::supportsSteppedExecution() const noexcept
 }
 
 std::unique_ptr<SteppedExecution> LLMInferenceRuntime::beginStepped(
-    LLMGenerationRequest const& request, cudaStream_t stream)
+    LLMGenerationRequest const& request, RequestId requestId, cudaStream_t stream)
 {
     ELLM_CHECK(mCoordinator != nullptr, "Runtime coordinator is not initialized.");
-    return mCoordinator->beginStepped(request, getProfilingEnabled(), stream);
+    ELLM_CHECK(requestId != 0, "Stepped execution requires a nonzero request ID.");
+    return mCoordinator->beginStepped(request, requestId, getProfilingEnabled(), stream);
 }
 
 std::vector<int32_t> LLMInferenceRuntime::countPromptTokens(LLMGenerationRequest const& request) const

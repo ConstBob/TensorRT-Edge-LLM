@@ -403,16 +403,13 @@ def test_dflash_target_cache_update_threads_managed_page_table(monkeypatch):
 
     monkeypatch.setattr(speculative, "operation", record_operation)
 
-    result = speculative.update_dflash_target_cache(*tensors,
-                                                    pages_per_slot=32)
+    result = speculative.update_dflash_target_cache(*tensors)
 
     assert result == "layer"
     assert observed == {
         "name": "dflash_target_cache_update",
         "inputs": tensors,
-        "attributes": {
-            "pages_per_slot": 32,
-        },
+        "attributes": {},
     }
 
 
@@ -441,10 +438,18 @@ def test_dflash2_draft_profiles_do_not_bind_runtime_selector_inputs():
         "spec_proposal_greedy_mask": (-1, ),
         "spec_proposal_uniforms": (-1, 7),
         "spec_anchor_token_ids": (-1, ),
-        "kvcache_start_index": (-1, ),
-        "inputs_embeds": (-1, -1, 5120),
-        "attention_pos_id": (-1, -1),
-        "attention_mask": (-1, -1, -1),
+        "inputs_embeds": (-1, 5120),
+        "positions": (-1, ),
+        "query_start_offsets": (-1, ),
+        "query_lengths": (-1, ),
+        "past_lengths": (-1, ),
+        "attention_sequence_lengths": (-1, ),
+        "state_indices": (-1, ),
+        "execution_phase_marker": (-1, ),
+        "context_sequence_count_carrier": (-1, ),
+        "kv_page_table": (-1, 2, -1),
+        "attention_position_ids": (-1, ),
+        "packed_attention_mask": (-1, -1),
     }
     tensors = [
         SimpleNamespace(name=name, shape=shape)
@@ -493,9 +498,12 @@ def test_dflash2_draft_profiles_do_not_bind_runtime_selector_inputs():
         assert "spec_proposal_greedy_mask" not in profile.shapes
         assert "spec_proposal_uniforms" not in profile.shapes
         assert "spec_anchor_token_ids" not in profile.shapes
-        assert profile.shapes["kvcache_start_index"][0] == (1, )
-        assert profile.shapes["inputs_embeds"] == ((1, 2, 5120), (8, 8, 5120),
-                                                   (8, 16, 5120))
-        assert profile.shapes["attention_pos_id"] == ((1, 2), (8, 8), (8, 16))
-        assert profile.shapes["attention_mask"] == ((1, 2, 1), (8, 8, 1),
-                                                    (8, 16, 1))
+        assert "kvcache_start_index" not in profile.shapes
+        assert "context_lengths" not in profile.shapes
+        assert "dflash_delta_lengths" not in profile.shapes
+        assert profile.shapes["inputs_embeds"] == ((2, 5120), (64, 5120),
+                                                   (128, 5120))
+        assert profile.shapes["attention_position_ids"] == ((2, ), (64, ),
+                                                            (128, ))
+        assert profile.shapes["packed_attention_mask"] == ((2, 1), (64, 1),
+                                                           (128, 1))

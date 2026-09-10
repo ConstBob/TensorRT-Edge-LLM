@@ -190,7 +190,7 @@ BoundedSwaKVPageManager::~BoundedSwaKVPageManager() noexcept
 }
 
 BoundedSwaKVPageManager::BeginRequestResult BoundedSwaKVPageManager::beginRequest(
-    int32_t batchSize, cudaStream_t stream)
+    std::vector<ResidentRef> const& residents, cudaStream_t stream)
 {
     ELLM_CHECK(stream == mStream, "SWA KV cache request stream differs from the manager construction stream");
     if (mPoisoned)
@@ -203,7 +203,16 @@ BoundedSwaKVPageManager::BeginRequestResult BoundedSwaKVPageManager::beginReques
     }
 
     int32_t const maxBatch = mBaseCache.getKVCacheManager().getConfig().maxBatchSize;
+    int32_t const batchSize = static_cast<int32_t>(residents.size());
     ELLM_CHECK(batchSize > 0 && batchSize <= maxBatch, "SWA KV cache request batch size is outside the engine range");
+    for (size_t i = 0; i < residents.size(); ++i)
+    {
+        ELLM_CHECK(residents[i].slot >= 0 && residents[i].slot < maxBatch,
+            "SWA KV cache resident slot is outside the engine range");
+        ELLM_CHECK(std::none_of(residents.begin(), residents.begin() + static_cast<ptrdiff_t>(i),
+                       [&](ResidentRef const& resident) { return resident.slot == residents[i].slot; }),
+            "SWA KV cache resident slots must be unique");
+    }
 
     int64_t const requiredPages = static_cast<int64_t>(batchSize) * mPrivatePagesPerSequence;
     if (requiredPages > static_cast<int64_t>(mFreePages.size()))
@@ -215,8 +224,10 @@ BoundedSwaKVPageManager::BeginRequestResult BoundedSwaKVPageManager::beginReques
     impl->states.resize(static_cast<size_t>(batchSize));
     size_t const maxRetainedPages
         = static_cast<size_t>((static_cast<int64_t>(mWindowSize) + mPageSize - 1) / mPageSize + 1);
-    for (SwaKVCacheState& state : impl->states)
+    for (size_t sequence = 0; sequence < impl->states.size(); ++sequence)
     {
+        SwaKVCacheState& state = impl->states[sequence];
+        state.resident = residents[sequence];
         state.pageSizeTokens = mPageSize;
         state.windowSizeTokens = mWindowSize;
         state.reservedPages.reserve(static_cast<size_t>(mPrivatePagesPerSequence));
@@ -434,10 +445,11 @@ SwaKVCacheStatus BoundedSwaKVPageManager::preparePrefill(
     impl.inputLengths = inputLengths;
     for (size_t slot = 0; slot < impl.states.size(); ++slot)
     {
-        mSwaPageTable.setRow(static_cast<int32_t>(slot), nullptr, 0);
+        int32_t const residentSlot = impl.states[slot].resident.slot;
+        mSwaPageTable.setRow(residentSlot, nullptr, 0);
         ELLM_CHECK(advance(impl.states[slot], impl.inputLengths[slot]),
             "SWA KV cache could not prepare the admitted prefill range");
-        bindNewPages(impl.states[slot], static_cast<int32_t>(slot));
+        bindNewPages(impl.states[slot], residentSlot);
     }
     mSwaPageTable.uploadDirty(impl.stream);
     impl.phase = RequestHandle::Impl::Phase::kExecuting;
@@ -454,7 +466,7 @@ SwaKVCacheStatus BoundedSwaKVPageManager::completePrefill(RequestHandle& request
     {
         ELLM_CHECK(impl.states[slot].pendingEndpoint == std::optional<int32_t>{impl.inputLengths[slot]},
             "SWA KV cache prefill endpoint differs from its prepared input length");
-        retire(impl.states[slot], static_cast<int32_t>(slot));
+        retire(impl.states[slot], impl.states[slot].resident.slot);
     }
     // The caller invokes this only after the runtime's existing host-visible prefill completion point.
     impl.deviceWorkPending = false;
@@ -475,7 +487,7 @@ SwaKVCacheStatus BoundedSwaKVPageManager::prepareDecodeStep(RequestHandle& reque
             impl.phase = RequestHandle::Impl::Phase::kFinishing;
             return SwaKVCacheStatus::kRequestFailed;
         }
-        bindNewPages(state, static_cast<int32_t>(slot));
+        bindNewPages(state, state.resident.slot);
     }
     mSwaPageTable.uploadDirty(impl.stream);
     impl.deviceWorkPending = true;
@@ -489,7 +501,7 @@ SwaKVCacheStatus BoundedSwaKVPageManager::completeDecodeStep(RequestHandle& requ
         "SWA KV cache decode completion requires pending model work");
     for (size_t slot = 0; slot < impl.states.size(); ++slot)
     {
-        retire(impl.states[slot], static_cast<int32_t>(slot));
+        retire(impl.states[slot], impl.states[slot].resident.slot);
     }
     // Vanilla decoding has already reached its existing host-visible completion point.
     impl.deviceWorkPending = false;
@@ -544,11 +556,19 @@ SwaKVCacheStatus BoundedSwaKVPageManager::compactBatch(RequestHandle& request)
     std::vector<int32_t> const& oldToNew = impl.pendingCompactionMapping;
     int32_t const newBatchSize = impl.pendingCompactionBatchSize;
     int32_t const oldBatchSize = static_cast<int32_t>(impl.states.size());
-    mBasePageTable.compactRows(oldToNew, newBatchSize);
+    for (int32_t oldSlot = 0; oldSlot < oldBatchSize; ++oldSlot)
+    {
+        if (oldToNew[static_cast<size_t>(oldSlot)] < 0)
+        {
+            int32_t const residentSlot = impl.states[static_cast<size_t>(oldSlot)].resident.slot;
+            mBasePageTable.setRow(residentSlot, nullptr, 0);
+            mSwaPageTable.setRow(residentSlot, nullptr, 0);
+            mBaseCache.clearResidentSlot(residentSlot, impl.stream);
+        }
+    }
     mBasePageTable.upload(impl.stream);
-    mSwaPageTable.compactRows(oldToNew, newBatchSize);
     mSwaPageTable.uploadDirty(impl.stream);
-    mBaseCache.compactBatchSlotState(*impl.pendingDeviceBatchMapping, oldBatchSize, newBatchSize, impl.stream);
+    mBaseCache.compactKVCacheLengths(*impl.pendingDeviceBatchMapping, oldBatchSize, newBatchSize, impl.stream);
 
     SwaKVCacheStatus const syncStatus = synchronize(request);
     if (syncStatus != SwaKVCacheStatus::kOk)
@@ -617,9 +637,9 @@ void BoundedSwaKVPageManager::clearAndRelease(std::unique_ptr<RequestHandle::Imp
     }
     try
     {
-        for (int32_t slot = 0; slot < static_cast<int32_t>(request->states.size()); ++slot)
+        for (SwaKVCacheState const& state : request->states)
         {
-            mSwaPageTable.setRow(slot, nullptr, 0);
+            mSwaPageTable.setRow(state.resident.slot, nullptr, 0);
         }
         mSwaPageTable.uploadDirty(request->stream);
     }

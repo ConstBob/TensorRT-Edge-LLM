@@ -105,7 +105,7 @@ public:
     //! founding prefill, and returns the handle the scheduler drives tick by tick; null on the
     //! refusals dispatchRequest would have reported as failure.
     std::unique_ptr<SteppedExecution> beginStepped(
-        LLMGenerationRequest const& request, bool enableProfiling, cudaStream_t stream);
+        LLMGenerationRequest const& request, RequestId requestId, bool enableProfiling, cudaStream_t stream);
 
     bool dispatchRequest(LLMGenerationRequest const& request, bool enableProfiling,
         bool outputThinkerEmbeddings = false, cudaStream_t stream = nullptr,

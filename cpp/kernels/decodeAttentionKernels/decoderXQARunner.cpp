@@ -54,7 +54,7 @@ constexpr uint32_t kHEAD_DIM_512_CTA_DIM_X{256U};
 // Max vanilla XQA kernel argument count. No-sliding kernels use one fewer argument.
 constexpr size_t kXQA_KERNEL_PARAM_COUNT{12U};
 // Max spec-decode XQA kernel argument count. No-sliding kernels use one fewer argument.
-constexpr size_t kSPEC_DECODE_XQA_KERNEL_PARAM_COUNT{16U};
+constexpr size_t kSPEC_DECODE_XQA_KERNEL_PARAM_COUNT{17U};
 
 //! @throws std::runtime_error if datatype is unsupported
 XQADataType trtToXqaDataType(nvinfer1::DataType type)
@@ -453,6 +453,7 @@ SpecDecodeXQAKernelParams makeSpecDecodeXQAKernelParams(
     kernelParams[idx++] = &params.numKVheads;
     kernelParams[idx++] = &params.headGroupSize;
     kernelParams[idx++] = &params.qCuSeqLen;
+    kernelParams[idx++] = &params.qSeqLens;
     if (slidingWindow)
     {
         kernelParams[idx++] = &params.slidingWinSize;

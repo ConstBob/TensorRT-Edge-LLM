@@ -41,7 +41,7 @@ namespace rt
 //!
 //! Transitional, and internal to the engine/runtime pair: the callback shape means the runtime
 //! invokes scheduling policy from inside its own loop, which is the inverse of the intended
-//! control plane. It exists to keep V0's runtime changes reviewable and is not exposed through
+//! control plane. It exists to keep the initial runtime changes reviewable and is not exposed through
 //! any public surface (pybind and the server never see it). The replacement is a scheduler-owned
 //! step loop over a typed runtime stepper (admit/step/retire returning typed results), at which
 //! point this hook is deleted -- do not build new contracts on it.
@@ -71,10 +71,13 @@ public:
     //! Whether the request may share this batch at all -- sampling parameters, adapter, budgets --
     //! is the scheduler's question (BatchCompatibility), answered before calling this.
     //!
-    //! @param request A single-sequence, text-only request. Its stream channel, stop strings and
-    //!        logit bias ride along; its sampling parameters are ignored in favour of the batch's.
-    //! @throws std::runtime_error for multi-sequence or multimodal requests; nothing is modified.
-    virtual AdmitDecision admitRequest(LLMGenerationRequest const& request, int32_t originalIndex) = 0;
+    //! @param request A single-sequence request. Its stream channel, stop strings and logit bias
+    //!        ride along; its sampling parameters are ignored in favour of the batch's. Scheduler
+    //!        policy keeps media requests founder-only until live admission has dedicated coverage.
+    //! @throws std::runtime_error for an invalid request or an unsupported media deployment;
+    //!         nothing is modified.
+    virtual AdmitDecision admitRequest(LLMGenerationRequest const& request, int32_t originalIndex, RequestId requestId)
+        = 0;
 
     //! @brief Turn one finished sequence's result into the caller-facing response, decoding
     //!        included, exactly as the founding request's own assembly would have.

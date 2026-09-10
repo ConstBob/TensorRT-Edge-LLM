@@ -264,6 +264,24 @@ TEST_F(ContextCacheRequestTests, ColdPublishThenWarmLookupPreservesLoraIdentity)
     ASSERT_TRUE(isolated->finish());
 }
 
+TEST_F(ContextCacheRequestTests, RequestLookupPolicyOverridesBatchDefaultPerSequence)
+{
+    DecodingInferenceContext producerContext = makeContext({makeTokens(129)}, mStream);
+    auto producer = begin(producerContext);
+    ASSERT_TRUE(producer.has_value());
+    completeRuntimePrefill(*producer, producerContext);
+    ASSERT_TRUE(producer->finish());
+
+    LLMGenerationRequest request{};
+    request.requests.resize(2);
+    request.requests[0].contextCacheLookupPolicy = ContextCacheLookupPolicy::kBypass;
+    DecodingInferenceContext context = makeContext({makeTokens(130), makeTokens(130)}, mStream);
+    auto mixed = ContextCacheRequest::begin(*mCoordinator, request, context, false, DecodingKvHeadroom{1, 0});
+    ASSERT_TRUE(mixed.has_value());
+    EXPECT_EQ(mixed->prefillStarts(), (std::vector<int32_t>{0, kTOKENS_PER_PAGE}));
+    ASSERT_TRUE(mixed->finish());
+}
+
 TEST_F(ContextCacheRequestTests, VanillaDecodePublishesOneTokenPageBoundaryAndRejectsPairingMisuse)
 {
     DecodingInferenceContext context = makeContext({makeTokens(255)}, mStream);
@@ -315,7 +333,7 @@ TEST_F(ContextCacheRequestTests, CancelledAndErrorSlotsAreNotPublished)
     ASSERT_TRUE(request->finish());
 }
 
-TEST_F(ContextCacheRequestTests, BatchCompactionUsesThePreparedMapping)
+TEST_F(ContextCacheRequestTests, BatchCompactionPreservesSchedulerOwnedResidentSlots)
 {
     DecodingInferenceContext context = makeContext({makeTokens(8), makeTokens(9)}, mStream);
     auto request = begin(context);
@@ -331,11 +349,13 @@ TEST_F(ContextCacheRequestTests, BatchCompactionUsesThePreparedMapping)
                   cudaMemcpyDeviceToHost),
         cudaSuccess);
     EXPECT_EQ(uploadedMapping, (std::vector<int32_t>{-1, 0}));
-    // The runtime-side reuse mirror must compact with the same keep-mapping, or reuseTokenLength
-    // reads the evicted slot's prefix afterwards.
     int32_t const survivorReuse = request->reuseTokenLength(1);
     ASSERT_TRUE(request->completeBatchCompaction({-1, 0}));
-    EXPECT_TRUE(std::equal(survivingRow.begin(), survivingRow.end(), mPageTable->hostRow(0)));
+    EXPECT_TRUE(std::all_of(mPageTable->hostRow(0), mPageTable->hostRow(0) + mPageTable->maxPagesPerSeq(),
+        [](PageId page) { return page == kUNUSED_PAGE_ENTRY; }));
+    EXPECT_TRUE(std::equal(survivingRow.begin(), survivingRow.end(), mPageTable->hostRow(1)));
+    EXPECT_EQ(request->prefillStarts().size(), 1U)
+        << "execution-row metadata must compact with the surviving logical sequence";
     EXPECT_EQ(request->reuseTokenLength(0), survivorReuse);
     ASSERT_TRUE(request->finish());
 }
@@ -420,6 +440,21 @@ TEST_F(ContextCacheRequestTests, ImageTheHostCannotReadBypassesRatherThanFails)
     ASSERT_TRUE(admitted.has_value());
     EXPECT_EQ(mCoordinator->metrics().lookupBypassSequences, 1U);
     EXPECT_EQ(mCoordinator->metrics().mediaAwareSequences, 0U);
+    ASSERT_TRUE(admitted->finish());
+}
+
+TEST_F(ContextCacheRequestTests, ImageBypassPreservesSchedulerOwnedResidentSlot)
+{
+    DecodingInferenceContext context = makeContext({makeImageTokens()}, mStream);
+    context.residentRefs[0] = ResidentRef{2, 7};
+    LLMGenerationRequest const request = makeImageRequest(rt::DeviceType::kGPU);
+
+    std::optional<ContextCacheRequest> admitted = ContextCacheRequest::begin(
+        *mCoordinator, request, context, false, DecodingKvHeadroom{1, 0}, {kIMAGE_TOKEN_ID});
+    ASSERT_TRUE(admitted.has_value());
+    EXPECT_EQ(mCoordinator->metrics().lookupBypassSequences, 1U);
+    EXPECT_TRUE(std::any_of(mPageTable->hostRow(2), mPageTable->hostRow(2) + mPageTable->maxPagesPerSeq(),
+        [](PageId page) { return page != kUNUSED_PAGE_ENTRY; }));
     ASSERT_TRUE(admitted->finish());
 }
 

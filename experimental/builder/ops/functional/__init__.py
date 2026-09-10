@@ -20,7 +20,6 @@ level; their lowering mechanism is not part of the model contract.
 """
 
 from ._operation import parameter
-from ._operation import supports_operation_attribute as supports
 from .attention import KV_PAGE_SIZE, attention, gemma4_attention, vit_attention
 
 # isort: off
@@ -29,11 +28,12 @@ from .core import (
     concatenate, constant, convolution, deconvolution, dynamic_lora,
     dynamic_reshape, dynamic_slice, embedding_lookup, empty_sequence,
     fourier_features, fused_nvfp4_gemm_all_reduce, gather_last_tokens,
-    nvfp4_a16_linear_from_weights, gather_nd, kv_cache_update, layer_norm,
-    linear, linear_f32, linear_f32_from_weights, linear_from_weights,
-    linear_with_weights, matmul, normalization, pad_last_dim, pixel_unshuffle,
-    reduce, reshape, rms_norm, rotary_embedding, scaled_dot_product_attention,
-    select, shape_of, slice_last_dim, tensor, topk, unwrap)
+    gather_nd, gather_token_rows, kv_cache_update, layer_norm, linear,
+    linear_f32, linear_f32_from_weights, linear_from_weights,
+    nvfp4_a16_linear_from_weights, linear_with_weights, matmul, normalization,
+    pad_last_dim, pixel_unshuffle, reduce, reshape, rms_norm, rotary_embedding,
+    scaled_dot_product_attention, select, shape_of, slice_last_dim, tensor,
+    topk, unwrap)
 # isort: on
 from .distributed import all_reduce
 from .moe import (MoeActivation, MoeRouting, fp16_moe, int4_moe, nvfp4_a16_moe,
@@ -69,6 +69,7 @@ __all__ = [
     "gated_delta_net",
     "gather_last_tokens",
     "gather_nd",
+    "gather_token_rows",
     "gemma4_attention",
     "dflash2_grouped_dynamic_conv",
     "hidden_state_feedback",
@@ -96,7 +97,6 @@ __all__ = [
     "select",
     "shape_of",
     "slice_last_dim",
-    "supports",
     "tensor",
     "topk",
     "unwrap",

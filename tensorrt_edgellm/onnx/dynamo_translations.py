@@ -52,9 +52,9 @@ _trt_edgellm = onnxscript.values.Opset("trt_edgellm", 1)
 def _attention_plugin_translation(
     qkv: onnxscript.FLOAT16,
     past_key_value: onnxscript.FLOAT16,
-    context_lengths: onnxscript.INT32,
+    query_lengths: onnxscript.INT32,
     rope_rotary_cos_sin: onnxscript.FLOAT,
-    kvcache_start_index: onnxscript.INT32,
+    past_lengths: onnxscript.INT32,
     kv_page_table: onnxscript.INT32,
     num_q_heads: int,
     num_kv_heads: int,
@@ -83,10 +83,14 @@ def _attention_plugin_translation(
     attention_sinks: Sequence[float] = (),
     enable_attention_sink: int = 0,
     enable_contiguous_query_swa: int = 0,
+    query_start_offsets: onnxscript.INT32 = None,
+    attention_sequence_lengths: onnxscript.INT32 = None,
+    execution_phase_marker: onnxscript.INT32 = None,
+    context_sequence_count_carrier: onnxscript.INT32 = None,
 ) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16]:
     """Unified attention plugin covering vanilla, FP8-KV, tree, and tree+FP8-KV.
 
-    Feeds the packed ``qkv`` tensor ``[B, S, (H_q + 2*H_kv) * D]`` to the V3
+    Feeds the packed ``qkv`` tensor ``[T_exec, (H_q + 2*H_kv) * D]`` to the V3
     ``AttentionPlugin``. The translation always wires the complete optional
     input layout in a stable order: q/k norm gammas, context-mask selector, and
     tree/vision attention mask inputs. The export post-pass compacts disabled
@@ -102,15 +106,13 @@ def _attention_plugin_translation(
         _op21.Constant(value_floats=k_norm_gamma),
         to=int(onnx.TensorProto.FLOAT16),
     )
-    # Sinks stay FP32: the XQA kernel reads them as `float const*`, unlike the
-    # gammas above. A zero-length constant signals "no sink".
     attention_sinks_fp32 = _op21.Constant(value_floats=attention_sinks)
     attn_4d, present_kv = _trt_edgellm.AttentionPlugin(
         qkv,
         past_key_value,
-        context_lengths,
+        query_lengths,
         rope_rotary_cos_sin,
-        kvcache_start_index,
+        past_lengths,
         kv_page_table,
         q_norm_gamma_fp16,
         k_norm_gamma_fp16,
@@ -120,6 +122,10 @@ def _attention_plugin_translation(
         skip_softmax_scale,
         swa_kv_cache_mode,
         attention_sinks_fp32,
+        query_start_offsets,
+        attention_sequence_lengths,
+        execution_phase_marker,
+        context_sequence_count_carrier,
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
@@ -137,9 +143,68 @@ def _attention_plugin_translation(
         enable_kv_shared=enable_kv_shared,
         enable_attention_sink=enable_attention_sink,
         enable_contiguous_query_swa=enable_contiguous_query_swa,
+        plugin_version="1",
         _outputs=2,
     )
     return attn_4d, present_kv
+
+
+def _attention_plugin_dispatch(
+    qkv,
+    past_key_value,
+    query_lengths,
+    rope_rotary_cos_sin,
+    past_lengths,
+    kv_page_table,
+    num_q_heads,
+    num_kv_heads,
+    head_size,
+    sliding_window_size,
+    enable_tree_attention,
+    enable_fp8_kv_cache,
+    attention_scale,
+    enable_context_mask_selector,
+    enable_vision_block_attention,
+    skip_softmax_scale_factor,
+    context_mask_selector=None,
+    attention_mask=None,
+    attention_pos_id=None,
+    qkv_scales=None,
+    q_norm_gamma=(),
+    k_norm_gamma=(),
+    rms_norm_eps=1e-6,
+    enable_qk_norm=0,
+    qk_norm_post_rope=0,
+    enable_kv_shared=0,
+    skip_softmax_scale=None,
+    swa_kv_cache_mode=None,
+    attention_sinks=(),
+    enable_attention_sink=0,
+    enable_contiguous_query_swa=0,
+    query_start_offsets=None,
+    attention_sequence_lengths=None,
+    execution_phase_marker=None,
+    context_sequence_count_carrier=None,
+):
+    q_norm_gamma = () if q_norm_gamma is None else q_norm_gamma
+    k_norm_gamma = () if k_norm_gamma is None else k_norm_gamma
+    # ONNX IR cannot infer the FLOATS attribute type from an empty sequence.
+    # Disabled sink inputs are pruned by the export post-pass, so use a typed
+    # placeholder until that pruning runs.
+    attention_sinks = (0.0, ) if not attention_sinks else attention_sinks
+    return _attention_plugin_translation(
+        qkv, past_key_value, query_lengths, rope_rotary_cos_sin, past_lengths,
+        kv_page_table, num_q_heads, num_kv_heads, head_size,
+        sliding_window_size, enable_tree_attention, enable_fp8_kv_cache,
+        attention_scale, enable_context_mask_selector,
+        enable_vision_block_attention, skip_softmax_scale_factor,
+        context_mask_selector, attention_mask, attention_pos_id, qkv_scales,
+        q_norm_gamma, k_norm_gamma, rms_norm_eps, enable_qk_norm,
+        qk_norm_post_rope, enable_kv_shared, skip_softmax_scale,
+        swa_kv_cache_mode, attention_sinks, enable_attention_sink,
+        enable_contiguous_query_swa, query_start_offsets,
+        attention_sequence_lengths, execution_phase_marker,
+        context_sequence_count_carrier)
 
 
 # ---------------------------------------------------------------------------
@@ -520,12 +585,16 @@ def _int8_sq_weight_dq_translation(
 
 
 @script()
-def _causal_conv1d_translation(
+def _causal_conv1d_ragged_translation(
     hidden_states: onnxscript.FLOAT16,
     weight: onnxscript.FLOAT16,
     bias: onnxscript.FLOAT16,
     conv_state: onnxscript.FLOAT16,
-    context_lengths: onnxscript.INT32,
+    query_lengths: onnxscript.INT32,
+    query_start_offsets: onnxscript.INT32,
+    state_indices: onnxscript.INT32,
+    execution_phase_marker: onnxscript.INT32,
+    context_sequence_count_carrier: onnxscript.INT32,
     stride: int,
     padding: int,
     dilation: int,
@@ -536,16 +605,20 @@ def _causal_conv1d_translation(
         weight,
         bias,
         conv_state,
-        context_lengths,
+        query_lengths,
+        query_start_offsets,
+        state_indices,
+        execution_phase_marker,
+        context_sequence_count_carrier,
         stride=stride,
         padding=padding,
         dilation=dilation,
         groups=groups,
         use_mtp=0,
+        plugin_version="1",
         _outputs=2,
     )
-    intermediate_conv_state_out = _op21.Identity(conv_state_out)
-    return output, conv_state_out, intermediate_conv_state_out
+    return output, conv_state_out, _op21.Identity(conv_state_out)
 
 
 @script()
@@ -555,7 +628,10 @@ def _causal_conv1d_with_intermediate_translation(
     bias: onnxscript.FLOAT16,
     conv_state: onnxscript.FLOAT16,
     context_lengths: onnxscript.INT32,
-    spec_verify_phase_marker: onnxscript.INT32,
+    query_start_offsets: onnxscript.INT32,
+    state_indices: onnxscript.INT32,
+    execution_phase_marker: onnxscript.INT32,
+    context_sequence_count_carrier: onnxscript.INT32,
     stride: int,
     padding: int,
     dilation: int,
@@ -567,12 +643,16 @@ def _causal_conv1d_with_intermediate_translation(
         bias,
         conv_state,
         context_lengths,
-        spec_verify_phase_marker,
+        query_start_offsets,
+        state_indices,
+        execution_phase_marker,
+        context_sequence_count_carrier,
         stride=stride,
         padding=padding,
         dilation=dilation,
         groups=groups,
         use_mtp=1,
+        plugin_version="1",
         _outputs=3,
     )
     return output, conv_state_out, intermediate_conv_state_out
@@ -585,7 +665,10 @@ def _causal_conv1d_with_intermediate_tree_translation(
     bias: onnxscript.FLOAT16,
     conv_state: onnxscript.FLOAT16,
     context_lengths: onnxscript.INT32,
-    spec_verify_phase_marker: onnxscript.INT32,
+    query_start_offsets: onnxscript.INT32,
+    state_indices: onnxscript.INT32,
+    execution_phase_marker: onnxscript.INT32,
+    context_sequence_count_carrier: onnxscript.INT32,
     tree_parent_ids: onnxscript.INT32,
     tree_depths: onnxscript.INT32,
     stride: int,
@@ -599,7 +682,10 @@ def _causal_conv1d_with_intermediate_tree_translation(
         bias,
         conv_state,
         context_lengths,
-        spec_verify_phase_marker,
+        query_start_offsets,
+        state_indices,
+        execution_phase_marker,
+        context_sequence_count_carrier,
         tree_parent_ids,
         tree_depths,
         stride=stride,
@@ -607,6 +693,7 @@ def _causal_conv1d_with_intermediate_tree_translation(
         dilation=dilation,
         groups=groups,
         use_ddtree=1,
+        plugin_version="1",
         _outputs=3,
     )
     return output, conv_state_out, intermediate_conv_state_out
@@ -622,10 +709,15 @@ def _causal_conv1d_dispatch(
     padding,
     dilation,
     groups,
+    query_start_offsets,
+    state_indices,
+    execution_phase_marker,
+    context_sequence_count_carrier,
 ):
-    return _causal_conv1d_translation(hidden_states, weight, bias, conv_state,
-                                      context_lengths, stride, padding,
-                                      dilation, groups)
+    return _causal_conv1d_ragged_translation(
+        hidden_states, weight, bias, conv_state, context_lengths,
+        query_start_offsets, state_indices, execution_phase_marker,
+        context_sequence_count_carrier, stride, padding, dilation, groups)
 
 
 def _causal_conv1d_intermediate_dispatch(
@@ -634,11 +726,14 @@ def _causal_conv1d_intermediate_dispatch(
     bias,
     conv_state,
     context_lengths,
+    query_start_offsets,
+    state_indices,
     stride,
     padding,
     dilation,
     groups,
-    spec_verify_phase_marker,
+    execution_phase_marker,
+    context_sequence_count_carrier,
     tree_parent_ids=None,
     tree_depths=None,
     use_ddtree_state=False,
@@ -650,15 +745,17 @@ def _causal_conv1d_intermediate_dispatch(
             )
         return _causal_conv1d_with_intermediate_tree_translation(
             hidden_states, weight, bias, conv_state, context_lengths,
-            spec_verify_phase_marker, tree_parent_ids, tree_depths, stride,
-            padding, dilation, groups)
+            query_start_offsets, state_indices, execution_phase_marker,
+            context_sequence_count_carrier, tree_parent_ids, tree_depths,
+            stride, padding, dilation, groups)
     return _causal_conv1d_with_intermediate_translation(
         hidden_states, weight, bias, conv_state, context_lengths,
-        spec_verify_phase_marker, stride, padding, dilation, groups)
+        query_start_offsets, state_indices, execution_phase_marker,
+        context_sequence_count_carrier, stride, padding, dilation, groups)
 
 
 @script()
-def _gated_delta_net_translation(
+def _gated_delta_net_ragged_translation(
     q: onnxscript.FLOAT16,
     k: onnxscript.FLOAT16,
     v: onnxscript.FLOAT16,
@@ -667,9 +764,14 @@ def _gated_delta_net_translation(
     A_log: onnxscript.FLOAT,
     dt_bias: onnxscript.FLOAT16,
     h0_source: onnxscript.FLOAT,
-    context_lengths: onnxscript.INT32,
+    query_lengths: onnxscript.INT32,
+    query_start_offsets: onnxscript.INT32,
+    state_indices: onnxscript.INT32,
+    execution_phase_marker: onnxscript.INT32,
+    context_sequence_count_carrier: onnxscript.INT32,
     k_dim: int,
     v_dim: int,
+    use_diffusion_state: int,
 ) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT, onnxscript.FLOAT]:
     output, h0_out = _trt_edgellm.gated_delta_net(
         q,
@@ -680,14 +782,19 @@ def _gated_delta_net_translation(
         A_log,
         dt_bias,
         h0_source,
-        context_lengths,
+        query_lengths,
+        query_start_offsets,
+        state_indices,
+        execution_phase_marker,
+        context_sequence_count_carrier,
         k_dim=k_dim,
         v_dim=v_dim,
         use_mtp=0,
+        use_diffusion_state=use_diffusion_state,
+        plugin_version="1",
         _outputs=2,
     )
-    intermediate_h0_out = _op21.Identity(h0_out)
-    return output, h0_out, intermediate_h0_out
+    return output, h0_out, _op21.Identity(h0_out)
 
 
 @script()
@@ -701,7 +808,10 @@ def _gated_delta_net_with_intermediate_translation(
     dt_bias: onnxscript.FLOAT16,
     h0_source: onnxscript.FLOAT,
     context_lengths: onnxscript.INT32,
-    spec_verify_phase_marker: onnxscript.INT32,
+    query_start_offsets: onnxscript.INT32,
+    state_indices: onnxscript.INT32,
+    execution_phase_marker: onnxscript.INT32,
+    context_sequence_count_carrier: onnxscript.INT32,
     k_dim: int,
     v_dim: int,
 ) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT, onnxscript.FLOAT]:
@@ -715,10 +825,14 @@ def _gated_delta_net_with_intermediate_translation(
         dt_bias,
         h0_source,
         context_lengths,
-        spec_verify_phase_marker,
+        query_start_offsets,
+        state_indices,
+        execution_phase_marker,
+        context_sequence_count_carrier,
         k_dim=k_dim,
         v_dim=v_dim,
         use_mtp=1,
+        plugin_version="1",
         _outputs=3,
     )
     return output, h0_out, intermediate_h0_out
@@ -735,7 +849,10 @@ def _gated_delta_net_with_intermediate_tree_translation(
     dt_bias: onnxscript.FLOAT16,
     h0_source: onnxscript.FLOAT,
     context_lengths: onnxscript.INT32,
-    spec_verify_phase_marker: onnxscript.INT32,
+    query_start_offsets: onnxscript.INT32,
+    state_indices: onnxscript.INT32,
+    execution_phase_marker: onnxscript.INT32,
+    context_sequence_count_carrier: onnxscript.INT32,
     tree_parent_ids: onnxscript.INT32,
     tree_depths: onnxscript.INT32,
     k_dim: int,
@@ -751,12 +868,16 @@ def _gated_delta_net_with_intermediate_tree_translation(
         dt_bias,
         h0_source,
         context_lengths,
-        spec_verify_phase_marker,
+        query_start_offsets,
+        state_indices,
+        execution_phase_marker,
+        context_sequence_count_carrier,
         tree_parent_ids,
         tree_depths,
         k_dim=k_dim,
         v_dim=v_dim,
         use_ddtree=1,
+        plugin_version="1",
         _outputs=3,
     )
     return output, h0_out, intermediate_h0_out
@@ -774,10 +895,16 @@ def _gated_delta_net_dispatch(
     context_lengths,
     k_dim,
     v_dim,
+    query_start_offsets,
+    state_indices,
+    execution_phase_marker,
+    context_sequence_count_carrier,
+    use_diffusion_state=False,
 ):
-    return _gated_delta_net_translation(q, k, v, a, b, A_log, dt_bias,
-                                        h0_source, context_lengths, k_dim,
-                                        v_dim)
+    return _gated_delta_net_ragged_translation(
+        q, k, v, a, b, A_log, dt_bias, h0_source, context_lengths,
+        query_start_offsets, state_indices, execution_phase_marker,
+        context_sequence_count_carrier, k_dim, v_dim, int(use_diffusion_state))
 
 
 def _gated_delta_net_intermediate_dispatch(
@@ -790,9 +917,12 @@ def _gated_delta_net_intermediate_dispatch(
     dt_bias,
     h0_source,
     context_lengths,
+    query_start_offsets,
+    state_indices,
     k_dim,
     v_dim,
-    spec_verify_phase_marker,
+    execution_phase_marker,
+    context_sequence_count_carrier,
     tree_parent_ids=None,
     tree_depths=None,
     use_ddtree_state=False,
@@ -804,11 +934,13 @@ def _gated_delta_net_intermediate_dispatch(
             )
         return _gated_delta_net_with_intermediate_tree_translation(
             q, k, v, a, b, A_log, dt_bias, h0_source, context_lengths,
-            spec_verify_phase_marker, tree_parent_ids, tree_depths, k_dim,
-            v_dim)
+            query_start_offsets, state_indices, execution_phase_marker,
+            context_sequence_count_carrier, tree_parent_ids, tree_depths,
+            k_dim, v_dim)
     return _gated_delta_net_with_intermediate_translation(
         q, k, v, a, b, A_log, dt_bias, h0_source, context_lengths,
-        spec_verify_phase_marker, k_dim, v_dim)
+        query_start_offsets, state_indices, execution_phase_marker,
+        context_sequence_count_carrier, k_dim, v_dim)
 
 
 @script()
@@ -821,8 +953,11 @@ def _update_ssm_state_translation(
     dt: onnxscript.FLOAT16,
     dt_bias: onnxscript.FLOAT16,
     state: onnxscript.FLOAT16,
-    context_lengths: onnxscript.INT32,
-    state_start_index: onnxscript.INT32,
+    query_lengths: onnxscript.INT32,
+    query_start_offsets: onnxscript.INT32,
+    state_indices: onnxscript.INT32,
+    execution_phase_marker: onnxscript.INT32,
+    context_sequence_count_carrier: onnxscript.INT32,
     dt_softplus: int,
     ngroups: int,
     chunk_size: int = 0,
@@ -836,11 +971,15 @@ def _update_ssm_state_translation(
         dt,
         dt_bias,
         state,
-        context_lengths,
-        state_start_index,
+        query_lengths,
+        query_start_offsets,
+        state_indices,
+        execution_phase_marker,
+        context_sequence_count_carrier,
         dt_softplus=dt_softplus,
         ngroups=ngroups,
         chunk_size=chunk_size,
+        plugin_version="1",
         _outputs=2,
     )
     return output, state_out
@@ -856,9 +995,11 @@ def _update_ssm_state_with_intermediate_linear_translation(
     dt: onnxscript.FLOAT16,
     dt_bias: onnxscript.FLOAT16,
     state: onnxscript.FLOAT16,
-    context_lengths: onnxscript.INT32,
-    state_start_index: onnxscript.INT32,
-    spec_verify_phase_marker: onnxscript.INT32,
+    query_lengths: onnxscript.INT32,
+    query_start_offsets: onnxscript.INT32,
+    state_indices: onnxscript.INT32,
+    execution_phase_marker: onnxscript.INT32,
+    context_sequence_count_carrier: onnxscript.INT32,
     dt_softplus: int,
     ngroups: int,
     chunk_size: int = 0,
@@ -875,13 +1016,16 @@ def _update_ssm_state_with_intermediate_linear_translation(
         dt,
         dt_bias,
         state,
-        context_lengths,
-        state_start_index,
-        spec_verify_phase_marker,
+        query_lengths,
+        query_start_offsets,
+        state_indices,
+        execution_phase_marker,
+        context_sequence_count_carrier,
         dt_softplus=dt_softplus,
         ngroups=ngroups,
         chunk_size=chunk_size,
         use_spec_verify_state=1,
+        plugin_version="1",
         _outputs=6,
     )
     return output, state_out, replay_da, replay_u, replay_b, replay_dt
@@ -897,9 +1041,11 @@ def _update_ssm_state_with_intermediate_tree_translation(
     dt: onnxscript.FLOAT16,
     dt_bias: onnxscript.FLOAT16,
     state: onnxscript.FLOAT16,
-    context_lengths: onnxscript.INT32,
-    state_start_index: onnxscript.INT32,
-    spec_verify_phase_marker: onnxscript.INT32,
+    query_lengths: onnxscript.INT32,
+    query_start_offsets: onnxscript.INT32,
+    state_indices: onnxscript.INT32,
+    execution_phase_marker: onnxscript.INT32,
+    context_sequence_count_carrier: onnxscript.INT32,
     tree_parent_ids: onnxscript.INT32,
     tree_depths: onnxscript.INT32,
     dt_softplus: int,
@@ -916,9 +1062,11 @@ def _update_ssm_state_with_intermediate_tree_translation(
         dt,
         dt_bias,
         state,
-        context_lengths,
-        state_start_index,
-        spec_verify_phase_marker,
+        query_lengths,
+        query_start_offsets,
+        state_indices,
+        execution_phase_marker,
+        context_sequence_count_carrier,
         tree_parent_ids,
         tree_depths,
         dt_softplus=dt_softplus,
@@ -926,6 +1074,7 @@ def _update_ssm_state_with_intermediate_tree_translation(
         chunk_size=chunk_size,
         use_spec_verify_state=1,
         use_ddtree=1,
+        plugin_version="1",
         _outputs=6,
     )
     return output, state_out, replay_da, replay_u, replay_b, replay_dt
@@ -940,9 +1089,11 @@ def _update_ssm_state_with_intermediate_dispatch(
     dt,
     dt_bias,
     state,
-    context_lengths,
-    state_start_index,
-    spec_verify_phase_marker,
+    query_lengths,
+    query_start_offsets,
+    state_indices,
+    execution_phase_marker,
+    context_sequence_count_carrier,
     dt_softplus,
     ngroups,
     chunk_size=0,
@@ -957,12 +1108,14 @@ def _update_ssm_state_with_intermediate_dispatch(
             )
         return _update_ssm_state_with_intermediate_tree_translation(
             hidden_states, ssm_a, ssm_b, ssm_c, ssm_d, dt, dt_bias, state,
-            context_lengths, state_start_index, spec_verify_phase_marker,
+            query_lengths, query_start_offsets, state_indices,
+            execution_phase_marker, context_sequence_count_carrier,
             tree_parent_ids, tree_depths, dt_softplus, ngroups, chunk_size)
     return _update_ssm_state_with_intermediate_linear_translation(
         hidden_states, ssm_a, ssm_b, ssm_c, ssm_d, dt, dt_bias, state,
-        context_lengths, state_start_index, spec_verify_phase_marker,
-        dt_softplus, ngroups, chunk_size)
+        query_lengths, query_start_offsets, state_indices,
+        execution_phase_marker, context_sequence_count_carrier, dt_softplus,
+        ngroups, chunk_size)
 
 
 # ---------------------------------------------------------------------------
@@ -1480,9 +1633,9 @@ def _dflash_target_kv_cache_update_translation(
     k_delta: onnxscript.FLOAT16,
     v_delta: onnxscript.FLOAT16,
     past_key_value: onnxscript.FLOAT16,
-    rope_cos_sin: onnxscript.FLOAT,
-    delta_start_positions: onnxscript.INT32,
-    delta_lengths: onnxscript.INT32,
+    token_aligned_rope_cos_sin: onnxscript.FLOAT,
+    delta_positions: onnxscript.INT32,
+    delta_token_to_sequence: onnxscript.INT32,
     kv_page_table: onnxscript.INT32,
 ) -> onnxscript.FLOAT16:
     """DFlash target KV cache update: apply RoPE to k_delta, write k+v into cache."""
@@ -1490,9 +1643,9 @@ def _dflash_target_kv_cache_update_translation(
         k_delta,
         v_delta,
         past_key_value,
-        rope_cos_sin,
-        delta_start_positions,
-        delta_lengths,
+        token_aligned_rope_cos_sin,
+        delta_positions,
+        delta_token_to_sequence,
         kv_page_table,
     )
     return present_kv
@@ -1573,7 +1726,7 @@ def build_custom_translation_table() -> dict:
 
     return {
         torch.ops.trt.attention_plugin.default:
-        _attention_plugin_translation,
+        _attention_plugin_dispatch,
         torch.ops.trt.qsa_attention_plugin.default:
         _qsa_attention_plugin_translation,
         torch.ops.trt.fp8_quantize.default:

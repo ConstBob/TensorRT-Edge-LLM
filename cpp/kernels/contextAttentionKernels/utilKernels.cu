@@ -21,6 +21,8 @@
 #include "common/pagedKvTypes.h"
 #include "kernels/common/slidingWindowUtils.cuh"
 
+#include <algorithm>
+
 namespace trt_edgellm
 {
 namespace kernel
@@ -335,6 +337,73 @@ __global__ void buildVisionBlockRangesKernel(int32_t const* visionBlockIds, int3
     blockEnd[base + pos] = end;
 }
 
+__global__ void gatherTokenAlignedRopeKernel(float const* source, float* output, int32_t const* positions,
+    int32_t const* queryStartOffsets, int32_t const* queryLengths, int32_t const* stateIndices, int32_t numTokens,
+    int32_t sourceRows, int32_t cacheCapacity, int32_t rotaryDim)
+{
+    int32_t const sequence = static_cast<int32_t>(blockIdx.x);
+    int32_t const start = queryStartOffsets[sequence];
+    int32_t const end = queryStartOffsets[sequence + 1];
+    int32_t const length = queryLengths[sequence];
+    if (start < 0 || end < start || end > numTokens || length < 0 || length > end - start)
+    {
+        return;
+    }
+
+    int32_t const sourceRow = sourceRows == 1 ? 0 : stateIndices[sequence];
+    bool const validSourceRow = sourceRow >= 0 && sourceRow < sourceRows;
+    int32_t const elements = (end - start) * rotaryDim;
+    int32_t const tileElement
+        = static_cast<int32_t>(blockIdx.y) * static_cast<int32_t>(blockDim.x) + static_cast<int32_t>(threadIdx.x);
+    int32_t const tileStride = static_cast<int32_t>(gridDim.y) * static_cast<int32_t>(blockDim.x);
+    for (int32_t localElement = tileElement; localElement < elements; localElement += tileStride)
+    {
+        int32_t const localToken = localElement / rotaryDim;
+        int32_t const channel = localElement % rotaryDim;
+        int32_t const token = start + localToken;
+        int32_t const position = positions[token];
+        bool const validToken = localToken < length && position >= 0 && position < cacheCapacity && validSourceRow;
+        float value = 0.0F;
+        if (validToken)
+        {
+            int64_t const sourceIndex
+                = (static_cast<int64_t>(sourceRow) * cacheCapacity + position) * rotaryDim + channel;
+            value = source[sourceIndex];
+        }
+        output[static_cast<int64_t>(token) * rotaryDim + channel] = value;
+    }
+}
+
+__global__ void scatterActiveRowsKernel(
+    uint8_t const* source, uint8_t* destination, int32_t const* stateIndices, int32_t residentRows, size_t rowBytes)
+{
+    int32_t const activeRow = static_cast<int32_t>(blockIdx.x);
+    int32_t const residentRow = stateIndices[activeRow];
+    if (residentRow < 0 || residentRow >= residentRows)
+    {
+        return;
+    }
+    uint8_t const* sourceRow = source + static_cast<size_t>(activeRow) * rowBytes;
+    uint8_t* destinationRow = destination + static_cast<size_t>(residentRow) * rowBytes;
+    if (rowBytes % sizeof(uint4) == 0)
+    {
+        auto const* sourceVectors = reinterpret_cast<uint4 const*>(sourceRow);
+        auto* destinationVectors = reinterpret_cast<uint4*>(destinationRow);
+        size_t const vectorCount = rowBytes / sizeof(uint4);
+        for (size_t vector = threadIdx.x; vector < vectorCount; vector += blockDim.x)
+        {
+            destinationVectors[vector] = sourceVectors[vector];
+        }
+    }
+    else
+    {
+        for (size_t byte = threadIdx.x; byte < rowBytes; byte += blockDim.x)
+        {
+            destinationRow[byte] = sourceRow[byte];
+        }
+    }
+}
+
 } // namespace
 
 void launchBuildVisionBlockRanges(int32_t const* visionBlockIds, int32_t const* contextLengths, int32_t* blockBegin,
@@ -349,6 +418,40 @@ void launchBuildVisionBlockRanges(int32_t const* visionBlockIds, int32_t const* 
         static_cast<uint32_t>((seqLen + kRANGE_THREADS - 1) / kRANGE_THREADS), static_cast<uint32_t>(batchSize));
     buildVisionBlockRangesKernel<<<grid, kRANGE_THREADS, 0, stream>>>(
         visionBlockIds, contextLengths, blockBegin, blockEnd, seqLen);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launchScatterActiveRows(void const* source, void* destination, int32_t const* stateIndices, int32_t activeRows,
+    int32_t residentRows, size_t rowBytes, cudaStream_t stream)
+{
+    check::check(source != nullptr && destination != nullptr && stateIndices != nullptr,
+        "Indexed row scatter received a null pointer");
+    check::check(activeRows > 0 && residentRows > 0 && rowBytes > 0, "Indexed row scatter received invalid extents");
+    scatterActiveRowsKernel<<<activeRows, 256, 0, stream>>>(
+        static_cast<uint8_t const*>(source), static_cast<uint8_t*>(destination), stateIndices, residentRows, rowBytes);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launchGatherTokenAlignedRope(float const* source, float* output, int32_t const* positions,
+    int32_t const* queryStartOffsets, int32_t const* queryLengths, int32_t const* stateIndices, int32_t numTokens,
+    int32_t numSequences, int32_t sourceRows, int32_t cacheCapacity, int32_t rotaryDim, cudaStream_t stream)
+{
+    check::check(source != nullptr && output != nullptr && positions != nullptr && queryStartOffsets != nullptr
+            && queryLengths != nullptr,
+        "Token-aligned RoPE gather received a null pointer");
+    check::check(
+        sourceRows == 1 || stateIndices != nullptr, "Resident token-aligned RoPE gather requires state indices");
+    check::check(numTokens > 0 && numSequences > 0 && sourceRows > 0 && cacheCapacity > 0 && rotaryDim > 0,
+        "Token-aligned RoPE gather received invalid dimensions");
+
+    constexpr int32_t kGATHER_THREADS = 256;
+    constexpr int32_t kMAX_TILES_PER_SEQUENCE = 32;
+    int64_t const averageElements = (static_cast<int64_t>(numTokens) * rotaryDim + numSequences - 1) / numSequences;
+    int32_t const tilesPerSequence = std::min<int64_t>(
+        kMAX_TILES_PER_SEQUENCE, std::max<int64_t>(1, (averageElements + kGATHER_THREADS - 1) / kGATHER_THREADS));
+    dim3 const grid(static_cast<uint32_t>(numSequences), static_cast<uint32_t>(tilesPerSequence));
+    gatherTokenAlignedRopeKernel<<<grid, kGATHER_THREADS, 0, stream>>>(source, output, positions, queryStartOffsets,
+        queryLengths, stateIndices, numTokens, sourceRows, cacheCapacity, rotaryDim);
     CUDA_CHECK(cudaGetLastError());
 }
 

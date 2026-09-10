@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2025 FlashInfer team.
 #
@@ -36,6 +37,7 @@ from gdn_prefill_sm12x_inverse import CollectiveInverse
 @dataclass
 class WorkDesc:
     seq_idx: cutlass.Int32
+    state_idx: cutlass.Int32
     private_q_head_idx: cutlass.Int32
     private_v_head_idx: cutlass.Int32
     tok_offset: cutlass.Int32
@@ -197,6 +199,8 @@ class FullyFusedGdnPrefillBlackwellGeforce:
     def get_next_work(
         self,
         context_lengths: cute.Tensor,
+        state_indices: cute.Tensor,
+        use_state_indices: cutlass.Int32,
         physical_seq_len: cutlass.Int32,
         num_q_heads: cutlass.Int32,
         num_v_heads: cutlass.Int32,
@@ -209,9 +213,14 @@ class FullyFusedGdnPrefillBlackwellGeforce:
         v_head_idx = o_head_idx * num_v_heads // num_sab_heads
         tok_start = seq_idx * physical_seq_len
         seq_len = cutlass.Int32(context_lengths[seq_idx])
+        indexed_state_idx = cutlass.Int32(state_indices[seq_idx])
+        state_idx = cutlass.Int32(
+            seq_idx + use_state_indices * (indexed_state_idx - seq_idx)
+        )
 
         return WorkDesc(
             seq_idx=seq_idx,
+            state_idx=state_idx,
             private_q_head_idx=q_head_idx,
             private_v_head_idx=v_head_idx,
             tok_offset=tok_start,
@@ -1250,7 +1259,7 @@ class FullyFusedGdnPrefillBlackwellGeforce:
         num_q_heads: cutlass.Int32,
         num_v_heads: cutlass.Int32,
         num_sab_heads: cutlass.Int32,
-        num_seqs: cutlass.Int32,
+        state_pool_rows: cutlass.Int32,
     ):
         self._math_order_init(wg_idx)
         q_consumer_state = pipeline.make_pipeline_state(
@@ -1283,18 +1292,20 @@ class FullyFusedGdnPrefillBlackwellGeforce:
         )
         tKVrKV.fill(self.acc_dtype(0.0))
 
-        # Plugin storage is row-major [N, Hv, K, V], so V must be the
-        # innermost mode in this reordered (K, V, Hv, N) view. FlashInfer's
+        # Plugin storage is row-major [resident, Hv, K, V], so V must be the
+        # innermost mode in this reordered (K, V, Hv, resident) view. FlashInfer's
         # original state tensor uses the opposite D-major orientation.
         state_layout = cute.make_ordered_layout(
-            (self.D, self.D, num_sab_heads, num_seqs), order=(1, 0, 2, 3)
+            (self.D, self.D, num_sab_heads, state_pool_rows), order=(1, 0, 2, 3)
         )
         o_head_idx = work_desc.o_head_idx(num_q_heads, num_v_heads)
         mState = cute.make_tensor(g_state.iterator, state_layout)
-        gStateKV = mState[None, None, o_head_idx, work_desc.seq_idx]
         mInitState = cute.make_tensor(g_init_state.iterator, state_layout)
-        gInitKV = mInitState[None, None, o_head_idx, work_desc.seq_idx]
-        self.kv_load(tKVrKV, gInitKV, kv_thr_mma)
+        # Invalid standalone indices use a zero initial state and never update the pool.
+        if cute.elem_less(cutlass.Int32(-1), work_desc.state_idx):
+            if cute.elem_less(work_desc.state_idx, state_pool_rows):
+                gInitKV = mInitState[None, None, o_head_idx, work_desc.state_idx]
+                self.kv_load(tKVrKV, gInitKV, kv_thr_mma)
 
         first_B = work_desc.seq_len
         if first_B > cutlass.Int32(self.BLK_KV):
@@ -1418,8 +1429,11 @@ class FullyFusedGdnPrefillBlackwellGeforce:
                 tKVrKV,
                 scale,
                 wg_idx,
-            )
-        self.kv_store(tKVrKV, gStateKV, kv_thr_mma)
+        )
+        if cute.elem_less(cutlass.Int32(-1), work_desc.state_idx):
+            if cute.elem_less(work_desc.state_idx, state_pool_rows):
+                gStateKV = mState[None, None, o_head_idx, work_desc.state_idx]
+                self.kv_store(tKVrKV, gStateKV, kv_thr_mma)
 
     # ─── Kernel entry point ───────────────────────────────────────────────────
 
@@ -1438,6 +1452,9 @@ class FullyFusedGdnPrefillBlackwellGeforce:
         g_init_state: cute.Tensor,
         g_tensormaps: cute.Tensor,
         context_lengths: cute.Tensor,
+        state_indices: cute.Tensor,
+        use_state_indices: cutlass.Int32,
+        state_pool_rows: cutlass.Int32,
         physical_seq_len: cutlass.Int32,
         scale: cutlass.Float32,
         num_q_heads: cutlass.Int32,
@@ -1595,6 +1612,9 @@ class FullyFusedGdnPrefillBlackwellGeforce:
             g_init_state,
             g_tensormaps,
             context_lengths,
+            state_indices,
+            use_state_indices,
+            state_pool_rows,
             physical_seq_len,
             scale,
             num_q_heads,
@@ -1631,6 +1651,9 @@ class FullyFusedGdnPrefillBlackwellGeforce:
         g_init_state: cute.Tensor,
         g_tensormaps: cute.Tensor,
         context_lengths: cute.Tensor,
+        state_indices: cute.Tensor,
+        use_state_indices: cutlass.Int32,
+        state_pool_rows: cutlass.Int32,
         physical_seq_len: cutlass.Int32,
         scale: cutlass.Float32,
         num_q_heads: cutlass.Int32,
@@ -1671,6 +1694,8 @@ class FullyFusedGdnPrefillBlackwellGeforce:
 
         work_desc = self.get_next_work(
             context_lengths,
+            state_indices,
+            use_state_indices,
             physical_seq_len,
             num_q_heads,
             num_v_heads,
@@ -1922,7 +1947,7 @@ class FullyFusedGdnPrefillBlackwellGeforce:
                 num_q_heads,
                 num_v_heads,
                 num_sab_heads,
-                num_seqs,
+                state_pool_rows,
             )
 
 
@@ -1949,6 +1974,8 @@ def run_gdn_prefill_blackwell_geforce(
     dt_bias: cute.Tensor,
     h0_in: cute.Tensor,
     h0_out: cute.Tensor,
+    state_indices: cute.Tensor,
+    use_state_indices: cutlass.Int32,
     context_lengths: cute.Tensor,
     o: cute.Tensor,
     tensormap_scratch: cute.Tensor,
@@ -1960,6 +1987,7 @@ def run_gdn_prefill_blackwell_geforce(
     num_q_heads = q.layout.shape[2]
     d = q.layout.shape[3]
     num_v_heads = v.layout.shape[2]
+    state_pool_rows = h0_out.layout.shape[0]
     total_tokens = n * physical_seq_len
 
     q_tma = cute.make_tensor(
@@ -2007,6 +2035,9 @@ def run_gdn_prefill_blackwell_geforce(
         h0_in,
         tensormap_scratch,
         context_lengths,
+        state_indices,
+        use_state_indices,
+        cutlass.Int32(state_pool_rows),
         cutlass.Int32(physical_seq_len),
         cutlass.Float32(AOT_HEAD_DIM ** -0.5),
         cutlass.Int32(num_q_heads),
@@ -2031,6 +2062,7 @@ def _make_placeholders(n, t, hqk, hv):
         "dt_bias": cp.zeros((hv,), dtype=fp16),
         "h0_in": cp.zeros((n, hv, AOT_HEAD_DIM, AOT_HEAD_DIM), dtype=cp.float32),
         "h0_out": cp.zeros((n, hv, AOT_HEAD_DIM, AOT_HEAD_DIM), dtype=cp.float32),
+        "state_indices": cp.arange(n, dtype=cp.int32),
         "context_lengths": cp.full((n,), t, dtype=cp.int32),
         "o": cp.zeros((n, t, hv, AOT_HEAD_DIM), dtype=fp16),
         "tensormap_scratch": cp.zeros((AOT_TENSORMAP_BYTES,), dtype=cp.uint8),
@@ -2085,6 +2117,7 @@ def _to_cute_tensors(placeholders):
         "dt_bias": _mark_1d_dynamic(placeholders["dt_bias"]),
         "h0_in": _mark_state_dynamic(placeholders["h0_in"]),
         "h0_out": _mark_state_dynamic(placeholders["h0_out"]),
+        "state_indices": _mark_1d_dynamic(placeholders["state_indices"]),
         "context_lengths": _mark_1d_dynamic(placeholders["context_lengths"]),
         "o": _mark_4d_dynamic(placeholders["o"]),
         "tensormap_scratch": _mark_1d_dynamic(
@@ -2108,6 +2141,7 @@ def compile_gdn_prefill_blackwell_geforce(gpu_arch=""):
         tensors["a"], tensors["b"],
         tensors["A_log"], tensors["dt_bias"],
         tensors["h0_in"], tensors["h0_out"],
+        tensors["state_indices"], cutlass.Int32(1),
         tensors["context_lengths"], tensors["o"],
         tensors["tensormap_scratch"], cutlass.Int32(1), stream,
     )
@@ -2156,8 +2190,13 @@ def run_accuracy_test(n, h, hv, k, v, seq_len, tolerance, gpu_arch=""):
     b_host = (rng.standard_normal((n, seq_len, hv), dtype=np.float32) * 0.1)
     A_log_host = rng.standard_normal(hv, dtype=np.float32) * 0.1
     dt_bias_host = rng.standard_normal(hv, dtype=np.float32) * 0.1
-    h0_host = rng.standard_normal((n, hv, k, v), dtype=np.float32) * 0.01
-    context_lengths_host = np.full((n,), seq_len, dtype=np.int32)
+    state_pool_rows = n + 2
+    resident_state_host = (
+        rng.standard_normal((state_pool_rows, hv, k, v), dtype=np.float32) * 0.01
+    )
+    context_lengths_host = np.maximum(
+        1, seq_len - np.arange(n, dtype=np.int32)
+    )
 
     q = cp.asarray(q_host, dtype=cp.float16)
     k_tensor = cp.asarray(k_host, dtype=cp.float16)
@@ -2166,10 +2205,7 @@ def run_accuracy_test(n, h, hv, k, v, seq_len, tolerance, gpu_arch=""):
     b = cp.asarray(b_host, dtype=cp.float16)
     A_log = cp.asarray(A_log_host, dtype=cp.float32)
     dt_bias = cp.asarray(dt_bias_host, dtype=cp.float16)
-    h0_in = cp.asarray(h0_host, dtype=cp.float32)
-    h0_out = cp.empty_like(h0_in)
     context_lengths = cp.asarray(context_lengths_host)
-    output = cp.empty((n, seq_len, hv, v), dtype=cp.float16)
 
     # Match CuteDslGDNRunner: normalization is external to the Blackwell GeForce AOT kernel.
     q_fp32 = q.astype(cp.float32)
@@ -2185,21 +2221,6 @@ def run_accuracy_test(n, h, hv, k, v, seq_len, tolerance, gpu_arch=""):
     tensormap_scratch = cp.zeros(
         (multiprocessor_count * AOT_TENSORMAP_BYTES,), dtype=cp.uint8
     )
-    arrays = {
-        "q": q,
-        "k": k_tensor,
-        "v": v_tensor,
-        "a": a,
-        "b": b,
-        "A_log": A_log,
-        "dt_bias": dt_bias,
-        "h0_in": h0_in,
-        "h0_out": h0_out,
-        "context_lengths": context_lengths,
-        "o": output,
-        "tensormap_scratch": tensormap_scratch,
-    }
-    tensors = _to_cute_tensors(arrays)
     stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
 
     print(
@@ -2212,40 +2233,92 @@ def run_accuracy_test(n, h, hv, k, v, seq_len, tolerance, gpu_arch=""):
         "[gdn_prefill_blackwell_geforce] Compilation time: %.4fs"
         % (time.time() - start)
     )
-    compiled(
-        tensors["q"], tensors["k"], tensors["v"],
-        tensors["a"], tensors["b"],
-        tensors["A_log"], tensors["dt_bias"],
-        tensors["h0_in"], tensors["h0_out"],
-        tensors["context_lengths"], tensors["o"],
-        tensors["tensormap_scratch"], cutlass.Int32(0), stream,
-    )
-    cp.cuda.get_current_stream().synchronize()
-
     q_ref = cp.asnumpy(q).astype(np.float32)
     k_ref = cp.asnumpy(k_tensor).astype(np.float32)
     v_ref = cp.asnumpy(v_tensor).astype(np.float32)
     a_ref = cp.asnumpy(a).astype(np.float32)
     b_ref = cp.asnumpy(b).astype(np.float32)
     dt_bias_ref = cp.asnumpy(dt_bias).astype(np.float32)
-    output_ref, state_ref = _run_numpy_prefill_reference(
-        q_ref, k_ref, v_ref, a_ref, b_ref,
-        A_log_host, dt_bias_ref, h0_host,
-        n, h, hv, k, v, seq_len, scale=k ** -0.5,
-        context_lengths_np=context_lengths_host,
-        use_qk_l2norm=False,
+    indexed_identity = np.arange(n, dtype=np.int32)
+    indexed_sparse = np.arange(n, 0, -1, dtype=np.int32)
+    invalid_indices = np.where(
+        np.arange(n, dtype=np.int32) % 2 == 0, -1, state_pool_rows
+    ).astype(np.int32)
+    mixed_indices = indexed_sparse.copy()
+    if n > 1:
+        mixed_indices[1] = -1
+    if n > 2:
+        mixed_indices[2] = state_pool_rows
+    cases = (
+        ("identity", indexed_identity, True),
+        ("permuted_sparse", indexed_sparse, True),
+        ("invalid", invalid_indices, True),
+        ("mixed_valid_invalid", mixed_indices, True),
+        ("identity_flag", invalid_indices, False),
     )
-    output_actual = cp.asnumpy(output).astype(np.float32)
-    state_actual = cp.asnumpy(h0_out).astype(np.float32)
-    output_error = float(np.max(np.abs(output_actual - output_ref)))
-    state_error = float(np.max(np.abs(state_actual - state_ref)))
-    print(
-        "[gdn_prefill_blackwell_geforce] output max abs error: %.8f; "
-        "final state max abs error: %.8f; tolerance: %.1e"
-        % (output_error, state_error, tolerance)
-    )
-    np.testing.assert_allclose(output_actual, output_ref, atol=tolerance, rtol=tolerance)
-    np.testing.assert_allclose(state_actual, state_ref, atol=tolerance, rtol=tolerance)
+    for case_name, state_indices_host, use_state_indices in cases:
+        resident_state = cp.asarray(resident_state_host, dtype=cp.float32)
+        output = cp.empty((n, seq_len, hv, v), dtype=cp.float16)
+        state_indices = cp.asarray(state_indices_host)
+        arrays = {
+            "q": q,
+            "k": k_tensor,
+            "v": v_tensor,
+            "a": a,
+            "b": b,
+            "A_log": A_log,
+            "dt_bias": dt_bias,
+            "h0_in": resident_state,
+            "h0_out": resident_state,
+            "state_indices": state_indices,
+            "context_lengths": context_lengths,
+            "o": output,
+            "tensormap_scratch": tensormap_scratch,
+        }
+        tensors = _to_cute_tensors(arrays)
+        compiled(
+            tensors["q"], tensors["k"], tensors["v"],
+            tensors["a"], tensors["b"],
+            tensors["A_log"], tensors["dt_bias"],
+            tensors["h0_in"], tensors["h0_out"],
+            tensors["state_indices"], cutlass.Int32(use_state_indices),
+            tensors["context_lengths"], tensors["o"],
+            tensors["tensormap_scratch"], cutlass.Int32(0), stream,
+        )
+        cp.cuda.get_current_stream().synchronize()
+
+        active_state = np.zeros((n, hv, k, v), dtype=np.float32)
+        expected_state = resident_state_host.copy()
+        for row in range(n):
+            state_slot = int(state_indices_host[row]) if use_state_indices else row
+            if 0 <= state_slot < state_pool_rows:
+                active_state[row] = resident_state_host[state_slot]
+        output_ref, state_ref = _run_numpy_prefill_reference(
+            q_ref, k_ref, v_ref, a_ref, b_ref,
+            A_log_host, dt_bias_ref, active_state,
+            n, h, hv, k, v, seq_len, scale=k ** -0.5,
+            context_lengths_np=context_lengths_host,
+            use_qk_l2norm=False,
+        )
+        for row in range(n):
+            state_slot = int(state_indices_host[row]) if use_state_indices else row
+            if 0 <= state_slot < state_pool_rows:
+                expected_state[state_slot] = state_ref[row]
+        output_actual = cp.asnumpy(output).astype(np.float32)
+        state_actual = cp.asnumpy(resident_state).astype(np.float32)
+        output_error = float(np.max(np.abs(output_actual - output_ref)))
+        state_error = float(np.max(np.abs(state_actual - expected_state)))
+        print(
+            "[gdn_prefill_blackwell_geforce] %s output max abs error: %.8f; "
+            "final state max abs error: %.8f; tolerance: %.1e"
+            % (case_name, output_error, state_error, tolerance)
+        )
+        np.testing.assert_allclose(
+            output_actual, output_ref, atol=tolerance, rtol=tolerance
+        )
+        np.testing.assert_allclose(
+            state_actual, expected_state, atol=tolerance, rtol=tolerance
+        )
     print("[gdn_prefill_blackwell_geforce] Standalone accuracy check PASSED")
 
 
@@ -2258,7 +2331,7 @@ def _parse_args(argv=None):
     parser.add_argument("--file_name", default="gdn_prefill_blackwell_geforce")
     parser.add_argument("--function_prefix", default="gdn_prefill_blackwell_geforce")
     parser.add_argument("--gpu_arch", default="")
-    parser.add_argument("--n", type=int, default=1)
+    parser.add_argument("--n", type=int, default=2)
     parser.add_argument("--h", type=int, default=16)
     parser.add_argument("--hv", type=int, default=32)
     parser.add_argument("--k", type=int, default=128)

@@ -118,8 +118,9 @@ def linear_with_weights(input: Tensor,
 
 def linear_from_weights(input: Tensor,
                         weights,
-                        rank: int = 3,
+                        rank: Optional[int] = None,
                         name: str = "") -> Tensor:
+    rank = input.ndim if rank is None else rank
     return tensor(current_net().linear_from_weights(input,
                                                     weights,
                                                     rank,
@@ -248,6 +249,11 @@ def empty_sequence(input: Tensor, last_dim: int) -> Tensor:
 
 def gather_last_tokens(input: Tensor, indices: Tensor) -> Tensor:
     return tensor(current_net().gather_last_tokens(input, indices))
+
+
+def gather_token_rows(input: Tensor, indices: Tensor) -> Tensor:
+    """Gather token-major hidden rows along the physical token axis."""
+    return input.gather(indices, axis=0)
 
 
 def gather_nd(input: Tensor,

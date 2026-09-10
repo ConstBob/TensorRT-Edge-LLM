@@ -17,6 +17,7 @@
 
 #include "gdnKernelUtils.cuh"
 
+#include "common/checkMacros.h"
 #include "common/cudaMacros.h"
 #include "common/logger.h"
 
@@ -295,6 +296,165 @@ void launchGdnStateTranspose(void const* src, void* dst, int32_t numBlocks, int3
     dim3 block(32, 8);
     gdnStateTransposeKernel<<<grid, block, 0, stream>>>(
         static_cast<float const*>(src), static_cast<float*>(dst), numBlocks, dim);
+}
+
+__global__ void gdnStateGatherTransposeKernel(float const* __restrict__ src, float* __restrict__ dst,
+    int32_t const* __restrict__ stateIndices, int32_t statePoolRows, int32_t numHeads, int32_t dim)
+{
+    __shared__ float tile[32][33];
+
+    int32_t const matrix = blockIdx.y;
+    int32_t const batch = matrix / numHeads;
+    int32_t const head = matrix % numHeads;
+    int32_t const residentRow = __ldg(stateIndices + batch);
+    bool const validResidentRow = residentRow >= 0 && residentRow < statePoolRows;
+    int32_t const srcMatrix = residentRow * numHeads + head;
+    int32_t const tilesPerRow = (dim + 31) / 32;
+    int32_t const tileRow = blockIdx.x / tilesPerRow;
+    int32_t const tileCol = blockIdx.x % tilesPerRow;
+    int32_t const baseRow = tileRow * 32;
+    int32_t const baseCol = tileCol * 32;
+    int64_t const srcOffset = static_cast<int64_t>(srcMatrix) * dim * dim;
+    int64_t const dstOffset = static_cast<int64_t>(matrix) * dim * dim;
+
+    for (int32_t j = 0; j < 32; j += 8)
+    {
+        int32_t const row = baseRow + threadIdx.y + j;
+        int32_t const col = baseCol + threadIdx.x;
+        if (row < dim && col < dim)
+        {
+            tile[threadIdx.y + j][threadIdx.x]
+                = validResidentRow ? src[srcOffset + static_cast<int64_t>(row) * dim + col] : 0.0F;
+        }
+    }
+    __syncthreads();
+
+    for (int32_t j = 0; j < 32; j += 8)
+    {
+        int32_t const row = baseCol + threadIdx.y + j;
+        int32_t const col = baseRow + threadIdx.x;
+        if (row < dim && col < dim)
+        {
+            dst[dstOffset + static_cast<int64_t>(row) * dim + col] = tile[threadIdx.x][threadIdx.y + j];
+        }
+    }
+}
+
+void launchGdnStateGatherTranspose(void const* src, void* dst, void const* stateIndices, int32_t batchSize,
+    int32_t statePoolRows, int32_t numHeads, int32_t dim, cudaStream_t stream)
+{
+    int32_t const tilesPerRow = (dim + 31) / 32;
+    dim3 const grid(tilesPerRow * tilesPerRow, batchSize * numHeads);
+    dim3 const block(32, 8);
+    gdnStateGatherTransposeKernel<<<grid, block, 0, stream>>>(static_cast<float const*>(src), static_cast<float*>(dst),
+        static_cast<int32_t const*>(stateIndices), statePoolRows, numHeads, dim);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void gdnStateGatherKernel(
+    float const* src, float* dst, int32_t const* stateIndices, int32_t statePoolRows, int64_t rowElements)
+{
+    int32_t const batch = blockIdx.y;
+    int64_t const element = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (element < rowElements)
+    {
+        int32_t const residentRow = stateIndices[batch];
+        dst[static_cast<int64_t>(batch) * rowElements + element] = residentRow >= 0 && residentRow < statePoolRows
+            ? src[static_cast<int64_t>(residentRow) * rowElements + element]
+            : 0.0F;
+    }
+}
+
+void launchGdnStateGather(void const* src, void* dst, void const* stateIndices, int32_t batchSize, int32_t numHeads,
+    int32_t statePoolRows, int32_t kDim, int32_t vDim, cudaStream_t stream)
+{
+    constexpr int32_t blockSize = 256;
+    int64_t const rowElements = static_cast<int64_t>(numHeads) * kDim * vDim;
+    dim3 const grid(static_cast<uint32_t>((rowElements + blockSize - 1) / blockSize), batchSize);
+    gdnStateGatherKernel<<<grid, blockSize, 0, stream>>>(static_cast<float const*>(src), static_cast<float*>(dst),
+        static_cast<int32_t const*>(stateIndices), statePoolRows, rowElements);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void gdnStateIndexedTransposeInPlaceKernel(float* state, int32_t const* __restrict__ stateIndices,
+    int32_t statePoolRows, int32_t numHeads, int32_t dim, int32_t tilesPerRow)
+{
+    __shared__ float tileA[32][33];
+    __shared__ float tileB[32][33];
+
+    int32_t tileRow = 0;
+    int32_t tileCol = blockIdx.x;
+    while (tileCol >= tilesPerRow - tileRow)
+    {
+        tileCol -= tilesPerRow - tileRow;
+        ++tileRow;
+    }
+    tileCol += tileRow;
+
+    int32_t const matrix = blockIdx.y;
+    int32_t const batch = matrix / numHeads;
+    int32_t const head = matrix % numHeads;
+    int32_t const residentRow = __ldg(stateIndices + batch);
+    if (residentRow < 0 || residentRow >= statePoolRows)
+    {
+        return;
+    }
+    int64_t const matrixOffset = static_cast<int64_t>(residentRow * numHeads + head) * dim * dim;
+    int32_t const rowBase = tileRow * 32;
+    int32_t const colBase = tileCol * 32;
+
+    for (int32_t j = 0; j < 32; j += 8)
+    {
+        int32_t const row = rowBase + threadIdx.y + j;
+        int32_t const col = colBase + threadIdx.x;
+        if (row < dim && col < dim)
+        {
+            tileA[threadIdx.y + j][threadIdx.x] = state[matrixOffset + static_cast<int64_t>(row) * dim + col];
+        }
+        if (tileRow != tileCol)
+        {
+            int32_t const peerRow = colBase + threadIdx.y + j;
+            int32_t const peerCol = rowBase + threadIdx.x;
+            if (peerRow < dim && peerCol < dim)
+            {
+                tileB[threadIdx.y + j][threadIdx.x]
+                    = state[matrixOffset + static_cast<int64_t>(peerRow) * dim + peerCol];
+            }
+        }
+    }
+    __syncthreads();
+
+    for (int32_t j = 0; j < 32; j += 8)
+    {
+        int32_t const row = colBase + threadIdx.y + j;
+        int32_t const col = rowBase + threadIdx.x;
+        if (row < dim && col < dim)
+        {
+            state[matrixOffset + static_cast<int64_t>(row) * dim + col] = tileA[threadIdx.x][threadIdx.y + j];
+        }
+        if (tileRow != tileCol)
+        {
+            int32_t const peerRow = rowBase + threadIdx.y + j;
+            int32_t const peerCol = colBase + threadIdx.x;
+            if (peerRow < dim && peerCol < dim)
+            {
+                state[matrixOffset + static_cast<int64_t>(peerRow) * dim + peerCol]
+                    = tileB[threadIdx.x][threadIdx.y + j];
+            }
+        }
+    }
+}
+
+void launchGdnStateIndexedTransposeInPlace(void* state, void const* stateIndices, int32_t batchSize,
+    int32_t statePoolRows, int32_t numHeads, int32_t dim, cudaStream_t stream)
+{
+    int32_t const tilesPerRow = (dim + 31) / 32;
+    int32_t const tilePairs = tilesPerRow * (tilesPerRow + 1) / 2;
+    dim3 const grid(tilePairs, batchSize * numHeads);
+    dim3 const block(32, 8);
+    gdnStateIndexedTransposeInPlaceKernel<<<grid, block, 0, stream>>>(static_cast<float*>(state),
+        static_cast<int32_t const*>(stateIndices), statePoolRows, numHeads, dim, tilesPerRow);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace trt_edgellm

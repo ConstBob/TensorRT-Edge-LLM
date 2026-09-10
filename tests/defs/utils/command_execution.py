@@ -85,13 +85,32 @@ def _read_context_reuse_profile(
         config: TestConfig,
         logger,
         remote_config: Optional[RemoteConfig] = None) -> int:
-    """Return reused prefill tokens and fail when an enabled cache never hits."""
+    """Validate context-cache metrics and return the reused prefill tokens."""
     profile_path = _sync_remote_output_file(config.get_profile_json_file(),
                                             remote_config, logger)
     with open(profile_path, encoding='utf-8') as profile_file:
         profile = json.load(profile_file)
 
     reused_tokens = profile.get('prefill', {}).get('reused_tokens')
+    if config.test_case == 'llm_spec_prefill_evict':
+        context_cache = profile.get('context_cache', {})
+        lookup_bypass_sequences = context_cache.get('lookup_bypass_sequences')
+        committed_publications = context_cache.get('publications',
+                                                   {}).get('committed')
+        if (not isinstance(reused_tokens, int) or reused_tokens < 0
+                or not isinstance(lookup_bypass_sequences, int)
+                or lookup_bypass_sequences <= 0
+                or not isinstance(committed_publications, int)
+                or committed_publications <= 0):
+            raise RuntimeError(
+                "The speculative prefill-eviction profile must report a "
+                "non-negative prefill.reused_tokens value, at least one "
+                "lookup bypass, and at least one committed publication: "
+                f"reused_tokens={reused_tokens!r}, "
+                f"lookup_bypass_sequences={lookup_bypass_sequences!r}, "
+                f"committed_publications={committed_publications!r}")
+        return reused_tokens
+
     if not isinstance(reused_tokens, int) or reused_tokens <= 0:
         raise RuntimeError(
             "Context reuse was enabled but the profile did not report a "

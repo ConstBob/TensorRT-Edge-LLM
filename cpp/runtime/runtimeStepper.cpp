@@ -21,6 +21,7 @@
 #include "common/logger.h"
 
 #include <exception>
+#include <type_traits>
 
 namespace trt_edgellm
 {
@@ -34,7 +35,7 @@ RuntimeStepper::RuntimeStepper(LLMRankRuntime::GenerationSession& session)
     for (int32_t slot = 0; slot < context.activeBatchSize; ++slot)
     {
         int32_t const originalIndex = context.batchIndexMapping[static_cast<size_t>(slot)];
-        mRefs.emplace(originalIndex, acquireHandle());
+        mRefs.emplace(originalIndex, context.residentRefs[static_cast<size_t>(slot)]);
         // Tokens the founding prefill produced inside beginGeneration are not yet reported; the
         // founding prefill tick claims them as its delta.
         size_t const generated = static_cast<size_t>(context.currentGenerateLengths[static_cast<size_t>(slot)]);
@@ -42,65 +43,82 @@ RuntimeStepper::RuntimeStepper(LLMRankRuntime::GenerationSession& session)
     }
 }
 
-ResidentRef RuntimeStepper::acquireHandle()
-{
-    if (!mFreeHandles.empty())
-    {
-        int32_t const handle = mFreeHandles.back();
-        mFreeHandles.pop_back();
-        return ResidentRef{handle, mHandleEpochs[static_cast<size_t>(handle)]};
-    }
-    int32_t const handle = static_cast<int32_t>(mHandleEpochs.size());
-    mHandleEpochs.push_back(0);
-    return ResidentRef{handle, 0};
-}
-
-void RuntimeStepper::releaseHandle(ResidentRef ref)
-{
-    ELLM_CHECK(ref.slot >= 0 && static_cast<size_t>(ref.slot) < mHandleEpochs.size()
-            && mHandleEpochs[static_cast<size_t>(ref.slot)] == ref.epoch,
-        "releaseHandle: the ref is not the handle's live owner.");
-    // The bump is the aliasing guard: a stale copy of this ref can never equal the handle's next
-    // owner, which is the invariant that made row-based refs unsound (a tail seat reused without
-    // any survivor moving handed the next resident an identical ref).
-    ++mHandleEpochs[static_cast<size_t>(ref.slot)];
-    mFreeHandles.push_back(ref.slot);
-}
-
 AdmissionResult RuntimeStepper::admit(AdmissionIntent intent)
 {
     ELLM_CHECK(!mPending.has_value(), "admit: the previous admission has not run its prefill tick yet.");
+    ELLM_CHECK(intent.requestId != 0, "Stepped admission requires a nonzero request ID.");
 
     // The same invariant admitSequence holds at its entry, for the same reason: it must fire
     // before the lease, or a violation would strand leased pages.
     ELLM_CHECK(!mSession.mContext.hasGuidedDecoding, "A guided batch cannot take an admission.");
 
     int32_t const originalIndex = intent.seed.originalIndex;
-    LLMRankRuntime::GenerationSession::AdmissionIntent inner{std::move(intent.seed)};
-    switch (mSession.reserveAdmission(inner))
+    auto const [refEntry, insertedRef] = mRefs.emplace(originalIndex, ResidentRef{});
+    ELLM_CHECK(insertedRef, "admit: original index is already resident.");
+    decltype(mReported)::iterator reportedEntry;
+    try
+    {
+        auto const inserted = mReported.emplace(originalIndex, 0);
+        ELLM_CHECK(inserted.second, "admit: original index already has a reporting watermark.");
+        reportedEntry = inserted.first;
+    }
+    catch (...)
+    {
+        mRefs.erase(refEntry);
+        throw;
+    }
+
+    LLMRankRuntime::GenerationSession::AdmissionIntent inner{std::move(intent.seed), intent.requestId, std::nullopt};
+    AdmitDecision reservation;
+    try
+    {
+        reservation = mSession.reserveAdmission(inner);
+    }
+    catch (...)
+    {
+        mRefs.erase(refEntry);
+        mReported.erase(reportedEntry);
+        throw;
+    }
+    switch (reservation)
     {
     case AdmitDecision::kAdmitted: break;
-    case AdmitDecision::kNoCapacity: return {AdmissionResult::Status::kNoCapacity, {}, {}};
-    case AdmitDecision::kFailed: return {AdmissionResult::Status::kRejected, {}, "reservation failed"};
+    case AdmitDecision::kNoCapacity:
+        mRefs.erase(refEntry);
+        mReported.erase(reportedEntry);
+        return {AdmissionResult::Status::kNoCapacity, {}, {}};
+    case AdmitDecision::kFailed:
+        mRefs.erase(refEntry);
+        mReported.erase(reportedEntry);
+        return {AdmissionResult::Status::kRejected, {}, "reservation failed"};
     }
 
     bool const leased = mSession.mManagedRequest != nullptr;
+    static_assert(std::is_nothrow_move_constructible_v<PendingAdmission>);
     try
     {
         PendingAdmission pending;
-        pending.seat = mSession.seatSlot(std::move(inner.seed));
-        pending.ref = acquireHandle();
+        pending.seat = mSession.seatSlot(std::move(inner));
+        pending.ref = mSession.mContext.residentRefs[static_cast<size_t>(pending.seat.slot)];
         pending.originalIndex = originalIndex;
         pending.leased = leased;
-        mRefs.emplace(originalIndex, pending.ref);
+        refEntry->second = pending.ref;
         // The seat's working history (prompt from prefillStart on) is not generated output.
-        mReported.emplace(originalIndex, mSession.mContext.tokenIds[static_cast<size_t>(pending.seat.slot)].size());
-        mPending = std::move(pending);
+        reportedEntry->second = mSession.mContext.tokenIds[static_cast<size_t>(pending.seat.slot)].size();
+        mPending.emplace(std::move(pending));
     }
     catch (std::exception const& error)
     {
         // seatSlot already retracted the lease on the throwing path; nothing is resident.
+        mRefs.erase(refEntry);
+        mReported.erase(reportedEntry);
         return {AdmissionResult::Status::kRejected, {}, error.what()};
+    }
+    catch (...)
+    {
+        mRefs.erase(refEntry);
+        mReported.erase(reportedEntry);
+        throw;
     }
     return {AdmissionResult::Status::kAdmitted, mPending->ref, {}};
 }
@@ -113,10 +131,14 @@ StepResult RuntimeStepper::prefill(ImmutablePrefillBatch const& batch)
         ELLM_CHECK(batch.target == mPending->ref, "prefill: the view does not name the pending admission.");
         PendingAdmission pending = std::move(*mPending);
         mPending.reset();
+        int32_t const slot = pending.seat.slot;
         AdmitDecision const decision = mSession.prefillSeated(std::move(pending.seat));
-        // kFailed left the slot terminal from birth; the step itself executed, and the seat's
-        // (empty, kError) result surfaces through the eviction that files it.
-        result.ok = true;
+        bool const terminal = slot >= 0 && slot < mSession.mContext.activeBatchSize
+            && mSession.mContext.finishedStates[static_cast<size_t>(slot)] != 0;
+        // A failed prefill and a lookahead token that is already terminal must be filed in this
+        // tick. Leaving either resident until decode would execute a row that has no valid next
+        // state, or advance once past EOS/length.
+        result.ok = !terminal || mSession.performBatchEvictAndSnapshot();
         result.publishedPrefix = pending.leased && decision == AdmitDecision::kAdmitted;
     }
     else
@@ -131,9 +153,9 @@ StepResult RuntimeStepper::prefill(ImmutablePrefillBatch const& batch)
 StepResult RuntimeStepper::decode(ImmutableDecodeBatch const& batch)
 {
     ELLM_CHECK(!mPending.has_value(), "decode: the pending admission must run its prefill tick first.");
-    std::vector<ResidentRef> const liveResidents = residents();
-    ELLM_CHECK(batch.residents == liveResidents,
-        "decode: the view must name every live resident in slot order; V0 runs a single cohort.");
+    ELLM_CHECK(batch.residents == residents(),
+        "decode: the view must name every live resident in execution order; the prefill-first scheduler runs one "
+        "cohort.");
     StepResult result;
     result.ok = mSession.advance();
     finalizeResult(result);
@@ -157,6 +179,19 @@ std::vector<ResidentRef> RuntimeStepper::residents() const
 void RuntimeStepper::finalizeResult(StepResult& result)
 {
     DecodingInferenceContext& context = mSession.mContext;
+    result.stepId = context.scheduledStep.id;
+    result.participants.reserve(context.scheduledStep.sequences.size());
+    result.execution.reserve(context.scheduledStep.sequences.size());
+    for (ScheduledSequence const& sequence : context.scheduledStep.sequences)
+    {
+        result.participants.push_back(sequence.identity);
+        result.execution.push_back(ScheduledSequenceDescriptor{sequence.identity, sequence.work, sequence.queryLength,
+            sequence.pastLength, sequence.selectLastTokenLogits});
+    }
+    if (!context.scheduledStep.sequences.empty())
+    {
+        result.work = context.scheduledStep.sequences.front().work;
+    }
 
     // Deltas: tokens a surviving resident holds beyond its reported watermark. An evicted
     // resident's final tokens travel inside its BatchResult snapshot instead.
@@ -176,9 +211,9 @@ void RuntimeStepper::finalizeResult(StepResult& result)
         }
     }
 
-    // Finished: everything the operation's eviction filed. Releasing the handle here is what makes
+    // Finished: everything the operation's eviction filed. Releasing the resident slot makes
     // the finished ref part of this commit unit: from the caller's next operation on, the ref is
-    // provably stale. Dense-row compaction needs no reporting -- refs never tracked rows.
+    // provably stale. Dense-row compaction needs no reporting because refs name physical rows.
     for (auto& [originalIndex, batchResult] : mSession.takeCompletedAtOrAbove(0))
     {
         auto const it = mRefs.find(originalIndex);
@@ -187,7 +222,6 @@ void RuntimeStepper::finalizeResult(StepResult& result)
             LOG_WARNING("Stepper: a result for original index %d has no ref; dropping it.", originalIndex);
             continue;
         }
-        releaseHandle(it->second);
         result.finished.emplace_back(it->second, std::move(batchResult));
         mRefs.erase(it);
         mReported.erase(originalIndex);
@@ -195,11 +229,11 @@ void RuntimeStepper::finalizeResult(StepResult& result)
 }
 
 std::unique_ptr<SteppedRequest> SteppedRequest::begin(LLMRankRuntime& runtime, LLMGenerationRequest prepared,
-    cudaStream_t stream, LLMRankRuntime::TokenBroadcastFn tokenBroadcast, int32_t parallelRank)
+    RequestId requestId, cudaStream_t stream, LLMRankRuntime::TokenBroadcastFn tokenBroadcast, int32_t parallelRank)
 {
     std::unique_ptr<SteppedRequest> stepped(new SteppedRequest(runtime, std::move(prepared), stream));
     stepped->mGeneration = runtime.beginGeneration(stepped->mRequest, stepped->mScratchResponse, stream,
-        /*outputThinkerEmbeddings=*/false, std::move(tokenBroadcast), parallelRank);
+        /*outputThinkerEmbeddings=*/false, std::move(tokenBroadcast), parallelRank, requestId);
     if (stepped->mGeneration == nullptr)
     {
         return nullptr;
@@ -222,10 +256,12 @@ SteppedRequest::SteppedRequest(LLMRankRuntime& runtime, LLMGenerationRequest pre
 
 SteppedRequest::~SteppedRequest() = default;
 
-AdmissionIntent SteppedRequest::buildIntent(LLMGenerationRequest const& request, int32_t originalIndex)
+AdmissionIntent SteppedRequest::buildIntent(
+    LLMGenerationRequest const& request, int32_t originalIndex, RequestId requestId)
 {
     AdmissionIntent intent;
-    intent.seed = mSession->buildAdmissionIntent(request, originalIndex).seed;
+    intent.requestId = requestId;
+    intent.seed = mSession->buildAdmissionIntent(request, originalIndex, requestId).seed;
     return intent;
 }
 
@@ -234,9 +270,9 @@ std::vector<ResidentRef> SteppedRequest::residents() const
     return mStepper->residents();
 }
 
-AdmissionResult SteppedRequest::admit(LLMGenerationRequest const& request, int32_t originalIndex)
+AdmissionResult SteppedRequest::admit(LLMGenerationRequest const& request, int32_t originalIndex, RequestId requestId)
 {
-    return mStepper->admit(buildIntent(request, originalIndex));
+    return mStepper->admit(buildIntent(request, originalIndex, requestId));
 }
 
 StepResult SteppedRequest::prefill(ImmutablePrefillBatch const& batch)
@@ -262,6 +298,13 @@ bool SteppedRequest::finish(LLMGenerationResponse& response)
     mStepper.reset();
     mSession.reset();
     return mRuntime.finishGeneration(*mGeneration, mRequest, response, mStream);
+}
+
+void SteppedRequest::abort() noexcept
+{
+    mStepper.reset();
+    mSession.reset();
+    mGeneration.reset();
 }
 
 } // namespace rt

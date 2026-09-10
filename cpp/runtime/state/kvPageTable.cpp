@@ -19,6 +19,7 @@
 
 #include "common/checkMacros.h"
 #include "common/pagedKvTypes.h"
+#include "kernels/dart/dartGatherKernels.h"
 
 #include <algorithm>
 #include <unordered_set>
@@ -60,7 +61,6 @@ KVPageTable::KVPageTable(int32_t maxBatch, int32_t maxPagesPerSeq, int32_t numPa
 
     size_t const tableSize = static_cast<size_t>(maxBatch) * kKV_HALVES * maxPagesPerSeq;
     mHost.assign(tableSize, kUNUSED_PAGE_ENTRY);
-    mHostScratch.resize(mHost.size(), kUNUSED_PAGE_ENTRY);
     // Device storage is uninitialized until the first upload, so every row initially needs a copy.
     mDirtyRows.resize(static_cast<size_t>(maxBatch), 1U);
     mUploadedHost = mHost;
@@ -238,113 +238,6 @@ void KVPageTable::clearEntry(int32_t slot, int32_t logicalPage)
     }
     setHostValue(kIndex, kUNUSED_PAGE_ENTRY);
     setHostValue(kIndex + mMaxPagesPerSeq, kUNUSED_PAGE_ENTRY);
-}
-
-void KVPageTable::compactRows(std::vector<int32_t> const& oldToNew, int32_t newBatch)
-{
-    check::check(
-        oldToNew.size() <= static_cast<size_t>(mMaxBatch), "KVPageTable::compactRows: mapping exceeds max batch size.");
-    check::check(newBatch >= 0 && newBatch <= mMaxBatch, "KVPageTable::compactRows: new batch size is out of range.");
-
-    std::vector<bool> destinationSeen(static_cast<size_t>(newBatch), false);
-    for (int32_t const destination : oldToNew)
-    {
-        if (destination < 0)
-        {
-            check::check(destination == -1, "KVPageTable::compactRows: invalid retired-slot marker.");
-            continue;
-        }
-        check::check(destination < newBatch, "KVPageTable::compactRows: destination is out of range.");
-        check::check(!destinationSeen[static_cast<size_t>(destination)],
-            "KVPageTable::compactRows: destination appears more than once.");
-        destinationSeen[static_cast<size_t>(destination)] = true;
-    }
-    check::check(std::all_of(destinationSeen.begin(), destinationSeen.end(), [](bool seen) { return seen; }),
-        "KVPageTable::compactRows: mapping does not cover every destination.");
-
-    if (mMode == Mode::kSparseWindow)
-    {
-        std::vector<std::unordered_map<int32_t, int32_t>> compacted(static_cast<size_t>(mMaxBatch));
-        for (size_t oldSlot = 0; oldSlot < oldToNew.size(); ++oldSlot)
-        {
-            int32_t const newSlot = oldToNew[oldSlot];
-            if (newSlot >= 0)
-            {
-                compacted[static_cast<size_t>(newSlot)] = mSparseLogicalPages[oldSlot];
-            }
-        }
-        for (int32_t slot = 0; slot < mMaxBatch; ++slot)
-        {
-            std::unordered_map<int32_t, int32_t> const oldMappings
-                = std::move(mSparseLogicalPages[static_cast<size_t>(slot)]);
-            for (auto const& [logicalPage, page] : oldMappings)
-            {
-                (void) page;
-                size_t const kIndex = static_cast<size_t>(slot) * kKV_HALVES * mMaxPagesPerSeq + logicalPage;
-                setHostValue(kIndex, kUNUSED_PAGE_ENTRY);
-                setHostValue(kIndex + mMaxPagesPerSeq, kUNUSED_PAGE_ENTRY);
-            }
-            mSparseActivePages[static_cast<size_t>(slot)].clear();
-        }
-        for (int32_t slot = 0; slot < newBatch; ++slot)
-        {
-            for (auto const& [logicalPage, page] : compacted[static_cast<size_t>(slot)])
-            {
-                setEntry(slot, logicalPage, page);
-            }
-        }
-        mIsIdentity = false;
-        return;
-    }
-
-    std::fill(mHostScratch.begin(), mHostScratch.end(), kUNUSED_PAGE_ENTRY);
-    size_t const rowElements = static_cast<size_t>(2 * mMaxPagesPerSeq);
-    for (size_t oldSlot = 0; oldSlot < oldToNew.size(); ++oldSlot)
-    {
-        int32_t const newSlot = oldToNew[oldSlot];
-        if (newSlot < 0)
-        {
-            continue;
-        }
-        std::copy_n(mHost.data() + oldSlot * rowElements, rowElements,
-            mHostScratch.data() + static_cast<size_t>(newSlot) * rowElements);
-    }
-    for (size_t index = 0; index < mHostScratch.size(); ++index)
-    {
-        setHostValue(index, mHostScratch[index]);
-    }
-    mIsIdentity = false;
-}
-
-void KVPageTable::swapRows(int32_t slotA, int32_t slotB)
-{
-    ELLM_CHECK(slotA >= 0 && slotA < mMaxBatch && slotB >= 0 && slotB < mMaxBatch,
-        "KVPageTable::swapRows: slot is out of range.");
-    // Sparse-window rows carry per-slot page-set maps this exchange does not move; swapping only
-    // the flat rows would silently desynchronize them, so a sparse table refuses.
-    ELLM_CHECK(mMode == Mode::kDense, "KVPageTable::swapRows: only dense tables can exchange rows.");
-    if (slotA == slotB)
-    {
-        return;
-    }
-
-    // Element-wise through setHostValue, not a raw swap_ranges: the entry-level dirty bookkeeping
-    // (mDirtyIndices / mUploadedHost) is what uploadDirty() and later setEntry/setRow calls trust,
-    // and a raw swap would leave it blind to the exchange.
-    size_t const rowElements = static_cast<size_t>(kKV_HALVES * mMaxPagesPerSeq);
-    size_t const offsetA = static_cast<size_t>(slotA) * rowElements;
-    size_t const offsetB = static_cast<size_t>(slotB) * rowElements;
-    for (size_t j = 0; j < rowElements; ++j)
-    {
-        int32_t const a = mHost[offsetA + j];
-        int32_t const b = mHost[offsetB + j];
-        setHostValue(offsetA + j, b);
-        setHostValue(offsetB + j, a);
-    }
-
-    // Even if the two rows happened to be identical, the identity mapping is no longer something
-    // this table can promise; isIdentity() is documented to fail closed.
-    mIsIdentity = false;
 }
 
 bool KVPageTable::checkInvariants(std::string& error) const
@@ -525,6 +418,30 @@ void KVPageTable::uploadDirty(cudaStream_t stream)
         CUDA_CHECK(cudaEventRecord(mUploadComplete, stream));
         mUploadPending = true;
     }
+}
+
+void KVPageTable::gatherRows(
+    rt::Tensor& destination, rt::Tensor const& residentSlots, int32_t numRows, cudaStream_t stream) const
+{
+    ELLM_CHECK(numRows >= 0 && numRows <= mMaxBatch, "KVPageTable::gatherRows: row count is out of range.");
+    ELLM_CHECK(residentSlots.getDataType() == nvinfer1::DataType::kINT32,
+        "KVPageTable::gatherRows: resident slots must be INT32.");
+    ELLM_CHECK(
+        residentSlots.getShape().volume() >= numRows, "KVPageTable::gatherRows: resident slot tensor is too small.");
+    ELLM_CHECK(
+        destination.getDataType() == nvinfer1::DataType::kINT32, "KVPageTable::gatherRows: destination must be INT32.");
+    int64_t const requiredBytes = static_cast<int64_t>(numRows) * 2 * mMaxPagesPerSeq * sizeof(int32_t);
+    ELLM_CHECK(
+        destination.getMemoryCapacity() >= requiredBytes, "KVPageTable::gatherRows: destination storage is too small.");
+    ELLM_CHECK(
+        destination.reshape({numRows, 2, mMaxPagesPerSeq}), "KVPageTable::gatherRows: destination reshape failed.");
+    if (numRows == 0)
+    {
+        return;
+    }
+    int64_t const rowBytes = static_cast<int64_t>(2) * mMaxPagesPerSeq * sizeof(int32_t);
+    kernel::gatherRows(destination.rawPointer(), mDevice.rawPointer(), residentSlots.dataPointer<int32_t>(), numRows,
+        rowBytes, stream);
 }
 
 rt::Tensor const& KVPageTable::kernelView() const

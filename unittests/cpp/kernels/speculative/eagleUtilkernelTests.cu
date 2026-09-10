@@ -588,7 +588,7 @@ TEST(EagleKernels, PrepareEagleAcceptDecodeTokenInputs)
     int32_t expectedContextLenBatch0 = 100 + maxAcceptedTokenNum; // 108
 
     // Expected for batch 1: 3 tokens
-    int64_t expectedSelectIndexBatch1 = 2;
+    int64_t expectedSelectIndexBatch1 = maxAcceptedTokenNum + 2;
     int32_t expectedContextLenBatch1 = 200 + maxAcceptedTokenNum; // 208
 
     for (int32_t batchSize : {1, 2, 4, 8})
@@ -632,7 +632,7 @@ TEST(EagleKernels, PrepareEagleAcceptDecodeTokenInputs)
         // Verify all batches have correct select indices and context lengths
         for (int32_t b = 0; b < batchSize; b++)
         {
-            EXPECT_EQ(actualSelectIndices[b], inputAcceptedTokenNums[b] - 1);
+            EXPECT_EQ(actualSelectIndices[b], b * maxAcceptedTokenNum + inputAcceptedTokenNums[b] - 1);
             // Context length uses maxAcceptedTokenNum (padded length) for correct XQA attention range
             EXPECT_EQ(actualContextLengths[b], inputSequenceStartIndices[b] + maxAcceptedTokenNum);
         }
@@ -966,6 +966,13 @@ static rt::Tensor uploadLayerInfos(std::vector<KVLayerInfo> const& hostInfos, cu
     return deviceInfos;
 }
 
+static rt::Tensor uploadStateIndices(std::vector<int32_t> const& hostIndices)
+{
+    rt::Tensor result({static_cast<int64_t>(hostIndices.size())}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice<int32_t>(result, hostIndices);
+    return result;
+}
+
 // ============================================================================
 // Test 8: eagleBaseAssembleHiddenState (split out from the old combined kernel)
 // Description: Test inplace compaction of accepted tokens from stride=draftTreeSize to stride=maxDepth
@@ -1137,9 +1144,11 @@ TEST(EagleKernels, EagleBaseCommitKVCacheHeterogeneousLayers)
         pageTable.setIdentity();
         pageTable.upload(stream);
 
-        eagleBaseCommitKVCache(acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice,
+        auto const stateIndicesDevice = uploadStateIndices({0});
+        eagleBaseCommitKVCache(acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice, stateIndicesDevice,
             static_cast<KVLayerInfo const*>(deviceInfos.rawPointer()), numLayers, headDim, maxKVHeads, activeBatchSize,
-            maxDepth, DataType::kHALF, stream, pageTable.kernelView().dataPointer<int32_t>(), numPages, maxPagesPerSeq);
+            maxBatchSize, maxDepth, DataType::kHALF, stream, pageTable.kernelView().dataPointer<int32_t>(), numPages,
+            maxPagesPerSeq);
 
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -1183,10 +1192,9 @@ TEST(EagleKernels, EagleBaseCommitKVCacheHeterogeneousLayers)
 }
 
 // ============================================================================
-// Test 8e: eagleBaseCommitKVCache with a non-identity (scrambled) page table
-// Description: a real permutation must route each slot's accepted-KV writes/reads through the
-// physical pages named by the table. This swaps the two slots' physical K/V pages and straddles
-// a page boundary on slot 0.
+// Test 8e: eagleBaseCommitKVCache with non-identity execution-to-resident mapping
+// Description: logical rows [0, 1] execute resident slots [1, 0]. Accepted-KV reads and writes
+// must use the resident page-table rows while per-sequence lengths remain logical-row aligned.
 // ============================================================================
 TEST(EagleKernels, EagleBaseCommitKVCacheNonIdentityPageTableRemapsPhysicalPages)
 {
@@ -1251,19 +1259,17 @@ TEST(EagleKernels, EagleBaseCommitKVCacheNonIdentityPageTableRemapsPhysicalPages
     copyHostToDevice<int32_t>(acceptLengthsDevice, inputAcceptLengths);
     copyHostToDevice<int32_t>(kvCacheLengthsDevice, inputKvCacheLengths);
 
-    // Full swap: slot 0's logical pages [0,1] land on physical pages [2,3] (slot 1's identity
-    // range); slot 1's logical pages [0,1] land on physical pages [0,1] (slot 0's identity range).
-    // Neither slot maps to its own identity range, and no physical page is targeted twice.
+    // The page table is resident-slot indexed. The state-index permutation below maps logical
+    // row 0 to resident slot 1 and logical row 1 to resident slot 0.
     rt::KVPageTable pageTable(maxBatchSize, maxPagesPerSeq, numPages);
-    std::vector<int32_t> const slot0Pages = {2, 3};
-    std::vector<int32_t> const slot1Pages = {0, 1};
-    pageTable.setRow(0, slot0Pages.data(), maxPagesPerSeq);
-    pageTable.setRow(1, slot1Pages.data(), maxPagesPerSeq);
+    pageTable.setIdentity();
     pageTable.upload(stream);
 
-    eagleBaseCommitKVCache(acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice,
+    auto const stateIndicesDevice = uploadStateIndices({1, 0});
+    eagleBaseCommitKVCache(acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice, stateIndicesDevice,
         static_cast<KVLayerInfo const*>(deviceInfos.rawPointer()), numLayers, headDim, maxKVHeads, activeBatchSize,
-        maxDepth, DataType::kHALF, stream, pageTable.kernelView().dataPointer<int32_t>(), numPages, maxPagesPerSeq);
+        maxBatchSize, maxDepth, DataType::kHALF, stream, pageTable.kernelView().dataPointer<int32_t>(), numPages,
+        maxPagesPerSeq);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     auto const host = copyDeviceToHost<half>(layerCache);
@@ -1340,9 +1346,11 @@ TEST(EagleKernels, EagleBaseCommitKVCacheSkipsWrongPlanePageIds)
     copyHostToDevice<int32_t>(pageTable,
         {4, 1, rt::kUNUSED_PAGE_ENTRY, rt::kUNUSED_PAGE_ENTRY, rt::kUNUSED_PAGE_ENTRY, rt::kUNUSED_PAGE_ENTRY, 0, 6});
 
-    eagleBaseCommitKVCache(acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice,
+    auto const stateIndicesDevice = uploadStateIndices({0, 1});
+    eagleBaseCommitKVCache(acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice, stateIndicesDevice,
         static_cast<KVLayerInfo const*>(deviceInfos.rawPointer()), /*numLayers=*/1, headDim, numKVHeads,
-        activeBatchSize, maxDepth, DataType::kHALF, stream, pageTable.dataPointer<int32_t>(), numPages, maxPagesPerSeq);
+        activeBatchSize, activeBatchSize, maxDepth, DataType::kHALF, stream, pageTable.dataPointer<int32_t>(), numPages,
+        maxPagesPerSeq);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     auto const host = copyDeviceToHost<half>(layerCache);
@@ -1429,9 +1437,11 @@ TEST(EagleKernels, EagleBaseCommitKVCacheAcceptRollbackTreeNodes)
     pageTable.setIdentity();
     pageTable.upload(stream);
 
-    eagleBaseCommitKVCache(acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice,
+    auto const stateIndicesDevice = uploadStateIndices({0, 1});
+    eagleBaseCommitKVCache(acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice, stateIndicesDevice,
         static_cast<KVLayerInfo const*>(deviceInfos.rawPointer()), numLayers, headDim, maxKVHeads, activeBatchSize,
-        maxDepth, DataType::kHALF, stream, pageTable.kernelView().dataPointer<int32_t>(), numPages, maxPagesPerSeq);
+        maxBatchSize, maxDepth, DataType::kHALF, stream, pageTable.kernelView().dataPointer<int32_t>(), numPages,
+        maxPagesPerSeq);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     auto const host = copyDeviceToHost<half>(layerCache);

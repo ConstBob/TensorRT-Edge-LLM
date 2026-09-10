@@ -133,7 +133,9 @@ def _requires_ddtree_state_inputs(model_dir):
 
 def _verify_tree_base_inputs(mode, onnx_path, model_dir):
     input_names = _onnx_graph_input_names(onnx_path)
-    expected_attention_inputs = {"attention_pos_id", "attention_mask"}
+    expected_attention_inputs = {
+        "attention_position_ids", "packed_attention_mask"
+    }
     missing = expected_attention_inputs - input_names
     if missing:
         pytest.fail(

@@ -286,6 +286,15 @@ KVLayerConfig const& KVCacheManager::getLayerConfig(int32_t attnLayerIdx) const 
     return mConfig.layerConfigs[attnLayerIdx];
 }
 
+KVLayerStorageMetadata KVCacheManager::getLayerStorageMetadata(int32_t attnLayerIdx) const noexcept
+{
+    KVLayerConfig const& layer = mConfig.layerConfigs[attnLayerIdx];
+    bool const reduced
+        = mConfig.useBoundedSwaKVCache && isReducedKvCacheCapacity(layer.kvCacheCapacity, mConfig.maxSequenceLength);
+    return {reduced ? KVCacheStorageKind::kReducedSwa : KVCacheStorageKind::kFull, numPages(attnLayerIdx),
+        computeMaxPagesPerSeq(mConfig.maxSequenceLength), layer.numKVHeads, layer.headDim};
+}
+
 int32_t KVCacheManager::numLayers() const noexcept
 {
     return mConfig.numAttentionLayers;

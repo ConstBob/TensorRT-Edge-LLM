@@ -20,9 +20,9 @@ from typing import Any, Dict
 
 from tensorrt_edgellm.dflash import DFlashVersion
 
-from ...ops.functional.attention import KV_PAGE_SIZE
 from .. import contracts
 from ..config import LAYER_ATTN, LAYER_GDN, LAYER_MAMBA, DeviceConfig
+from ..ragged import builder_config_fields, checked_kv_pool_pages
 
 
 def normalize_rope_scaling(rope_scaling):
@@ -191,6 +191,7 @@ def build_runtime_config(cfg: DeviceConfig, args) -> Dict[str, Any]:
             "recurrent_state_num_heads": gc.num_value_heads,
             "recurrent_state_head_dim": gc.key_head_dim,
             "recurrent_state_size": gc.value_head_dim,
+            "recurrent_spec_verify_mode": "snapshot",
             "conv_dim": gc.conv_dim,
             "conv_kernel": gc.conv_kernel,
             "use_rope": cfg.num_attn_layers > 0,
@@ -323,9 +324,9 @@ def build_runtime_config(cfg: DeviceConfig, args) -> Dict[str, Any]:
     if cfg.eagle_base:
         out["eagle_hidden_state_layers"] = list(cfg.eagle3_target_layer_ids)
 
-    max_kv_pool_pages = args.max_batch_size * (
-        (args.max_kv_cache_capacity + KV_PAGE_SIZE - 1) // KV_PAGE_SIZE)
-    out["builder_config"] = {
+    _, max_kv_pool_pages = checked_kv_pool_pages(args.max_batch_size,
+                                                 args.max_kv_cache_capacity)
+    builder_config = {
         "tp_size": args.tp_size,
         "max_input_len": args.max_input_len,
         "spec_draft": args.resolved_spec_role == contracts.SpecRole.DRAFT,
@@ -334,9 +335,13 @@ def build_runtime_config(cfg: DeviceConfig, args) -> Dict[str, Any]:
         "max_lora_rank": args.max_lora_rank,
         "max_kv_cache_capacity": args.max_kv_cache_capacity,
         "max_kv_pool_pages": max_kv_pool_pages,
-        "max_verify_tree_size": args.max_verify_tree_size,
-        "max_draft_tree_size": args.max_draft_tree_size,
     }
+    builder_config.update(builder_config_fields(cfg, args))
+    if args.resolved_spec_role == contracts.SpecRole.BASE:
+        builder_config["max_verify_tree_size"] = args.max_verify_tree_size
+    if args.resolved_spec_role == contracts.SpecRole.DRAFT:
+        builder_config["max_draft_tree_size"] = args.max_draft_tree_size
+    out["builder_config"] = builder_config
     if args.tp_size > 1:
         overrides = _tp_rank_overrides(out, args.tp_size)
         out["rank_configs"] = [{

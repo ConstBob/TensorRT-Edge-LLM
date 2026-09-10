@@ -58,13 +58,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ...config import LAYER_GDN, GdnConfig, ModelConfig
-from ..default.modeling_default import MLP, OnnxSpec, RMSNorm
-from ..linear import (AWQLinear, ColumnParallelLinear, FP16Linear, GPTQLinear,
-                      ModelOptAWQPrepackedLinear, NVFP4LinearMethod,
+from ...dflash import DFlashVersion
+from ..default.modeling_default import (MLP, OnnxSpec, RMSNorm,
+                                        _concat_hidden_in_provider_order)
+from ..linear import (ColumnParallelLinear, FP16Linear, NVFP4LinearMethod,
                       ReplicatedLinear, TPMode, is_nvfp4_linear, make_linear)
 from ..ops import (KV_PAGE_SIZE, attention_plugin, causal_conv1d,
                    causal_conv1d_with_intermediate, gated_delta_net,
-                   gated_delta_net_with_intermediate, int4_gemm_plugin_version)
+                   gated_delta_net_with_intermediate)
 
 __all__ = ["Qwen3_5CausalLM"]
 
@@ -106,7 +107,8 @@ class Qwen3_5RMSNorm(nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance +
                                                     self.variance_epsilon)
         hidden_states = hidden_states.to(input_dtype)
-        return (1.0 + self.weight.to(input_dtype)) * hidden_states
+        weight = self.weight.to(input_dtype)
+        return (torch.ones_like(weight) + weight) * hidden_states
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +234,7 @@ class GdnMixer(nn.Module):
         conv_state: torch.Tensor,
         recurrent_state: torch.Tensor,
         context_lengths: torch.Tensor,
-        spec_verify_phase_marker: "torch.Tensor | None" = None,
+        execution_phase_marker: "torch.Tensor | None" = None,
         tree_parent_ids: "torch.Tensor | None" = None,
         tree_depths: "torch.Tensor | None" = None,
         collect_intermediate_states: bool = False,
@@ -267,7 +269,7 @@ class GdnMixer(nn.Module):
                 padding=self.conv_kernel - 1,
                 dilation=1,
                 groups=self.conv_dim,
-                spec_verify_phase_marker=spec_verify_phase_marker,
+                execution_phase_marker=execution_phase_marker,
                 tree_parent_ids=tree_parent_ids,
                 tree_depths=tree_depths,
                 use_ddtree_state=tree_parent_ids is not None,
@@ -313,7 +315,7 @@ class GdnMixer(nn.Module):
                 context_lengths,
                 self.k_dim,
                 self.v_dim,
-                spec_verify_phase_marker=spec_verify_phase_marker,
+                execution_phase_marker=execution_phase_marker,
                 tree_parent_ids=tree_parent_ids,
                 tree_depths=tree_depths,
                 use_ddtree_state=tree_parent_ids is not None,
@@ -339,6 +341,119 @@ class GdnMixer(nn.Module):
 
         return (output, conv_state_out, recurrent_state_out,
                 intermediate_conv_state_out, intermediate_recurrent_state_out)
+
+    def forward_ragged(
+        self,
+        hidden_states: torch.Tensor,
+        conv_state: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        query_start_offsets: torch.Tensor,
+        query_lengths: torch.Tensor,
+        state_indices: torch.Tensor,
+        execution_phase_marker: torch.Tensor,
+        context_sequence_count_carrier: torch.Tensor,
+        tree_parent_ids: "torch.Tensor | None" = None,
+        tree_depths: "torch.Tensor | None" = None,
+        use_intermediate_state: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor]:
+        if hasattr(self, "in_proj_fused"):
+            fused_out = self.in_proj_fused(hidden_states)
+            mixed_qkv, z, b, a = fused_out.split(self._fused_splits, dim=-1)
+        elif hasattr(self, "in_proj_qkvz"):
+            qkvz_out = self.in_proj_qkvz(hidden_states)
+            mixed_qkv, z = qkvz_out.split(self._fused_splits[:2], dim=-1)
+            b, a = self.in_proj_ba(hidden_states).split(self._fused_splits[2:],
+                                                        dim=-1)
+        else:
+            mixed_qkv = self.in_proj_qkv(hidden_states)
+            z = self.in_proj_z(hidden_states)
+            b = self.in_proj_b(hidden_states)
+            a = self.in_proj_a(hidden_states)
+
+        if not use_intermediate_state:
+            mixed_qkv, conv_state_out, intermediate_conv_state = causal_conv1d(
+                mixed_qkv,
+                self.conv1d.weight,
+                self.conv1d.bias,
+                conv_state,
+                query_lengths,
+                stride=1,
+                padding=self.conv_kernel - 1,
+                dilation=1,
+                groups=self.conv_dim,
+                query_start_offsets=query_start_offsets,
+                state_indices=state_indices,
+                execution_phase_marker=execution_phase_marker,
+                context_sequence_count_carrier=context_sequence_count_carrier)
+        else:
+            mixed_qkv, conv_state_out, intermediate_conv_state = causal_conv1d_with_intermediate(
+                mixed_qkv,
+                self.conv1d.weight,
+                self.conv1d.bias,
+                conv_state,
+                query_lengths,
+                query_start_offsets,
+                state_indices,
+                stride=1,
+                padding=self.conv_kernel - 1,
+                dilation=1,
+                groups=self.conv_dim,
+                execution_phase_marker=execution_phase_marker,
+                context_sequence_count_carrier=context_sequence_count_carrier,
+                tree_parent_ids=tree_parent_ids,
+                tree_depths=tree_depths,
+                use_ddtree_state=tree_parent_ids is not None)
+        mixed_qkv = F.silu(mixed_qkv)
+        query, key, value = mixed_qkv.split(
+            [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        query = query.unflatten(-1, (self.num_k_heads, self.k_dim))
+        key = key.unflatten(-1, (self.num_k_heads, self.k_dim))
+        value = value.unflatten(-1, (self.num_v_heads, self.v_dim))
+        if not use_intermediate_state:
+            core_attn_out, recurrent_state_out, intermediate_recurrent_state = gated_delta_net(
+                query,
+                key,
+                value,
+                a,
+                b,
+                self.A_log.to(torch.float32),
+                self.dt_bias,
+                recurrent_state,
+                query_lengths,
+                self.k_dim,
+                self.v_dim,
+                query_start_offsets=query_start_offsets,
+                state_indices=state_indices,
+                execution_phase_marker=execution_phase_marker,
+                context_sequence_count_carrier=context_sequence_count_carrier)
+        else:
+            core_attn_out, recurrent_state_out, intermediate_recurrent_state = gated_delta_net_with_intermediate(
+                query,
+                key,
+                value,
+                a,
+                b,
+                self.A_log.to(torch.float32),
+                self.dt_bias,
+                recurrent_state,
+                query_lengths,
+                query_start_offsets,
+                state_indices,
+                self.k_dim,
+                self.v_dim,
+                execution_phase_marker=execution_phase_marker,
+                context_sequence_count_carrier=context_sequence_count_carrier,
+                tree_parent_ids=tree_parent_ids,
+                tree_depths=tree_depths,
+                use_ddtree_state=tree_parent_ids is not None)
+        core_attn_out = self.norm(core_attn_out.reshape(-1, self.v_dim))
+        core_attn_out = core_attn_out * F.silu(z.reshape(-1, self.v_dim))
+        core_attn_out = core_attn_out.reshape(hidden_states.shape[0],
+                                              self.value_dim)
+        return (self.out_proj(core_attn_out), conv_state_out,
+                recurrent_state_out, intermediate_conv_state,
+                intermediate_recurrent_state)
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +487,6 @@ class GatedAttention(nn.Module):
         self.attention_scale = config.attention_scaling
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
         self.sliding_window_size = -1
-        # Skip-softmax (BLASST) calibrated scale factor S (0.0 = disabled).
         self.skip_softmax_scale_factor = config.skip_softmax_scale_factor
         module_prefix = f"layers.{layer_idx}.self_attn"
 
@@ -395,10 +509,6 @@ class GatedAttention(nn.Module):
                                   bias=config.attention_bias,
                                   module_name=f"{module_prefix}.v_proj",
                                   tp_mode=TPMode.COL)
-        self._materialize_int4_v = (isinstance(
-            self.v_proj, (AWQLinear, GPTQLinear, ModelOptAWQPrepackedLinear))
-                                    and int4_gemm_plugin_version() == 2)
-
         if self.enable_fp8_kv_cache:
             self.q_proj.register_buffer("q_scale", torch.ones(1))
             self.k_proj.register_buffer("k_scale", torch.ones(1))
@@ -438,14 +548,6 @@ class GatedAttention(nn.Module):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        if self._materialize_int4_v:
-            # A direct V2 plugin -> Concat edge lets TRT virtualize the plugin
-            # output as a strided slice, although the plugin's LINEAR output is
-            # contiguous.  This live-row mask is exactly one for valid requests
-            # and gives TRT a native producer that can honor the Concat stride.
-            active_rows = (context_lengths > 0).to(value_states.dtype)
-            value_states = value_states * active_rows.reshape(batch_size, 1, 1)
-
         # QK norm (on reshaped per-head tensors)
         query_states = self.q_norm(query_states)
         query_states = query_states.reshape(batch_size, seq_len,
@@ -470,7 +572,6 @@ class GatedAttention(nn.Module):
             "enable_vision_block_attention": False,
             "skip_softmax_scale_factor": self.skip_softmax_scale_factor,
         }
-        # The plugin requires the override input exactly when the attribute is non-zero.
         if skip_softmax_scale is not None and self.skip_softmax_scale_factor > 0.0:
             kwargs["skip_softmax_scale"] = skip_softmax_scale
         if enable_tree:
@@ -493,6 +594,73 @@ class GatedAttention(nn.Module):
         attn_output = attn_output.reshape(batch_size, seq_len,
                                           self.num_heads * self.head_dim)
         return self.o_proj(attn_output), present_key_value
+
+    def forward_ragged(
+        self,
+        hidden_states: torch.Tensor,
+        past_key_value: torch.Tensor,
+        rope_rotary_cos_sin: torch.Tensor,
+        positions: torch.Tensor,
+        query_start_offsets: torch.Tensor,
+        query_lengths: torch.Tensor,
+        past_lengths: torch.Tensor,
+        attention_sequence_lengths: torch.Tensor,
+        state_indices: torch.Tensor,
+        execution_phase_marker: torch.Tensor,
+        context_sequence_count_carrier: torch.Tensor,
+        kv_page_table: torch.Tensor,
+        skip_softmax_scale: "torch.Tensor | None" = None,
+        attention_position_ids: "torch.Tensor | None" = None,
+        packed_attention_mask: "torch.Tensor | None" = None,
+        tree_parent_ids: "torch.Tensor | None" = None,
+        tree_depths: "torch.Tensor | None" = None,
+        valid_tree_counts: "torch.Tensor | None" = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = hidden_states.shape[0]
+        q_output = self.q_proj(hidden_states).reshape(num_tokens,
+                                                      self.num_heads,
+                                                      self.head_dim * 2)
+        query_states, gate_states = q_output.chunk(2, dim=-1)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+        query_states = self.q_norm(query_states).reshape(
+            num_tokens, self.num_heads * self.head_dim)
+        key_states = self.k_norm(
+            key_states.reshape(num_tokens, self.num_kv_heads,
+                               self.head_dim)).reshape(
+                                   num_tokens,
+                                   self.num_kv_heads * self.head_dim)
+        attn_output, present_key_value = attention_plugin(
+            torch.cat([query_states, key_states, value_states], dim=-1),
+            past_key_value,
+            query_lengths,
+            rope_rotary_cos_sin,
+            past_lengths,
+            kv_page_table,
+            num_q_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_dim,
+            sliding_window_size=self.sliding_window_size,
+            enable_tree_attention=packed_attention_mask is not None,
+            enable_fp8_kv_cache=self.enable_fp8_kv_cache,
+            attention_scale=self.attention_scale,
+            enable_context_mask_selector=False,
+            enable_vision_block_attention=False,
+            skip_softmax_scale_factor=self.skip_softmax_scale_factor,
+            qkv_scales=getattr(self, "_qkv_scales_float", [1.0, 1.0, 1.0]),
+            query_start_offsets=query_start_offsets,
+            attention_sequence_lengths=attention_sequence_lengths,
+            execution_phase_marker=execution_phase_marker,
+            context_sequence_count_carrier=context_sequence_count_carrier,
+            attention_pos_id=attention_position_ids,
+            attention_mask=packed_attention_mask,
+            skip_softmax_scale=(skip_softmax_scale
+                                if self.skip_softmax_scale_factor > 0.0 else
+                                None))
+        attn_output = attn_output * torch.sigmoid(gate_states)
+        return self.o_proj(
+            attn_output.reshape(num_tokens, self.num_heads *
+                                self.head_dim)), present_key_value
 
 
 # ---------------------------------------------------------------------------
@@ -539,7 +707,7 @@ class Qwen3_5DecoderLayer(nn.Module):
         # GDN-specific (ignored by attention layers)
         conv_state: "torch.Tensor | None" = None,
         recurrent_state: "torch.Tensor | None" = None,
-        spec_verify_phase_marker: "torch.Tensor | None" = None,
+        execution_phase_marker: "torch.Tensor | None" = None,
         tree_parent_ids: "torch.Tensor | None" = None,
         tree_depths: "torch.Tensor | None" = None,
         collect_intermediate_states: bool = False,
@@ -554,7 +722,7 @@ class Qwen3_5DecoderLayer(nn.Module):
                  conv_state,
                  recurrent_state,
                  context_lengths,
-                 spec_verify_phase_marker=spec_verify_phase_marker,
+                 execution_phase_marker=execution_phase_marker,
                  tree_parent_ids=tree_parent_ids,
                  tree_depths=tree_depths,
                  collect_intermediate_states=collect_intermediate_states)
@@ -580,6 +748,42 @@ class Qwen3_5DecoderLayer(nn.Module):
             hidden_states = residual + self.mlp(
                 self.post_attention_layernorm(hidden_states))
             return hidden_states, present_kv
+
+    def forward_ragged(self, hidden_states: torch.Tensor, **kwargs):
+        hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+        residual = hidden_states
+        normed = self.input_layernorm(hidden_states)
+        if self.layer_type == LAYER_GDN:
+            (mixer_out, conv_out, recurrent_out, intermediate_conv_out,
+             intermediate_recurrent_out) = self.linear_attn.forward_ragged(
+                 normed, kwargs["conv_state"], kwargs["recurrent_state"],
+                 kwargs["query_start_offsets"], kwargs["query_lengths"],
+                 kwargs["state_indices"], kwargs["execution_phase_marker"],
+                 kwargs["context_sequence_count_carrier"],
+                 kwargs.get("tree_parent_ids"), kwargs.get("tree_depths"),
+                 kwargs.get("use_intermediate_state", False))
+            mixer_out = mixer_out.reshape(-1, residual.shape[-1])
+            hidden_states = residual + mixer_out
+            hidden_states = hidden_states + self.mlp(
+                self.post_attention_layernorm(hidden_states))
+            return (hidden_states, conv_out, recurrent_out,
+                    intermediate_conv_out, intermediate_recurrent_out)
+        attn_out, present_kv = self.self_attn.forward_ragged(
+            normed, kwargs["past_key_value"], kwargs["rope_rotary_cos_sin"],
+            kwargs["positions"], kwargs["query_start_offsets"],
+            kwargs["query_lengths"], kwargs["past_lengths"],
+            kwargs["attention_sequence_lengths"], kwargs["state_indices"],
+            kwargs["execution_phase_marker"],
+            kwargs["context_sequence_count_carrier"], kwargs["kv_page_table"],
+            kwargs.get("skip_softmax_scale"),
+            kwargs.get("attention_position_ids"),
+            kwargs.get("packed_attention_mask"), kwargs.get("tree_parent_ids"),
+            kwargs.get("tree_depths"), kwargs.get("valid_tree_counts"))
+        attn_out = attn_out.reshape(-1, residual.shape[-1])
+        hidden_states = residual + attn_out
+        hidden_states = hidden_states + self.mlp(
+            self.post_attention_layernorm(hidden_states))
+        return hidden_states, present_kv
 
 
 # ---------------------------------------------------------------------------
@@ -621,7 +825,7 @@ class Qwen3_5Backbone(nn.Module):
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
         skip_softmax_scale: "torch.Tensor | None" = None,
-        spec_verify_phase_marker: "torch.Tensor | None" = None,
+        execution_phase_marker: "torch.Tensor | None" = None,
         tree_parent_ids: "torch.Tensor | None" = None,
         tree_depths: "torch.Tensor | None" = None,
         collect_intermediate_states: bool = False,
@@ -633,7 +837,7 @@ class Qwen3_5Backbone(nn.Module):
         present_recurrent_states_list: List[torch.Tensor] = []
         intermediate_conv_states_list: List[torch.Tensor] = []
         intermediate_recurrent_states_list: List[torch.Tensor] = []
-        dflash_hidden_list: List[torch.Tensor] = []
+        dflash_hidden_by_layer: dict[int, torch.Tensor] = {}
         dflash_target_set = set(dflash_target_layer_ids or [])
         attn_idx = 0
         gdn_idx = 0
@@ -647,7 +851,7 @@ class Qwen3_5Backbone(nn.Module):
                      context_lengths=context_lengths,
                      conv_state=conv_states[gdn_idx],
                      recurrent_state=recurrent_states[gdn_idx],
-                     spec_verify_phase_marker=spec_verify_phase_marker,
+                     execution_phase_marker=execution_phase_marker,
                      tree_parent_ids=tree_parent_ids,
                      tree_depths=tree_depths,
                      collect_intermediate_states=collect_intermediate_states,
@@ -675,11 +879,11 @@ class Qwen3_5Backbone(nn.Module):
                 attn_idx += 1
 
             if layer_idx in dflash_target_set:
-                dflash_hidden_list.append(hidden_states)
+                dflash_hidden_by_layer[layer_idx] = hidden_states
 
         normed_hidden = self.norm(hidden_states)
-        dflash_hidden_concat = (torch.cat(dflash_hidden_list, dim=-1)
-                                if dflash_hidden_list else None)
+        dflash_hidden_concat = _concat_hidden_in_provider_order(
+            dflash_hidden_by_layer, dflash_target_layer_ids)
 
         return (normed_hidden, tuple(present_key_values_list),
                 tuple(present_conv_states_list),
@@ -687,6 +891,98 @@ class Qwen3_5Backbone(nn.Module):
                 tuple(intermediate_conv_states_list),
                 tuple(intermediate_recurrent_states_list),
                 dflash_hidden_concat)
+
+    def forward_ragged(
+        self,
+        inputs_embeds: torch.Tensor,
+        past_key_values: Tuple[torch.Tensor, ...],
+        rope_rotary_cos_sin: torch.Tensor,
+        positions: torch.Tensor,
+        query_start_offsets: torch.Tensor,
+        query_lengths: torch.Tensor,
+        past_lengths: torch.Tensor,
+        attention_sequence_lengths: torch.Tensor,
+        state_indices: torch.Tensor,
+        execution_phase_marker: torch.Tensor,
+        context_sequence_count_carrier: torch.Tensor,
+        kv_page_table: torch.Tensor,
+        conv_states: Tuple[torch.Tensor, ...],
+        recurrent_states: Tuple[torch.Tensor, ...],
+        skip_softmax_scale: "torch.Tensor | None" = None,
+        attention_position_ids: "torch.Tensor | None" = None,
+        packed_attention_mask: "torch.Tensor | None" = None,
+        tree_parent_ids: "torch.Tensor | None" = None,
+        tree_depths: "torch.Tensor | None" = None,
+        valid_tree_counts: "torch.Tensor | None" = None,
+        collect_intermediate_states: bool = False,
+        target_layer_ids: "List[int] | None" = None,
+    ) -> Tuple[torch.Tensor, Tuple, Tuple, Tuple, Tuple, Tuple,
+               "torch.Tensor | None"]:
+        hidden_states = inputs_embeds
+        present_key_values = []
+        present_conv_states = []
+        present_recurrent_states = []
+        intermediate_conv_states = []
+        intermediate_recurrent_states = []
+        target_hidden_by_layer: dict[int, torch.Tensor] = {}
+        target_layer_set = set(target_layer_ids or [])
+        attn_idx = 0
+        gdn_idx = 0
+        common = {
+            "rope_rotary_cos_sin": rope_rotary_cos_sin,
+            "positions": positions,
+            "query_start_offsets": query_start_offsets,
+            "query_lengths": query_lengths,
+            "past_lengths": past_lengths,
+            "attention_sequence_lengths": attention_sequence_lengths,
+            "state_indices": state_indices,
+            "execution_phase_marker": execution_phase_marker,
+            "context_sequence_count_carrier": context_sequence_count_carrier,
+            "kv_page_table": kv_page_table,
+            "skip_softmax_scale": skip_softmax_scale,
+            "attention_position_ids": attention_position_ids,
+            "packed_attention_mask": packed_attention_mask,
+            "tree_parent_ids": tree_parent_ids,
+            "tree_depths": tree_depths,
+            "valid_tree_counts": valid_tree_counts,
+            "use_intermediate_state": collect_intermediate_states,
+        }
+        for layer_idx, (layer, layer_type) in enumerate(
+                zip(self.layers, self.layer_types)):
+            if layer_type == LAYER_GDN:
+                (hidden_states, conv_out, recurrent_out, intermediate_conv_out,
+                 intermediate_recurrent_out) = layer.forward_ragged(
+                     hidden_states,
+                     conv_state=conv_states[gdn_idx],
+                     recurrent_state=recurrent_states[gdn_idx],
+                     **common)
+                present_conv_states.append(conv_out)
+                present_recurrent_states.append(recurrent_out)
+                if collect_intermediate_states:
+                    intermediate_conv_states.append(intermediate_conv_out)
+                    intermediate_recurrent_states.append(
+                        intermediate_recurrent_out)
+                gdn_idx += 1
+            else:
+                hidden_states, present_kv = layer.forward_ragged(
+                    hidden_states,
+                    past_key_value=past_key_values[attn_idx],
+                    **common)
+                present_key_values.append(present_kv)
+                attn_idx += 1
+            self._capture_ragged_layer_output(layer_idx, hidden_states)
+            if layer_idx in target_layer_set:
+                target_hidden_by_layer[layer_idx] = hidden_states
+        target_hidden_concat = _concat_hidden_in_provider_order(
+            target_hidden_by_layer, target_layer_ids)
+        return (self.norm(hidden_states), tuple(present_key_values),
+                tuple(present_conv_states), tuple(present_recurrent_states),
+                tuple(intermediate_conv_states),
+                tuple(intermediate_recurrent_states), target_hidden_concat)
+
+    def _capture_ragged_layer_output(self, layer_idx: int,
+                                     hidden_states: torch.Tensor) -> None:
+        del layer_idx, hidden_states
 
 
 # ---------------------------------------------------------------------------
@@ -718,91 +1014,81 @@ def _is_dspark_base_export(config: ModelConfig) -> bool:
     return bool(getattr(config, "dspark_base", False))
 
 
+def _is_jetspec_base_export(config: ModelConfig) -> bool:
+    """Return True when exporting the Qwen3.5 hybrid base for JetSpec verify."""
+    return bool(getattr(config, "jetspec_base", False))
+
+
 def _is_spec_tree_base_export(config: ModelConfig) -> bool:
     """Return True when exporting DDTree metadata for Qwen3.5 hybrid state.
 
     DFlash, JetSpec, and MTP tree bases consume the same
     ``tree_parent_ids`` / ``tree_depths`` verify inputs.
     """
-    return (bool(getattr(config, "dflash_base", False))
-            or bool(getattr(config, "dflash_tree_base", False))
+    dflash2_base = (bool(getattr(config, "dflash_base", False)) and getattr(
+        config, "dflash_version", DFlashVersion.V1) == DFlashVersion.V2)
+    return (dflash2_base or bool(getattr(config, "dflash_tree_base", False))
             or bool(getattr(config, "jetspec_tree_base", False))
             or bool(getattr(config, "mtp_tree_base", False)))
 
 
-def _make_flat_wrapper_hybrid(model: nn.Module,
-                              Na: int,
-                              Ng: int,
-                              mtp_base: bool = False,
-                              dflash_base: bool = False,
-                              dflash_tree_base: bool = False) -> nn.Module:
-    """Build flat forward wrapper for Qwen3.5 hybrid (GDN + attention).
-
-    Extends the transformer wrapper with ``conv_state_i`` and
-    ``recurrent_state_i`` inputs and ``present_conv_state_i`` /
-    ``present_recurrent_state_i`` outputs.
-
-    ``Na`` = number of attention layers, ``Ng`` = number of GDN layers.
-    """
+def _make_flat_wrapper_hybrid_ragged(model: nn.Module, Na: int, Ng: int,
+                                     spec_base: bool, tree_attention: bool,
+                                     tree_metadata: bool,
+                                     emit_accept_hidden: bool) -> nn.Module:
+    """Build the flat wrapper for the unified hybrid token-major ABI."""
     param_names: List[str] = (
         ["inputs_embeds"] + [f"past_key_values_{i}" for i in range(Na)] + [
-            "rope_rotary_cos_sin", "context_lengths", "kvcache_start_index",
-            "kv_page_table", "last_token_ids"
-        ] + [f"conv_state_{i}"
-             for i in range(Ng)] + [f"recurrent_state_{i}" for i in range(Ng)])
-    spec_base = mtp_base or dflash_base
-    if spec_base:
-        param_names += [
-            "attention_pos_id", "attention_mask", "spec_verify_phase_marker"
-        ]
-    if dflash_tree_base:
-        param_names += ["tree_parent_ids", "tree_depths"]
-    # Always in the traced signature; export.py drops the dangling graph
-    # input when no AttentionPlugin consumes it.
-    param_names += ["skip_softmax_scale"]
-
+            "rope_rotary_cos_sin", "positions", "query_start_offsets",
+            "query_lengths", "past_lengths", "attention_sequence_lengths",
+            "state_indices", "execution_phase_marker",
+            "context_sequence_count_carrier", "kv_page_table", "logits_indices"
+        ] + [f"conv_state_{i}" for i in range(Ng)] +
+        [f"recurrent_state_{i}" for i in range(Ng)] + ["skip_softmax_scale"])
+    if tree_attention:
+        param_names += ["attention_position_ids", "packed_attention_mask"]
+    if tree_metadata:
+        param_names += ["tree_parent_ids", "tree_depths", "valid_tree_counts"]
     past_kv_tuple = "({},)".format(", ".join(
         f"past_key_values_{i}" for i in range(Na))) if Na else "()"
     conv_tuple = "({},)".format(", ".join(f"conv_state_{i}"
                                           for i in range(Ng))) if Ng else "()"
     rec_tuple = "({},)".format(", ".join(f"recurrent_state_{i}"
                                          for i in range(Ng))) if Ng else "()"
-
-    mtp_kwargs = (", attention_pos_id=attention_pos_id"
-                  ", attention_mask=attention_mask"
-                  ", spec_verify_phase_marker=spec_verify_phase_marker"
-                  if spec_base else "")
-    if dflash_tree_base:
-        mtp_kwargs += (", tree_parent_ids=tree_parent_ids"
-                       ", tree_depths=tree_depths")
-    skip_kwarg = ", skip_softmax_scale=skip_softmax_scale"
-
-    if spec_base:
-        body = (
-            f"    logits, hidden_states, present_key_values, "
-            f"present_conv_states, present_recurrent_states, "
-            f"intermediate_conv_states, intermediate_recurrent_states = self._model(\n"
-            f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
-            f"context_lengths, kvcache_start_index, kv_page_table, "
-            f"last_token_ids,\n"
-            f"        {conv_tuple}, {rec_tuple}{mtp_kwargs}{skip_kwarg})\n"
-            f"    return ((logits, hidden_states) + tuple(present_key_values)\n"
-            f"            + tuple(present_conv_states)"
-            f" + tuple(present_recurrent_states)"
-            f" + tuple(intermediate_conv_states)"
-            f" + tuple(intermediate_recurrent_states))\n")
-    else:
-        body = (
-            f"    logits, present_key_values, present_conv_states, "
-            f"present_recurrent_states = self._model(\n"
-            f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
-            f"context_lengths, kvcache_start_index, kv_page_table, "
-            f"last_token_ids,\n"
-            f"        {conv_tuple}, {rec_tuple}{skip_kwarg})\n"
-            f"    return ((logits,) + tuple(present_key_values)\n"
-            f"            + tuple(present_conv_states)"
-            f" + tuple(present_recurrent_states))\n")
-
+    tree_kwargs = (", attention_position_ids=attention_position_ids"
+                   ", packed_attention_mask=packed_attention_mask"
+                   if tree_attention else "")
+    tree_kwargs += (", tree_parent_ids=tree_parent_ids"
+                    ", tree_depths=tree_depths"
+                    ", valid_tree_counts=valid_tree_counts"
+                    if tree_metadata else "")
+    unpack = (
+        "    logits, hidden_states, accept_hidden_states, present_key_values, "
+        "present_conv_states, present_recurrent_states, "
+        "intermediate_conv_states, intermediate_recurrent_states = outputs\n"
+        if emit_accept_hidden else
+        "    logits, hidden_states, present_key_values, present_conv_states, "
+        "present_recurrent_states, intermediate_conv_states, "
+        "intermediate_recurrent_states = outputs\n")
+    accept_result = (" + (accept_hidden_states,)"
+                     if emit_accept_hidden else "")
+    body = (
+        f"    outputs = self._model.forward_ragged(\n"
+        f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
+        f"positions, query_start_offsets, query_lengths, "
+        f"past_lengths, attention_sequence_lengths, "
+        f"state_indices, execution_phase_marker, context_sequence_count_carrier, "
+        f"kv_page_table, logits_indices, "
+        f"{conv_tuple}, {rec_tuple}, skip_softmax_scale{tree_kwargs})\n" +
+        unpack +
+        f"    result = ((logits,) + ((hidden_states,) if hidden_states is not None else ()) "
+        f"{accept_result} "
+        f"+ tuple(present_key_values)\n"
+        f"            + tuple(present_conv_states)"
+        f" + tuple(present_recurrent_states))\n" +
+        ("    result += (tuple(intermediate_conv_states)"
+         " + tuple(intermediate_recurrent_states))\n" if spec_base else "") +
+        "    return result\n")
     src = "def _forward(self, {}):\n{}".format(", ".join(param_names), body)
     globs: dict = {}
     exec(src, globs)  # noqa: S102
@@ -1035,32 +1321,43 @@ class Qwen3_5CausalLM(nn.Module):
         """Return all model-specific parameters needed for ONNX export."""
         config = self.config
         gc = config.gdn_cfg
-        Na = config.num_attn_layers
         Ng = config.num_gdn_layers
         assert gc is not None or Ng == 0, (
             "Qwen3.5 requires gdn_cfg when any layer is GDN")
+        return self._token_major_onnx_export_spec()
+
+    def _token_major_onnx_export_spec(self) -> OnnxSpec:
+        """Return the unified Qwen3.5 token-major export contract."""
+        config = self.config
+        gc = config.gdn_cfg
+        Na = config.num_attn_layers
+        Ng = config.num_gdn_layers
+        assert gc is not None or Ng == 0
         mtp_base = _is_mtp_base_export(config)
         dflash_base = _is_dflash_base_export(config)
+        jetspec_base = _is_jetspec_base_export(config)
         dspark_base = _is_dspark_base_export(config)
-        target_hidden_base = dflash_base or dspark_base
-        spec_tree_base = _is_spec_tree_base_export(config)
+        target_hidden_base = dflash_base or jetspec_base or dspark_base
+        spec_base = mtp_base or target_hidden_base
+        tree_attention = spec_base
+        tree_metadata = _is_spec_tree_base_export(config)
         device = next(itertools.chain(self.parameters(),
                                       self.buffers())).device
+        num_sequences = _BATCH_SIZE
+        query_length = _SEQ_LEN
+        physical_tokens = num_sequences * query_length
+        pool_rows = 4
         dtype16 = torch.float16
-        batch_size, seq_len, past_len, max_pos = (_BATCH_SIZE, _SEQ_LEN,
-                                                  _PAST_LEN, _MAX_POS)
+        kv_dtype = (torch.float8_e4m3fn
+                    if config.quant.kv_cache_quant == "fp8" else dtype16)
 
-        inputs_embeds = torch.zeros(batch_size,
-                                    seq_len,
+        inputs_embeds = torch.zeros(physical_tokens,
                                     config.hidden_size,
                                     dtype=dtype16,
                                     device=device)
-        kv_dtype = (torch.float8_e4m3fn
-                    if config.quant.kv_cache_quant == "fp8" else dtype16)
-        # Paged KV pool binding: [2, num_pages, KV_PAGE_SIZE, num_kv_heads, head_dim].
-        past_key_values_list: List[torch.Tensor] = [
+        past_key_values = [
             torch.zeros(2,
-                        1,
+                        2,
                         KV_PAGE_SIZE,
                         config.num_key_value_heads,
                         config.head_dim,
@@ -1068,162 +1365,251 @@ class Qwen3_5CausalLM(nn.Module):
                         device=device) for _ in range(Na)
         ]
         rotary_dim = int(config.head_dim * config.partial_rotary_factor)
-        rope_rotary_cos_sin = torch.zeros(batch_size,
-                                          max_pos,
+        rope_rotary_cos_sin = torch.zeros(physical_tokens,
                                           rotary_dim,
                                           dtype=torch.float32,
                                           device=device)
-        context_lengths = torch.zeros(batch_size,
-                                      dtype=torch.int32,
-                                      device=device)
-        kvcache_start_index = torch.zeros(batch_size,
-                                          dtype=torch.int32,
-                                          device=device)
-        kv_page_table = torch.zeros(batch_size,
+        positions = torch.arange(query_length,
+                                 dtype=torch.int32,
+                                 device=device).repeat(num_sequences)
+        query_start_offsets = torch.arange(0,
+                                           physical_tokens + 1,
+                                           query_length,
+                                           dtype=torch.int32,
+                                           device=device)
+        query_lengths = torch.full((num_sequences, ),
+                                   query_length,
+                                   dtype=torch.int32,
+                                   device=device)
+        past_lengths = torch.zeros(num_sequences,
+                                   dtype=torch.int32,
+                                   device=device)
+        attention_sequence_lengths = query_lengths.clone()
+        state_indices = torch.tensor([2, 0], dtype=torch.int32, device=device)
+        execution_phase_marker = torch.zeros(2,
+                                             dtype=torch.int32,
+                                             device=device)
+        context_sequence_count_carrier = torch.zeros(num_sequences,
+                                                     dtype=torch.int32,
+                                                     device=device)
+        kv_page_table = torch.zeros(num_sequences,
                                     2,
-                                    1,
+                                    2,
                                     dtype=torch.int32,
                                     device=device)
-        spec_base = mtp_base or target_hidden_base
-        select_len = 2 if spec_base else 1
-        last_token_ids = torch.zeros(batch_size,
-                                     select_len,
-                                     dtype=torch.int64,
-                                     device=device)
-
-        conv_states: List[torch.Tensor] = [
-            torch.zeros(batch_size,
+        logits_indices = (torch.tensor(
+            [0, 2, 3], dtype=torch.int64, device=device) if spec_base else
+                          query_start_offsets[1:].to(torch.int64) - 1)
+        conv_states = [
+            torch.zeros(pool_rows,
                         gc.conv_dim,
                         gc.conv_kernel,
                         dtype=self.CONV_STATE_DTYPE,
                         device=device) for _ in range(Ng)
         ]
-        recurrent_states: List[torch.Tensor] = [
-            torch.zeros(batch_size,
+        recurrent_states = [
+            torch.zeros(pool_rows,
                         gc.num_value_heads,
                         gc.key_head_dim,
                         gc.value_head_dim,
                         dtype=self.RECURRENT_STATE_DTYPE,
                         device=device) for _ in range(Ng)
         ]
-
-        args = (inputs_embeds, *past_key_values_list, rope_rotary_cos_sin,
-                context_lengths, kvcache_start_index, kv_page_table,
-                last_token_ids, *conv_states, *recurrent_states)
-
+        args = (inputs_embeds, *past_key_values, rope_rotary_cos_sin,
+                positions, query_start_offsets, query_lengths, past_lengths,
+                attention_sequence_lengths, state_indices,
+                execution_phase_marker, context_sequence_count_carrier,
+                kv_page_table, logits_indices, *conv_states, *recurrent_states)
         input_names = (
             ["inputs_embeds"] + [f"past_key_values_{i}" for i in range(Na)] + [
-                "rope_rotary_cos_sin", "context_lengths",
-                "kvcache_start_index", "kv_page_table", "last_token_ids"
+                "rope_rotary_cos_sin", "positions", "query_start_offsets",
+                "query_lengths", "past_lengths", "attention_sequence_lengths",
+                "state_indices", "execution_phase_marker",
+                "context_sequence_count_carrier", "kv_page_table",
+                "logits_indices"
             ] + [f"conv_state_{i}" for i in range(Ng)] +
             [f"recurrent_state_{i}" for i in range(Ng)])
         output_names = (["logits"] +
                         [f"present_key_values_{i}" for i in range(Na)] +
                         [f"present_conv_state_{i}" for i in range(Ng)] +
                         [f"present_recurrent_state_{i}" for i in range(Ng)])
+        if spec_base or getattr(self, "emit_hidden_states", False):
+            output_names.insert(1, "hidden_states")
+        emit_accept_hidden = bool(
+            spec_base and getattr(self, "emit_accept_hidden_states", False))
+        if emit_accept_hidden:
+            output_names.insert(2, "accept_hidden_states")
+        if spec_base:
+            output_names += [f"intermediate_conv_state_{i}" for i in range(Ng)]
+            output_names += [
+                f"intermediate_recurrent_state_{i}" for i in range(Ng)
+            ]
 
-        batch = torch.export.Dim("batch", min=1, max=256)
-        seq = torch.export.Dim("seq_len", min=1, max=32768)
-        pos = torch.export.Dim("max_pos", min=1, max=32768)
-        rope_batch = torch.export.Dim("rope_batch", min=1, max=256)
-        kv_batch = torch.export.Dim("kv_batch", min=1, max=256)
-        page_batch = torch.export.Dim("page_batch", min=1, max=256)
+        tokens = torch.export.Dim("physical_tokens", min=1, max=8_388_608)
+        logits_rows = torch.export.Dim("logits_rows", min=1, max=8_388_608)
+        sequences = torch.export.Dim("num_sequences", min=1, max=256)
+        context_sequences = torch.export.Dim("num_context_sequences",
+                                             min=0,
+                                             max=256)
+        state_pool = torch.export.Dim("state_pool_rows", min=1, max=256)
         max_pages = torch.export.Dim("max_pages_per_seq", min=1, max=32768)
         num_pages = torch.export.Dim("num_pages", min=1, max=1048576)
-        num_selected = torch.export.Dim("num_selected", min=1,
-                                        max=256) if spec_base else None
+        phase_extent = torch.export.Dim("execution_phase_extent", min=1, max=8)
+        packed_mask_width = torch.export.Dim("packed_mask_width",
+                                             min=1,
+                                             max=64)
+        all_shapes: list = [{0: tokens}]
+        all_shapes.extend({1: num_pages} for _ in range(Na))
+        all_shapes.extend([
+            {
+                0: tokens
+            },
+            {
+                0: tokens
+            },
+            {
+                0: sequences + 1
+            },
+            {
+                0: sequences
+            },
+            {
+                0: sequences
+            },
+            {
+                0: sequences
+            },
+            {
+                0: sequences
+            },
+            {
+                0: phase_extent
+            },
+            {
+                0: context_sequences
+            },
+            {
+                0: sequences,
+                2: max_pages
+            },
+            {
+                0: logits_rows if spec_base else sequences
+            },
+        ])
+        all_shapes.extend({0: state_pool} for _ in range(Ng))
+        all_shapes.extend({0: state_pool} for _ in range(Ng))
 
-        all_shapes: list = [{0: batch, 1: seq}]  # inputs_embeds
-        for _ in range(Na):
-            all_shapes.append({1:
-                               num_pages})  # past_key_values_i (pool-shaped)
-        all_shapes.append({0: rope_batch, 1: pos})  # rope_rotary_cos_sin
-        all_shapes.append({0: batch})  # context_lengths
-        all_shapes.append({0: kv_batch})  # kvcache_start_index
-        all_shapes.append({0: page_batch, 2: max_pages})  # kv_page_table
-        if spec_base:
-            all_shapes.append({0: batch, 1: num_selected})  # last_token_ids
-        else:
-            all_shapes.append({0: batch})  # last_token_ids
-        for _ in range(Ng):
-            all_shapes.append({0: batch})  # conv_state_i
-        for _ in range(Ng):
-            all_shapes.append({0: batch})  # recurrent_state_i
-
-        if spec_base:
-            attention_pos_id = torch.zeros(batch_size,
-                                           seq_len,
-                                           dtype=torch.int32,
-                                           device=device)
-            attention_mask = torch.zeros(batch_size,
-                                         seq_len,
-                                         seq_len + past_len,
-                                         dtype=torch.int32,
-                                         device=device)
-            spec_verify_phase_marker = torch.zeros(1,
-                                                   dtype=torch.int32,
-                                                   device=device)
-            args = args + (attention_pos_id, attention_mask,
-                           spec_verify_phase_marker)
-            input_names = input_names + [
-                "attention_pos_id", "attention_mask",
-                "spec_verify_phase_marker"
-            ]
-            output_names = (
-                ["logits", "hidden_states"] +
-                [f"present_key_values_{i}" for i in range(Na)] +
-                [f"present_conv_state_{i}" for i in range(Ng)] +
-                [f"present_recurrent_state_{i}" for i in range(Ng)] +
-                [f"intermediate_conv_state_{i}" for i in range(Ng)] +
-                [f"intermediate_recurrent_state_{i}" for i in range(Ng)])
-
-            verify_seq = torch.export.Dim("verify_seq_len", min=1, max=32768)
-            mask_kv_len = torch.export.Dim("mask_kv_len", min=1, max=65536)
-            all_shapes.append({0: batch, 1: verify_seq})  # attention_pos_id
-            all_shapes.append({
-                0: batch,
-                1: verify_seq,
-                2: mask_kv_len
-            })  # attention_mask
-            all_shapes.append({0: torch.export.Dim.AUTO
-                               })  # spec_verify_phase_marker
-            if spec_tree_base:
-                tree_parent_ids = torch.zeros(batch_size,
-                                              seq_len,
-                                              dtype=torch.int32,
-                                              device=device)
-                tree_depths = torch.zeros(batch_size,
-                                          seq_len,
-                                          dtype=torch.int32,
-                                          device=device)
-                args = args + (tree_parent_ids, tree_depths)
-                input_names = input_names + ["tree_parent_ids", "tree_depths"]
-                all_shapes.append({0: batch, 1: verify_seq})  # tree_parent_ids
-                all_shapes.append({0: batch, 1: verify_seq})  # tree_depths
-
-        # Trailing runtime skip-softmax override input (mirrors
-        # modeling_default.py: int8 shape-only carrier, dynamic length).
-        skip_softmax_scale = torch.zeros(1, dtype=torch.int8, device=device)
+        skip_softmax_scale = torch.zeros(2, dtype=torch.int8, device=device)
         skip_dim = torch.export.Dim("skip_softmax_scale_len",
                                     min=0,
                                     max=1048576)
-        args = args + (skip_softmax_scale, )
-        input_names = input_names + ["skip_softmax_scale"]
-        all_shapes.append({0: skip_dim})  # skip_softmax_scale
+        args += (skip_softmax_scale, )
+        input_names += ["skip_softmax_scale"]
+        all_shapes.append({0: skip_dim})
 
-        wrapped = _make_flat_wrapper_hybrid(self,
-                                            Na,
-                                            Ng,
-                                            mtp_base=mtp_base,
-                                            dflash_base=target_hidden_base,
-                                            dflash_tree_base=spec_tree_base)
+        if tree_attention:
+            attention_position_ids = positions.clone()
+            packed_attention_mask = torch.zeros(physical_tokens,
+                                                (query_length + 31) // 32,
+                                                dtype=torch.int32,
+                                                device=device)
+            args += (attention_position_ids, packed_attention_mask)
+            input_names += ["attention_position_ids", "packed_attention_mask"]
+            all_shapes.extend([{0: tokens}, {0: tokens, 1: packed_mask_width}])
+
+        if tree_metadata:
+            tree_parent_ids = torch.full((physical_tokens, ),
+                                         -1,
+                                         dtype=torch.int32,
+                                         device=device)
+            tree_depths = torch.zeros(physical_tokens,
+                                      dtype=torch.int32,
+                                      device=device)
+            valid_tree_counts = query_lengths.clone()
+            args += (tree_parent_ids, tree_depths, valid_tree_counts)
+            input_names += [
+                "tree_parent_ids", "tree_depths", "valid_tree_counts"
+            ]
+            all_shapes.extend([{0: tokens}, {0: tokens}, {0: sequences}])
+
+        wrapped = _make_flat_wrapper_hybrid_ragged(self, Na, Ng, spec_base,
+                                                   tree_attention,
+                                                   tree_metadata,
+                                                   emit_accept_hidden)
+
         wrapped.eval()
-
         return OnnxSpec(wrapped=wrapped,
                         args=args,
                         input_names=input_names,
                         output_names=output_names,
                         dynamic_shapes=all_shapes)
+
+    def forward_ragged(
+        self,
+        inputs_embeds: torch.Tensor,
+        past_key_values: Tuple[torch.Tensor, ...],
+        rope_rotary_cos_sin: torch.Tensor,
+        positions: torch.Tensor,
+        query_start_offsets: torch.Tensor,
+        query_lengths: torch.Tensor,
+        past_lengths: torch.Tensor,
+        attention_sequence_lengths: torch.Tensor,
+        state_indices: torch.Tensor,
+        execution_phase_marker: torch.Tensor,
+        context_sequence_count_carrier: torch.Tensor,
+        kv_page_table: torch.Tensor,
+        logits_indices: torch.Tensor,
+        conv_states: Tuple[torch.Tensor, ...] = (),
+        recurrent_states: Tuple[torch.Tensor, ...] = (),
+        skip_softmax_scale: "torch.Tensor | None" = None,
+        attention_position_ids: "torch.Tensor | None" = None,
+        packed_attention_mask: "torch.Tensor | None" = None,
+        tree_parent_ids: "torch.Tensor | None" = None,
+        tree_depths: "torch.Tensor | None" = None,
+        valid_tree_counts: "torch.Tensor | None" = None,
+    ) -> Tuple:
+        mtp_base = _is_mtp_base_export(self.config)
+        dflash_base = _is_dflash_base_export(self.config)
+        jetspec_base = _is_jetspec_base_export(self.config)
+        dspark_base = _is_dspark_base_export(self.config)
+        target_hidden_base = dflash_base or jetspec_base or dspark_base
+        target_layer_ids = (
+            self.config.dspark_target_layer_ids if dspark_base else
+            self.config.jetspec_target_layer_ids if jetspec_base else
+            self.config.dflash_target_layer_ids if dflash_base else None)
+        (hidden_states, present_kv, present_conv, present_recurrent,
+         intermediate_conv, intermediate_recurrent,
+         target_hidden) = self.model.forward_ragged(
+             inputs_embeds,
+             past_key_values,
+             rope_rotary_cos_sin,
+             positions,
+             query_start_offsets,
+             query_lengths,
+             past_lengths,
+             attention_sequence_lengths,
+             state_indices,
+             execution_phase_marker,
+             context_sequence_count_carrier,
+             kv_page_table,
+             conv_states,
+             recurrent_states,
+             skip_softmax_scale,
+             attention_position_ids=attention_position_ids,
+             packed_attention_mask=packed_attention_mask,
+             tree_parent_ids=tree_parent_ids,
+             tree_depths=tree_depths,
+             valid_tree_counts=valid_tree_counts,
+             collect_intermediate_states=(mtp_base or target_hidden_base),
+             target_layer_ids=target_layer_ids)
+        selected_hidden_states = torch.index_select(hidden_states, 0,
+                                                    logits_indices)
+        logits = self.lm_head(selected_hidden_states).to(torch.float32)
+        emitted_hidden = target_hidden if target_hidden_base else (
+            hidden_states if
+            (mtp_base or getattr(self, "emit_hidden_states", False)) else None)
+        return (logits, emitted_hidden, present_kv, present_conv,
+                present_recurrent, intermediate_conv, intermediate_recurrent)
 
     def forward(
         self,
@@ -1239,16 +1625,18 @@ class Qwen3_5CausalLM(nn.Module):
         attention_pos_id: "torch.Tensor | None" = None,
         attention_mask: "torch.Tensor | None" = None,
         skip_softmax_scale: "torch.Tensor | None" = None,
-        spec_verify_phase_marker: "torch.Tensor | None" = None,
+        execution_phase_marker: "torch.Tensor | None" = None,
         tree_parent_ids: "torch.Tensor | None" = None,
         tree_depths: "torch.Tensor | None" = None,
     ) -> Tuple:
         mtp_base = _is_mtp_base_export(self.config)
         dflash_base = _is_dflash_base_export(self.config)
+        jetspec_base = _is_jetspec_base_export(self.config)
         dspark_base = _is_dspark_base_export(self.config)
-        target_hidden_base = dflash_base or dspark_base
+        target_hidden_base = dflash_base or jetspec_base or dspark_base
         target_layer_ids = (
             self.config.dspark_target_layer_ids if dspark_base else
+            self.config.jetspec_target_layer_ids if jetspec_base else
             self.config.dflash_target_layer_ids if dflash_base else None)
         (hidden_states, present_key_values, present_conv_states,
          present_recurrent_states, intermediate_conv_states,
@@ -1264,7 +1652,7 @@ class Qwen3_5CausalLM(nn.Module):
              attention_mask=attention_mask,
              attention_pos_id=attention_pos_id,
              skip_softmax_scale=skip_softmax_scale,
-             spec_verify_phase_marker=spec_verify_phase_marker,
+             execution_phase_marker=execution_phase_marker,
              tree_parent_ids=tree_parent_ids,
              tree_depths=tree_depths,
              collect_intermediate_states=(mtp_base or target_hidden_base),

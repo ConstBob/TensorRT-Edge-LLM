@@ -118,24 +118,9 @@ void launchApplyRopeWriteKVSplitQKV(rt::Tensor const& cosSinCache, rt::Tensor co
 //! KV cache belongs to a donor layer and must not be modified.
 //!
 //! @param[in] cosSinCache FP32 type tensor with layout of [cosSinCacheBatchSize, cosSinCacheSeqLen, rotaryDim]
-//! @param[in] kvCacheEndLens INT32 type tensor with layout of [batchSize], used to compute RoPE position.
 //! @param[in,out] q FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hq, headDim]. RoPE applied in-place.
 //! @param[in] stream CUDA stream to launch the kernel
-void launchApplyRopeQOnly(
-    rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens, rt::Tensor& q, cudaStream_t stream);
-
-//! @brief Launch kernel to apply RoPE to Q only, using per-token position IDs (tree decoding).
-//!
-//! For shared-KV layers during tree/speculative decoding, each candidate token has its own
-//! position in the tree. RoPE is applied to Q using these explicit position IDs.
-//! No KV cache write is performed (the donor layer's cache is already populated).
-//!
-//! @param[in] cosSinCache FP32 type tensor with layout of [cosSinCacheBatchSize, cosSinCacheSeqLen, rotaryDim]
-//! @param[in] tokenPosIds INT32 type tensor with layout of [batchSize, runtimeSeqLen], per-token position IDs.
-//! @param[in,out] q FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hq, headDim]. RoPE applied in-place.
-//! @param[in] stream CUDA stream to launch the kernel
-void launchApplyRopeQOnlyTreeDecoding(
-    rt::Tensor const& cosSinCache, rt::Tensor const& tokenPosIds, rt::Tensor& q, cudaStream_t stream);
+void launchApplyRopeQOnly(rt::Tensor const& cosSinCache, rt::Tensor& q, cudaStream_t stream);
 
 //! @brief Launch kernel to read a packed QKV tensor, apply RoPE to Q and K, write roped Q to
 //!        a split scratch tensor, and optionally write roped K and V to KVCache. Optionally also
@@ -184,6 +169,8 @@ void launchApplyRopeQOnlyTreeDecoding(
 //!             their donor layer already owns and populated the cache.
 //! @param[in]  enablePdl Allow this kernel to overlap its producer, wait before reading producer-owned position
 //!             metadata or @p packedQKV, and trigger dependents after every CTA has completed its output stores.
+//! @param[in]  tokenAlignedRope Whether cosSinCache rows are aligned with packed execution rows instead of absolute
+//!             token positions.
 //! @throws std::runtime_error if tensor shape or data type is incorrect.
 void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::OptionalInputTensor kvCacheEndLens,
     rt::OptionalInputTensor tokenPosIds, rt::Tensor const& packedQKV, rt::Tensor& qScratch, rt::Tensor& kvCache,
@@ -191,7 +178,7 @@ void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::Optiona
     void* kScratchOut = nullptr, void* vScratchOut = nullptr, void* fp8QOut = nullptr, float qScale = 1.0f,
     half const* qNormGamma = nullptr, half const* kNormGamma = nullptr, float rmsNormEps = 1e-6f,
     bool qkNormPostRope = false, rt::OptionalInputTensor cuQSeqLens = std::nullopt, bool writeKVCache = true,
-    bool enablePdl = false);
+    bool enablePdl = false, bool tokenAlignedRope = false);
 
 } // namespace kernel
 } // namespace trt_edgellm

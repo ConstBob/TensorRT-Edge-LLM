@@ -135,7 +135,8 @@ public:
     bool supportsSteppedExecution() const noexcept;
 
     //! Open one request under the stepped control plane; see RuntimeCoordinator::beginStepped.
-    std::unique_ptr<SteppedExecution> beginStepped(LLMGenerationRequest const& request, cudaStream_t stream);
+    std::unique_ptr<SteppedExecution> beginStepped(
+        LLMGenerationRequest const& request, RequestId requestId, cudaStream_t stream);
 
     //! @brief Ranks this runtime spans. 1 when it runs on a single device.
     //!

@@ -24,6 +24,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -71,6 +72,7 @@ TEST(DecoderUtilsTests, FinishedSlotsIgnoreAcceptedTokens)
     context.finishedStates = {1, 0};
     context.tokenIds = {{100}, {200}};
     context.currentGenerateLengths = {1, 1};
+    context.committedLengths = {10, 20};
     context.shouldStopAfterAcceptedToken = [](int32_t, int32_t) { return false; };
 
     rt::Tensor hostAcceptLengths({2}, rt::DeviceType::kCPU, DataType::kINT32);
@@ -87,8 +89,48 @@ TEST(DecoderUtilsTests, FinishedSlotsIgnoreAcceptedTokens)
     EXPECT_EQ(context.tokenIds[0], std::vector<int32_t>({100}));
     EXPECT_EQ(context.tokenIds[1], std::vector<int32_t>({200, 201}));
     EXPECT_EQ(context.currentGenerateLengths, std::vector<int32_t>({1, 2}));
+    EXPECT_EQ(context.committedLengths, std::vector<int32_t>({10, 21}));
     EXPECT_EQ(hostAcceptLengths.dataPointer<int32_t>()[0], 0);
     EXPECT_EQ(hostAcceptLengths.dataPointer<int32_t>()[1], 1);
 
     CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
+TEST(DecoderUtilsTests, SpecPrefillPreservesRestoredPrefixFrontier)
+{
+    rt::DecodingInferenceContext context;
+    context.activeBatchSize = 2;
+    context.effectivePrefillLengths = {3, 2};
+    context.prefillStartLengths = {0, 5};
+    context.residentRefs = {rt::ResidentRef{4, 1}, rt::ResidentRef{1, 2}};
+
+    rt::RaggedExecutionBatch const batch = rt::decoder_utils::buildSpecPrefillRaggedBatch(context, 4);
+
+    EXPECT_EQ(batch.shape.numSequences, 2);
+    EXPECT_EQ(batch.shape.validTokens, 5);
+    EXPECT_EQ(batch.shape.physicalTokens, 8);
+    EXPECT_EQ(batch.shape.queryWidth, 4);
+    EXPECT_EQ(batch.queryStartOffsets, std::vector<int32_t>({0, 4, 8}));
+    EXPECT_EQ(batch.queryLengths, std::vector<int32_t>({3, 2}));
+    EXPECT_EQ(batch.pastLengths, std::vector<int32_t>({0, 5}));
+    EXPECT_EQ(batch.attentionSequenceLengths, std::vector<int32_t>({3, 7}));
+    EXPECT_EQ(batch.positions, std::vector<int32_t>({0, 1, 2, -1, 5, 6, -1, -1}));
+    EXPECT_EQ(batch.stateIndices, std::vector<int32_t>({4, 1}));
+    EXPECT_EQ(batch.logitsIndices, std::vector<int64_t>({2, 5}));
+}
+
+TEST(DecoderUtilsTests, ContextBatchWithColdAndRestoredRowsUsesChunkPhase)
+{
+    EXPECT_EQ(rt::decoder_utils::contextPrefillPhase({0, 0}, 2), rt::ExecutionPhase::kContextPrefill);
+    EXPECT_EQ(rt::decoder_utils::contextPrefillPhase({0, 5}, 2), rt::ExecutionPhase::kContextChunk);
+    EXPECT_THROW(rt::decoder_utils::contextPrefillPhase({0}, 2), std::runtime_error);
+    EXPECT_THROW(rt::decoder_utils::contextPrefillPhase({0, -1}, 2), std::runtime_error);
+    EXPECT_THROW(rt::decoder_utils::contextPrefillPhase({5, -1}, 2), std::runtime_error);
+}
+
+TEST(DecoderUtilsTests, SpecPrefillRejectsPhysicalTokenOverflow)
+{
+    rt::DecodingInferenceContext context;
+    context.activeBatchSize = std::numeric_limits<int32_t>::max();
+    EXPECT_THROW(rt::decoder_utils::buildSpecPrefillRaggedBatch(context, 2), std::runtime_error);
 }

@@ -54,7 +54,7 @@ TEST(GenerateMultimodalIndices, AudioOnly)
     auto ids = makeCpuIds({10, kAudioTok, 20, kAudioTok, 30}, 1, 5);
     auto result = rt::generateMultimodalIndices(ids, kAudioTok, std::nullopt);
     auto v = toVec(result);
-    EXPECT_EQ(v, (std::vector<int32_t>{0, 0, 0, 1, 0}));
+    EXPECT_EQ(v, (std::vector<int32_t>{-1, 0, -1, 1, -1}));
 }
 
 // Image-only tokens (explicit imageTokenId)
@@ -64,7 +64,7 @@ TEST(GenerateMultimodalIndices, ImageOnlyExplicitId)
     auto ids = makeCpuIds({10, kImageTok, 20, kImageTok, kImageTok}, 1, 5);
     auto result = rt::generateMultimodalIndices(ids, std::nullopt, kImageTok);
     auto v = toVec(result);
-    EXPECT_EQ(v, (std::vector<int32_t>{0, 0, 0, 1, 2}));
+    EXPECT_EQ(v, (std::vector<int32_t>{-1, 0, -1, 1, 2}));
 }
 
 // Mixed audio + image tokens
@@ -76,7 +76,7 @@ TEST(GenerateMultimodalIndices, MixedAudioImage)
     auto result = rt::generateMultimodalIndices(ids, kAudioTok, kImageTok);
     auto v = toVec(result);
     // audio indices: 0, 1; image indices: 0, 1
-    EXPECT_EQ(v, (std::vector<int32_t>{0, 0, 1, 1, 0}));
+    EXPECT_EQ(v, (std::vector<int32_t>{0, 0, 1, 1, -1}));
 }
 
 // No multimodal tokens (all normal text)
@@ -85,7 +85,7 @@ TEST(GenerateMultimodalIndices, NoMultimodalTokens)
     auto ids = makeCpuIds({10, 20, 30, 40}, 1, 4);
     auto result = rt::generateMultimodalIndices(ids, std::nullopt, std::nullopt);
     auto v = toVec(result);
-    EXPECT_EQ(v, (std::vector<int32_t>{0, 0, 0, 0}));
+    EXPECT_EQ(v, (std::vector<int32_t>{-1, -1, -1, -1}));
 }
 
 // Multi-batch with global indexing across batches
@@ -99,7 +99,7 @@ TEST(GenerateMultimodalIndices, MultiBatchGlobalIndexing)
     auto ids = makeCpuIds({kAudioTok, 10, kImageTok, kAudioTok, kImageTok, 10}, 2, 3);
     auto result = rt::generateMultimodalIndices(ids, kAudioTok, kImageTok);
     auto v = toVec(result);
-    EXPECT_EQ(v, (std::vector<int32_t>{0, 0, 0, 1, 1, 0}));
+    EXPECT_EQ(v, (std::vector<int32_t>{0, -1, 0, 1, 1, -1}));
 }
 
 // Contiguous image runs get one block id each; audio tokens stay causal (-1).

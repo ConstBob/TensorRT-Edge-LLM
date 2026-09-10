@@ -541,6 +541,11 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
             request.samplingSeed = requestItem.contains("sampling_seed") && !requestItem["sampling_seed"].is_null()
                 ? std::optional<uint64_t>{requestItem["sampling_seed"].get<uint64_t>()}
                 : defaultSamplingSeed;
+            if (requestItem.contains("context_cache_lookup_policy")
+                && !requestItem["context_cache_lookup_policy"].is_null())
+            {
+                request.contextCacheLookupPolicy = parseContextCacheLookupPolicy(requestItem);
+            }
             request.messages = std::move(chatMessages);
             request.imageBuffers = std::move(imageBuffers);
             request.audioBuffers = std::move(audioBuffers);

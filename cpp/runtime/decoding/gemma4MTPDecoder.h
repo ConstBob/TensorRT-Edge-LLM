@@ -72,7 +72,8 @@ public:
     void setContextMemory(Tensor& memory) override;
 
     bool hasSystemPromptKVCache(SystemPromptCacheKey const& key) const override;
-    void restoreSystemPromptKVCache(SystemPromptCacheKey const& key, int32_t batchIdx, cudaStream_t stream) override;
+    void restoreSystemPromptKVCache(
+        SystemPromptCacheKey const& key, int32_t residentSlot, cudaStream_t stream) override;
     bool runSystemPromptPrefill(DecodingInferenceContext& context) override;
     void saveSystemPromptKVCache(SystemPromptCacheKey const& key, std::string const& prompt,
         std::vector<tokenizer::Rank> const& tokenizedPrompt, int32_t promptIdsLength, cudaStream_t stream) override;
@@ -108,6 +109,7 @@ private:
     Tensor mHostAcceptLengths;    //!< [B] INT32 host staging.
     Tensor mHostAcceptedTokenIds; //!< [B, specDraftStep + 1] INT32 host staging.
     Tensor mArgmaxScratch;        //!< [B * (specDraftStep + 1)] INT32 accept argmax scratch.
+    RaggedExecutionBatch mRaggedMetadataScratch;
 
     bool mUseTree{false};
     Tensor mStackedDraftLogits; //!< [B, specDraftStep + 1, draftVocab] per-depth proposal logits.

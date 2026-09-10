@@ -220,6 +220,9 @@ struct LLMGenerationRequest
         //! Stable seed for this logical request; independent of its active batch slot.
         std::optional<uint64_t> samplingSeed;
 
+        //! Optional sequence-level override of the batch context-cache lookup policy.
+        std::optional<ContextCacheLookupPolicy> contextCacheLookupPolicy;
+
         mutable FormattedRequest formatted; //!< Formatted request (populated by tokenizer or user-provided)
     };
     //! \endcond
@@ -377,6 +380,7 @@ struct RopeConfig
     float rotaryTheta{100000.0F};             //!< Base frequency for rotary embeddings
     float partialRotaryFactor{1.0F};          //!< Fraction of head angles rotated by proportional RoPE
     int32_t maxPositionEmbeddings{32768};     //!< Maximum position embeddings supported
+    std::vector<int32_t> mropeSection;        //!< MRoPE frequency partition, empty for non-MRoPE
     std::optional<LongRopeParams> longRope{}; //!< Long-Rope specific parameters
     std::optional<YarnParams> yarn{};         //!< YaRN specific parameters
     std::optional<Llama3Params> llama3{};     //!< Llama-3 scaling parameters

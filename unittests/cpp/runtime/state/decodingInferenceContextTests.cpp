@@ -40,7 +40,7 @@ DecodingInferenceContext makeRunningBatch()
 {
     DecodingInferenceContext context;
     context.initialize(/*batchSize=*/1, /*maxGenLength=*/64, /*visual=*/{}, /*deepstack=*/{}, /*loraName=*/"",
-        /*cudaStream=*/nullptr);
+        /*cudaStream=*/nullptr, /*residentCapacity=*/4);
     context.rawBatchedInputIds.push_back({11, 12, 13});
     context.tokenIds[0] = {11, 12, 13, 100, 101}; // prompt plus two generated tokens
     context.currentGenerateLengths[0] = 2;
@@ -58,6 +58,24 @@ SlotSeed makeSeed(int32_t originalIndex = 1)
     return seed;
 }
 
+int32_t appendTestSlot(DecodingInferenceContext& context, SlotSeed seed, RequestId requestId)
+{
+    std::optional<ResidentRef> const resident = context.residentSlots.acquire();
+    if (!resident.has_value())
+    {
+        throw std::runtime_error("test resident pool is full");
+    }
+    try
+    {
+        return context.appendSlot(std::move(seed), SequenceIdentity{requestId, *resident});
+    }
+    catch (...)
+    {
+        EXPECT_TRUE(context.residentSlots.release(*resident));
+        throw;
+    }
+}
+
 } // namespace
 
 TEST(DecodingInferenceContextAppendTests, GrowsEveryVectorWithoutDisturbingResidents)
@@ -65,7 +83,7 @@ TEST(DecodingInferenceContextAppendTests, GrowsEveryVectorWithoutDisturbingResid
     DecodingInferenceContext context = makeRunningBatch();
     ASSERT_TRUE(context.perSlotSizesConsistent());
 
-    int32_t const slot = context.appendSlot(makeSeed());
+    int32_t const slot = appendTestSlot(context, makeSeed(), /*requestId=*/701);
     EXPECT_EQ(slot, 1);
     EXPECT_EQ(context.activeBatchSize, 2);
     EXPECT_TRUE(context.perSlotSizesConsistent());
@@ -75,6 +93,11 @@ TEST(DecodingInferenceContextAppendTests, GrowsEveryVectorWithoutDisturbingResid
     EXPECT_EQ(context.rawBatchedInputIds[1], (std::vector<int32_t>{21, 22}));
     EXPECT_EQ(context.currentGenerateLengths[1], 0);
     EXPECT_EQ(context.effectivePrefillLengths[1], 0);
+    EXPECT_EQ(context.prefillStartLengths[1], 0);
+    EXPECT_EQ(context.committedLengths[1], 0);
+    EXPECT_EQ(context.requestIds[1], 701U);
+    EXPECT_NE(context.residentRefs[1], context.residentRefs[0]);
+    EXPECT_TRUE(context.residentSlots.contains(context.residentRefs[1]));
     EXPECT_EQ(context.finishedStates[1], 0);
     EXPECT_EQ(context.batchIndexMapping[1], 1);
     EXPECT_EQ(context.systemPrompts[1], "sys");
@@ -98,26 +121,26 @@ TEST(DecodingInferenceContextAppendTests, RejectsWhatWouldCorruptTheBatch)
     DecodingInferenceContext empty;
     empty.initialize(1, 64, {}, {}, "", nullptr);
     empty.activeBatchSize = 0;
-    EXPECT_THROW(empty.appendSlot(makeSeed()), std::runtime_error);
+    EXPECT_THROW(appendTestSlot(empty, makeSeed(), /*requestId=*/701), std::runtime_error);
 
     DecodingInferenceContext context = makeRunningBatch();
 
     SlotSeed noPrompt = makeSeed();
     noPrompt.promptTokenIds.clear();
-    EXPECT_THROW(context.appendSlot(noPrompt), std::runtime_error);
+    EXPECT_THROW(appendTestSlot(context, noPrompt, /*requestId=*/701), std::runtime_error);
 
     // Original index 0 is held by the live slot; a duplicate would file two sequences' results in
     // one bucket.
-    EXPECT_THROW(context.appendSlot(makeSeed(/*originalIndex=*/0)), std::runtime_error);
+    EXPECT_THROW(appendTestSlot(context, makeSeed(/*originalIndex=*/0), /*requestId=*/701), std::runtime_error);
 
     // Same rule against results already collected.
     context.completedBatches[7] = {};
-    EXPECT_THROW(context.appendSlot(makeSeed(/*originalIndex=*/7)), std::runtime_error);
+    EXPECT_THROW(appendTestSlot(context, makeSeed(/*originalIndex=*/7), /*requestId=*/701), std::runtime_error);
 
     // A reused prefix covering the whole prompt would leave nothing to prefill.
     SlotSeed allReused = makeSeed();
     allReused.prefillStart = static_cast<int32_t>(allReused.promptTokenIds.size());
-    EXPECT_THROW(context.appendSlot(allReused), std::runtime_error);
+    EXPECT_THROW(appendTestSlot(context, allReused, /*requestId=*/701), std::runtime_error);
 
     // Every rejection above must leave the batch exactly as it was.
     EXPECT_EQ(context.activeBatchSize, 1);
@@ -133,7 +156,7 @@ TEST(DecodingInferenceContextAppendTests, RejectsAChannelAttachedElsewhereWithou
 
     SlotSeed seed = makeSeed();
     seed.channel = channel;
-    EXPECT_THROW(context.appendSlot(seed), std::runtime_error);
+    EXPECT_THROW(appendTestSlot(context, seed, /*requestId=*/701), std::runtime_error);
     EXPECT_EQ(context.activeBatchSize, 1);
     EXPECT_TRUE(context.perSlotSizesConsistent());
 }
@@ -144,7 +167,7 @@ TEST(DecodingInferenceContextAppendTests, InheritsLogprobsCapacityFromAnExisting
     context.numLogprobs = 4;
     context.stepLogprobs[0].data.resize(64 * 4);
 
-    int32_t const slot = context.appendSlot(makeSeed());
+    int32_t const slot = appendTestSlot(context, makeSeed(), /*requestId=*/701);
     EXPECT_EQ(context.stepLogprobs[slot].data.size(), context.stepLogprobs[0].data.size());
     EXPECT_EQ(context.stepLogprobs[slot].numSteps, 0);
 }
@@ -153,13 +176,13 @@ TEST(DecodingInferenceContextAppendTests, TracksTheConditionalPruningVector)
 {
     // Off: the vector stays empty, matching the "missing entry means 0" convention.
     DecodingInferenceContext context = makeRunningBatch();
-    context.appendSlot(makeSeed());
+    appendTestSlot(context, makeSeed(), /*requestId=*/701);
     EXPECT_TRUE(context.prunedPrefillTokens.empty());
 
     // On: it must grow with the batch or later per-slot reads shift by one.
     DecodingInferenceContext pruned = makeRunningBatch();
     pruned.prunedPrefillTokens.assign(1, 9);
-    pruned.appendSlot(makeSeed());
+    appendTestSlot(pruned, makeSeed(), /*requestId=*/701);
     ASSERT_EQ(pruned.prunedPrefillTokens.size(), 2U);
     EXPECT_EQ(pruned.prunedPrefillTokens[0], 9);
     EXPECT_EQ(pruned.prunedPrefillTokens[1], 0);
@@ -169,12 +192,12 @@ TEST(DecodingInferenceContextAppendTests, RaisesTheLogitBiasFlagsExactlyWhenBias
 {
     DecodingInferenceContext context = makeRunningBatch();
 
-    context.appendSlot(makeSeed(1));
+    appendTestSlot(context, makeSeed(1), /*requestId=*/701);
     EXPECT_FALSE(context.hasLogitBias) << "a slot without bias must not raise the flag";
 
     SlotSeed biased = makeSeed(2);
     biased.logitBias = {{42, -1.0F}};
-    context.appendSlot(biased);
+    appendTestSlot(context, biased, /*requestId=*/702);
     EXPECT_TRUE(context.hasLogitBias);
     EXPECT_TRUE(context.logitBiasGpuDirty) << "the slot-indexed GPU table must be re-uploaded after growth";
 }
@@ -188,7 +211,7 @@ TEST(DecodingInferenceContextAppendTests, AReusedPrefixSeedsOnlyTheSuffixIntoThe
     SlotSeed seed = makeSeed();
     seed.promptTokenIds = {21, 22, 23, 24};
     seed.prefillStart = 3;
-    int32_t const slot = context.appendSlot(seed);
+    int32_t const slot = appendTestSlot(context, seed, /*requestId=*/701);
 
     EXPECT_EQ(context.rawBatchedInputIds[static_cast<size_t>(slot)], (std::vector<int32_t>{21, 22, 23, 24}));
     EXPECT_EQ(context.tokenIds[static_cast<size_t>(slot)], (std::vector<int32_t>{24}));
@@ -209,7 +232,7 @@ TEST(DecodingInferenceContextAppendTests, SurvivesTheEvictionThatFollowsIt)
     SlotSeed seed = makeSeed();
     seed.channel = StreamChannel::create();
     seed.samplingSeed = 77;
-    int32_t const slotB = context.appendSlot(seed);
+    int32_t const slotB = appendTestSlot(context, seed, /*requestId=*/701);
     context.prunedPrefillTokens[static_cast<size_t>(slotB)] = 5; // as B's seated prefill would record
 
     context.finishedStates[0] = 1; // A is done
@@ -228,6 +251,10 @@ TEST(DecodingInferenceContextAppendTests, SurvivesTheEvictionThatFollowsIt)
     compactVector(mapping, context.systemPrompts);
     compactVector(mapping, context.rawBatchedInputIds);
     compactVector(mapping, context.effectivePrefillLengths);
+    compactVector(mapping, context.prefillStartLengths);
+    compactVector(mapping, context.committedLengths);
+    compactVector(mapping, context.requestIds);
+    compactVector(mapping, context.residentRefs);
     if (!context.prunedPrefillTokens.empty())
     {
         compactVector(mapping, context.prunedPrefillTokens);
@@ -251,7 +278,7 @@ TEST(DecodingInferenceContextAppendTests, SurvivesTheEvictionThatFollowsIt)
     EXPECT_EQ(context.prunedPrefillTokens[0], 5) << "B inherited A's pruning count";
 }
 
-// swapSlots: the host half of seating a resident slot at index zero for a pass that assumes it.
+// swapExecutionRows presents one logical sequence at row zero without moving resident state.
 
 TEST(DecodingInferenceContextSwapTests, ExchangesEveryPerSlotFieldAndIsItsOwnInverse)
 {
@@ -259,10 +286,10 @@ TEST(DecodingInferenceContextSwapTests, ExchangesEveryPerSlotFieldAndIsItsOwnInv
     SlotSeed seed = makeSeed();
     seed.channel = StreamChannel::create();
     seed.logitBias = {{7, 2.0F}};
-    context.appendSlot(seed);
+    appendTestSlot(context, seed, /*requestId=*/701);
     context.thinkingDone[0] = 1; // A left its thinking block; B has not
 
-    context.swapSlots(0, 1);
+    context.swapExecutionRows(0, 1);
     // B's identity, history and delivery state now sit at slot 0; A's at slot 1.
     EXPECT_EQ(context.tokenIds[0], (std::vector<int32_t>{21, 22}));
     EXPECT_EQ(context.batchIndexMapping[0], 1);
@@ -276,7 +303,7 @@ TEST(DecodingInferenceContextSwapTests, ExchangesEveryPerSlotFieldAndIsItsOwnInv
     EXPECT_TRUE(context.perSlotSizesConsistent());
 
     // The restore is the same call.
-    context.swapSlots(0, 1);
+    context.swapExecutionRows(0, 1);
     EXPECT_EQ(context.tokenIds[0], (std::vector<int32_t>{11, 12, 13, 100, 101}));
     EXPECT_EQ(context.batchIndexMapping[0], 0);
     EXPECT_EQ(context.tokenIds[1], (std::vector<int32_t>{21, 22}));
@@ -287,10 +314,10 @@ TEST(DecodingInferenceContextSwapTests, ExchangesEveryPerSlotFieldAndIsItsOwnInv
 TEST(DecodingInferenceContextSwapTests, RejectsOutOfRangeAndIgnoresSelfSwap)
 {
     DecodingInferenceContext context = makeRunningBatch();
-    EXPECT_THROW(context.swapSlots(0, 1), std::runtime_error); // batch of 1 has no slot 1
-    EXPECT_THROW(context.swapSlots(-1, 0), std::runtime_error);
+    EXPECT_THROW(context.swapExecutionRows(0, 1), std::runtime_error); // batch of 1 has no row 1
+    EXPECT_THROW(context.swapExecutionRows(-1, 0), std::runtime_error);
 
     std::vector<int32_t> const before = context.tokenIds[0];
-    context.swapSlots(0, 0);
+    context.swapExecutionRows(0, 0);
     EXPECT_EQ(context.tokenIds[0], before);
 }

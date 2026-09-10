@@ -28,7 +28,8 @@ from ...checkpoint import checkpoint_utils
 from ...config import (QUANT_INT4_AWQ, QUANT_INT4_AWQ_MODELOPT,
                        QUANT_INT4_GPTQ, QUANT_NVFP4, ModelConfig)
 from ..default.modeling_default import (MLP, Attention, CausalLM, DecoderLayer,
-                                        OnnxSpec, RMSNorm)
+                                        OnnxSpec, RMSNorm,
+                                        _concat_hidden_in_provider_order)
 from ..linear import TPMode, make_linear
 from ..ops import (KV_PAGE_SIZE, attention_plugin, int4_moe_plugin,
                    nvfp4_moe_plugin, nvfp4_moe_plugin_geforce,
@@ -126,6 +127,8 @@ def _kv_cache_dims_for_layer(config: ModelConfig,
 
 def _gemma4_uses_swa_kv_cache(config: ModelConfig) -> bool:
     """Return whether this Gemma4 export supports bounded SWA pools."""
+    if config.is_diffusion_gemma:
+        return False
     if (int(getattr(config, "sliding_window_size", -1)) <= 0
             or "sliding_attention" not in getattr(
                 config, "attention_layer_types", [])):
@@ -347,6 +350,94 @@ def _make_gemma4_flat_wrapper(model: nn.Module,
     return _Wrapper(model)
 
 
+def _make_gemma4_flat_wrapper_ragged(
+        model: nn.Module,
+        num_layers: int,
+        num_ple_inputs: int,
+        use_dual_rope: bool = False,
+        use_swa_kv_cache: bool = False,
+        vision_block_attention: bool = False,
+        emit_hidden_states: bool = False,
+        tree_attention: bool = False) -> nn.Module:
+    """Build the vanilla Gemma4 wrapper for the token-major runtime ABI."""
+    param_names: List[str] = (
+        ["inputs_embeds"] +
+        [f"ple_token_embeds_{i}" for i in range(num_ple_inputs)] +
+        [f"past_key_values_{i}" for i in range(num_layers)])
+    if use_dual_rope:
+        param_names += [
+            "rope_rotary_cos_sin_sliding", "rope_rotary_cos_sin_full"
+        ]
+    else:
+        param_names += ["rope_rotary_cos_sin"]
+    param_names += [
+        "positions", "query_start_offsets", "query_lengths", "past_lengths",
+        "attention_sequence_lengths", "state_indices",
+        "execution_phase_marker", "context_sequence_count_carrier",
+        "kv_page_table"
+    ]
+    if use_swa_kv_cache:
+        param_names += ["swa_kv_page_table", "swa_kv_cache_mode"]
+    param_names += ["logits_indices"]
+    if vision_block_attention:
+        param_names += ["vision_block_ids"]
+    if tree_attention:
+        param_names += [
+            "attention_position_ids", "packed_attention_mask",
+            "tree_parent_ids", "tree_depths", "valid_tree_counts"
+        ]
+
+    past_kv_tuple = "({},)".format(", ".join(f"past_key_values_{i}"
+                                             for i in range(num_layers)))
+    ple_tuple = ("({},)".format(", ".join(
+        f"ple_token_embeds_{i}"
+        for i in range(num_ple_inputs))) if num_ple_inputs else "()")
+    if use_dual_rope:
+        rope_arg = "None"
+        rope_kwargs = (
+            ", rope_rotary_cos_sin_sliding=rope_rotary_cos_sin_sliding"
+            ", rope_rotary_cos_sin_full=rope_rotary_cos_sin_full")
+    else:
+        rope_arg = "rope_rotary_cos_sin"
+        rope_kwargs = ""
+    vision_kwarg = (", vision_block_ids=vision_block_ids"
+                    if vision_block_attention else "")
+    tree_kwargs = (", attention_position_ids=attention_position_ids"
+                   ", packed_attention_mask=packed_attention_mask"
+                   ", tree_parent_ids=tree_parent_ids"
+                   ", tree_depths=tree_depths"
+                   ", valid_tree_counts=valid_tree_counts"
+                   if tree_attention else "")
+    swa_kwargs = (", swa_kv_page_table=swa_kv_page_table"
+                  ", swa_kv_cache_mode=swa_kv_cache_mode"
+                  if use_swa_kv_cache else "")
+    body = (
+        f"    outputs = self._model.forward_ragged(\n"
+        f"        inputs_embeds, {past_kv_tuple}, {rope_arg}, positions, "
+        f"query_start_offsets, query_lengths, "
+        f"past_lengths, attention_sequence_lengths, "
+        f"state_indices, execution_phase_marker, context_sequence_count_carrier, "
+        f"kv_page_table, logits_indices, "
+        f"ple_token_embeds={ple_tuple}{rope_kwargs}{vision_kwarg}{tree_kwargs}"
+        f"{swa_kwargs})\n"
+        f"    logits, hidden_states, present_key_values = outputs\n"
+        f"    if hidden_states is None:\n"
+        f"        return (logits,) + tuple(present_key_values)\n"
+        f"    return (logits, hidden_states) + tuple(present_key_values)\n")
+    src = "def _forward(self, {}):\n{}".format(", ".join(param_names), body)
+    globs: dict = {}
+    exec(src, globs)  # noqa: S102
+
+    class _Wrapper(nn.Module):
+
+        def __init__(self, wrapped_model: nn.Module) -> None:
+            super().__init__()
+            self._model = wrapped_model
+
+    _Wrapper.forward = globs["_forward"]
+    return _Wrapper(model)
+
+
 def _resolve_hidden_activation(
         activation_name: str) -> Callable[[torch.Tensor], torch.Tensor]:
     """Return the Gemma4 PLE gate activation."""
@@ -518,6 +609,11 @@ class Gemma4Attention(Attention):
         swa_kv_page_table: torch.Tensor | None = None,
         swa_kv_cache_mode: torch.Tensor | None = None,
         shared_key_value: Tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_position_ids: torch.Tensor | None = None,
+        packed_attention_mask: torch.Tensor | None = None,
+        tree_parent_ids: torch.Tensor | None = None,
+        tree_depths: torch.Tensor | None = None,
+        valid_tree_counts: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]
                | None]:
         batch_size, seq_len, _ = hidden_states.shape
@@ -625,6 +721,109 @@ class Gemma4Attention(Attention):
         )
         attn_output = attn_output.reshape(batch_size, seq_len,
                                           self.num_heads * self.head_dim)
+        current_key_value = (None if self.is_kv_shared else
+                             (key_states, value_states))
+        return self.o_proj(attn_output), present_key_value, current_key_value
+
+    def forward_ragged(
+        self,
+        hidden_states: torch.Tensor,
+        past_key_value: torch.Tensor,
+        rope_rotary_cos_sin: torch.Tensor,
+        positions: torch.Tensor,
+        query_start_offsets: torch.Tensor,
+        query_lengths: torch.Tensor,
+        past_lengths: torch.Tensor,
+        attention_sequence_lengths: torch.Tensor,
+        state_indices: torch.Tensor,
+        execution_phase_marker: torch.Tensor,
+        context_sequence_count_carrier: torch.Tensor,
+        kv_page_table: torch.Tensor,
+        swa_kv_page_table: torch.Tensor | None = None,
+        swa_kv_cache_mode: torch.Tensor | None = None,
+        shared_key_value: Tuple[torch.Tensor, torch.Tensor] | None = None,
+        vision_block_ids: torch.Tensor | None = None,
+        context_mask_selector: torch.Tensor | None = None,
+        attention_position_ids: torch.Tensor | None = None,
+        packed_attention_mask: torch.Tensor | None = None,
+        tree_parent_ids: torch.Tensor | None = None,
+        tree_depths: torch.Tensor | None = None,
+        valid_tree_counts: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]
+               | None]:
+        query_states = self.q_proj(hidden_states)
+        if self.is_kv_shared:
+            if self.use_swa_pool and shared_key_value is not None:
+                key_states, value_states = shared_key_value
+            else:
+                key_states = None
+                value_states = None
+        else:
+            key_states = self.k_proj(hidden_states)
+            value_states = (key_states if self.attention_k_eq_v else
+                            self.v_proj(hidden_states))
+
+        if self.q_norm is not None:
+            query_states = self.q_norm(
+                query_states.unflatten(
+                    -1, (self.num_heads, self.head_dim))).flatten(-2)
+        if not self.is_kv_shared:
+            if self.k_norm is not None:
+                key_states = self.k_norm(
+                    key_states.unflatten(
+                        -1, (self.num_kv_heads, self.head_dim))).flatten(-2)
+            if self.v_norm is not None:
+                value_states = self.v_norm(
+                    value_states.unflatten(
+                        -1, (self.num_kv_heads, self.head_dim))).flatten(-2)
+
+        enable_tree = packed_attention_mask is not None
+        layer_page_table = kv_page_table
+        if self.use_swa_pool and not enable_tree:
+            if swa_kv_page_table is None:
+                raise ValueError(
+                    "SWA-capable Gemma4 layers require swa_kv_page_table.")
+            layer_page_table = swa_kv_page_table
+
+        kwargs: dict = {
+            "num_q_heads": self.num_heads,
+            "num_kv_heads": self.num_kv_heads,
+            "head_size": self.head_dim,
+            "sliding_window_size": self.sliding_window_size,
+            "enable_tree_attention": enable_tree,
+            "enable_fp8_kv_cache": self.enable_fp8_kv_cache,
+            "attention_scale": self.attention_scale,
+            "enable_context_mask_selector": context_mask_selector is not None,
+            "enable_vision_block_attention": vision_block_ids is not None,
+            "skip_softmax_scale_factor": 0.0,
+            "qkv_scales": getattr(self, "_qkv_scales_float", [1.0, 1.0, 1.0]),
+            "query_start_offsets": query_start_offsets,
+            "attention_sequence_lengths": attention_sequence_lengths,
+            "execution_phase_marker": execution_phase_marker,
+            "context_sequence_count_carrier": context_sequence_count_carrier,
+        }
+        if vision_block_ids is not None:
+            kwargs["attention_mask"] = vision_block_ids
+        if context_mask_selector is not None:
+            kwargs["context_mask_selector"] = context_mask_selector
+        if enable_tree:
+            kwargs.update(attention_mask=packed_attention_mask,
+                          attention_pos_id=attention_position_ids)
+        if self.use_swa_pool and not enable_tree:
+            if swa_kv_cache_mode is None:
+                raise ValueError(
+                    "Bounded-capable Gemma4 SWA layers require swa_kv_cache_mode."
+                )
+            kwargs["swa_kv_cache_mode"] = swa_kv_cache_mode
+        if key_states is None:
+            qkv = query_states
+            kwargs["enable_kv_shared"] = 1
+        else:
+            qkv = torch.cat([query_states, key_states, value_states], dim=-1)
+        attn_output, present_key_value = attention_plugin(
+            qkv, past_key_value, query_lengths, rope_rotary_cos_sin,
+            past_lengths, layer_page_table, **kwargs)
+        attn_output = attn_output.flatten(-2)
         current_key_value = (None if self.is_kv_shared else
                              (key_states, value_states))
         return self.o_proj(attn_output), present_key_value, current_key_value
@@ -915,12 +1114,12 @@ class Gemma4FusedBF16MoEExperts(nn.Module):
         super().__init__()
         E = config.num_experts
         H = config.hidden_size
-        I = config.moe_intermediate_size
+        intermediate_size = config.moe_intermediate_size
         # Register as parameters so state_dict loading can populate them.
         self.gate_up_proj = nn.Parameter(
-            torch.empty(E, 2 * I, H, dtype=torch.bfloat16))
+            torch.empty(E, 2 * intermediate_size, H, dtype=torch.bfloat16))
         self.down_proj = nn.Parameter(
-            torch.empty(E, H, I, dtype=torch.bfloat16))
+            torch.empty(E, H, intermediate_size, dtype=torch.bfloat16))
 
 
 class Gemma4Int4MoEBlock(nn.Module):
@@ -1216,12 +1415,12 @@ class Gemma4DecoderLayer(DecoderLayer):
         if self.hidden_size_per_layer_input <= 0:
             raise ValueError(
                 "per_layer_input was provided but Gemma4 PLE is disabled.")
-        if per_layer_input.ndim != 3:
+        if per_layer_input.ndim not in (2, 3):
             raise ValueError(
                 "Gemma4DecoderLayer._apply_per_layer_input expects "
-                "per_layer_input to be rank-3, got shape "
+                "per_layer_input to be token-major or batch-major, got shape "
                 f"{tuple(per_layer_input.shape)}.")
-        if per_layer_input.shape[:2] != hidden_states.shape[:2]:
+        if per_layer_input.shape[:-1] != hidden_states.shape[:-1]:
             raise ValueError(
                 "Gemma4DecoderLayer._apply_per_layer_input expects "
                 "per_layer_input batch/sequence dimensions to match "
@@ -1313,6 +1512,78 @@ class Gemma4DecoderLayer(DecoderLayer):
         hidden_states = hidden_states * self._layer_scalar(
             phase_is_encoder, hidden_states)
 
+        return hidden_states, present_key_value, current_key_value
+
+    def forward_ragged(
+        self,
+        hidden_states: torch.Tensor,
+        past_key_value: torch.Tensor,
+        rope_rotary_cos_sin: torch.Tensor,
+        positions: torch.Tensor,
+        query_start_offsets: torch.Tensor,
+        query_lengths: torch.Tensor,
+        past_lengths: torch.Tensor,
+        attention_sequence_lengths: torch.Tensor,
+        state_indices: torch.Tensor,
+        execution_phase_marker: torch.Tensor,
+        context_sequence_count_carrier: torch.Tensor,
+        kv_page_table: torch.Tensor,
+        swa_kv_page_table: torch.Tensor | None = None,
+        swa_kv_cache_mode: torch.Tensor | None = None,
+        shared_key_value: Tuple[torch.Tensor, torch.Tensor] | None = None,
+        vision_block_ids: torch.Tensor | None = None,
+        per_layer_input: torch.Tensor | None = None,
+        context_mask_selector: torch.Tensor | None = None,
+        phase_is_encoder: torch.Tensor | None = None,
+        attention_position_ids: torch.Tensor | None = None,
+        packed_attention_mask: torch.Tensor | None = None,
+        tree_parent_ids: torch.Tensor | None = None,
+        tree_depths: torch.Tensor | None = None,
+        valid_tree_counts: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]
+               | None]:
+        residual = hidden_states
+        hidden_states, present_key_value, current_key_value = self.self_attn.forward_ragged(
+            self.input_layernorm(hidden_states),
+            past_key_value,
+            rope_rotary_cos_sin,
+            positions,
+            query_start_offsets,
+            query_lengths,
+            past_lengths,
+            attention_sequence_lengths,
+            state_indices,
+            execution_phase_marker,
+            context_sequence_count_carrier,
+            kv_page_table,
+            swa_kv_page_table=swa_kv_page_table,
+            swa_kv_cache_mode=swa_kv_cache_mode,
+            shared_key_value=shared_key_value,
+            vision_block_ids=vision_block_ids,
+            context_mask_selector=context_mask_selector,
+            attention_position_ids=attention_position_ids,
+            packed_attention_mask=packed_attention_mask,
+            tree_parent_ids=tree_parent_ids,
+            tree_depths=tree_depths,
+            valid_tree_counts=valid_tree_counts)
+        hidden_states = residual + self.post_attention_layernorm(hidden_states)
+
+        residual = hidden_states
+        hidden_states = self.mlp(self.pre_feedforward_layernorm(hidden_states))
+        if self.enable_moe_block:
+            hidden_states_1 = self.post_feedforward_layernorm_1(hidden_states)
+            expert_input = self.pre_feedforward_layernorm_2(residual)
+            hidden_states_2 = self.moe_block(expert_input, residual)
+            hidden_states_2 = hidden_states_2.reshape(residual.shape)
+            hidden_states_2 = self.post_feedforward_layernorm_2(
+                hidden_states_2)
+            hidden_states = hidden_states_1 + hidden_states_2
+        hidden_states = residual + self.post_feedforward_layernorm(
+            hidden_states)
+        hidden_states = self._apply_per_layer_input(hidden_states,
+                                                    per_layer_input)
+        hidden_states = hidden_states * self._layer_scalar(
+            phase_is_encoder, hidden_states)
         return hidden_states, present_key_value, current_key_value
 
 
@@ -1411,7 +1682,7 @@ class Gemma4Transformer(nn.Module):
                 "Gemma4 PLE expects one ple_token_embeds input per layer; "
                 f"got {len(ple_token_embeds)} for {len(self.layers)} layers.")
 
-        combined = (projected_per_layer_inputs[:, :, layer_index, :] +
+        combined = (projected_per_layer_inputs[..., layer_index, :] +
                     ple_token_embeds[layer_index].to(
                         dtype=projected_per_layer_inputs.dtype))
         scale = self.per_layer_input_scale.to(dtype=combined.dtype,
@@ -1461,7 +1732,7 @@ class Gemma4Transformer(nn.Module):
         current_swa_key_values: dict[int, Tuple[torch.Tensor,
                                                 torch.Tensor]] = {}
         all_hidden_states: list = []
-        target_hidden_list: list = []
+        target_hidden_by_layer: dict[int, torch.Tensor] = {}
         target_layer_set = set(target_layer_ids or [])
 
         for layer_index, layer in enumerate(self.layers):
@@ -1511,11 +1782,11 @@ class Gemma4Transformer(nn.Module):
                 current_swa_key_values[layer_index] = current_key_value
 
             if layer_index in target_layer_set:
-                target_hidden_list.append(hidden_states)
+                target_hidden_by_layer[layer_index] = hidden_states
 
         self.last_pre_norm_hidden_states = hidden_states
-        self.target_hidden_concat = (torch.cat(target_hidden_list, dim=-1)
-                                     if target_hidden_list else None)
+        self.target_hidden_concat = _concat_hidden_in_provider_order(
+            target_hidden_by_layer, target_layer_ids)
         self.dflash_hidden_concat = self.target_hidden_concat
         normed = self.norm(hidden_states)
 
@@ -1524,6 +1795,113 @@ class Gemma4Transformer(nn.Module):
 
         return (normed, tuple(present_key_values_list),
                 tuple(all_hidden_states) if output_hidden_states else None)
+
+    def forward_ragged(
+        self,
+        inputs_embeds: torch.Tensor,
+        past_key_values: Tuple[torch.Tensor, ...],
+        rope_rotary_cos_sin: torch.Tensor | None,
+        positions: torch.Tensor,
+        query_start_offsets: torch.Tensor,
+        query_lengths: torch.Tensor,
+        past_lengths: torch.Tensor,
+        attention_sequence_lengths: torch.Tensor,
+        state_indices: torch.Tensor,
+        execution_phase_marker: torch.Tensor,
+        context_sequence_count_carrier: torch.Tensor,
+        kv_page_table: torch.Tensor,
+        swa_kv_page_table: torch.Tensor | None = None,
+        swa_kv_cache_mode: torch.Tensor | None = None,
+        vision_block_ids: torch.Tensor | None = None,
+        context_mask_selector: torch.Tensor | None = None,
+        phase_is_encoder: torch.Tensor | None = None,
+        ple_token_embeds: Tuple[torch.Tensor, ...] = (),
+        rope_rotary_cos_sin_sliding: torch.Tensor | None = None,
+        rope_rotary_cos_sin_full: torch.Tensor | None = None,
+        attention_position_ids: torch.Tensor | None = None,
+        packed_attention_mask: torch.Tensor | None = None,
+        tree_parent_ids: torch.Tensor | None = None,
+        tree_depths: torch.Tensor | None = None,
+        valid_tree_counts: torch.Tensor | None = None,
+        output_hidden_states: bool = False,
+        target_layer_ids: "List[int] | None" = None,
+    ) -> Tuple:
+        hidden_states = inputs_embeds
+        token_phase = phase_is_encoder
+        projected_per_layer_inputs = self._project_per_layer_inputs(
+            inputs_embeds)
+        present_key_values = []
+        current_swa_key_values: dict[int, Tuple[torch.Tensor,
+                                                torch.Tensor]] = {}
+        all_hidden_states = []
+        target_hidden_by_layer: dict[int, torch.Tensor] = {}
+        target_layer_set = set(target_layer_ids or [])
+        for layer_index, layer in enumerate(self.layers):
+            if output_hidden_states:
+                all_hidden_states.append(hidden_states)
+            layer_rope = _select_rope_for_layer(layer, rope_rotary_cos_sin,
+                                                rope_rotary_cos_sin_sliding,
+                                                rope_rotary_cos_sin_full)
+            per_layer_input = self._combine_per_layer_input(
+                projected_per_layer_inputs, ple_token_embeds, layer_index)
+            shared_key_value = None
+            if layer_index in self.swa_kv_donor_indices:
+                donor_index = self.swa_kv_donor_indices[layer_index]
+                if donor_index not in current_swa_key_values:
+                    raise ValueError(
+                        "Gemma4 SWA shared-KV consumer is missing its current donor K/V: "
+                        f"consumer={layer_index}, donor={donor_index}.")
+                shared_key_value = current_swa_key_values[donor_index]
+            hidden_states, present_kv, current_key_value = layer.forward_ragged(
+                hidden_states,
+                past_key_values[layer_index],
+                layer_rope,
+                positions,
+                query_start_offsets,
+                query_lengths,
+                past_lengths,
+                attention_sequence_lengths,
+                state_indices,
+                execution_phase_marker,
+                context_sequence_count_carrier,
+                kv_page_table,
+                swa_kv_page_table=swa_kv_page_table,
+                swa_kv_cache_mode=swa_kv_cache_mode,
+                shared_key_value=shared_key_value,
+                vision_block_ids=vision_block_ids,
+                per_layer_input=per_layer_input,
+                context_mask_selector=context_mask_selector,
+                phase_is_encoder=token_phase,
+                attention_position_ids=attention_position_ids,
+                packed_attention_mask=packed_attention_mask,
+                tree_parent_ids=tree_parent_ids,
+                tree_depths=tree_depths,
+                valid_tree_counts=valid_tree_counts)
+            present_key_values.append(present_kv)
+            if layer_index in self.swa_kv_donor_layers:
+                if current_key_value is None:
+                    raise ValueError(
+                        f"Gemma4 SWA donor layer {layer_index} did not produce current K/V."
+                    )
+                current_swa_key_values[layer_index] = current_key_value
+            if layer_index in target_layer_set:
+                target_hidden_by_layer[layer_index] = hidden_states
+        self.last_pre_norm_hidden_states = hidden_states
+        self.target_hidden_concat = _concat_hidden_in_provider_order(
+            target_hidden_by_layer, target_layer_ids)
+        normed = self.norm(hidden_states)
+        fallback_hidden = None
+        if output_hidden_states:
+            all_hidden_states.append(normed)
+            n_layers = len(all_hidden_states) - 1
+            indices = [2, n_layers // 2, n_layers - 4]
+            fallback_hidden = torch.cat(
+                [all_hidden_states[i] for i in indices],
+                dim=-1).to(torch.float16)
+        outputs = (normed, tuple(present_key_values))
+        if output_hidden_states:
+            return outputs + (fallback_hidden, )
+        return outputs
 
 
 class Gemma4ForCausalLM(CausalLM):
@@ -1561,115 +1939,132 @@ class Gemma4ForCausalLM(CausalLM):
         vision_block_attention = bool(config.use_vision_bidirectional_attention
                                       ) and not tree_attention_base
         use_swa_kv_cache = _gemma4_uses_swa_kv_cache(config)
-        if (not self.ple_enabled and not config.use_dual_rope
-                and not vision_block_attention and not tree_attention_base
-                and not use_swa_kv_cache):
-            return super().onnx_export_spec()
+        return self._ragged_onnx_export_spec_gemma4(
+            vision_block_attention=vision_block_attention,
+            tree_attention=tree_attention_base,
+            use_swa_kv_cache=use_swa_kv_cache)
 
-        Na = config.num_hidden_layers
-        num_ple_inputs = Na if self.ple_enabled else 0
+    def _ragged_onnx_export_spec_gemma4(
+            self,
+            vision_block_attention: bool,
+            tree_attention: bool = False,
+            use_swa_kv_cache: bool = False) -> OnnxSpec:
+        config = self.config
+        num_layers = config.num_hidden_layers
+        num_ple_inputs = num_layers if self.ple_enabled else 0
         device = next(itertools.chain(self.parameters(),
                                       self.buffers())).device
-        dtype16 = torch.float16
-        batch_size, seq_len, past_len, max_pos = (_DUMMY_BATCH_SIZE,
-                                                  _DUMMY_SEQ_LEN,
-                                                  _DUMMY_PAST_LEN,
-                                                  _DUMMY_ROPE_CACHE_LEN)
-
-        inputs_embeds = torch.zeros(batch_size,
-                                    seq_len,
+        num_sequences = 2
+        query_length = 2
+        physical_tokens = num_sequences * query_length
+        kv_dtype = (torch.float8_e4m3fn
+                    if config.quant.kv_cache_quant == "fp8" else torch.float16)
+        inputs_embeds = torch.zeros(physical_tokens,
                                     config.hidden_size,
-                                    dtype=dtype16,
+                                    dtype=torch.float16,
                                     device=device)
-        ple_token_embeds_list: List[torch.Tensor] = [
-            torch.zeros(batch_size,
-                        seq_len,
+        ple_token_embeds = [
+            torch.zeros(physical_tokens,
                         config.hidden_size_per_layer_input,
-                        dtype=dtype16,
+                        dtype=torch.float16,
                         device=device) for _ in range(num_ple_inputs)
         ]
-        kv_dtype = (torch.float8_e4m3fn
-                    if config.quant.kv_cache_quant == "fp8" else dtype16)
-        # Paged KV pool binding: [2, num_pages, KV_PAGE_SIZE, num_kv_heads, head_dim].
-        past_key_values_list: List[torch.Tensor] = [
-            torch.zeros(
-                2,
-                1,
-                KV_PAGE_SIZE,
-                num_kv_heads,
-                layer_head_dim,
-                dtype=kv_dtype,
-                device=device,
-            ) for num_kv_heads, layer_head_dim in (
-                _kv_cache_dims_for_layer(config, layer_idx)
-                for layer_idx in range(Na))
+        past_key_values = [
+            torch.zeros(2,
+                        2,
+                        KV_PAGE_SIZE,
+                        num_kv_heads,
+                        layer_head_dim,
+                        dtype=kv_dtype,
+                        device=device) for num_kv_heads, layer_head_dim in (
+                            _kv_cache_dims_for_layer(config, layer_idx)
+                            for layer_idx in range(num_layers))
         ]
-
-        args = (inputs_embeds, *ple_token_embeds_list, *past_key_values_list)
-        input_names = (
-            ["inputs_embeds"] +
-            [f"ple_token_embeds_{i}" for i in range(num_ple_inputs)] +
-            [f"past_key_values_{i}" for i in range(Na)])
-
+        rope_inputs = []
+        rope_names = []
         if config.use_dual_rope:
-            sliding_head_dim = _head_dim_for_attention_type(
-                config, "sliding_attention")
-            full_head_dim = _head_dim_for_attention_type(
-                config, "full_attention")
-            sliding_rotary_dim = _rotary_dim_from_rope_config(
-                config, config.sliding_rope_config, sliding_head_dim)
-            full_rotary_dim = _rotary_dim_from_rope_config(
-                config, config.full_rope_config, full_head_dim)
-            rope_rotary_cos_sin_sliding = torch.zeros(batch_size,
-                                                      max_pos,
-                                                      sliding_rotary_dim,
-                                                      dtype=torch.float32,
-                                                      device=device)
-            rope_rotary_cos_sin_full = torch.zeros(batch_size,
-                                                   max_pos,
-                                                   full_rotary_dim,
-                                                   dtype=torch.float32,
-                                                   device=device)
-            args = args + (rope_rotary_cos_sin_sliding,
-                           rope_rotary_cos_sin_full)
-            input_names = input_names + [
+            sliding_dim = _rotary_dim_from_rope_config(
+                config, config.sliding_rope_config,
+                _head_dim_for_attention_type(config, "sliding_attention"))
+            full_dim = _rotary_dim_from_rope_config(
+                config, config.full_rope_config,
+                _head_dim_for_attention_type(config, "full_attention"))
+            rope_inputs = [
+                torch.zeros(physical_tokens,
+                            sliding_dim,
+                            dtype=torch.float32,
+                            device=device),
+                torch.zeros(physical_tokens,
+                            full_dim,
+                            dtype=torch.float32,
+                            device=device),
+            ]
+            rope_names = [
                 "rope_rotary_cos_sin_sliding", "rope_rotary_cos_sin_full"
             ]
         else:
-            rotary_head_dim = _head_dim_for_attention_type(
-                config, "full_attention")
-            rotary_dim = _rotary_dim_from_rope_config(config, None,
-                                                      rotary_head_dim)
-            rope_rotary_cos_sin = torch.zeros(batch_size,
-                                              max_pos,
-                                              rotary_dim,
-                                              dtype=torch.float32,
-                                              device=device)
-            args = args + (rope_rotary_cos_sin, )
-            input_names = input_names + ["rope_rotary_cos_sin"]
+            rotary_dim = _rotary_dim_from_rope_config(
+                config, None,
+                _head_dim_for_attention_type(config, "full_attention"))
+            rope_inputs = [
+                torch.zeros(physical_tokens,
+                            rotary_dim,
+                            dtype=torch.float32,
+                            device=device)
+            ]
+            rope_names = ["rope_rotary_cos_sin"]
 
-        context_lengths = torch.zeros(batch_size,
-                                      dtype=torch.int32,
-                                      device=device)
-        kvcache_start_index = torch.zeros(batch_size,
-                                          dtype=torch.int32,
-                                          device=device)
-        kv_page_table = torch.zeros(batch_size,
+        positions = torch.arange(query_length,
+                                 dtype=torch.int32,
+                                 device=device).repeat(num_sequences)
+        query_start_offsets = torch.arange(0,
+                                           physical_tokens + 1,
+                                           query_length,
+                                           dtype=torch.int32,
+                                           device=device)
+        query_lengths = torch.full((num_sequences, ),
+                                   query_length,
+                                   dtype=torch.int32,
+                                   device=device)
+        past_lengths = torch.zeros(num_sequences,
+                                   dtype=torch.int32,
+                                   device=device)
+        attention_sequence_lengths = query_lengths.clone()
+        state_indices = torch.arange(num_sequences,
+                                     dtype=torch.int32,
+                                     device=device)
+        execution_phase_marker = torch.zeros(2,
+                                             dtype=torch.int32,
+                                             device=device)
+        context_sequence_count_carrier = torch.zeros(num_sequences,
+                                                     dtype=torch.int32,
+                                                     device=device)
+        kv_page_table = torch.zeros(num_sequences,
                                     2,
-                                    1,
+                                    2,
                                     dtype=torch.int32,
                                     device=device)
-        last_token_ids = torch.zeros(batch_size,
-                                     1,
-                                     dtype=torch.int64,
-                                     device=device)
+        logits_indices = (torch.tensor(
+            [0, 2, 3], dtype=torch.int64, device=device) if tree_attention else
+                          query_start_offsets[1:].to(torch.int64) - 1)
 
-        args = args + (context_lengths, kvcache_start_index, kv_page_table)
-        input_names = input_names + [
-            "context_lengths", "kvcache_start_index", "kv_page_table"
-        ]
+        args = (inputs_embeds, *ple_token_embeds, *past_key_values,
+                *rope_inputs, positions, query_start_offsets, query_lengths,
+                past_lengths, attention_sequence_lengths, state_indices,
+                execution_phase_marker, context_sequence_count_carrier,
+                kv_page_table)
+        input_names = (
+            ["inputs_embeds"] +
+            [f"ple_token_embeds_{i}" for i in range(num_ple_inputs)] +
+            [f"past_key_values_{i}"
+             for i in range(num_layers)] + rope_names + [
+                 "positions", "query_start_offsets", "query_lengths",
+                 "past_lengths", "attention_sequence_lengths", "state_indices",
+                 "execution_phase_marker", "context_sequence_count_carrier",
+                 "kv_page_table"
+             ])
         if use_swa_kv_cache:
-            swa_kv_page_table = torch.zeros(batch_size,
+            swa_kv_page_table = torch.zeros(num_sequences,
                                             2,
                                             1,
                                             dtype=torch.int32,
@@ -1679,27 +2074,46 @@ class Gemma4ForCausalLM(CausalLM):
             input_names = input_names + [
                 "swa_kv_page_table", "swa_kv_cache_mode"
             ]
-        args = args + (last_token_ids, )
-        input_names = input_names + ["last_token_ids"]
+        args += (logits_indices, )
+        input_names += ["logits_indices"]
         if vision_block_attention:
-            vision_block_ids = torch.full((batch_size, seq_len),
+            vision_block_ids = torch.full((physical_tokens, ),
                                           -1,
                                           dtype=torch.int32,
                                           device=device)
             args = args + (vision_block_ids, )
-            input_names = input_names + ["vision_block_ids"]
-        output_names = (["logits"] +
-                        [f"present_key_values_{i}" for i in range(Na)])
-        if self.emit_hidden_states and not eagle_base:
-            output_names = (["logits", "hidden_states"] +
-                            [f"present_key_values_{i}" for i in range(Na)])
+            input_names += ["vision_block_ids"]
+        if tree_attention:
+            tree_inputs = (positions.clone(),
+                           torch.zeros(physical_tokens,
+                                       query_length,
+                                       dtype=torch.int32,
+                                       device=device),
+                           torch.full((physical_tokens, ),
+                                      -1,
+                                      dtype=torch.int32,
+                                      device=device),
+                           torch.zeros(physical_tokens,
+                                       dtype=torch.int32,
+                                       device=device), query_lengths.clone())
+            args += tree_inputs
+            input_names += [
+                "attention_position_ids", "packed_attention_mask",
+                "tree_parent_ids", "tree_depths", "valid_tree_counts"
+            ]
 
-        batch = torch.export.Dim("batch", min=1, max=256)
-        seq = torch.export.Dim("seq_len", min=1, max=32768)
-        pos = torch.export.Dim("max_pos", min=1, max=32768)
-        rope_batch = torch.export.Dim("rope_batch", min=1, max=256)
-        kv_batch = torch.export.Dim("kv_batch", min=1, max=256)
-        page_batch = torch.export.Dim("page_batch", min=1, max=256)
+        output_names = ["logits"] + [
+            f"present_key_values_{i}" for i in range(num_layers)
+        ]
+        has_hidden_output = (self.emit_hidden_states or tree_attention)
+        if has_hidden_output:
+            output_names.insert(1, "hidden_states")
+        tokens = torch.export.Dim("physical_tokens", min=1, max=8_388_608)
+        logits_rows = torch.export.Dim("logits_rows", min=1, max=8_388_608)
+        sequences = torch.export.Dim("num_sequences", min=1, max=256)
+        context_sequences = torch.export.Dim("num_context_sequences",
+                                             min=0,
+                                             max=256)
         max_pages = torch.export.Dim("max_pages_per_seq", min=1, max=32768)
         num_pages = torch.export.Dim("num_pages", min=1, max=1048576)
         swa_page_batch = (torch.export.Dim("swa_page_batch", min=1, max=256)
@@ -1710,74 +2124,167 @@ class Gemma4ForCausalLM(CausalLM):
         num_swa_pages = (torch.export.Dim("num_swa_pages", min=1, max=1048576)
                          if use_swa_kv_cache else None)
 
-        num_selected = torch.export.Dim(
-            "num_selected", min=1, max=256) if tree_attention_base else None
-        all_shapes: list = [{0: batch, 1: seq}]
-        for _ in range(num_ple_inputs):
-            all_shapes.append({0: batch, 1: seq})
-        for layer_idx in range(Na):
-            pool_pages = (num_swa_pages if _gemma4_uses_swa_pool(
-                config, layer_idx) else num_pages)
-            all_shapes.append({1:
-                               pool_pages})  # past_key_values_i (pool-shaped)
-        all_shapes.append({0: rope_batch, 1: pos})
-        if config.use_dual_rope:
-            all_shapes.append({0: rope_batch, 1: pos})
-        all_shapes.append({0: batch})
-        all_shapes.append({0: kv_batch})
-        all_shapes.append({0: page_batch, 2: max_pages})  # kv_page_table
+        phase_extent = torch.export.Dim("execution_phase_extent", min=1, max=8)
+        packed_mask_width = torch.export.Dim("packed_mask_width",
+                                             min=1,
+                                             max=64)
+        all_shapes: list = [{0: tokens}]
+        all_shapes.extend({0: tokens} for _ in range(num_ple_inputs))
+        for layer_idx in range(num_layers):
+            pool_pages = (num_swa_pages if use_swa_kv_cache
+                          and _gemma4_uses_swa_pool(config, layer_idx) else
+                          num_pages)
+            all_shapes.append({1: pool_pages})
+        all_shapes.extend({0: tokens} for _ in rope_inputs)
+        all_shapes.extend([
+            {
+                0: tokens
+            },
+            {
+                0: sequences + 1
+            },
+            {
+                0: sequences
+            },
+            {
+                0: sequences
+            },
+            {
+                0: sequences
+            },
+            {
+                0: sequences
+            },
+            {
+                0: phase_extent
+            },
+            {
+                0: context_sequences
+            },
+            {
+                0: sequences,
+                2: max_pages
+            },
+        ])
         if use_swa_kv_cache:
-            all_shapes.append({
-                0: swa_page_batch,
-                2: swa_max_pages
-            })  # swa_kv_page_table
-            # torch.export specializes dimensions of size 0 or 1. Export the
-            # sample as static length 1; the ONNX normalization pass restores
-            # this shape-only input to a symbolic dimension for runtime 0/1.
-            all_shapes.append({})  # swa_kv_cache_mode
-        if tree_attention_base:
-            all_shapes.append({0: batch, 1: num_selected})
-        else:
-            all_shapes.append({0: batch})
+            all_shapes.extend([{0: swa_page_batch, 2: swa_max_pages}, {}])
+        all_shapes.append({0: logits_rows if tree_attention else sequences})
         if vision_block_attention:
-            all_shapes.append({0: batch, 1: seq})
-        if tree_attention_base:
-            attention_pos_id = torch.zeros(batch_size,
-                                           seq_len,
-                                           dtype=torch.int32,
-                                           device=device)
-            attention_mask = torch.zeros(batch_size,
-                                         seq_len,
-                                         seq_len + past_len,
-                                         dtype=torch.int32,
-                                         device=device)
-            args = args + (attention_pos_id, attention_mask)
-            input_names = input_names + ["attention_pos_id", "attention_mask"]
-            output_names = ["logits", "hidden_states"
-                            ] + [f"present_key_values_{i}" for i in range(Na)]
-
-            eagle_seq = torch.export.Dim("eagle_seq_len", min=1, max=32768)
-            mask_kv_len = torch.export.Dim("mask_kv_len", min=1, max=65536)
-            all_shapes.append({0: batch, 1: eagle_seq})
-            all_shapes.append({0: batch, 1: eagle_seq, 2: mask_kv_len})
-
-        wrapped = _make_gemma4_flat_wrapper(
+            all_shapes.append({0: tokens})
+        if tree_attention:
+            all_shapes.extend([{
+                0: tokens
+            }, {
+                0: tokens,
+                1: packed_mask_width
+            }, {
+                0: tokens
+            }, {
+                0: tokens
+            }, {
+                0: sequences
+            }])
+        wrapped = _make_gemma4_flat_wrapper_ragged(
             self,
-            Na,
-            num_ple_inputs=num_ple_inputs,
+            num_layers,
+            num_ple_inputs,
             use_dual_rope=config.use_dual_rope,
             use_swa_kv_cache=use_swa_kv_cache,
-            eagle_base=tree_attention_base,
             vision_block_attention=vision_block_attention,
-            emit_hidden_states=(self.emit_hidden_states
-                                or config.gemma4_mtp_base))
+            emit_hidden_states=has_hidden_output,
+            tree_attention=tree_attention)
         wrapped.eval()
-
         return OnnxSpec(wrapped=wrapped,
                         args=args,
                         input_names=input_names,
                         output_names=output_names,
                         dynamic_shapes=all_shapes)
+
+    def forward_ragged(
+        self,
+        inputs_embeds: torch.Tensor,
+        past_key_values: Tuple[torch.Tensor, ...],
+        rope_rotary_cos_sin: torch.Tensor | None,
+        positions: torch.Tensor,
+        query_start_offsets: torch.Tensor,
+        query_lengths: torch.Tensor,
+        past_lengths: torch.Tensor,
+        attention_sequence_lengths: torch.Tensor,
+        state_indices: torch.Tensor,
+        execution_phase_marker: torch.Tensor,
+        context_sequence_count_carrier: torch.Tensor,
+        kv_page_table: torch.Tensor,
+        logits_indices: torch.Tensor,
+        swa_kv_page_table: torch.Tensor | None = None,
+        swa_kv_cache_mode: torch.Tensor | None = None,
+        vision_block_ids: torch.Tensor | None = None,
+        ple_token_embeds: Tuple[torch.Tensor, ...] = (),
+        rope_rotary_cos_sin_sliding: torch.Tensor | None = None,
+        rope_rotary_cos_sin_full: torch.Tensor | None = None,
+        attention_position_ids: torch.Tensor | None = None,
+        packed_attention_mask: torch.Tensor | None = None,
+        tree_parent_ids: torch.Tensor | None = None,
+        tree_depths: torch.Tensor | None = None,
+        valid_tree_counts: torch.Tensor | None = None,
+    ) -> Tuple:
+        target_layer_ids = None
+        for enabled, field in ((getattr(self.config, "dspark_base",
+                                        False), "dspark_target_layer_ids"),
+                               (getattr(self.config, "dflash_base",
+                                        False), "dflash_target_layer_ids"),
+                               (self.config.eagle_base,
+                                "eagle3_target_layer_ids")):
+            if enabled:
+                target_layer_ids = getattr(self.config, field, None)
+                break
+        collect_eagle_hidden_states = (self.config.eagle_base
+                                       and not target_layer_ids)
+        model_outputs = self.model.forward_ragged(
+            inputs_embeds,
+            past_key_values,
+            rope_rotary_cos_sin,
+            positions,
+            query_start_offsets,
+            query_lengths,
+            past_lengths,
+            attention_sequence_lengths,
+            state_indices,
+            execution_phase_marker,
+            context_sequence_count_carrier,
+            kv_page_table,
+            swa_kv_page_table=swa_kv_page_table,
+            swa_kv_cache_mode=swa_kv_cache_mode,
+            vision_block_ids=vision_block_ids,
+            ple_token_embeds=ple_token_embeds,
+            rope_rotary_cos_sin_sliding=rope_rotary_cos_sin_sliding,
+            rope_rotary_cos_sin_full=rope_rotary_cos_sin_full,
+            attention_position_ids=attention_position_ids,
+            packed_attention_mask=packed_attention_mask,
+            tree_parent_ids=tree_parent_ids,
+            tree_depths=tree_depths,
+            valid_tree_counts=valid_tree_counts,
+            output_hidden_states=collect_eagle_hidden_states,
+            target_layer_ids=target_layer_ids)
+        if collect_eagle_hidden_states:
+            hidden_states, present_key_values, fallback_hidden = model_outputs
+        else:
+            hidden_states, present_key_values = model_outputs
+            fallback_hidden = None
+        selected_hidden_states = torch.index_select(hidden_states, 0,
+                                                    logits_indices)
+        logits = self.lm_head(selected_hidden_states).to(torch.float32)
+        if self.config.final_logit_softcapping is not None:
+            cap = self.config.final_logit_softcapping
+            logits = torch.tanh(logits / cap) * cap
+        emitted_hidden = getattr(self.model, "target_hidden_concat", None)
+        if emitted_hidden is None:
+            if collect_eagle_hidden_states:
+                emitted_hidden = fallback_hidden
+            elif self.emit_hidden_states:
+                emitted_hidden = self.model.last_pre_norm_hidden_states
+            elif self.config.gemma4_mtp_base:
+                emitted_hidden = hidden_states
+        return logits, emitted_hidden, present_key_values
 
     def forward(
         self,

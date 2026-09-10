@@ -67,6 +67,22 @@ int32_t baseVerifyIntermediateSeqLen(DeploymentConfig const& bundle)
     }
     return isDFlashDDTreeShape(bundle) ? bundle.specConfig->verifySize : bundle.specConfig->dflashBlockSize;
 }
+
+void initializeRopeCaches(SharedResources& resources, LLMEngineConfig const& cfg, cudaStream_t stream)
+{
+    if (cfg.useDualRope)
+    {
+        check::check(
+            cfg.slidingRopeConfig.type != RopeType::kLongRope && cfg.fullRopeConfig.type != RopeType::kLongRope,
+            "LongRope is not supported with dual RoPE bindings");
+        resources.ropePool.getOrCreate(cfg.slidingRopeConfig, cfg.slidingRotaryDim, cfg.maxKVCacheCapacity, stream);
+        resources.ropePool.getOrCreate(cfg.fullRopeConfig, cfg.fullRotaryDim, cfg.maxKVCacheCapacity, stream);
+    }
+    else if (cfg.ropeConfig.type != RopeType::kMRope)
+    {
+        resources.ropePool.getOrCreate(cfg.ropeConfig, cfg.rotaryDim, cfg.maxKVCacheCapacity, stream);
+    }
+}
 } // namespace
 
 void allocateZeroBuffer(SharedResources& res, int64_t bytes)
@@ -165,23 +181,7 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
     resources->cacheManagers.push_back(std::make_unique<HybridCacheManager>(hybridCfg, stream));
     appendPageTables(*resources, resources->cacheManagers.back()->getKVCacheManager(), stream);
 
-    // RoPE cache
-    // For MRope, the cache is stored in PipelineIO (initialized below).
-    // For standard / dynamic / LongRope / NoRope, getOrCreate handles initialization.
-    if (cfg.useDualRope)
-    {
-        check::check(
-            cfg.slidingRopeConfig.type != RopeType::kLongRope && cfg.fullRopeConfig.type != RopeType::kLongRope,
-            "LongRope is not supported with dual RoPE bindings");
-        resources->ropePool.getOrCreate(cfg.slidingRopeConfig, cfg.slidingRotaryDim, cfg.maxKVCacheCapacity, stream);
-        resources->ropePool.getOrCreate(cfg.fullRopeConfig, cfg.fullRotaryDim, cfg.maxKVCacheCapacity, stream);
-    }
-    else if (cfg.ropeConfig.type != RopeType::kMRope)
-    {
-        // Standard / Dynamic / LongRope / NoRope — getOrCreate handles initialization.
-        resources->ropePool.getOrCreate(cfg.ropeConfig, cfg.rotaryDim, cfg.maxKVCacheCapacity, stream);
-    }
-    // MRope: handled via PipelineIO::mropeCosSin below.
+    initializeRopeCaches(*resources, cfg, stream);
 
     // LoRA
     if (cfg.maxSupportedLoraRank > 0)
@@ -325,22 +325,8 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
         appendPageTables(*resources, resources->cacheManagers.back()->getKVCacheManager(), stream);
     }
 
-    // RoPE cache (shared — base and draft use same RoPE config)
-    if (bundle.base.useDualRope)
-    {
-        check::check(bundle.base.slidingRopeConfig.type != RopeType::kLongRope
-                && bundle.base.fullRopeConfig.type != RopeType::kLongRope,
-            "LongRope is not supported with dual RoPE bindings");
-        resources->ropePool.getOrCreate(
-            bundle.base.slidingRopeConfig, bundle.base.slidingRotaryDim, bundle.base.maxKVCacheCapacity, stream);
-        resources->ropePool.getOrCreate(
-            bundle.base.fullRopeConfig, bundle.base.fullRotaryDim, bundle.base.maxKVCacheCapacity, stream);
-    }
-    else if (bundle.base.ropeConfig.type != RopeType::kMRope)
-    {
-        resources->ropePool.getOrCreate(
-            bundle.base.ropeConfig, bundle.base.rotaryDim, bundle.base.maxKVCacheCapacity, stream);
-    }
+    initializeRopeCaches(*resources, bundle.base, stream);
+    initializeRopeCaches(*resources, *bundle.draft, stream);
 
     // LoRA
     if (bundle.base.maxSupportedLoraRank > 0)

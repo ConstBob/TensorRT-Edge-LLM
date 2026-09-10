@@ -157,7 +157,7 @@ struct DeploymentConfig
 //!   against the engines' capacities:
 //!     - `specConfig->verifySize <= specConfig->maxVerifySize`
 //!     - non-DFlash/JetSpec: `specConfig->draftingStep * specConfig->draftingTopK <= specConfig->maxDraftProposalSize`
-//!     - MTP: `draftingStep + 1 <= 9` (EAGLE utility kernel depth limit);
+//!     - MTP: `draftingStep + 1 <= 16` (EAGLE utility kernel depth limit);
 //!       `draftingTopK == 1` selects the linear chain and requires `verifySize == draftingStep + 1`,
 //!       while `draftingTopK > 1` selects tree drafting and requires
 //!       `draftingTopK < verifySize`, `draftingTopK <= 8`, and `verifySize <= 128`
@@ -166,7 +166,8 @@ struct DeploymentConfig
 //!       `draftingTopK` is candidateTopK: 1 uses the linear-tree fast path while >1 uses branching DDTree.
 //!       Branching DDTree supports `verifySize <= 128` and accepted path length <= 32; linear DFlash/JetSpec
 //!       normalizes `verifySize` to `dflashBlockSize` for compatibility with the historical API.
-//!     - DSpark: `verifySize == proposalLen + 1`; the DSpark block size/gamma denotes proposal tokens.
+//!     - DSpark chain mode verifies the anchor plus the selected proposal length; tree mode uses the configured
+//!       verification-node budget. The DSpark block size/gamma denotes the maximum proposal depth.
 //!   Throws with named-fields message on violation.
 //!
 //! @throws std::runtime_error on any validation failure or parse failure.

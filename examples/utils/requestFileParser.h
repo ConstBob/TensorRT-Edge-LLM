@@ -62,6 +62,7 @@ namespace exampleUtils
  *         "save_system_prompt_kv_cache": bool,
  *         "disable_spec_decode": bool,
  *         "sampling_seed": uint64,             // optional per-request override,
+ *         "context_cache_lookup_policy": str,  // optional per-request override,
  *         "messages": [
  *           {"role": "...", "content": "..."},
  *           {"role": "...", "content": [{"type":"text", "text":"..."},

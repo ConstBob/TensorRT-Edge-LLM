@@ -58,6 +58,7 @@ Json makeMinimalConfig()
     bc["max_kv_pool_pages"] = 4;
     bc["max_lora_rank"] = 0;
     bc["spec_base"] = false;
+    bc["ragged_backend"] = "entry_padded_compatibility";
     config["builder_config"] = bc;
     return config;
 }
@@ -76,7 +77,9 @@ std::filesystem::path writeJsonToTempFile(Json const& json)
 //! Useful for tests that want to write inline JSON literals directly.
 std::filesystem::path writeTempConfig(std::string const& jsonStr)
 {
-    return writeJsonToTempFile(Json::parse(jsonStr));
+    Json json = Json::parse(jsonStr);
+    json["builder_config"]["ragged_backend"] = "entry_padded_compatibility";
+    return writeJsonToTempFile(json);
 }
 
 //! Extend the minimal config with the fields a hybrid model requires
@@ -152,6 +155,85 @@ TEST_F(LLMEngineConfigTest, ParseMinimalConfig)
     EXPECT_EQ(cfg.maxVerifyTreeSize, 0);
     EXPECT_EQ(cfg.maxDraftTreeSize, 0);
     EXPECT_EQ(cfg.kvCacheDtype, nvinfer1::DataType::kHALF);
+    EXPECT_EQ(cfg.raggedBackend, RaggedBackendKind::kEntryPaddedCompatibility);
+    EXPECT_EQ(cfg.maxNumSequences, 2);
+    EXPECT_EQ(cfg.maxQueryLength, 128);
+    EXPECT_EQ(cfg.maxPhysicalTokens, 256);
+    EXPECT_EQ(cfg.recurrentPoolRows, 2);
+}
+
+TEST_F(LLMEngineConfigTest, RejectsUnsupportedRaggedBackend)
+{
+    Json json = makeMinimalConfig();
+    json["builder_config"]["ragged_backend"] = "native_compact_ragged";
+    EXPECT_THROW(parseEngineConfig(writeJsonToTempFile(json)), std::runtime_error);
+}
+
+TEST_F(LLMEngineConfigTest, EveryCommonDecoderRoleRequiresUnifiedContractMetadata)
+{
+    struct RoleCase
+    {
+        char const* role;
+        char const* specDecodeType;
+    };
+    std::array<RoleCase, 9> const cases{{
+        {"llm", "none"},
+        {"base", "eagle3"},
+        {"draft", "eagle3"},
+        {"base", "mtp"},
+        {"draft", "mtp"},
+        {"draft", "dflash"},
+        {"draft", "dspark"},
+        {"draft", "gemma4_mtp"},
+        {"dllm", "none"},
+    }};
+
+    for (RoleCase const& roleCase : cases)
+    {
+        SCOPED_TRACE(std::string(roleCase.role) + ":" + roleCase.specDecodeType);
+        Json json = makeMinimalConfig();
+        json["engine_role"] = roleCase.role;
+        json["spec_decode_type"] = roleCase.specDecodeType;
+        json["builder_config"].erase("ragged_backend");
+        EXPECT_THROW(parseEngineConfig(writeJsonToTempFile(json)), std::runtime_error);
+    }
+}
+
+TEST_F(LLMEngineConfigTest, RejectsDerivedRaggedPhysicalCapacityOverflow)
+{
+    Json json = makeMinimalConfig();
+    json["builder_config"]["max_batch_size"] = std::numeric_limits<int32_t>::max();
+    json["builder_config"]["max_input_len"] = 2;
+    json["builder_config"]["max_kv_cache_capacity"] = 2;
+
+    EXPECT_THROW(parseEngineConfig(writeJsonToTempFile(json)), std::runtime_error);
+}
+
+TEST_F(LLMEngineConfigTest, DerivesRaggedCapacityFromMaxInputLength)
+{
+    Json json = makeMinimalConfig();
+    json["builder_config"]["max_input_len"] = 129;
+
+    LLMEngineConfig const cfg = parseEngineConfig(writeJsonToTempFile(json));
+    EXPECT_EQ(cfg.maxQueryLength, 129);
+    EXPECT_EQ(cfg.maxPhysicalTokens, 258);
+}
+
+TEST_F(LLMEngineConfigTest, SpecBaseRaggedQueryCapacityCoversVerifyWidth)
+{
+    Json json = makeMinimalConfig();
+    json["spec_decode_type"] = "eagle3";
+    json["engine_role"] = "base";
+    json["builder_config"]["spec_base"] = true;
+    json["builder_config"]["max_verify_tree_size"] = 129;
+
+    LLMEngineConfig const treeDominates = parseEngineConfig(writeJsonToTempFile(json));
+    EXPECT_EQ(treeDominates.maxQueryLength, 129);
+    EXPECT_EQ(treeDominates.maxPhysicalTokens, 258);
+
+    json["builder_config"]["max_input_len"] = 160;
+    json["builder_config"]["max_verify_tree_size"] = 140;
+    EXPECT_EQ(parseEngineConfig(writeJsonToTempFile(json)).maxQueryLength, 160);
 }
 
 TEST_F(LLMEngineConfigTest, ResolvesIndependentFullAndSwaPoolPagesPerLayer)
@@ -202,7 +284,8 @@ TEST_F(LLMEngineConfigTest, EveryInferenceRecipeCarriesTheActiveSwaModeLength)
     config.kvLayerConfigs = {KVLayerConfig{8, 128, 129}};
 
     auto expectModeLength = [&](int64_t expected) {
-        EXPECT_EQ(config.prefillDims(/*batch=*/2, /*seqLen=*/16, /*kvCacheAllEmpty=*/true).swaKVCacheModeLen, expected);
+        EXPECT_EQ(config.prefillDims(/*batch=*/2, /*seqLen=*/16, ExecutionPhase::kContextPrefill).swaKVCacheModeLen,
+            expected);
         EXPECT_EQ(config.decodeDims(/*batch=*/2).swaKVCacheModeLen, expected);
         EXPECT_EQ(config.denoiseDims(/*batch=*/2, /*canvasLen=*/16).swaKVCacheModeLen, expected);
         EXPECT_EQ(config.diffusionCommitDims(/*batch=*/2, /*commitLen=*/4).swaKVCacheModeLen, expected);
@@ -734,6 +817,18 @@ TEST_F(LLMEngineConfigTest, DiffusionGemmaSamplerConfig)
     EXPECT_EQ(cfg.diffusionStabilityWindow, 3);
 }
 
+TEST_F(LLMEngineConfigTest, DiffusionRaggedQueryCapacityCoversCanvasWidth)
+{
+    Json json = makeMinimalConfig();
+    json["engine_role"] = "dllm";
+    json["diffusion_unified_conditioning"] = true;
+    json["diffusion_config"] = {{"canvas_length", 129}};
+
+    LLMEngineConfig const cfg = parseEngineConfig(writeJsonToTempFile(json));
+    EXPECT_EQ(cfg.maxQueryLength, 129);
+    EXPECT_EQ(cfg.maxPhysicalTokens, 258);
+}
+
 TEST_F(LLMEngineConfigTest, DiffusionGemmaDllmRequiresUnifiedConditioning)
 {
     Json json = makeMinimalConfig();
@@ -988,51 +1083,54 @@ LLMEngineConfig makeRecipeConfig(int32_t maxKV, bool mrope)
 TEST(LLMEngineConfigRecipesTest, PrefillDims)
 {
     auto const cfg = makeRecipeConfig(/*maxKV=*/4096, /*mrope=*/false);
-    auto const d = cfg.prefillDims(/*batch=*/2, /*seqLen=*/128, /*kvCacheAllEmpty=*/true);
+    auto const d = cfg.prefillDims(/*batch=*/2, /*seqLen=*/128, ExecutionPhase::kContextPrefill);
     EXPECT_EQ(d.batch, 2);
-    EXPECT_EQ(d.seqLen, 128);
+    EXPECT_EQ(d.seqLen, 256);
     EXPECT_EQ(d.kvLen, 4096);
-    EXPECT_EQ(d.selectLen, 1);
-    EXPECT_EQ(d.attnMaskSeqLen, 1); // dummy attention shape during prefill
-    EXPECT_EQ(d.ropeBatch, 1);      // non-MRope
-    EXPECT_EQ(d.packedMaskLen, 1);  // pinned to 1 alongside attnMaskSeqLen
+    EXPECT_EQ(d.selectLen, 2);
+    EXPECT_EQ(d.attnMaskSeqLen, 256); // token-aligned attention metadata
+    EXPECT_EQ(d.ropeBatch, 1);        // non-MRope
+    EXPECT_EQ(d.packedMaskLen, 1);
     EXPECT_EQ(d.contextMaskSelectorLen, 0);
     EXPECT_EQ(d.startIndexLen, 0); // plugin-path empty-cache sentinel
-    EXPECT_EQ(d.specVerifyPhaseLen, 0);
+    EXPECT_EQ(d.executionPhaseLen, static_cast<int64_t>(ExecutionPhase::kContextPrefill));
 }
 
 TEST(LLMEngineConfigRecipesTest, PrefillDimsMRope)
 {
     auto const cfg = makeRecipeConfig(/*maxKV=*/4096, /*mrope=*/true);
-    auto const d = cfg.prefillDims(/*batch=*/3, /*seqLen=*/65, /*kvCacheAllEmpty=*/true);
-    EXPECT_EQ(d.ropeBatch, 3);      // MRope → batch
-    EXPECT_EQ(d.attnMaskSeqLen, 1); // dummy attention shape during prefill
-    EXPECT_EQ(d.packedMaskLen, 1);  // pinned to 1 alongside attnMaskSeqLen
+    auto const d = cfg.prefillDims(/*batch=*/3, /*seqLen=*/65, ExecutionPhase::kContextPrefill);
+    EXPECT_EQ(d.ropeBatch, 3);        // MRope → batch
+    EXPECT_EQ(d.attnMaskSeqLen, 195); // token-aligned attention metadata
+    EXPECT_EQ(d.packedMaskLen, 1);
     EXPECT_EQ(d.contextMaskSelectorLen, 0);
     EXPECT_EQ(d.startIndexLen, 0); // plugin-path empty-cache sentinel
-    EXPECT_EQ(d.specVerifyPhaseLen, 0);
+    EXPECT_EQ(d.executionPhaseLen, static_cast<int64_t>(ExecutionPhase::kContextPrefill));
 }
 
 TEST(LLMEngineConfigRecipesTest, PrefillDimsChunked)
 {
     // Chunked prefill (cache non-empty) uses [batch] startIndexLen.
     auto const cfg = makeRecipeConfig(/*maxKV=*/4096, /*mrope=*/false);
-    auto const d = cfg.prefillDims(/*batch=*/2, /*seqLen=*/128, /*kvCacheAllEmpty=*/false);
+    auto const d = cfg.prefillDims(/*batch=*/2, /*seqLen=*/128, ExecutionPhase::kContextChunk);
     EXPECT_EQ(d.startIndexLen, 2);
-    EXPECT_EQ(d.specVerifyPhaseLen, 0);
+    EXPECT_EQ(d.executionPhaseLen, static_cast<int64_t>(ExecutionPhase::kContextChunk));
 }
 
 TEST(LLMEngineConfigRecipesTest, DiffusionGemmaInitialPrefillBindsFullKVCapacity)
 {
     LLMEngineConfig cfg = makeRecipeConfig(/*maxKV=*/1024, /*mrope=*/false);
     cfg.isDiffusionBackbone = true;
-    auto const d = cfg.prefillDims(/*batch=*/1, /*seqLen=*/36, /*kvCacheAllEmpty=*/true);
+    auto const d = cfg.prefillDims(/*batch=*/1, /*seqLen=*/36, ExecutionPhase::kDiffusionCommit);
     EXPECT_EQ(d.batch, 1);
     EXPECT_EQ(d.seqLen, 36);
     EXPECT_EQ(d.kvLen, 1024);
     EXPECT_EQ(d.selectLen, 1);
     EXPECT_EQ(d.contextMaskSelectorLen, 0);
     EXPECT_EQ(d.startIndexLen, 1);
+    EXPECT_EQ(d.executionPhaseLen, static_cast<int64_t>(ExecutionPhase::kDiffusionCommit));
+    EXPECT_EQ(d.contextSequenceCount, 0);
+    EXPECT_THROW(cfg.prefillDims(/*batch=*/1, /*seqLen=*/36, ExecutionPhase::kContextPrefill), std::runtime_error);
 }
 
 TEST(LLMEngineConfigRecipesTest, DiffusionGemmaDenoiseAndCommitDims)
@@ -1042,13 +1140,15 @@ TEST(LLMEngineConfigRecipesTest, DiffusionGemmaDenoiseAndCommitDims)
     EXPECT_EQ(denoise.kvLen, 1024);
     EXPECT_EQ(denoise.seqLen, 8);
     EXPECT_EQ(denoise.selectLen, 8);
+    EXPECT_EQ(denoise.attnMaskSeqLen, 8);
     EXPECT_EQ(denoise.contextMaskSelectorLen, 1);
     EXPECT_EQ(denoise.startIndexLen, 1);
 
     auto const denoiseVarlenBatch = cfg.denoiseDims(/*batch=*/2, /*canvasLen=*/8);
     EXPECT_EQ(denoiseVarlenBatch.kvLen, 1024);
-    EXPECT_EQ(denoiseVarlenBatch.seqLen, 8);
-    EXPECT_EQ(denoiseVarlenBatch.selectLen, 8);
+    EXPECT_EQ(denoiseVarlenBatch.seqLen, 16);
+    EXPECT_EQ(denoiseVarlenBatch.selectLen, 16);
+    EXPECT_EQ(denoiseVarlenBatch.attnMaskSeqLen, 16);
     EXPECT_EQ(denoiseVarlenBatch.contextMaskSelectorLen, 2);
     EXPECT_EQ(denoiseVarlenBatch.startIndexLen, 2);
 
@@ -1056,13 +1156,15 @@ TEST(LLMEngineConfigRecipesTest, DiffusionGemmaDenoiseAndCommitDims)
     EXPECT_EQ(commit.kvLen, 1024);
     EXPECT_EQ(commit.seqLen, 8);
     EXPECT_EQ(commit.selectLen, 8);
+    EXPECT_EQ(commit.attnMaskSeqLen, 8);
     EXPECT_EQ(commit.contextMaskSelectorLen, 0);
     EXPECT_EQ(commit.startIndexLen, 1);
 
     auto const commitVarlenBatch = cfg.diffusionCommitDims(/*batch=*/2, /*commitLen=*/8);
     EXPECT_EQ(commitVarlenBatch.kvLen, 1024);
-    EXPECT_EQ(commitVarlenBatch.seqLen, 8);
-    EXPECT_EQ(commitVarlenBatch.selectLen, 8);
+    EXPECT_EQ(commitVarlenBatch.seqLen, 16);
+    EXPECT_EQ(commitVarlenBatch.selectLen, 16);
+    EXPECT_EQ(commitVarlenBatch.attnMaskSeqLen, 16);
     EXPECT_EQ(commitVarlenBatch.contextMaskSelectorLen, 0);
     EXPECT_EQ(commitVarlenBatch.startIndexLen, 2);
 }
@@ -1072,14 +1174,14 @@ TEST(LLMEngineConfigRecipesTest, DecodeDims)
     auto const cfg = makeRecipeConfig(/*maxKV=*/2048, /*mrope=*/false);
     auto const d = cfg.decodeDims(/*batch=*/4);
     EXPECT_EQ(d.batch, 4);
-    EXPECT_EQ(d.seqLen, 1);
+    EXPECT_EQ(d.seqLen, 4);
     EXPECT_EQ(d.kvLen, 2048);
-    EXPECT_EQ(d.selectLen, 1);
-    EXPECT_EQ(d.attnMaskSeqLen, 1);
+    EXPECT_EQ(d.selectLen, 4);
+    EXPECT_EQ(d.attnMaskSeqLen, 4);
     EXPECT_EQ(d.ropeBatch, 1);
     EXPECT_EQ(d.packedMaskLen, 1); // explicit 1 in decode
     EXPECT_EQ(d.startIndexLen, 4); // batch
-    EXPECT_EQ(d.specVerifyPhaseLen, 0);
+    EXPECT_EQ(d.executionPhaseLen, static_cast<int64_t>(ExecutionPhase::kAutoregressiveDecode));
 }
 
 TEST(LLMEngineConfigRecipesTest, DecodeDimsMRope)
@@ -1089,44 +1191,91 @@ TEST(LLMEngineConfigRecipesTest, DecodeDimsMRope)
     EXPECT_EQ(d.ropeBatch, 4); // MRope → batch
 }
 
-TEST(LLMEngineConfigRecipesTest, SpecVerifyDimsIsOnlyRecipeWithSelectLenNeq1)
+TEST(LLMEngineConfigRecipesTest, RaggedPrefillAndDecodeUsePhysicalTokenExtent)
+{
+    LLMEngineConfig cfg = makeRecipeConfig(/*maxKV=*/4096, /*mrope=*/false);
+    auto const prefill = cfg.prefillDims(/*batch=*/3, /*seqLen=*/5, ExecutionPhase::kContextPrefill);
+    EXPECT_EQ(prefill.batch, 3);
+    EXPECT_EQ(prefill.seqLen, 15);
+    EXPECT_EQ(prefill.selectLen, 3);
+    EXPECT_EQ(prefill.queryOffsetLen, 4);
+    EXPECT_EQ(prefill.executionPhaseLen, static_cast<int64_t>(ExecutionPhase::kContextPrefill));
+    EXPECT_EQ(prefill.contextSequenceCount, 3);
+
+    auto const decode = cfg.decodeDims(/*batch=*/3);
+    EXPECT_EQ(decode.batch, 3);
+    EXPECT_EQ(decode.seqLen, 3);
+    EXPECT_EQ(decode.selectLen, 3);
+    EXPECT_EQ(decode.queryOffsetLen, 4);
+    EXPECT_EQ(decode.executionPhaseLen, static_cast<int64_t>(ExecutionPhase::kAutoregressiveDecode));
+    EXPECT_EQ(decode.contextSequenceCount, 0);
+}
+
+TEST(LLMEngineConfigRecipesTest, EveryRuntimePhaseHasAnExplicitShapeExtent)
+{
+    LLMEngineConfig cfg = makeRecipeConfig(/*maxKV=*/4096, /*mrope=*/false);
+    EXPECT_EQ(cfg.prefillDims(2, 4, ExecutionPhase::kContextPrefill).executionPhaseLen,
+        static_cast<int64_t>(ExecutionPhase::kContextPrefill));
+    EXPECT_EQ(cfg.prefillDims(2, 4, ExecutionPhase::kContextChunk).executionPhaseLen,
+        static_cast<int64_t>(ExecutionPhase::kContextChunk));
+    EXPECT_EQ(cfg.decodeDims(2).executionPhaseLen, static_cast<int64_t>(ExecutionPhase::kAutoregressiveDecode));
+    EXPECT_EQ(cfg.proposalDims(2, 8, 4).executionPhaseLen, static_cast<int64_t>(ExecutionPhase::kSpecDraftProposal));
+    EXPECT_EQ(cfg.specVerifyDims(2, 8).executionPhaseLen, static_cast<int64_t>(ExecutionPhase::kSpecTargetVerify));
+    EXPECT_EQ(cfg.denoiseDims(2, 8).executionPhaseLen, static_cast<int64_t>(ExecutionPhase::kDiffusionDenoise));
+    EXPECT_EQ(cfg.diffusionCommitDims(2, 8).executionPhaseLen, static_cast<int64_t>(ExecutionPhase::kDiffusionCommit));
+}
+
+TEST(LLMEngineConfigRecipesTest, SpecAndDiffusionRecipesUsePhysicalTokenExtent)
+{
+    LLMEngineConfig cfg = makeRecipeConfig(/*maxKV=*/4096, /*mrope=*/false);
+    EXPECT_EQ(cfg.proposalDims(/*batch=*/3, /*paddedTreeSize=*/8, /*draftTopK=*/4).seqLen, 24);
+    EXPECT_EQ(cfg.proposalDims(/*batch=*/3, /*paddedTreeSize=*/8, /*draftTopK=*/4).contextSequenceCount, 0);
+    EXPECT_EQ(cfg.specVerifyDims(/*batch=*/3, /*verifySize=*/8).seqLen, 24);
+    EXPECT_EQ(cfg.specVerifyDims(/*batch=*/3, /*verifySize=*/8).contextSequenceCount, 0);
+    EXPECT_EQ(cfg.denoiseDims(/*batch=*/3, /*canvasLen=*/8).seqLen, 24);
+    EXPECT_EQ(cfg.denoiseDims(/*batch=*/3, /*canvasLen=*/8).contextSequenceCount, 0);
+    EXPECT_EQ(cfg.diffusionCommitDims(/*batch=*/3, /*commitLen=*/8).seqLen, 24);
+    EXPECT_EQ(cfg.diffusionCommitDims(/*batch=*/3, /*commitLen=*/8).contextSequenceCount, 0);
+}
+
+TEST(LLMEngineConfigRecipesTest, SpecVerifySelectsEveryPhysicalRow)
 {
     auto const cfg = makeRecipeConfig(/*maxKV=*/8192, /*mrope=*/false);
     auto const d = cfg.specVerifyDims(/*batch=*/1, /*verifySize=*/8);
     EXPECT_EQ(d.batch, 1);
     EXPECT_EQ(d.seqLen, 8);
     EXPECT_EQ(d.kvLen, 8192);
-    EXPECT_EQ(d.selectLen, 8);      // verifySize — unique to this recipe
+    EXPECT_EQ(d.selectLen, 8);
     EXPECT_EQ(d.attnMaskSeqLen, 8); // verifySize — proposal attention shape
     EXPECT_EQ(d.ropeBatch, 1);
     EXPECT_EQ(d.packedMaskLen, 1); // divUp(8, 32) = 1
     EXPECT_EQ(d.startIndexLen, 1); // batch (cache non-empty during verify)
-    EXPECT_EQ(d.specVerifyPhaseLen, 1);
+    EXPECT_EQ(d.executionPhaseLen, static_cast<int64_t>(ExecutionPhase::kSpecTargetVerify));
 }
 
-TEST(LLMEngineConfigRecipesTest, ShortPrefillDoesNotSetSpecVerifyPhaseMarker)
+TEST(LLMEngineConfigRecipesTest, ShortPrefillUsesContextPhase)
 {
     auto const cfg = makeRecipeConfig(/*maxKV=*/8192, /*mrope=*/false);
     for (int32_t seqLen = 2; seqLen <= 16; ++seqLen)
     {
-        auto const d = cfg.prefillDims(/*batch=*/2, seqLen, /*kvCacheAllEmpty=*/true);
-        EXPECT_EQ(d.seqLen, seqLen);
-        EXPECT_EQ(d.specVerifyPhaseLen, 0);
+        auto const d = cfg.prefillDims(/*batch=*/2, seqLen, ExecutionPhase::kContextPrefill);
+        EXPECT_EQ(d.seqLen, 2 * seqLen);
+        EXPECT_EQ(d.executionPhaseLen, static_cast<int64_t>(ExecutionPhase::kContextPrefill));
     }
     auto const verifyDims = cfg.specVerifyDims(/*batch=*/2, /*verifySize=*/16);
-    EXPECT_EQ(verifyDims.specVerifyPhaseLen, 1);
+    EXPECT_EQ(verifyDims.executionPhaseLen, static_cast<int64_t>(ExecutionPhase::kSpecTargetVerify));
 }
 
 TEST(LLMEngineConfigRecipesTest, ProposalDims)
 {
     auto const cfg = makeRecipeConfig(/*maxKV=*/4096, /*mrope=*/false);
     auto const d = cfg.proposalDims(/*batch=*/2, /*paddedTreeSize=*/16, /*draftTopK=*/4);
-    EXPECT_EQ(d.seqLen, 16);
-    EXPECT_EQ(d.selectLen, 4);       // draftTopK — one per tree branch
-    EXPECT_EQ(d.attnMaskSeqLen, 16); // paddedTreeSize — tree attention shape
+    EXPECT_EQ(d.seqLen, 32);
+    EXPECT_EQ(d.selectLen, 8);       // batch * draftTopK token-major selected rows
+    EXPECT_EQ(d.attnMaskSeqLen, 32); // flattened physical proposal rows
     EXPECT_EQ(d.packedMaskLen, 1);   // divUp(16, 32) = 1
     EXPECT_EQ(d.startIndexLen, 2);   // batch
-    EXPECT_EQ(d.specVerifyPhaseLen, 0);
+    EXPECT_EQ(d.executionPhaseLen, static_cast<int64_t>(ExecutionPhase::kSpecDraftProposal));
 }
 
 TEST(LLMEngineConfigRecipesTest, AcceptDims)
@@ -1134,12 +1283,12 @@ TEST(LLMEngineConfigRecipesTest, AcceptDims)
     auto const cfg = makeRecipeConfig(/*maxKV=*/4096, /*mrope=*/false);
     auto const d = cfg.acceptDims(/*batch=*/3, /*acceptLen=*/33);
     EXPECT_EQ(d.batch, 3);
-    EXPECT_EQ(d.seqLen, 33);
-    EXPECT_EQ(d.selectLen, 1);
-    EXPECT_EQ(d.attnMaskSeqLen, 33); // acceptLen — tree attention shape
+    EXPECT_EQ(d.seqLen, 99);
+    EXPECT_EQ(d.selectLen, 3);
+    EXPECT_EQ(d.attnMaskSeqLen, 99); // flattened physical accept rows
     EXPECT_EQ(d.packedMaskLen, 2);   // divUp(33, 32) = 2 — exercises the boundary
     EXPECT_EQ(d.startIndexLen, 3);   // batch
-    EXPECT_EQ(d.specVerifyPhaseLen, 0);
+    EXPECT_EQ(d.executionPhaseLen, static_cast<int64_t>(ExecutionPhase::kSpecDraftProposal));
 }
 
 TEST(LLMEngineConfigRecipesTest, ResetDimsRopeBatchOneEvenForMRope)
@@ -1161,7 +1310,7 @@ TEST(LLMEngineConfigRecipesTest, ResetDimsRopeBatchOneEvenForMRope)
         EXPECT_EQ(d.ropeBatch, 1); // Always 1, regardless of MRope
         EXPECT_EQ(d.packedMaskLen, 1);
         EXPECT_EQ(d.startIndexLen, 1); // placeholder bind; matches batch=1
-        EXPECT_EQ(d.specVerifyPhaseLen, 0);
+        EXPECT_EQ(d.executionPhaseLen, static_cast<int64_t>(ExecutionPhase::kAutoregressiveDecode));
     }
 }
 
@@ -1211,6 +1360,47 @@ TEST_F(LLMEngineConfigTest, ParseDraftEngineConfigMinimal)
     EXPECT_FALSE(cfg.isSpecDecodeBase);
     EXPECT_EQ(cfg.maxDraftTreeSize, 4);
     EXPECT_EQ(cfg.baseModelHiddenSize, 768);
+}
+
+TEST_F(LLMEngineConfigTest, DraftRaggedQueryCapacityCoversProposalWidth)
+{
+    Json json = makeMinimalDraftConfig();
+    json["builder_config"]["max_draft_tree_size"] = 129;
+
+    LLMEngineConfig const treeDominates = parseDraftEngineConfig(writeJsonToTempFile(json));
+    EXPECT_EQ(treeDominates.maxQueryLength, 129);
+    EXPECT_EQ(treeDominates.maxPhysicalTokens, 258);
+
+    json["builder_config"]["max_draft_tree_size"] = 140;
+    EXPECT_EQ(parseDraftEngineConfig(writeJsonToTempFile(json)).maxQueryLength, 140);
+}
+
+TEST_F(LLMEngineConfigTest, DSparkDraftCapacityIncludesNonAnchorInputRow)
+{
+    Json json = makeMinimalDraftConfig();
+    json["spec_decode_type"] = "dspark";
+    json["builder_config"]["max_input_len"] = 8;
+    json["builder_config"]["max_draft_tree_size"] = 16;
+    json["dspark_config"]["sample_from_anchor"] = false;
+    json["dspark_config"]["target_layer_ids"] = {0};
+
+    LLMEngineConfig const cfg = parseDraftEngineConfig(writeJsonToTempFile(json));
+    EXPECT_FALSE(cfg.dsparkSampleFromAnchor);
+    EXPECT_EQ(cfg.maxQueryLength, 17);
+    EXPECT_EQ(cfg.maxPhysicalTokens, 34);
+}
+
+TEST_F(LLMEngineConfigTest, RejectsDSparkNonAnchorDraftCapacityOverflow)
+{
+    Json json = makeMinimalDraftConfig();
+    json["spec_decode_type"] = "dspark";
+    json["builder_config"]["max_batch_size"] = 1;
+    json["builder_config"]["max_input_len"] = 1;
+    json["builder_config"]["max_draft_tree_size"] = std::numeric_limits<int32_t>::max();
+    json["dspark_config"]["sample_from_anchor"] = false;
+    json["dspark_config"]["target_layer_ids"] = {0};
+
+    EXPECT_THROW(parseDraftEngineConfig(writeJsonToTempFile(json)), std::runtime_error);
 }
 
 TEST_F(LLMEngineConfigTest, ParseDraftEngineConfigMTPBaseModelHiddenSize)

@@ -214,18 +214,28 @@ std::optional<ContextCacheRequest> ContextCacheRequest::begin(ContextCacheCoordi
     admission.tokenStateContract = tokenStateContract;
     admission.commitPolicy = commitPolicy;
     admission.replayTailLength = request.contextCacheReplayTailLength;
-
-    // Bypass neither looks up nor publishes, so the media hashes it would key on are not built.
-    bool const usesCache = admission.lookupPolicy == ContextCacheLookupPolicy::kUseCache;
+    ELLM_CHECK(context.residentRefs.size() == context.rawBatchedInputIds.size(),
+        "Context-cache admission requires one resident identity per input sequence");
     admission.sequences.reserve(context.rawBatchedInputIds.size());
     for (size_t seqIdx = 0; seqIdx < context.rawBatchedInputIds.size(); ++seqIdx)
     {
+        std::optional<ContextCacheLookupPolicy> const sequenceLookupPolicy
+            = (seqIdx < request.requests.size()) ? request.requests[seqIdx].contextCacheLookupPolicy : std::nullopt;
+        ContextCacheLookupPolicy const effectiveLookupPolicy
+            = admission.lookupPolicy == ContextCacheLookupPolicy::kBypass
+            ? ContextCacheLookupPolicy::kBypass
+            : sequenceLookupPolicy.value_or(admission.lookupPolicy);
         std::vector<imageUtils::ImageData> const& images
             = (seqIdx < request.requests.size()) ? request.requests[seqIdx].imageBuffers : kEmptyImageBuffers;
         std::vector<audioUtils::AudioData> const& audio
             = (seqIdx < request.requests.size()) ? request.requests[seqIdx].audioBuffers : kEmptyAudioBuffers;
-        admission.sequences.push_back(makeContextCacheSequenceAdmission(context.rawBatchedInputIds[seqIdx],
-            context.loraWeightsName, usesCache ? mediaTokenIds : kEmptyMediaTokenIds, images, audio, context.stream));
+        ContextCacheSequenceAdmission sequence
+            = makeContextCacheSequenceAdmission(context.rawBatchedInputIds[seqIdx], context.loraWeightsName,
+                effectiveLookupPolicy == ContextCacheLookupPolicy::kUseCache ? mediaTokenIds : kEmptyMediaTokenIds,
+                images, audio, context.stream);
+        sequence.resident = context.residentRefs[seqIdx];
+        sequence.lookupPolicy = sequenceLookupPolicy;
+        admission.sequences.push_back(std::move(sequence));
     }
 
     ContextCacheCoordinator::BeginRequestResult admitted
@@ -257,12 +267,14 @@ int32_t ContextCacheRequest::reuseTokenLength(int32_t slot) const noexcept
 }
 
 ContextCacheRequest::AdmitSequenceStatus ContextCacheRequest::admitSequence(std::vector<int32_t> const& tokenIds,
-    std::string const& loraWeightsName, DecodingKvHeadroom const& headroom, int32_t& prefillStart, cudaStream_t stream,
-    std::vector<int32_t> const& mediaTokenIds, std::vector<imageUtils::ImageData> const& imageBuffers,
-    std::vector<audioUtils::AudioData> const& audioBuffers)
+    std::string const& loraWeightsName, DecodingKvHeadroom const& headroom, int32_t& prefillStart, ResidentRef resident,
+    cudaStream_t stream, std::vector<int32_t> const& mediaTokenIds,
+    std::vector<imageUtils::ImageData> const& imageBuffers, std::vector<audioUtils::AudioData> const& audioBuffers)
 {
-    ContextCacheSequenceAdmission const admission = makeContextCacheSequenceAdmission(
+    mPrefillStarts.reserve(mPrefillStarts.size() + 1);
+    ContextCacheSequenceAdmission admission = makeContextCacheSequenceAdmission(
         tokenIds, loraWeightsName, mediaTokenIds, imageBuffers, audioBuffers, stream);
+    admission.resident = resident;
     ContextCacheCoordinator::AdmitSequenceResult result = mCoordinator.admitSequence(mRequest, admission, headroom);
     if (result.status != ContextCacheCoordinatorStatus::kOk)
     {
@@ -278,11 +290,15 @@ ContextCacheRequest::AdmitSequenceStatus ContextCacheRequest::admitSequence(std:
     return AdmitSequenceStatus::kAdmitted;
 }
 
-void ContextCacheRequest::retractSequenceAdmission()
+bool ContextCacheRequest::retractSequenceAdmission() noexcept
 {
-    ELLM_CHECK(!mPrefillStarts.empty(), "Context cache admission retraction without a recorded admission");
-    mCoordinator.retractSequenceAdmission(mRequest);
+    if (mPrefillStarts.empty())
+    {
+        return false;
+    }
+    bool const status = mCoordinator.retractSequenceAdmission(mRequest);
     mPrefillStarts.pop_back();
+    return status;
 }
 
 bool ContextCacheRequest::finalizeSequenceAdmission(
