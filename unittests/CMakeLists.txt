@@ -144,6 +144,8 @@ edgellm_add_unit_test(
   cpp/runtime/multiDevice
   cpp/runtime/weight)
 
+edgellm_add_unit_test(NAME unitTestScheduler DIRS cpp/scheduler)
+
 edgellm_add_unit_test(NAME unitTestRuntimeState DIRS cpp/runtime/state)
 
 edgellm_add_unit_test(NAME unitTestContextCache DIRS

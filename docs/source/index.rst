@@ -75,6 +75,7 @@ and action models on NVIDIA edge platforms.
    developer_guide/software-design/cpp-runtime-overview.md
    developer_guide/software-design/llm-inference-runtime.md
    developer_guide/software-design/llm-streaming.md
+   developer_guide/software-design/in-flight-batching.md
    developer_guide/software-design/memory-monitoring.md
    developer_guide/software-design/openai-server.md
 
