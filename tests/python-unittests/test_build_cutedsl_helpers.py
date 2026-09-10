@@ -545,6 +545,48 @@ def test_nvfp4_a16_blackwell_moe_registry_rejects_other_sms(sm):
         build_cutedsl.select_variants(sm, "nvfp4_a16_blackwell_moe")
 
 
+def test_qsa_decode_registry_matches_runner_split_k_constants():
+    """Runner partial-workspace sizing must match the export-baked grid."""
+    decode_variants = [
+        variant for variant in build_cutedsl.KERNEL_VARIANTS
+        if variant.group == "qsa"
+        and variant.name.startswith("qsa_sparse_decode_")
+    ]
+    assert decode_variants
+
+    # A literal typed back into the registry would bypass the constants.
+    expected_max_splits = str(build_cutedsl._QSA_DECODE_MAX_SPLITS)
+    expected_m_block = str(build_cutedsl._QSA_DECODE_M_BLOCK)
+    expected_threads = str(build_cutedsl._QSA_DECODE_THREADS)
+    expected_depth = str(build_cutedsl._QSA_DECODE_PIPE_DEPTH)
+    for variant in decode_variants:
+        args = variant.script_args
+        assert args[args.index("--max_splits") + 1] == expected_max_splits
+        assert args[args.index("--m_block_size") + 1] == expected_m_block
+        assert args[args.index("--num_threads") + 1] == expected_threads
+        assert args[args.index("--pipe_depth") + 1] == expected_depth
+
+    # The kernel module's own decode defaults (what the JIT path and the
+    # benchmark harness instantiate) must be the baked AOT geometry.
+    kernel_src = (_REPO_ROOT / "kernelSrcs" / "qsa_cutedsl" /
+                  "qsa_sparse_gqa.py").read_text(encoding="utf-8")
+    threads = re.search(r"^QSA_DECODE_DEFAULT_THREADS = (\d+)$", kernel_src,
+                        re.M)
+    depth = re.search(r"^QSA_DECODE_DEFAULT_PIPE_DEPTH = (\d+)$", kernel_src,
+                      re.M)
+    assert threads is not None and depth is not None
+    assert int(threads.group(1)) == build_cutedsl._QSA_DECODE_THREADS
+    assert int(depth.group(1)) == build_cutedsl._QSA_DECODE_PIPE_DEPTH
+
+    runner_header = (_REPO_ROOT / "cpp" / "kernels" / "qsaAttention" /
+                     "cuteDslQsaSparseRunner.h").read_text(encoding="utf-8")
+    max_splits = re.search(r"kMaxSplits\{(\d+)\}", runner_header)
+    partial_rows = re.search(r"kPartialRows\{(\d+)\}", runner_header)
+    assert max_splits is not None and partial_rows is not None
+    assert int(max_splits.group(1)) == build_cutedsl._QSA_DECODE_MAX_SPLITS
+    assert int(partial_rows.group(1)) == build_cutedsl._QSA_DECODE_M_BLOCK
+
+
 @pytest.mark.parametrize("sm", _RMSNORM_SUPPORTED_SMS)
 def test_rmsnorm_registry_has_all_compile_time_variants(sm):
     variants = build_cutedsl.select_variants(sm, "rmsnorm")

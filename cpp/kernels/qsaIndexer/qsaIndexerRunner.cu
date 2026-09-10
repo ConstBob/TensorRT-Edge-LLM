@@ -138,7 +138,7 @@ size_t getQsaIndexerWorkspaceSize(int32_t batchSize, int32_t maxSeqLen)
 template <typename T>
 void runQsaIndexerPrefill(int32_t* outIdx, T const* indexQk, float const* cosSin, int32_t const* contextLengths,
     T const* wQ, T const* wK, float rmsEps, void* workspace, size_t workspaceBytes, int32_t batchSize, int32_t seqLen,
-    cudaStream_t stream)
+    QsaIndexerPoolState const* poolState, cudaStream_t stream)
 {
     ELLM_CHECK(outIdx != nullptr && indexQk != nullptr && cosSin != nullptr && contextLengths != nullptr
             && wQ != nullptr && wK != nullptr && workspace != nullptr,
@@ -170,10 +170,22 @@ void runQsaIndexerPrefill(int32_t* outIdx, T const* indexQk, float const* cosSin
     size_t const cubTempBytes = getCubSortTempBytes(rowChunk, numBlocks);
     void* const cubTemp = assignFromWorkspace<std::byte>(cursor, cubTempBytes);
 
-    // K1a + K1b: prep all query heads and compressed keys once.
+    // K1a + K1b: prep all query heads and compressed keys once. With a pool state the K1b
+    // paged variant additionally persists each kbar to the pool V-tails (dense output
+    // bit-identical), and the tail scatter persists the raw index-K of the trailing
+    // incomplete block — the decode pipeline's B1/B2 read exactly this state.
     launchQsaIndexQPrep<T>(qNormed, indexQk, cosSin, contextLengths, wQ, rmsEps, batchSize, seqLen, stream);
-    launchQsaIndexKCompress<T>(kbar, indexQk, cosSin, contextLengths, wK, rmsEps, batchSize, seqLen, numBlocks,
-        /* blockBegin = */ 0, /* blockEnd = */ numBlocks, /* pastLen = */ 0, stream);
+    if (poolState != nullptr)
+    {
+        launchQsaRawKTailWritePrefill<T>(indexQk, contextLengths, *poolState, batchSize, seqLen, stream);
+        launchQsaIndexKCompressPaged<T>(kbar, indexQk, cosSin, contextLengths, wK, rmsEps, *poolState, batchSize,
+            seqLen, numBlocks, /* blockBegin = */ 0, /* blockEnd = */ numBlocks, /* pastLen = */ 0, stream);
+    }
+    else
+    {
+        launchQsaIndexKCompress<T>(kbar, indexQk, cosSin, contextLengths, wK, rmsEps, batchSize, seqLen, numBlocks,
+            /* blockBegin = */ 0, /* blockEnd = */ numBlocks, /* pastLen = */ 0, stream);
+    }
 
     SegmentOffsetIterator const beginOffsets(thrust::counting_iterator<int32_t>(0), SegmentOffsetOp{numBlocks});
     SegmentOffsetIterator const endOffsets(thrust::counting_iterator<int32_t>(1), SegmentOffsetOp{numBlocks});
@@ -199,11 +211,62 @@ void runQsaIndexerPrefill(int32_t* outIdx, T const* indexQk, float const* cosSin
     }
 }
 
+size_t getQsaIndexerDecodeWorkspaceSize(int32_t maxBatchSize, int32_t maxBlocks)
+{
+    ELLM_CHECK(maxBatchSize > 0 && maxBlocks > 0,
+        "getQsaIndexerDecodeWorkspaceSize: maxBatchSize and maxBlocks must be positive");
+
+    constexpr size_t kElemSize = 2; // half / bfloat16
+    size_t size = 0;
+    // Slot 0: qNormed [B, 1, 4, 128] T.
+    size += alignUp(static_cast<size_t>(maxBatchSize) * kQSA_INDEXER_NUM_HEADS * kQSA_INDEXER_HEAD_DIM * kElemSize);
+    // Slot 1: logits [B, maxBlocks] FP32.
+    size += alignUp(static_cast<size_t>(maxBatchSize) * maxBlocks * sizeof(float));
+    return size;
+}
+
+template <typename T>
+void runQsaIndexerDecode(int32_t* outIdx, T const* indexQk, float const* cosSin, int32_t const* contextLengths,
+    T const* wQ, T const* wK, float rmsEps, QsaIndexerPoolState const& poolState, int32_t* splitCounters,
+    void* workspace, size_t workspaceBytes, int32_t batchSize, int32_t maxBlocks, cudaStream_t stream)
+{
+    ELLM_CHECK(outIdx != nullptr && indexQk != nullptr && cosSin != nullptr && contextLengths != nullptr
+            && wQ != nullptr && wK != nullptr && workspace != nullptr,
+        "runQsaIndexerDecode: null pointer argument");
+    ELLM_CHECK(batchSize > 0 && maxBlocks > 0, "runQsaIndexerDecode: batchSize and maxBlocks must be positive");
+    ELLM_CHECK(reinterpret_cast<uintptr_t>(workspace) % kWorkspaceAlignment == 0,
+        "runQsaIndexerDecode: workspace must be 128-byte aligned");
+    ELLM_CHECK(workspaceBytes >= getQsaIndexerDecodeWorkspaceSize(batchSize, maxBlocks),
+        "runQsaIndexerDecode: workspace too small; need "
+            + std::to_string(getQsaIndexerDecodeWorkspaceSize(batchSize, maxBlocks)) + " bytes, got "
+            + std::to_string(workspaceBytes));
+
+    // Carve the workspace; layout documented at getQsaIndexerDecodeWorkspaceSize.
+    std::byte* cursor = static_cast<std::byte*>(workspace);
+    T* const qNormed = assignFromWorkspace<T>(
+        cursor, static_cast<size_t>(batchSize) * kQSA_INDEXER_NUM_HEADS * kQSA_INDEXER_HEAD_DIM * sizeof(T));
+    float* const logits
+        = assignFromWorkspace<float>(cursor, static_cast<size_t>(batchSize) * maxBlocks * sizeof(float));
+
+    launchQsaIndexerPreDecode<T>(
+        qNormed, indexQk, cosSin, contextLengths, wQ, wK, rmsEps, poolState, batchSize, stream);
+    launchQsaIndexScoresDecode<T>(logits, qNormed, contextLengths, poolState, batchSize, maxBlocks, stream);
+    launchQsaTopKExpandDecode(
+        outIdx, logits, contextLengths, splitCounters, poolState.numKVHeads, batchSize, maxBlocks, stream);
+}
+
 // Explicit instantiations for the supported activation types.
 template void runQsaIndexerPrefill<half>(int32_t*, half const*, float const*, int32_t const*, half const*, half const*,
-    float, void*, size_t, int32_t, int32_t, cudaStream_t);
+    float, void*, size_t, int32_t, int32_t, QsaIndexerPoolState const*, cudaStream_t);
 template void runQsaIndexerPrefill<__nv_bfloat16>(int32_t*, __nv_bfloat16 const*, float const*, int32_t const*,
-    __nv_bfloat16 const*, __nv_bfloat16 const*, float, void*, size_t, int32_t, int32_t, cudaStream_t);
+    __nv_bfloat16 const*, __nv_bfloat16 const*, float, void*, size_t, int32_t, int32_t, QsaIndexerPoolState const*,
+    cudaStream_t);
+
+template void runQsaIndexerDecode<half>(int32_t*, half const*, float const*, int32_t const*, half const*, half const*,
+    float, QsaIndexerPoolState const&, int32_t*, void*, size_t, int32_t, int32_t, cudaStream_t);
+template void runQsaIndexerDecode<__nv_bfloat16>(int32_t*, __nv_bfloat16 const*, float const*, int32_t const*,
+    __nv_bfloat16 const*, __nv_bfloat16 const*, float, QsaIndexerPoolState const&, int32_t*, void*, size_t, int32_t,
+    int32_t, cudaStream_t);
 
 } // namespace kernel
 } // namespace trt_edgellm

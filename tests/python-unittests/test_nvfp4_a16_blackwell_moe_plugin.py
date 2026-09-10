@@ -178,17 +178,20 @@ def _moe_reference(fixture: MoeFixture, hidden_states, router_logits,
     output = torch.zeros((hidden_2d.shape[0], case.hidden_size),
                          dtype=torch.float32,
                          device=hidden_states.device)
-    dense_fc1 = fixture.dense_fc1.to(hidden_states.device)
-    dense_fc2 = fixture.dense_fc2.to(hidden_states.device)
+    # One expert's dense fp32 weights on the device at a time: the full
+    # stacks (4.8 GiB for the Nemotron shape) next to the packed plugin
+    # inputs leave no headroom on the 6 GiB Thor CI device.
     for expert_id in range(case.num_experts):
         token_slot = (indices == expert_id).nonzero(as_tuple=False)
         if token_slot.numel() == 0:
             continue
         tokens = token_slot[:, 0]
         slots = token_slot[:, 1]
-        fc1 = hidden_2d[tokens] @ dense_fc1[expert_id].T
+        fc1_w = fixture.dense_fc1[expert_id].to(hidden_states.device)
+        fc2_w = fixture.dense_fc2[expert_id].to(hidden_states.device)
+        fc1 = hidden_2d[tokens] @ fc1_w.T
         act = torch.relu(fc1).square().to(torch.float16).to(torch.float32)
-        down = act @ dense_fc2[expert_id].T
+        down = act @ fc2_w.T
         output.index_add_(0, tokens, down * weights[tokens, slots, None])
     return output.to(torch.float16).reshape_as(hidden_states)
 

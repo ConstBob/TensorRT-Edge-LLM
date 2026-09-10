@@ -91,16 +91,21 @@ tests:
   - tests/python-unittests/test_attention_plugin.py::test_head512_vision_chunked_prefill_rejected
   - tests/python-unittests/test_attention_plugin.py::test_head512_shared_vision_prefill_reads_donor_cache
 
-  # QsaAttentionPlugin (Qwen Sparse Attention prefill) tests
+  # QsaAttentionPlugin (Qwen Sparse Attention prefill + decode) tests
   # (test_reference_* are CPU-only torch reference self-tests)
   - tests/python-unittests/test_qsa_attention_plugin.py::test_reference_dense_equivalence
   - tests/python-unittests/test_qsa_attention_plugin.py::test_reference_index_list_invariants
   - tests/python-unittests/test_qsa_attention_plugin.py::test_reference_sparse_regime_differs_from_dense
+  - tests/python-unittests/test_qsa_attention_plugin.py::test_reference_decode_step_matches_prefill_rows
   - tests/python-unittests/test_qsa_attention_plugin.py::test_plugin_dense_equivalence_prefill
   - tests/python-unittests/test_qsa_attention_plugin.py::test_plugin_sparse_prefill
   - tests/python-unittests/test_qsa_attention_plugin.py::test_plugin_kv_write_through
-  - tests/python-unittests/test_qsa_attention_plugin.py::test_plugin_decode_shape_rejected
   - tests/python-unittests/test_qsa_attention_plugin.py::test_plugin_determinism
+  - tests/python-unittests/test_qsa_attention_plugin.py::test_plugin_decode_ragged_batch
+  - tests/python-unittests/test_qsa_attention_plugin.py::test_plugin_decode_pool_tail_state
+  - tests/python-unittests/test_qsa_attention_plugin.py::test_plugin_decode_nan_tail_poisoning
+  - tests/python-unittests/test_qsa_attention_plugin.py::test_plugin_decode_s_gt1_rejected
+  - tests/python-unittests/test_qsa_attention_plugin.py::test_plugin_decode_graph_capture_smoke
 
   # Mamba selective-state-update (update_ssm_state) plugin tests
   - tests/python-unittests/test_mamba_plugin.py::test_decode

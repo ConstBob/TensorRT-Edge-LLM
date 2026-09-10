@@ -78,28 +78,83 @@ struct QsaSparsePrefillParams
 class CuteDslQsaSparsePrefillRunner
 {
 public:
-    explicit CuteDslQsaSparsePrefillRunner(nvinfer1::DataType dataType);
-
-    ~CuteDslQsaSparsePrefillRunner() = default;
-    CuteDslQsaSparsePrefillRunner(CuteDslQsaSparsePrefillRunner const&) = delete;
-    CuteDslQsaSparsePrefillRunner& operator=(CuteDslQsaSparsePrefillRunner const&) = delete;
+    CuteDslQsaSparsePrefillRunner() = delete;
 
     //! Returns whether the QSA AOT family covers this shape on this SM.
     static bool canImplement(
         int32_t numQHeads, int32_t numKVHeads, int32_t headDim, int32_t smVersion, nvinfer1::DataType dataType);
 
     //! Ensures the variant selected by run() is loaded (CUDA-graph-capture aware).
-    bool preflight(cudaStream_t stream);
+    static bool preflight(nvinfer1::DataType dataType, cudaStream_t stream);
 
     //! Launches sparse prefill attention over the gathered index lists.
-    bool run(QsaSparsePrefillParams const& params);
+    static bool run(nvinfer1::DataType dataType, QsaSparsePrefillParams const& params);
 
 private:
-    nvinfer1::DataType mDataType{nvinfer1::DataType::kHALF};
-
 #if defined(CUTE_DSL_QSA_ENABLED)
     static detail::LazyKernelModule<qsa_sparse_d256_fp16_Kernel_Module_t> sSparseD256Fp16;
     static detail::LazyKernelModule<qsa_sparse_d256_bf16_Kernel_Module_t> sSparseD256Bf16;
+#endif // defined(CUTE_DSL_QSA_ENABLED)
+};
+
+//! Per-launch parameters for the QSA split-K sparse DECODE kernel.
+//!
+//! One query token per sequence: @c qPtr / @c oPtr are [batchSize, 1, numQHeads, headDim].
+//! K/V come from the paged pool [2*numPages, 128, numKVHeads, poolHeadDim] through
+//! @c pageTable [batchSize, 2, maxPagesPerSeq] (V page ids pre-offset by +numPages); only
+//! columns [0, headDim) of each row are read — the tail carries the QSA indexer state.
+//! @c indices is [batchSize, 1, topK] Int32 (-1 padded). @c contextLengths is the TOTAL
+//! per-sequence length including the new token. @c partialO (fp32
+//! [batchSize*numKVHeads*kMaxSplits, kPartialRows, headDim]), @c partialStats (fp32
+//! [batchSize*numKVHeads*kMaxSplits, 2, kPartialRows]) and @c splitCounters (int32
+//! [batchSize*numKVHeads]) live in plugin workspace; counters MUST be zero on entry
+//! (the kernel release-resets them, but fresh workspaces start as garbage).
+struct QsaSparseDecodeParams
+{
+    void const* qPtr{};
+    void const* kvPoolPtr{};
+    int32_t const* pageTable{};
+    int32_t const* indices{};
+    int32_t const* contextLengths{};
+    void* oPtr{};
+    float* partialO{};
+    float* partialStats{};
+    int32_t* splitCounters{};
+    int32_t batchSize{};
+    int32_t numQHeads{};
+    int32_t numKVHeads{};
+    int32_t headDim{};
+    int32_t poolHeadDim{};
+    int32_t numFlatPages{}; //!< 2 * numPages (both planes)
+    int32_t maxPagesPerSeq{};
+    int32_t topK{};
+    float attentionScale{};
+    cudaStream_t stream{};
+};
+
+//! Runner for the single-launch split-K QSA sparse decode kernel.
+class CuteDslQsaSparseDecodeRunner
+{
+public:
+    //! Grid split dimension baked into the AOT variants (build_cutedsl.py --max_splits).
+    static constexpr int32_t kMaxSplits{8};
+    //! Accumulator row count of the partial workspaces (m_block_size).
+    static constexpr int32_t kPartialRows{16};
+
+    CuteDslQsaSparseDecodeRunner() = delete;
+
+    static bool canImplement(int32_t numQHeads, int32_t numKVHeads, int32_t headDim, int32_t poolHeadDim,
+        int32_t smVersion, nvinfer1::DataType dataType);
+
+    //! Ensures the decode variant is loaded (CUDA-graph-capture aware).
+    static bool preflight(nvinfer1::DataType dataType, cudaStream_t stream);
+
+    static bool run(nvinfer1::DataType dataType, QsaSparseDecodeParams const& params);
+
+private:
+#if defined(CUTE_DSL_QSA_ENABLED)
+    static detail::LazyKernelModule<qsa_sparse_decode_d256_fp16_Kernel_Module_t> sDecodeD256Fp16;
+    static detail::LazyKernelModule<qsa_sparse_decode_d256_bf16_Kernel_Module_t> sDecodeD256Bf16;
 #endif // defined(CUTE_DSL_QSA_ENABLED)
 };
 

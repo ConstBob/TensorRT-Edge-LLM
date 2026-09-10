@@ -57,10 +57,6 @@ TEST(QsaIndexerJitCompiler, KeyValidation)
     QsaIndexerJitKey badDataType = key;
     badDataType.dataType = static_cast<QsaIndexerJitDataType>(2);
     EXPECT_FALSE(canCompileQsaIndexerJitKernel(badDataType));
-
-    QsaIndexerJitKey badAbi = key;
-    badAbi.sourceAbi = kQSA_INDEXER_JIT_SOURCE_ABI + 1;
-    EXPECT_FALSE(canCompileQsaIndexerJitKernel(badAbi));
 }
 
 //! The kernels are arch-generic; NVRTC-compile both dtype variants for whatever device is

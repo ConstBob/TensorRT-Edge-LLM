@@ -132,6 +132,12 @@ void launchApplyRopeQOnly(rt::Tensor const& cosSinCache, rt::Tensor& q, cudaStre
 //!   - Tree decoding: pass @p tokenPosIds (-1 = padding token, no cache write).
 //!   - CuTeDSL + FP8: pass @p fp8QOut for FP8 roped Q; otherwise qScratch gets FP16 Q.
 //!
+//! Unlike the other variants, the pool head dimension (kvCache shape d[4], poolHeadDim) may
+//! exceed the packed-QKV head dimension (headDim = packedQKV shape d[3]): pool row offsets
+//! stride by poolHeadDim while only the leading headDim elements of each row are written, so
+//! the row tail [headDim, poolHeadDim) is never clobbered and a caller may keep per-token
+//! state there.
+//!
 //! @param[in]  cosSinCache  FP32 tensor [cosSinCacheBatchSize, cosSinCacheSeqLen, rotaryDim]
 //! @param[in]  kvCacheEndLens Optional INT32 tensor [batchSize] — KV cache end position after insertion.
 //!             Pass nullopt for prefill without prior cache (starts at position 0).
@@ -140,7 +146,8 @@ void launchApplyRopeQOnly(rt::Tensor const& cosSinCache, rt::Tensor& q, cudaStre
 //! @param[in]  packedQKV    FP16 tensor [batchSize, runtimeSeqLen, Hq+2*Hkv, headDim], read-only.
 //! @param[out] qScratch     FP16 tensor [batchSize, runtimeSeqLen, Hq, headDim] — roped Q output
 //!             (unless @p fp8QOut is non-null, in which case this is unused).
-//! @param[out] kvCache      FP16/FP8 paged pool [2, numPages, kTOKENS_PER_PAGE, Hkv, headDim] — K/V written here.
+//! @param[out] kvCache      FP16/FP8 paged pool [2, numPages, kTOKENS_PER_PAGE, Hkv, poolHeadDim],
+//!             poolHeadDim >= headDim (see above).
 //! @param[in]  kScale       K dequant scale (quant→orig). Use 1.0f for FP16 KV cache.
 //! @param[in]  vScale       V dequant scale (quant→orig). Use 1.0f for FP16 KV cache.
 //! @param[in]  stream       CUDA stream.

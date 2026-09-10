@@ -24,10 +24,6 @@
 namespace trt_edgellm
 {
 
-//! Bump whenever kernelSrcs/qsaIndexer/qsaIndexerJitKernels.cu changes its entry-point
-//! signatures, launch geometry expectations, or the meaning of a -D define.
-inline constexpr uint32_t kQSA_INDEXER_JIT_SOURCE_ABI{1U};
-
 enum class QsaIndexerJitDataType : uint32_t
 {
     kHALF = 0,
@@ -36,18 +32,20 @@ enum class QsaIndexerJitDataType : uint32_t
 
 //! \brief Key that identifies one NVRTC-compiled QSA indexer module variant.
 //!
-//! One compilation produces a single cubin holding all five extern "C" entry points
-//! (qsa_indexer_q_prep, qsa_indexer_k_compress, qsa_indexer_scores, qsa_indexer_ids_fill,
-//! qsa_indexer_expand) specialized for (sm, dataType).
+//! One compilation produces a single cubin holding all ten extern "C" entry points
+//! (qsa_indexer_q_prep, qsa_indexer_k_compress, qsa_indexer_k_compress_paged,
+//! qsa_indexer_scores, qsa_indexer_ids_fill, qsa_indexer_expand,
+//! qsa_indexer_raw_k_tail_write_prefill, qsa_indexer_pre_decode,
+//! qsa_indexer_scores_decode, qsa_indexer_topk_expand_decode) specialized for
+//! (sm, dataType).
 struct QsaIndexerJitKey
 {
     int32_t sm{};
     QsaIndexerJitDataType dataType{QsaIndexerJitDataType::kHALF};
-    uint32_t sourceAbi{kQSA_INDEXER_JIT_SOURCE_ABI};
 
     auto asTuple() const noexcept
     {
-        return std::tie(sm, dataType, sourceAbi);
+        return std::tie(sm, dataType);
     }
 
     bool operator==(QsaIndexerJitKey const& other) const noexcept
