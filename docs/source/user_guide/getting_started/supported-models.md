@@ -228,6 +228,7 @@ handled automatically by export and runtime.
 
 - **Alpamayo:** [nvidia/Alpamayo-R1-10B](https://huggingface.co/nvidia/Alpamayo-R1-10B)
 - **Cosmos3-Edge:** [nvidia/Cosmos3-Edge](https://huggingface.co/nvidia/Cosmos3-Edge), [nvidia/Cosmos3-Edge-Policy-DROID](https://huggingface.co/nvidia/Cosmos3-Edge-Policy-DROID)
+- **pi0.5:** [lerobot/pi05_libero_base](https://huggingface.co/lerobot/pi05_libero_base)
 
 ## Speculative Draft Checkpoints
 

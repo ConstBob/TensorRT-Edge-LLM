@@ -960,6 +960,17 @@ TEST(XQATreeAttentionDecodingTest, accuracyKVRatio6HeadDim256)
     TestXQATreeAttentionDecodingAccuracy(1, 24, 4, 256, 256, 32);
 }
 
+TEST(XQATreeAttentionDecodingTest, accuracyKVRatio8HeadDim256)
+{
+    // pi0.5 action expert: ten action tokens over a 968-token prefix, on the paged pool
+    // it ships with -- 128-token pages, capacity rounded up to 1024, so the last page is
+    // partial.
+    TestXQATreeAttentionDecodingAccuracy(1, 8, 1, 256, 978, 10, false, 0, 128, std::nullopt, {}, 1024);
+    // Same expert at a shorter prefix, which lands the trailing page 15 tokens in
+    // rather than 82, so the partial-page tail is exercised at both ends.
+    TestXQATreeAttentionDecodingAccuracy(1, 8, 1, 256, 783, 10, false, 0, 128, std::nullopt, {}, 1024);
+}
+
 TEST(XQATreeAttentionDecodingTest, accuracyKVRatio8HeadDim512)
 {
     TestXQATreeAttentionDecodingAccuracy(1, 32, 4, 512, 256, 20);

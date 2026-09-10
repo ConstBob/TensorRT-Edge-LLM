@@ -13,9 +13,11 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-# Experimental models. Each subdirectory is a self-contained model that links
-# the core edgellm libraries (edgellmCore, edgellmBuilder, edgellmKernels, ...).
+message(STATUS "Configuring experimental model: pi05")
 
-add_subdirectory(cosmos3)
-add_subdirectory(nemotron3_5_asr)
-add_subdirectory(pi05)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/cpp/CMakeLists.txt)
+  add_subdirectory(cpp)
+endif()
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/examples/CMakeLists.txt)
+  add_subdirectory(examples)
+endif()

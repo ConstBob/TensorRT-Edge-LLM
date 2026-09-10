@@ -1,6 +1,8 @@
 tests:
   - tests/defs/test_common.py::test_build_project
   - tests/defs/test_common.py::test_unit_tests
+  # After the generic ctest run, so unitTestPi05 is not registered for it.
+  - tests/defs/test_pi05.py::test_cpp_build_and_unit_tests
 
   - tests/defs/test_audio_pipeline.py::TestASRPipeline::test_engine_build[Qwen3-ASR-0.6B-fp16-mxsl4096-mxbs1-mxil1024-mnts100-mxts3000]
   - tests/defs/test_audio_pipeline.py::TestASRPipeline::test_inference[Qwen3-ASR-0.6B-fp16-mxsl4096-mxbs1-mxil1024-mnts100-mxts3000-asr_basic]
