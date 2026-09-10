@@ -92,6 +92,15 @@ _LLM_DENSE_PAGED = ["--is_persistent", "--export_only", "--paged_kv"]
 _LLM_DENSE_FP8_PAGED = _LLM_DENSE_PAGED + ["--in_dtype", "Float8E4M3FN"]
 _VIT = ["--is_persistent", "--export_only", "--vit_mode"]
 _VIT_FP8 = _VIT + ["--in_dtype", "Float8E4M3FN"]
+# cpp/kernels/qsaAttention/cuteDslQsaSparseRunner.h (kMaxSplits, kPartialRows)
+# sizes the split-K partial workspace from these numbers.
+_QSA_DECODE_MAX_SPLITS = 8
+_QSA_DECODE_M_BLOCK = 16
+# Decode CTA geometry (must match QSA_DECODE_DEFAULT_THREADS /
+# QSA_DECODE_DEFAULT_PIPE_DEPTH in qsa_cutedsl/qsa_sparse_gqa.py): 4 warps per
+# CTA, each with its own 1-stage cp.async gather pipeline.
+_QSA_DECODE_THREADS = 128
+_QSA_DECODE_PIPE_DEPTH = 1
 
 
 @dataclass
@@ -137,9 +146,9 @@ class KernelVariant:
 #   gdn              — Gated Delta Net decode/prefill
 #   fmha             — FP16 Context/ViT FMHA, plus optimized Blackwell
 #                      persistent variants on SM100/101/110.
-#   qsa              — Qwen Sparse Attention (QSA) sparse-GQA prefill:
-#                      per-query top-k token-index gather attention
-#                      (Qwen3.8-Flash-Next).
+#   qsa              — Qwen Sparse Attention (QSA) sparse-GQA prefill +
+#                      split-K decode: per-query top-k token-index gather
+#                      attention (Qwen3.8-Flash-Next).
 #   ssd              — Mamba2 SSM chunk-scan prefill
 #   gemm             — Talker MLP cuBLAS replacement (Ampere/Blackwell/BW GeForce)
 #   f16_moe          — FP16 grouped FC1/FC2 MoE (Ampere/Blackwell/SM12x)
@@ -1063,11 +1072,12 @@ KERNEL_VARIANTS = [
             "--skip_rescale", "--export_only",
         ],
     ),
-    # --- QSA sparse-GQA group (Qwen3.8-Flash-Next prefill) ---
-    # One CTA per (query token, kv head); the M tile is the GQA head group
-    # and the KV traversal is a per-row cp.async gather over the indexer's
-    # top-k token-index list.  B/S/H_q/H_kv/topk stay runtime-dynamic; only
-    # head_dim and the (Br, Bc, threads) tuning are baked.
+    # --- QSA sparse-GQA group (Qwen3.8-Flash-Next prefill + split-K decode) ---
+    # Prefill: one CTA per (query token, kv head); the M tile is the GQA head
+    # group and the KV traversal is a per-row cp.async gather over the
+    # indexer's top-k token-index list.  B/S/H_q/H_kv/topk stay
+    # runtime-dynamic; head_dim and the (Br, Bc, threads) tuning are baked
+    # (the decode variants below also bake MAX_SPLITS).
     KernelVariant(
         name="qsa_sparse_d256_fp16",
         group="qsa",
@@ -1088,6 +1098,36 @@ KERNEL_VARIANTS = [
             "--head_dim", "256",
             "--m_block_size", "16", "--n_block_size", "16", "--num_threads", "32",
             "--dtype", "BFloat16", "--export_only",
+        ],
+    ),
+    # Decode: single-launch split-K over the paged pool (widened rows; the
+    # indexer-state tail is never read).  MAX_SPLITS is baked into the grid.
+    KernelVariant(
+        name="qsa_sparse_decode_d256_fp16",
+        group="qsa",
+        supported_sms=[100, 101, 110],
+        script="qsa_cutedsl/qsa_sparse_gqa.py",
+        script_args=[
+            "--head_dim", "256",
+            "--m_block_size", str(_QSA_DECODE_M_BLOCK),
+            "--n_block_size", "16", "--num_threads", str(_QSA_DECODE_THREADS),
+            "--pipe_depth", str(_QSA_DECODE_PIPE_DEPTH),
+            "--dtype", "Float16", "--decode",
+            "--max_splits", str(_QSA_DECODE_MAX_SPLITS), "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="qsa_sparse_decode_d256_bf16",
+        group="qsa",
+        supported_sms=[100, 101, 110],
+        script="qsa_cutedsl/qsa_sparse_gqa.py",
+        script_args=[
+            "--head_dim", "256",
+            "--m_block_size", str(_QSA_DECODE_M_BLOCK),
+            "--n_block_size", "16", "--num_threads", str(_QSA_DECODE_THREADS),
+            "--pipe_depth", str(_QSA_DECODE_PIPE_DEPTH),
+            "--dtype", "BFloat16", "--decode",
+            "--max_splits", str(_QSA_DECODE_MAX_SPLITS), "--export_only",
         ],
     ),
     # --- NvFP4 MoE group (decomposed FC1/FC2; SM110/Thor today) ---

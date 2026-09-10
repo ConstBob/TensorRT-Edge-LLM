@@ -30,6 +30,7 @@
 #include "kernels/qsaIndexer/qsaIndexerRunner.h"
 #include "plugins/utils/pluginUtils.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -55,10 +56,10 @@ constexpr char const* kQSA_ATTENTION_PLUGIN_NAME{"QsaAttentionPlugin"};
 // the positional contract is fixed.
 constexpr int32_t kIN_QKV_IDX{0};                   //!< [B, S, (Hq + 2*Hkv) * D] FP16 packed QKV
 constexpr int32_t kIN_INDEX_QK_IDX{1};              //!< [B, S, (idxHeads + 1) * idxDim] FP16 indexer projection
-constexpr int32_t kIN_KV_CACHE_IDX{2};              //!< [2, numPages, 128, Hkv, D] FP16 paged pool
+constexpr int32_t kIN_KV_CACHE_IDX{2};              //!< [2, numPages, 128, Hkv, D + idxDim] FP16 widened pool
 constexpr int32_t kIN_CONTEXT_LENGTH_IDX{3};        //!< [B] INT32 live lengths
 constexpr int32_t kIN_ROPE_COS_SIN_IDX{4};          //!< [1, maxPos, 64] FP32 rope table (main + indexer)
-constexpr int32_t kIN_KV_CACHE_START_IDX{5};        //!< [0] INT32 — prefill sentinel (v1 rejects [B])
+constexpr int32_t kIN_KV_CACHE_START_IDX{5};        //!< [0] INT32 = prefill; [B] (values = past lengths) = decode
 constexpr int32_t kIN_KV_PAGE_TABLE_IDX{6};         //!< [B, 2, maxPagesPerSeq] INT32
 constexpr int32_t kIN_Q_NORM_GAMMA_IDX{7};          //!< [D] FP16 Constant, pre-folded (1 + w)
 constexpr int32_t kIN_K_NORM_GAMMA_IDX{8};          //!< [D] FP16 Constant, pre-folded (1 + w)
@@ -75,7 +76,10 @@ constexpr int32_t kNUM_REQUIRED_OUTPUTS{2};
 //! (64 of 128); its last dim is therefore pinned to the indexer rotary dim.
 constexpr int32_t kQSA_ROPE_TABLE_DIM{kernel::kQSA_INDEXER_ROTARY_DIM};
 
-bool isQsaPagedPoolShape(Dims const& shape, int32_t numKVHeads, int32_t headSize)
+//! The QSA pool head dimension is DERIVED as head_size + indexer_head_dim (no extra plugin
+//! attribute): each pool row is [roped K or raw V | indexer-state tail]. The tail layout is
+//! owned by the indexer (see the class doc and qsaIndexerKernels.h).
+bool isQsaPagedPoolShape(Dims const& shape, int32_t numKVHeads, int32_t headSize, int32_t indexerHeadDim)
 {
     if (shape.nbDims != 5)
     {
@@ -83,10 +87,10 @@ bool isQsaPagedPoolShape(Dims const& shape, int32_t numKVHeads, int32_t headSize
     }
     bool const validNumPages = shape.d[1] == -1 || shape.d[1] > 0;
     return shape.d[0] == 2 && validNumPages && shape.d[2] == rt::kTOKENS_PER_PAGE && shape.d[3] == numKVHeads
-        && shape.d[4] == headSize;
+        && shape.d[4] == headSize + indexerHeadDim;
 }
 
-// Workspace layout (cumulative; each slot 128-byte aligned):
+// Prefill workspace layout (cumulative; each slot 128-byte aligned):
 //
 //   Slot  | Shape                       | Type  | Used by
 //   ------+-----------------------------+-------+------------------------------------------
@@ -98,7 +102,8 @@ bool isQsaPagedPoolShape(Dims const& shape, int32_t numKVHeads, int32_t headSize
 //   5     | [B, S, Hkv, D]              | HALF  | vScratch            (V mirror)
 //   6     | [B, S, kQSA_INDEX_WIDTH]    | INT32 | outIdx              (indexer output)
 //   7     | getQsaIndexerWorkspaceSize  | BYTE  | indexer scratch     (scores / sort / temp)
-size_t getQsaWorkspaceSize(int64_t batchSize, int64_t seqLen, int32_t numQHeads, int32_t numKVHeads, int32_t headSize)
+size_t getQsaPrefillWorkspaceSize(
+    int64_t batchSize, int64_t seqLen, int32_t numQHeads, int32_t numKVHeads, int32_t headSize)
 {
     size_t workspaceSize = 0;
     workspaceSize = accumulateWorkspaceSize(workspaceSize, {batchSize + 1}, DataType::kINT32);
@@ -112,6 +117,43 @@ size_t getQsaWorkspaceSize(int64_t batchSize, int64_t seqLen, int32_t numQHeads,
     workspaceSize = accumulateWorkspaceSize(workspaceSize,
         {static_cast<int64_t>(
             kernel::getQsaIndexerWorkspaceSize(static_cast<int32_t>(batchSize), static_cast<int32_t>(seqLen)))},
+        DataType::kINT8);
+    return workspaceSize;
+}
+
+//! Compressed-block capacity implied by a page-table width: every page holds
+//! kTOKENS_PER_PAGE tokens, and blocks compress kQSA_COMPRESS_RATIO tokens each.
+int64_t qsaMaxBlocksForPages(int64_t maxPagesPerSeq)
+{
+    return maxPagesPerSeq * (rt::kTOKENS_PER_PAGE / kernel::kQSA_COMPRESS_RATIO);
+}
+
+// Decode workspace layout (cumulative; each slot 128-byte aligned; carve order in
+// enqueueDecode must match):
+//
+//   Slot  | Shape                             | Type  | Used by
+//   ------+-----------------------------------+-------+----------------------------------
+//   0     | [B, 1, Hq, D]                     | HALF  | qScratch      (roped Q)
+//   1     | [B, 1, kQSA_INDEX_WIDTH]          | INT32 | outIdx        (indexer output)
+//   2     | [B*Hkv*kMaxSplits, kPartialRows, D] | FP32 | partialO    (split-K partials)
+//   3     | [B*Hkv*kMaxSplits, 2, kPartialRows] | FP32 | partialStats (row max / denom)
+//   4     | [B, Hkv]                          | INT32 | splitCounters (zeroed by B3 each step)
+//   5     | getQsaIndexerDecodeWorkspaceSize  | BYTE  | indexer scratch (qNormed + logits)
+size_t getQsaDecodeWorkspaceSize(
+    int64_t batchSize, int64_t maxPagesPerSeq, int32_t numQHeads, int32_t numKVHeads, int32_t headSize)
+{
+    int64_t const partialSlots = batchSize * numKVHeads * CuteDslQsaSparseDecodeRunner::kMaxSplits;
+    size_t workspaceSize = 0;
+    workspaceSize = accumulateWorkspaceSize(workspaceSize, {batchSize, 1, numQHeads, headSize}, DataType::kHALF);
+    workspaceSize = accumulateWorkspaceSize(workspaceSize, {batchSize, 1, kernel::kQSA_INDEX_WIDTH}, DataType::kINT32);
+    workspaceSize = accumulateWorkspaceSize(
+        workspaceSize, {partialSlots, CuteDslQsaSparseDecodeRunner::kPartialRows, headSize}, DataType::kFLOAT);
+    workspaceSize = accumulateWorkspaceSize(
+        workspaceSize, {partialSlots, 2, CuteDslQsaSparseDecodeRunner::kPartialRows}, DataType::kFLOAT);
+    workspaceSize = accumulateWorkspaceSize(workspaceSize, {batchSize, numKVHeads}, DataType::kINT32);
+    workspaceSize = accumulateWorkspaceSize(workspaceSize,
+        {static_cast<int64_t>(kernel::getQsaIndexerDecodeWorkspaceSize(
+            static_cast<int32_t>(batchSize), static_cast<int32_t>(qsaMaxBlocksForPages(maxPagesPerSeq))))},
         DataType::kINT8);
     return workspaceSize;
 }
@@ -168,23 +210,22 @@ void QsaAttentionPlugin::validateConfiguration() const
     ELLM_CHECK(mNumQHeads > 0 && mNumKVHeads > 0 && mHeadSize > 0,
         "QsaAttentionPlugin requires positive num_q_heads, num_kv_heads and head_size.");
     ELLM_CHECK(mNumQHeads % mNumKVHeads == 0, "QsaAttentionPlugin requires num_q_heads % num_kv_heads == 0.");
-    // The v1 indexer kernels are specialized to the Qwen3.8-Flash-Next configuration.
+    // The indexer kernels are specialized to the Qwen3.8-Flash-Next configuration.
     ELLM_CHECK(mIndexerNumHeads == kernel::kQSA_INDEXER_NUM_HEADS,
-        "QsaAttentionPlugin v1 requires indexer_n_heads == " + std::to_string(kernel::kQSA_INDEXER_NUM_HEADS) + ".");
+        "QsaAttentionPlugin requires indexer_n_heads == " + std::to_string(kernel::kQSA_INDEXER_NUM_HEADS) + ".");
     ELLM_CHECK(mIndexerHeadDim == kernel::kQSA_INDEXER_HEAD_DIM,
-        "QsaAttentionPlugin v1 requires indexer_head_dim == " + std::to_string(kernel::kQSA_INDEXER_HEAD_DIM) + ".");
+        "QsaAttentionPlugin requires indexer_head_dim == " + std::to_string(kernel::kQSA_INDEXER_HEAD_DIM) + ".");
     ELLM_CHECK(mIndexerBudget == kernel::kQSA_INDEX_BUDGET,
-        "QsaAttentionPlugin v1 requires indexer_budget == " + std::to_string(kernel::kQSA_INDEX_BUDGET) + ".");
+        "QsaAttentionPlugin requires indexer_budget == " + std::to_string(kernel::kQSA_INDEX_BUDGET) + ".");
     ELLM_CHECK(mIndexerCompressRatio == kernel::kQSA_COMPRESS_RATIO,
-        "QsaAttentionPlugin v1 requires indexer_compress_ratio == " + std::to_string(kernel::kQSA_COMPRESS_RATIO)
-            + ".");
+        "QsaAttentionPlugin requires indexer_compress_ratio == " + std::to_string(kernel::kQSA_COMPRESS_RATIO) + ".");
     ELLM_CHECK(std::isfinite(mRmsNormEps) && mRmsNormEps > 0.0F,
         "QsaAttentionPlugin requires a positive finite rms_norm_eps.");
     validateAttentionScale(mAttentionScale);
 
     int32_t const indexWidth = mIndexerBudget + mIndexerCompressRatio - 1;
     ELLM_CHECK(indexWidth == kernel::kQSA_INDEX_WIDTH,
-        "QsaAttentionPlugin v1 index width must equal " + std::to_string(kernel::kQSA_INDEX_WIDTH) + ".");
+        "QsaAttentionPlugin index width must equal " + std::to_string(kernel::kQSA_INDEX_WIDTH) + ".");
 
     int32_t smVersion = getSMVersion();
     applyThorSMRenumberWAR(smVersion);
@@ -192,6 +233,11 @@ void QsaAttentionPlugin::validateConfiguration() const
     ELLM_CHECK(
         CuteDslQsaSparsePrefillRunner::canImplement(mNumQHeads, mNumKVHeads, mHeadSize, smVersion, DataType::kHALF),
         "QsaAttentionPlugin: no QSA sparse prefill kernel for Hq=" + std::to_string(mNumQHeads)
+            + ", Hkv=" + std::to_string(mNumKVHeads) + ", D=" + std::to_string(mHeadSize) + " on SM"
+            + std::to_string(smVersion) + " (build with -DENABLE_CUTE_DSL=\"fmha;qsa\").");
+    ELLM_CHECK(CuteDslQsaSparseDecodeRunner::canImplement(
+                   mNumQHeads, mNumKVHeads, mHeadSize, mHeadSize + mIndexerHeadDim, smVersion, DataType::kHALF),
+        "QsaAttentionPlugin: no QSA sparse decode kernel for Hq=" + std::to_string(mNumQHeads)
             + ", Hkv=" + std::to_string(mNumKVHeads) + ", D=" + std::to_string(mHeadSize) + " on SM"
             + std::to_string(smVersion) + " (build with -DENABLE_CUTE_DSL=\"fmha;qsa\").");
 }
@@ -343,7 +389,7 @@ bool QsaAttentionPlugin::supportsFormatCombination(
         return desc.type == DataType::kHALF && desc.dims.nbDims == 3
             && (desc.dims.d[2] == -1 || desc.dims.d[2] == (mIndexerNumHeads + 1) * mIndexerHeadDim);
     case kIN_KV_CACHE_IDX:
-        return desc.type == DataType::kHALF && isQsaPagedPoolShape(desc.dims, mNumKVHeads, mHeadSize);
+        return desc.type == DataType::kHALF && isQsaPagedPoolShape(desc.dims, mNumKVHeads, mHeadSize, mIndexerHeadDim);
     case kIN_CONTEXT_LENGTH_IDX: return desc.type == DataType::kINT32 && desc.dims.nbDims == 1;
     case kIN_ROPE_COS_SIN_IDX:
         return desc.type == DataType::kFLOAT && desc.dims.nbDims == 3
@@ -365,7 +411,8 @@ bool QsaAttentionPlugin::supportsFormatCombination(
     }
     if (outPos == kOUT_KV_CACHE_IDX)
     {
-        return desc.type == inOut[kIN_KV_CACHE_IDX].desc.type && isQsaPagedPoolShape(desc.dims, mNumKVHeads, mHeadSize);
+        return desc.type == inOut[kIN_KV_CACHE_IDX].desc.type
+            && isQsaPagedPoolShape(desc.dims, mNumKVHeads, mHeadSize, mIndexerHeadDim);
     }
     return false;
 }
@@ -381,9 +428,10 @@ int32_t QsaAttentionPlugin::configurePlugin(DynamicPluginTensorDesc const* in, [
         // extremes must describe a well-formed paged pool and page table.
         check::check(in[kIN_KV_CACHE_IDX].desc.dims.nbDims == out[kOUT_KV_CACHE_IDX].desc.dims.nbDims,
             "QsaAttentionPlugin: present_key_value must match past_key_value rank.");
-        check::check(isQsaPagedPoolShape(in[kIN_KV_CACHE_IDX].max, mNumKVHeads, mHeadSize)
-                && isQsaPagedPoolShape(out[kOUT_KV_CACHE_IDX].max, mNumKVHeads, mHeadSize),
-            "QsaAttentionPlugin: KV pool profile max must be [2, numPages, kTOKENS_PER_PAGE, Hkv, D].");
+        check::check(isQsaPagedPoolShape(in[kIN_KV_CACHE_IDX].max, mNumKVHeads, mHeadSize, mIndexerHeadDim)
+                && isQsaPagedPoolShape(out[kOUT_KV_CACHE_IDX].max, mNumKVHeads, mHeadSize, mIndexerHeadDim),
+            "QsaAttentionPlugin: KV pool profile max must be [2, numPages, kTOKENS_PER_PAGE, Hkv, "
+            "head_size + indexer_head_dim].");
         check::check(in[kIN_KV_PAGE_TABLE_IDX].max.nbDims == 3 && in[kIN_KV_PAGE_TABLE_IDX].max.d[1] == 2,
             "QsaAttentionPlugin: kv_page_table profile max must be [B, 2, maxPagesPerSeq].");
         return 0;
@@ -400,9 +448,13 @@ size_t QsaAttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* input
 {
     try
     {
+        // Sized from the profile MAX dims day-one: the returned size is serialized into the
+        // engine, so it must cover every runtime shape of this profile in both modes.
         int64_t const maxBatchSize = inputs[kIN_QKV_IDX].max.d[0];
         int64_t const maxSeqLen = inputs[kIN_QKV_IDX].max.d[1];
-        return getQsaWorkspaceSize(maxBatchSize, maxSeqLen, mNumQHeads, mNumKVHeads, mHeadSize);
+        int64_t const maxPagesPerSeq = inputs[kIN_KV_PAGE_TABLE_IDX].max.d[2];
+        return std::max(getQsaPrefillWorkspaceSize(maxBatchSize, maxSeqLen, mNumQHeads, mNumKVHeads, mHeadSize),
+            getQsaDecodeWorkspaceSize(maxBatchSize, maxPagesPerSeq, mNumQHeads, mNumKVHeads, mHeadSize));
     }
     catch (std::exception const& e)
     {
@@ -449,15 +501,33 @@ int32_t QsaAttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, Plugi
     check::check(inputDesc != nullptr && outputDesc != nullptr && inputs != nullptr && outputs != nullptr,
         "QsaAttentionPlugin received null enqueue descriptors or bindings.");
 
-    // v1 is prefill-only: kvcache_start_index with runtime shape [0] is the NORMAL_PREFILL
-    // sentinel (same convention as AttentionPlugin's mode deduction).
-    if (inputDesc[kIN_KV_CACHE_START_IDX].dims.d[0] != 0)
+    // Mode deduction (same convention as AttentionPlugin): kvcache_start_index runtime shape
+    // [0] selects NORMAL_PREFILL; shape [B] selects decode and requires S == 1 (chunked
+    // prefill and speculative decode are not supported). In decode the start values are the
+    // per-sequence PAST lengths; the kernels derive everything from context_lengths (the
+    // TOTAL lengths including the new token), so the values are never dereferenced here.
+    int64_t const startIdxLen = inputDesc[kIN_KV_CACHE_START_IDX].dims.d[0];
+    int64_t const modeBatchSize = inputDesc[kIN_QKV_IDX].dims.d[0];
+    int64_t const modeSeqLen = inputDesc[kIN_QKV_IDX].dims.d[1];
+    if (startIdxLen != 0)
     {
-        LOG_ERROR(
-            "QsaAttentionPlugin v1 supports normal prefill only: kvcache_start_index must have runtime shape "
-            "[0], got [%lld].",
-            static_cast<long long>(inputDesc[kIN_KV_CACHE_START_IDX].dims.d[0]));
-        return -1;
+        if (startIdxLen != modeBatchSize)
+        {
+            LOG_ERROR(
+                "QsaAttentionPlugin: kvcache_start_index must have runtime shape [0] (prefill) or [B] "
+                "(decode); got [%lld] with B=%lld.",
+                static_cast<long long>(startIdxLen), static_cast<long long>(modeBatchSize));
+            return -1;
+        }
+        if (modeSeqLen != 1)
+        {
+            LOG_ERROR(
+                "QsaAttentionPlugin: decode (kvcache_start_index shape [B]) requires S == 1; got S=%lld. "
+                "Chunked prefill / speculative decode are not supported.",
+                static_cast<long long>(modeSeqLen));
+            return -1;
+        }
+        return enqueueDecode(inputDesc, outputDesc, inputs, outputs, workspace, stream);
     }
 
     PluginTensorDesc const& packedQKVInputDesc = inputDesc[kIN_QKV_IDX];
@@ -473,16 +543,18 @@ int32_t QsaAttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, Plugi
         "QsaAttentionPlugin: index_qk must be [B, S, (indexer_n_heads + 1) * indexer_head_dim] matching QKV.");
 
     // One rope table serves the main partial rope and the indexer rope; the indexer kernels
-    // take a batch-invariant [maxPos, 64] view, so v1 requires a batch-1 table.
+    // take a batch-invariant [maxPos, 64] view, so a batch-1 table is required.
     PluginTensorDesc const& ropeCosSinDesc = inputDesc[kIN_ROPE_COS_SIN_IDX];
     check::check(ropeCosSinDesc.dims.d[0] == 1 && ropeCosSinDesc.dims.d[2] == kQSA_ROPE_TABLE_DIM,
-        "QsaAttentionPlugin v1 requires a batch-1 rope table [1, maxPos, 64].");
+        "QsaAttentionPlugin requires a batch-1 rope table [1, maxPos, 64].");
     check::check(ropeCosSinDesc.dims.d[1] >= runtimeSeqLen,
         "QsaAttentionPlugin: rope table must cover the runtime sequence length.");
 
     PluginTensorDesc const& kvCacheInputDesc = inputDesc[kIN_KV_CACHE_IDX];
-    check::check(isQsaPagedPoolShape(kvCacheInputDesc.dims, mNumKVHeads, mHeadSize) && kvCacheInputDesc.dims.d[1] > 0,
-        "QsaAttentionPlugin requires the paged KV pool [2, numPages, kTOKENS_PER_PAGE, Hkv, D].");
+    check::check(isQsaPagedPoolShape(kvCacheInputDesc.dims, mNumKVHeads, mHeadSize, mIndexerHeadDim)
+            && kvCacheInputDesc.dims.d[1] > 0,
+        "QsaAttentionPlugin requires the widened paged KV pool [2, numPages, kTOKENS_PER_PAGE, Hkv, "
+        "head_size + indexer_head_dim].");
     check::check(inputs[kIN_KV_CACHE_IDX] != nullptr && inputs[kIN_KV_PAGE_TABLE_IDX] != nullptr
             && outputs[kOUT_KV_CACHE_IDX] != nullptr,
         "QsaAttentionPlugin requires non-null KV pool and page-table bindings.");
@@ -565,7 +637,9 @@ int32_t QsaAttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, Plugi
         cuKVSeqLensTensor, kvCacheEndIdxsTensor, std::nullopt, runtimeSeqLen, stream);
 
     // ---- Stage 1: split packed QKV, fused qk-norm (pre-folded 1 + w gammas) + partial
-    // rope, paged KV write-through, and the dense K/V mirrors the sparse kernel consumes. ----
+    // rope, paged KV write-through, and the dense K/V mirrors the sparse kernel consumes.
+    // The widened pool row (head_size + indexer_head_dim) flows through the pool tensor shape
+    // (see launchApplyRopeFromPackedToSplit); the mirrors stay head_size-dense. ----
     kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor, rt::OptionalInputTensor{}, rt::OptionalInputTensor{},
         packedQKVTensor, qInputTensor, presentKVCacheTensor, 1.0F /* kScale */, 1.0F /* vScale */, stream, pageTable,
         maxPagesPerSeq, kInputTensor.rawPointer(), vInputTensor.rawPointer(), nullptr /* fp8QOut */, 1.0F /* qScale */,
@@ -573,15 +647,25 @@ int32_t QsaAttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, Plugi
         rt::OptionalInputTensor{cuQSeqLensTensor});
 
     // ---- Stage 2: QSA indexer — per-query top-512 block selection expanded to the int32
-    // token-index lists (padding rows all -1). ----
+    // token-index lists (padding rows all -1). The pool state makes the pipeline also
+    // persist every complete block's kbar and the trailing incomplete block's raw index-K
+    // into the pool tails, which is what the decode steps resume from. ----
+    kernel::QsaIndexerPoolState poolState{};
+    poolState.poolPtr = presentKVCacheTensor.rawPointer();
+    poolState.pageTable = pageTable;
+    poolState.maxPagesPerSeq = maxPagesPerSeq;
+    poolState.numPages = numPages;
+    poolState.numKVHeads = mNumKVHeads;
+    poolState.poolHeadDim = mHeadSize + mIndexerHeadDim;
+    poolState.headSize = mHeadSize;
     kernel::runQsaIndexerPrefill<half>(outIdxTensor.dataPointer<int32_t>(),
         static_cast<half const*>(inputs[kIN_INDEX_QK_IDX]), ropeCosSinTensor.dataPointer<float>(),
         contextLengthTensor.dataPointer<int32_t>(), indexerQGammaDevicePtr, indexerKGammaDevicePtr, mRmsNormEps,
-        indexerWorkspaceTensor.rawPointer(), indexerWorkspaceBytes, runtimeBatchSize, runtimeSeqLen, stream);
+        indexerWorkspaceTensor.rawPointer(), indexerWorkspaceBytes, runtimeBatchSize, runtimeSeqLen, &poolState,
+        stream);
 
     // ---- Stage 3: sparse GQA attention over the dense mirrors. ----
-    CuteDslQsaSparsePrefillRunner runner(DataType::kHALF);
-    if (!runner.preflight(stream))
+    if (!CuteDslQsaSparsePrefillRunner::preflight(DataType::kHALF, stream))
     {
         return -1;
     }
@@ -600,7 +684,164 @@ int32_t QsaAttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc, Plugi
     params.topK = kernel::kQSA_INDEX_WIDTH;
     params.attentionScale = mAttentionScale;
     params.stream = stream;
-    if (!runner.run(params))
+    if (!CuteDslQsaSparsePrefillRunner::run(DataType::kHALF, params))
+    {
+        return -1;
+    }
+    return 0;
+}
+
+int32_t QsaAttentionPlugin::enqueueDecode(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
+    void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream)
+{
+    // Callers reach this only through enqueueImpl's mode deduction: S == 1 and
+    // kvcache_start_index has runtime shape [B]. context_lengths carries the TOTAL
+    // per-sequence lengths including the token being decoded.
+    PluginTensorDesc const& packedQKVInputDesc = inputDesc[kIN_QKV_IDX];
+    int32_t const runtimeBatchSize = static_cast<int32_t>(packedQKVInputDesc.dims.d[0]);
+    int32_t const combinedHeads = mNumQHeads + 2 * mNumKVHeads;
+    check::check(packedQKVInputDesc.dims.d[2] == combinedHeads * mHeadSize,
+        "QsaAttentionPlugin: packed QKV last dim must equal (Hq + 2*Hkv) * head_size.");
+
+    PluginTensorDesc const& indexQkInputDesc = inputDesc[kIN_INDEX_QK_IDX];
+    check::check(indexQkInputDesc.dims.d[0] == runtimeBatchSize && indexQkInputDesc.dims.d[1] == 1
+            && indexQkInputDesc.dims.d[2] == (mIndexerNumHeads + 1) * mIndexerHeadDim,
+        "QsaAttentionPlugin: decode index_qk must be [B, 1, (indexer_n_heads + 1) * indexer_head_dim].");
+
+    // The rope table must cover every decode position; positions are device-side
+    // (context_lengths - 1), so coverage against the profile-declared table length is the
+    // builder's contract — only the batch-1 layout is validated here.
+    PluginTensorDesc const& ropeCosSinDesc = inputDesc[kIN_ROPE_COS_SIN_IDX];
+    check::check(ropeCosSinDesc.dims.d[0] == 1 && ropeCosSinDesc.dims.d[2] == kQSA_ROPE_TABLE_DIM,
+        "QsaAttentionPlugin requires a batch-1 rope table [1, maxPos, 64].");
+
+    PluginTensorDesc const& kvCacheInputDesc = inputDesc[kIN_KV_CACHE_IDX];
+    check::check(isQsaPagedPoolShape(kvCacheInputDesc.dims, mNumKVHeads, mHeadSize, mIndexerHeadDim)
+            && kvCacheInputDesc.dims.d[1] > 0,
+        "QsaAttentionPlugin requires the widened paged KV pool [2, numPages, kTOKENS_PER_PAGE, Hkv, "
+        "head_size + indexer_head_dim].");
+    check::check(inputs[kIN_KV_CACHE_IDX] != nullptr && inputs[kIN_KV_PAGE_TABLE_IDX] != nullptr
+            && outputs[kOUT_KV_CACHE_IDX] != nullptr,
+        "QsaAttentionPlugin requires non-null KV pool and page-table bindings.");
+
+    PluginTensorDesc const& kvPageTableInputDesc = inputDesc[kIN_KV_PAGE_TABLE_IDX];
+    check::check(kvPageTableInputDesc.dims.d[0] == runtimeBatchSize && kvPageTableInputDesc.dims.d[1] == 2
+            && kvPageTableInputDesc.dims.d[2] > 0,
+        "QsaAttentionPlugin: kv_page_table must be [B, 2, maxPagesPerSeq].");
+    int32_t const maxPagesPerSeq = static_cast<int32_t>(kvPageTableInputDesc.dims.d[2]);
+    int32_t const numPages = static_cast<int32_t>(kvCacheInputDesc.dims.d[1]);
+    check::check(numPages >= maxPagesPerSeq,
+        "QsaAttentionPlugin requires at least one physical page per logical page-table column.");
+
+    check::check(inputDesc[kIN_Q_NORM_GAMMA_IDX].dims.d[0] == mHeadSize
+            && inputDesc[kIN_K_NORM_GAMMA_IDX].dims.d[0] == mHeadSize,
+        "QsaAttentionPlugin: q/k_norm_gamma length must equal head_size.");
+    check::check(inputDesc[kIN_INDEXER_Q_NORM_GAMMA_IDX].dims.d[0] == mIndexerHeadDim
+            && inputDesc[kIN_INDEXER_K_NORM_GAMMA_IDX].dims.d[0] == mIndexerHeadDim,
+        "QsaAttentionPlugin: indexer q/k norm gamma length must equal indexer_head_dim.");
+    auto const* qNormGammaDevicePtr = static_cast<half const*>(inputs[kIN_Q_NORM_GAMMA_IDX]);
+    auto const* kNormGammaDevicePtr = static_cast<half const*>(inputs[kIN_K_NORM_GAMMA_IDX]);
+    auto const* indexerQGammaDevicePtr = static_cast<half const*>(inputs[kIN_INDEXER_Q_NORM_GAMMA_IDX]);
+    auto const* indexerKGammaDevicePtr = static_cast<half const*>(inputs[kIN_INDEXER_K_NORM_GAMMA_IDX]);
+
+    auto* alignedWorkspacePtr = static_cast<std::byte*>(workspace);
+    if (alignedWorkspacePtr == nullptr
+        || reinterpret_cast<uintptr_t>(alignedWorkspacePtr) % static_cast<uintptr_t>(kDEVICE_ALIGNMENT) != 0)
+    {
+        LOG_ERROR("QsaAttentionPlugin workspace pointer is not aligned to device alignment granularity.");
+        return -1;
+    }
+
+    // Non-owned tensor views over the bindings.
+    rt::Tensor const packedQKVTensor(const_cast<void*>(inputs[kIN_QKV_IDX]),
+        rt::Coords{runtimeBatchSize, 1, combinedHeads, mHeadSize}, rt::DeviceType::kGPU, packedQKVInputDesc.type);
+    rt::Tensor const contextLengthTensor(const_cast<void*>(inputs[kIN_CONTEXT_LENGTH_IDX]),
+        rt::Coords{inputDesc[kIN_CONTEXT_LENGTH_IDX].dims}, rt::DeviceType::kGPU,
+        inputDesc[kIN_CONTEXT_LENGTH_IDX].type);
+    check::check(contextLengthTensor.getShape()[0] == runtimeBatchSize,
+        "QsaAttentionPlugin: context_lengths must have shape [B].");
+    rt::Tensor const ropeCosSinTensor(const_cast<void*>(inputs[kIN_ROPE_COS_SIN_IDX]), rt::Coords{ropeCosSinDesc.dims},
+        rt::DeviceType::kGPU, ropeCosSinDesc.type);
+    rt::Tensor presentKVCacheTensor(
+        outputs[kOUT_KV_CACHE_IDX], rt::Coords{kvCacheInputDesc.dims}, rt::DeviceType::kGPU, kvCacheInputDesc.type);
+    rt::Tensor const kvPageTableTensor(const_cast<void*>(inputs[kIN_KV_PAGE_TABLE_IDX]),
+        rt::Coords{kvPageTableInputDesc.dims}, rt::DeviceType::kGPU, kvPageTableInputDesc.type);
+    int32_t const* const pageTable = kvPageTableTensor.dataPointer<int32_t>();
+    rt::Tensor attentionOutputTensor(outputs[kOUT_ATTENTION_IDX], rt::Coords{outputDesc[kOUT_ATTENTION_IDX].dims},
+        rt::DeviceType::kGPU, outputDesc[kOUT_ATTENTION_IDX].type);
+
+    // ---- Workspace carving (order must match getQsaDecodeWorkspaceSize) ----
+    int64_t const partialSlots
+        = static_cast<int64_t>(runtimeBatchSize) * mNumKVHeads * CuteDslQsaSparseDecodeRunner::kMaxSplits;
+    rt::Tensor qInputTensor
+        = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize, 1, mNumQHeads, mHeadSize}, DataType::kHALF);
+    rt::Tensor outIdxTensor = assignTensorFromWorkspace(
+        alignedWorkspacePtr, {runtimeBatchSize, 1, kernel::kQSA_INDEX_WIDTH}, DataType::kINT32);
+    rt::Tensor partialOTensor = assignTensorFromWorkspace(
+        alignedWorkspacePtr, {partialSlots, CuteDslQsaSparseDecodeRunner::kPartialRows, mHeadSize}, DataType::kFLOAT);
+    rt::Tensor partialStatsTensor = assignTensorFromWorkspace(
+        alignedWorkspacePtr, {partialSlots, 2, CuteDslQsaSparseDecodeRunner::kPartialRows}, DataType::kFLOAT);
+    rt::Tensor splitCountersTensor
+        = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize, mNumKVHeads}, DataType::kINT32);
+    int32_t const maxBlocks = static_cast<int32_t>(qsaMaxBlocksForPages(maxPagesPerSeq));
+    size_t const indexerWorkspaceBytes = kernel::getQsaIndexerDecodeWorkspaceSize(runtimeBatchSize, maxBlocks);
+    rt::Tensor indexerWorkspaceTensor = assignTensorFromWorkspace(
+        alignedWorkspacePtr, {static_cast<int64_t>(indexerWorkspaceBytes)}, DataType::kINT8);
+
+    // ---- Stage 1: rope + append the new token's K/V to the pool. kvCacheEndLens =
+    // context_lengths (TOTAL lengths) so the kernel ropes at position ctx - 1 and writes the
+    // pool row ctx - 1 (precedent: AttentionPlugin vanilla decoding; widened rows: see
+    // launchApplyRopeFromPackedToSplit). ----
+    kernel::launchApplyRopeFromPackedToSplit(ropeCosSinTensor, rt::OptionalInputTensor{contextLengthTensor},
+        rt::OptionalInputTensor{}, packedQKVTensor, qInputTensor, presentKVCacheTensor, 1.0F /* kScale */,
+        1.0F /* vScale */, stream, pageTable, maxPagesPerSeq, nullptr /* kScratch */, nullptr /* vScratch */,
+        nullptr /* fp8QOut */, 1.0F /* qScale */, qNormGammaDevicePtr, kNormGammaDevicePtr, mRmsNormEps);
+
+    // ---- Stage 2: indexer decode — B1 either persists the new token's raw index-K tail
+    // (block still incomplete) or compresses the block it completes into a kbar V-tail,
+    // B2 scores the visible blocks, B3 zeroes
+    // the split counters (guaranteeing zero-on-entry for stage 3, including the first step
+    // on a garbage workspace) and emits the top-512 expanded index list. ----
+    kernel::QsaIndexerPoolState poolState{};
+    poolState.poolPtr = presentKVCacheTensor.rawPointer();
+    poolState.pageTable = pageTable;
+    poolState.maxPagesPerSeq = maxPagesPerSeq;
+    poolState.numPages = numPages;
+    poolState.numKVHeads = mNumKVHeads;
+    poolState.poolHeadDim = mHeadSize + mIndexerHeadDim;
+    poolState.headSize = mHeadSize;
+    kernel::runQsaIndexerDecode<half>(outIdxTensor.dataPointer<int32_t>(),
+        static_cast<half const*>(inputs[kIN_INDEX_QK_IDX]), ropeCosSinTensor.dataPointer<float>(),
+        contextLengthTensor.dataPointer<int32_t>(), indexerQGammaDevicePtr, indexerKGammaDevicePtr, mRmsNormEps,
+        poolState, splitCountersTensor.dataPointer<int32_t>(), indexerWorkspaceTensor.rawPointer(),
+        indexerWorkspaceBytes, runtimeBatchSize, maxBlocks, stream);
+
+    // ---- Stage 3: single-launch split-K sparse attention over the paged pool. ----
+    if (!CuteDslQsaSparseDecodeRunner::preflight(DataType::kHALF, stream))
+    {
+        return -1;
+    }
+    QsaSparseDecodeParams params{};
+    params.qPtr = qInputTensor.rawPointer();
+    params.kvPoolPtr = presentKVCacheTensor.rawPointer();
+    params.pageTable = pageTable;
+    params.indices = outIdxTensor.dataPointer<int32_t>();
+    params.contextLengths = contextLengthTensor.dataPointer<int32_t>();
+    params.oPtr = attentionOutputTensor.rawPointer();
+    params.partialO = partialOTensor.dataPointer<float>();
+    params.partialStats = partialStatsTensor.dataPointer<float>();
+    params.splitCounters = splitCountersTensor.dataPointer<int32_t>();
+    params.batchSize = runtimeBatchSize;
+    params.numQHeads = mNumQHeads;
+    params.numKVHeads = mNumKVHeads;
+    params.headDim = mHeadSize;
+    params.poolHeadDim = mHeadSize + mIndexerHeadDim;
+    params.numFlatPages = 2 * numPages;
+    params.maxPagesPerSeq = maxPagesPerSeq;
+    params.topK = kernel::kQSA_INDEX_WIDTH;
+    params.attentionScale = mAttentionScale;
+    params.stream = stream;
+    if (!CuteDslQsaSparseDecodeRunner::run(DataType::kHALF, params))
     {
         return -1;
     }
@@ -624,10 +865,10 @@ int32_t QsaAttentionPlugin::onShapeChange([[maybe_unused]] PluginTensorDesc cons
         LOG_ERROR("QsaAttentionPlugin '%s' failed to JIT the QSA indexer kernels: %s", mLayerName.c_str(), e.what());
         return -1;
     }
-    CuteDslQsaSparsePrefillRunner runner(DataType::kHALF);
-    if (!runner.preflight(nullptr))
+    if (!CuteDslQsaSparsePrefillRunner::preflight(DataType::kHALF, nullptr)
+        || !CuteDslQsaSparseDecodeRunner::preflight(DataType::kHALF, nullptr))
     {
-        LOG_ERROR("QsaAttentionPlugin '%s' failed to load the CuTe DSL sparse kernel module.", mLayerName.c_str());
+        LOG_ERROR("QsaAttentionPlugin '%s' failed to load the CuTe DSL sparse kernel modules.", mLayerName.c_str());
         return -1;
     }
     return 0;

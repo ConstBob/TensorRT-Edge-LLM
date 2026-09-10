@@ -2135,7 +2135,7 @@ def _(q_raw, k_raw, v, gamma, rel_key, valid, seq_len_carrier, chunk_size,
 
 
 # ---------------------------------------------------------------------------
-# Custom op: trt::qsa_attention_plugin  (Qwen Sparse Attention, prefill)
+# Custom op: trt::qsa_attention_plugin  (Qwen Sparse Attention, prefill + decode)
 # ---------------------------------------------------------------------------
 
 
@@ -2162,7 +2162,8 @@ def qsa_attention_plugin(
     indexer_q_norm_gamma: List[float],
     indexer_k_norm_gamma: List[float],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Stub for ``QsaAttentionPlugin`` (Qwen Sparse Attention, prefill-only v1).
+    """Stub for ``QsaAttentionPlugin`` (Qwen Sparse Attention, prefill +
+    single-token decode).
 
     A weight-free block-compressed indexer selects the top-``indexer_budget``
     KV blocks (of ``indexer_compress_ratio`` tokens each) per query token, and
@@ -2177,19 +2178,29 @@ def qsa_attention_plugin(
     +====+=====================+=======+==========================================+
     | 0  | qkv                 | FP16  | [B, S, (Hq + 2*Hkv) * D] packed          |
     | 1  | index_qk            | FP16  | [B, S, (indexer_n_heads+1)*indexer_dim]  |
-    | 2  | past_key_value      | FP16  | [2, num_pages, KV_PAGE_SIZE, Hkv, D]     |
+    | 2  | past_key_value      | FP16  | [2, num_pages, KV_PAGE_SIZE, Hkv,        |
+    |    |                     |       | D + indexer_head_dim] (see Decode below) |
     | 3  | context_lengths     | INT32 | [B]                                      |
     | 4  | rope_rotary_cos_sin | FP32  | [rope_batch, max_pos, 64] (shared table: |
     |    |                     |       | main partial-rope-64 + indexer; layout   |
     |    |                     |       | cos [0:32], sin [32:64])                 |
-    | 5  | kvcache_start_index | INT32 | [kv_batch]; runtime shape [0] = prefill  |
-    |    |                     |       | sentinel (any other length is rejected)  |
+    | 5  | kvcache_start_index | INT32 | [kv_batch]; runtime shape [0] = prefill, |
+    |    |                     |       | [B] = single-token decode (S == 1; the   |
+    |    |                     |       | values are past lengths, not read)       |
     | 6  | kv_page_table       | INT32 | [B, 2, max_pages_per_seq]                |
     | 7  | q_norm_gamma        | FP16  | [D] Constant engine weights              |
     | 8  | k_norm_gamma        | FP16  | [D] Constant engine weights              |
     | 9  | indexer_q_norm_gamma| FP16  | [128] Constant engine weights            |
     | 10 | indexer_k_norm_gamma| FP16  | [128] Constant engine weights            |
     +----+---------------------+-------+------------------------------------------+
+
+    Decode (``kvcache_start_index`` runtime shape ``[B]``, ``S == 1``): the
+    leading ``D`` columns of every pool row hold roped K / raw V; the tail
+    ``[D, D + indexer_head_dim)`` persists the QSA indexer state across steps
+    (block ``g``'s kbar in the V-row tail of token ``4g``; the raw index-K of
+    the trailing incomplete block's tokens in their K-row tails, head 0).
+    ``context_lengths`` are the TOTAL
+    lengths including the token being decoded.
 
     Gamma semantics (IMPORTANT):
 

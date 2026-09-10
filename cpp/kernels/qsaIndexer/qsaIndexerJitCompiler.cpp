@@ -17,9 +17,11 @@
 
 #include "qsaIndexerJitCompiler.h"
 
+#include "common/pagedKvTypes.h"
 #include "common/stringUtils.h"
 #include "kernels/PluginJitKernels/pluginJitCompileCache.h"
 #include "kernels/PluginJitKernels/pluginJitCompiler.h"
+#include "qsaIndexerKernels.h"
 
 #include <stdexcept>
 #include <string>
@@ -43,8 +45,7 @@ struct QsaIndexerJitKeyHasher
         using DataTypeValue = std::underlying_type_t<QsaIndexerJitDataType>;
         size_t hash{0xCBF29CE484222325ULL};
         hash = mix(hash, static_cast<size_t>(key.sm));
-        hash = mix(hash, static_cast<size_t>(static_cast<DataTypeValue>(key.dataType)));
-        return mix(hash, static_cast<size_t>(key.sourceAbi));
+        return mix(hash, static_cast<size_t>(static_cast<DataTypeValue>(key.dataType)));
     }
 };
 
@@ -53,10 +54,6 @@ void validateKey(QsaIndexerJitKey const& key)
     if (key.sm <= 0)
     {
         throw std::invalid_argument("QSA indexer JIT requires a positive SM version");
-    }
-    if (key.sourceAbi != kQSA_INDEXER_JIT_SOURCE_ABI)
-    {
-        throw std::invalid_argument("Unsupported QSA indexer JIT source ABI");
     }
     switch (key.dataType)
     {
@@ -68,7 +65,7 @@ void validateKey(QsaIndexerJitKey const& key)
 
 std::string keyToString(QsaIndexerJitKey const& key)
 {
-    return format::fmtstr("SM%d, dtype=%u, source ABI=%u", key.sm, static_cast<uint32_t>(key.dataType), key.sourceAbi);
+    return format::fmtstr("SM%d, dtype=%u", key.sm, static_cast<uint32_t>(key.dataType));
 }
 
 //! The kernels are arch-generic, so compile for the plain (non-"a") architecture. Thor is
@@ -91,9 +88,21 @@ std::string getGpuArchitectureOption(int32_t sm)
 std::vector<std::string> buildNvrtcOptions(QsaIndexerJitKey const& key)
 {
     // --use_fast_math matches the Release nvcc flags the AOT kernels were validated with.
+    // The geometry defines are the device source's only definition of the indexer and pool
+    // constants.
     return {"--std=c++17", "--use_fast_math", "--device-as-default-execution-space", getGpuArchitectureOption(key.sm),
         "-DNDEBUG", "-DQSA_INDEXER_DATA_TYPE=" + std::to_string(static_cast<uint32_t>(key.dataType)),
-        "-DQSA_INDEXER_SOURCE_ABI=" + std::to_string(key.sourceAbi)};
+        "-DQSA_INDEXER_NUM_HEADS=" + std::to_string(kernel::kQSA_INDEXER_NUM_HEADS),
+        "-DQSA_INDEXER_HEAD_DIM=" + std::to_string(kernel::kQSA_INDEXER_HEAD_DIM),
+        "-DQSA_INDEXER_COMPRESS_RATIO=" + std::to_string(kernel::kQSA_COMPRESS_RATIO),
+        "-DQSA_INDEXER_INDEX_BUDGET=" + std::to_string(kernel::kQSA_INDEX_BUDGET),
+        "-DQSA_INDEXER_INDEX_WIDTH=" + std::to_string(kernel::kQSA_INDEX_WIDTH),
+        "-DQSA_INDEXER_ROTARY_DIM=" + std::to_string(kernel::kQSA_INDEXER_ROTARY_DIM),
+        "-DQSA_INDEXER_TOPK_THREADS=" + std::to_string(kernel::kQSA_INDEXER_TOPK_THREADS),
+        "-DQSA_INDEXER_SCORES_COLUMNS_PER_CTA=" + std::to_string(kernel::kQSA_INDEXER_SCORES_COLUMNS_PER_CTA),
+        "-DQSA_INDEXER_SCORES_COLUMNS_PER_WARP=" + std::to_string(kernel::kQSA_INDEXER_SCORES_COLUMNS_PER_WARP),
+        "-DQSA_INDEXER_TOKENS_PER_PAGE=" + std::to_string(rt::kTOKENS_PER_PAGE),
+        "-DQSA_INDEXER_UNUSED_PAGE_ENTRY=" + std::to_string(rt::kUNUSED_PAGE_ENTRY)};
 }
 
 } // namespace

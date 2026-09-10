@@ -13,21 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-QsaAttentionPlugin (Qwen Sparse Attention, prefill v1) unit tests.
+QsaAttentionPlugin (Qwen Sparse Attention, prefill + decode) unit tests.
 
 Two layers of coverage:
 
-1. ``QsaTorchReference`` self-tests (pure torch, CPU, no TensorRT / CUDA):
-   the dense-equivalence invariant (for S <= 2051 the sparse selection is
-   exactly the full causal prefix, so sparse output == causal SDPA) and the
-   structural invariants of the produced index lists.
+1. ``QsaTorchReference`` / ``QsaDecodeTorchReference`` self-tests (pure
+   torch, CPU, no TensorRT / CUDA): the dense-equivalence invariant (for
+   S <= 2051 the sparse selection is exactly the full causal prefix, so
+   sparse output == causal SDPA), the structural invariants of the produced
+   index lists, and the decode-step == prefill-row equivalence of the
+   stateful decode reference.
 
 2. Plugin tests driving the TRT ``QsaAttentionPlugin`` through the
    ``PluginRunner`` harness on CUDA: dense-equivalence prefill, sparse
    prefill vs the full FP32 QSA torch reference, paged-KV write-through,
-   decode-shape rejection, and determinism.
+   determinism, and the decode mode — prefill + N single-token steps (flat
+   and ragged batches), persisted pool-tail indexer state, NaN tail
+   poisoning, S > 1 rejection, and a CUDA-graph capture smoke test.
 
-Algorithm contract under test (frozen with the C++ plugin, M3):
+Algorithm contract under test (frozen with the C++ plugin):
 
 * Main path: split packed qkv [B,S,(Hq+2*Hkv)*D] -> per-head Gemma qk-norm
   (``normalize(x) * gamma`` with gamma PRE-FOLDED as (1+w)) -> partial neox
@@ -42,6 +46,19 @@ Algorithm contract under test (frozen with the C++ plugin, M3):
 * Sparse GQA: attend only listed tokens; FP32 softmax at 1/sqrt(256) applied
   on FP32 scores after the QK dot; -1 masked; all-invalid row -> zeros; rows
   past context_lengths -> exact zeros.
+* Decode (kvcache_start_index runtime shape [B] — values are the past
+  lengths, never dereferenced — REQUIRES S == 1; context_lengths = TOTAL
+  lengths including the new token): rope appends K/V at pool row ctx-1; the
+  indexer either persists the new token's raw index-K (indexQk columns
+  [512:640)) BIT-UNMODIFIED into its K-row tail (head 0, pool columns
+  [256:384) of the widened row) while its block is still incomplete
+  (ctx % 4 != 0), or, when ctx % 4 == 0, compresses the completed block from
+  the three persisted raw keys plus the new one and writes kbar into the
+  V-row tail of token 4g (the completing token's raw key is never stored);
+  then top-512 select + expand to outIdx [B, 1, 2051] and split-K sparse
+  attention over the paged pool. Prefill persists every complete block's
+  kbar and only the trailing incomplete block's raw keys, so decode-era
+  indexer state is bit-compatible with prefill (see qsaIndexerKernels.h).
 
 Top-k tie-break caveat: block scores are compared in FP32, and the plugin's
 warp-reduction accumulation order differs from torch's, so blocks whose
@@ -109,6 +126,11 @@ ROPE_THETA = 1.0e7
 RMS_NORM_EPS = 1e-6
 # Tokens per page of the paged-KV pool. Must match kTOKENS_PER_PAGE.
 PAGE_SIZE = 128
+# Widened pool row: [roped K or raw V (HEAD_SIZE) | indexer-state tail]. The
+# plugin DERIVES it as head_size + indexer_head_dim (no separate attribute);
+# the rope kernel writes only the leading HEAD_SIZE columns of each row (see
+# applyRopeWriteKV.h).
+POOL_HEAD_DIM = HEAD_SIZE + INDEXER_HEAD_DIM  # 384
 
 QKV_PACKED = (NUM_Q_HEADS + 2 * NUM_KV_HEADS) * HEAD_SIZE  # 7168
 INDEX_QK_PACKED = (INDEXER_N_HEADS + 1) * INDEXER_HEAD_DIM  # 640
@@ -251,6 +273,32 @@ class QsaTorchReference:
         return q, k, v
 
     # -- indexer ------------------------------------------------------------ #
+    def compress_kbar(self, k_raw, ik_gamma_raw, table):
+        """Compressed keys of every complete block of one sequence.
+
+        ``k_raw`` [L, D_idx] FP32 raw index-K history. Returns FP32
+        [L // ratio, D_idx] (values exact fp16): FIXED-ORDER fp32 mean
+        (((k0+k1)+k2)+k3) * 0.25 -> cast fp16 -> Gemma-norm (1 + w_raw) ->
+        rope@4g -> fp16 storage cast. Bit-compat-critical: the decode-path
+        recompress from the persisted raw-K pool tails must land on the
+        same bits as the prefill compress.
+        """
+        dev = k_raw.device
+        num_blocks = k_raw.shape[0] // self.ratio
+        if num_blocks == 0:
+            return torch.zeros((0, self.di), dtype=torch.float32, device=dev)
+        kg = k_raw[:num_blocks * self.ratio].reshape(num_blocks, self.ratio,
+                                                     self.di)
+        mean = kg[:, 0]
+        for j in range(1, self.ratio):
+            mean = mean + kg[:, j]
+        mean = (mean * (1.0 / self.ratio)).to(torch.float16).float()
+        kbar = gemma_rms_norm(mean, 1.0 + ik_gamma_raw.float(), self.eps)
+        block_pos = torch.arange(num_blocks, device=dev,
+                                 dtype=torch.long) * self.ratio
+        kbar = apply_partial_rope(kbar, table, block_pos, self.interleaved)
+        return kbar.to(torch.float16).float()
+
     def build_indices(self, index_qk, iq_gamma_raw, ik_gamma_raw, table,
                       context_lengths):
         """Full indexer pipeline -> int32 index lists [B, S, width] (-1 pad).
@@ -263,7 +311,6 @@ class QsaTorchReference:
         dev = index_qk.device
         out = torch.full((b, s, self.width), -1, dtype=torch.int32, device=dev)
         iq_gamma = 1.0 + iq_gamma_raw.float()
-        ik_gamma = 1.0 + ik_gamma_raw.float()
         ar_ratio = torch.arange(self.ratio, device=dev, dtype=torch.int64)
         for bi in range(b):
             length = int(context_lengths[bi])
@@ -284,21 +331,7 @@ class QsaTorchReference:
             n_vis = (positions + 1) // self.ratio  # [length]
             top_idx = None
             if num_blocks > 0:
-                # Compressed keys: FIXED-ORDER fp32 mean (((k0+k1)+k2)+k3)*0.25
-                # -> cast fp16 -> gemma-norm -> rope@4g (bit-compat-critical).
-                kg = k_raw[:num_blocks * self.ratio].reshape(
-                    num_blocks, self.ratio, self.di)
-                mean = kg[:, 0]
-                for j in range(1, self.ratio):
-                    mean = mean + kg[:, j]
-                mean = mean * (1.0 / self.ratio)
-                mean = mean.to(torch.float16).float()
-                kbar = gemma_rms_norm(mean, ik_gamma, self.eps)
-                block_pos = torch.arange(
-                    num_blocks, device=dev, dtype=torch.long) * self.ratio
-                kbar = apply_partial_rope(kbar, table, block_pos,
-                                          self.interleaved)
-                kbar = kbar.to(torch.float16).float()
+                kbar = self.compress_kbar(k_raw, ik_gamma_raw, table)
                 # scores[t, g] = sum_h relu(q[t,h] . kbar[g]) / sqrt(D_idx):
                 # relu per head, THEN sum over heads, THEN scale — all FP32.
                 dots = torch.einsum("thd,gd->thg", q_idx, kbar)
@@ -411,6 +444,104 @@ class QsaTorchReference:
         """Causal-dense variant of :meth:`forward` (no indexer)."""
         q, k, v = self.main_qkv(qkv, q_gamma_folded, k_gamma_folded, table)
         return self.dense_attention(q, k, v, context_lengths)
+
+
+class QsaDecodeTorchReference:
+    """Stateful decode-step reference over a full token history (pure torch).
+
+    Sequence b's token t is row t of the given history tensors: prefill
+    consumed rows [0, L0_b) and decode step s consumes row L0_b + s. For any
+    TOTAL context length ctx (including the token being decoded) the class
+    reproduces the plugin decode contract with exactly the prefill
+    reference's numerics restricted to the last row — the plugin persists
+    raw index-K tails bit-unmodified and (re)compresses kbar through the
+    same fp16 chain, so decode-era indexer state is bit-compatible with
+    prefill and the decode row must equal prefill row ctx - 1 (pinned by
+    ``test_reference_decode_step_matches_prefill_rows``).
+
+    Rows past a sequence's own history (ragged batches) are never read:
+    every access is bounded by that sequence's ctx.
+    """
+
+    def __init__(self, ref: QsaTorchReference, qkv_hist, index_qk_hist,
+                 q_gamma_folded, k_gamma_folded, iq_gamma_raw, ik_gamma_raw,
+                 table):
+        self.ref = ref
+        batch, length, _ = index_qk_hist.shape
+        dev = index_qk_hist.device
+        # Indexer state: q rows Gemma-normed (1 + w_raw) -> rope@t -> fp16
+        # cast; kbar per complete block through the shared compress chain.
+        q_raw = index_qk_hist[..., :ref.nh * ref.di].reshape(
+            batch, length, ref.nh, ref.di).float()
+        k_raw = index_qk_hist[..., ref.nh * ref.di:].float()
+        positions = torch.arange(length, device=dev, dtype=torch.long)
+        q_idx = gemma_rms_norm(q_raw, 1.0 + iq_gamma_raw.float(), ref.eps)
+        q_idx = torch.stack([
+            apply_partial_rope(q_idx[bi], table, positions, ref.interleaved)
+            for bi in range(batch)
+        ])
+        self.q_idx = q_idx.to(torch.float16).float()  # [B, L, NH, D_idx]
+        self.kbar = torch.stack([
+            ref.compress_kbar(k_raw[bi], ik_gamma_raw, table)
+            for bi in range(batch)
+        ])  # [B, L // ratio, D_idx]
+        # Main-path q/k/v feed only step_output — computed lazily so
+        # index-only checks (the long-context self-test) stay cheap.
+        self._main_args = (qkv_hist, q_gamma_folded, k_gamma_folded, table)
+        self._main = None
+
+    def _main_qkv(self):
+        if self._main is None:
+            self._main = self.ref.main_qkv(*self._main_args)
+        return self._main
+
+    def block_scores(self, bi: int, ctx: int) -> "torch.Tensor":
+        """FP32 block logits of the decode row: [ctx // ratio] (may be
+        empty). Only complete blocks are visible: n_vis = ctx // ratio."""
+        n_vis = ctx // self.ref.ratio
+        dots = torch.einsum("hd,gd->hg", self.q_idx[bi, ctx - 1],
+                            self.kbar[bi, :n_vis])
+        return torch.relu(dots).sum(dim=0) / math.sqrt(self.ref.di)
+
+    def step_indices(self, bi: int, ctx: int) -> "torch.Tensor":
+        """Decode-row token indices (int64; all valid — no -1 padding):
+        min(512, ctx // 4) top-score blocks expanded to 4 tokens each in
+        descending-logit order, then the ctx % 4 tail tokens."""
+        ref = self.ref
+        dev = self.q_idx.device
+        n_vis = ctx // ref.ratio
+        parts = []
+        if n_vis > 0:
+            n_sel = min(ref.budget, n_vis)
+            blocks = torch.topk(self.block_scores(bi, ctx),
+                                n_sel).indices.to(torch.int64)
+            ar = torch.arange(ref.ratio, device=dev, dtype=torch.int64)
+            parts.append((blocks[:, None] * ref.ratio + ar).reshape(-1))
+        if n_vis * ref.ratio < ctx:  # ctx % ratio tokens, ALWAYS appended
+            parts.append(
+                torch.arange(n_vis * ref.ratio,
+                             ctx,
+                             device=dev,
+                             dtype=torch.int64))
+        return torch.cat(parts)
+
+    def step_output(self, bi: int, ctx: int):
+        """(FP32 attention row [Hq, D] at position ctx - 1, token indices).
+
+        Sparse GQA over the listed tokens only; FP32 softmax with the scale
+        applied on the FP32 scores after the QK dot (as the plugin does).
+        """
+        ref = self.ref
+        idx = self.step_indices(bi, ctx)
+        q, k, v = self._main_qkv()
+        group = ref.hq // ref.hkv
+        qc = q[bi, ctx - 1].reshape(ref.hkv, group, ref.d)
+        kg = k[bi][idx]  # [N, Hkv, D]
+        vg = v[bi][idx]
+        scores = torch.einsum("kgd,nkd->kgn", qc, kg) * ref.scale
+        probs = torch.softmax(scores, dim=-1)  # every listed token is valid
+        out = torch.einsum("kgn,nkd->kgd", probs, vg).reshape(ref.hq, ref.d)
+        return out, idx
 
 
 # --------------------------------------------------------------------------- #
@@ -571,9 +702,10 @@ def test_reference_sparse_regime_differs_from_dense():
 def _require_qsa_plugin():
     """Skip (not fail) when the QSA plugin cannot run here.
 
-    Unlike the mature plugins (which fail loudly on a missing build), the QSA
-    C++ plugin (M3) lands in parallel with these tests, so a missing library
-    or unregistered creator is an expected state and skips cleanly.
+    Unlike the mature plugins (which fail loudly on a missing build), QSA is
+    SM 100/101/110-only and is compiled only when ENABLE_CUTE_DSL includes
+    "qsa", so a missing library or unregistered creator is an expected state
+    and skips cleanly.
     """
     if _device_sm() not in QSA_SMS:
         pytest.skip(f"QSA kernels not registered for SM{_device_sm()} "
@@ -591,13 +723,15 @@ def _require_qsa_plugin():
 
 
 class QsaPluginRunner:
-    """Builds + runs a QsaAttentionPlugin engine for prefill testing.
+    """Builds + runs a QsaAttentionPlugin engine for prefill/decode testing.
 
     The 11-input plugin contract (all required):
-    qkv, index_qk, past_key_value (paged pool [2, numPages, PAGE_SIZE, Hkv,
-    D]), context_lengths, rope_rotary_cos_sin [1, maxPos, 64],
-    kvcache_start_index (runtime shape [0] = prefill), kv_page_table
-    [B, 2, mpps], and the four FP16 gamma constants (engine weights).
+    qkv, index_qk, past_key_value (widened paged pool [2, numPages,
+    PAGE_SIZE, Hkv, POOL_HEAD_DIM] — K/V in the first HEAD_SIZE of each row,
+    indexer-state tails after), context_lengths, rope_rotary_cos_sin
+    [1, maxPos, 64], kvcache_start_index (runtime shape [0] = prefill),
+    kv_page_table [B, 2, mpps], and the four FP16 gamma constants (engine
+    weights).
     """
 
     def __init__(self,
@@ -622,13 +756,14 @@ class QsaPluginRunner:
         self._pool = None
         self._page_table = None
 
-        pool_shape = (2, self.num_pages, PAGE_SIZE, NUM_KV_HEADS, HEAD_SIZE)
+        pool_shape = (2, self.num_pages, PAGE_SIZE, NUM_KV_HEADS,
+                      POOL_HEAD_DIM)
         rope_shape = (1, self.mpe, ROTARY_DIM)
         input_specs = [
             ("qkv", trt.float16, (-1, -1, QKV_PACKED)),
             ("index_qk", trt.float16, (-1, -1, INDEX_QK_PACKED)),
             ("past_key_value", trt.float16, (2, -1, PAGE_SIZE, NUM_KV_HEADS,
-                                             HEAD_SIZE)),
+                                             POOL_HEAD_DIM)),
             ("context_lengths", trt.int32, (-1, )),
             ("rope_rotary_cos_sin", trt.float32, rope_shape),
             ("kvcache_start_index", trt.int32, (-1, )),
@@ -644,8 +779,8 @@ class QsaPluginRunner:
             "past_key_value": (pool_shape, pool_shape, pool_shape),
             "context_lengths": ((1, ), (batch_size, ), (batch_size, )),
             "rope_rotary_cos_sin": (rope_shape, rope_shape, rope_shape),
-            # [0] is the prefill sentinel; max allows binding [B] so the
-            # decode-shape rejection test exercises the runtime guard.
+            # [0] is the prefill sentinel; max allows binding [B], which
+            # selects decode mode (and, with S > 1, the runtime rejection).
             "kvcache_start_index": ((0, ), (0, ), (batch_size, )),
             "kv_page_table": ((1, 2, self.mpps), (batch_size, 2, self.mpps),
                               (batch_size, 2, self.mpps)),
@@ -694,7 +829,7 @@ class QsaPluginRunner:
     def _get_pool(self):
         if self._pool is None:
             self._pool = torch.zeros(
-                (2, self.num_pages, PAGE_SIZE, NUM_KV_HEADS, HEAD_SIZE),
+                (2, self.num_pages, PAGE_SIZE, NUM_KV_HEADS, POOL_HEAD_DIM),
                 dtype=torch.float16,
                 device=DEV)
         return self._pool
@@ -711,29 +846,23 @@ class QsaPluginRunner:
                                            dim=1).contiguous()
         return self._page_table
 
-    def run(self,
-            qkv,
-            index_qk,
-            context_lengths,
-            rope_table,
-            kv_start_shape=(0, ),
-            attention_output=None):
-        """Execute one prefill. Returns the [B, S, Hq, D] FP16 output.
+    def run(self, qkv, index_qk, context_lengths, rope_table, zero_pool=True):
+        """Execute one prefill (kvcache_start_index bound with the [0]
+        sentinel). Returns the [B, S, Hq, D] FP16 output.
 
-        ``kv_start_shape=(0,)`` binds the prefill sentinel; passing ``(B,)``
-        exercises the decode-shape rejection path. The pool is zeroed before
-        each run so KV comparisons never see stale pages.
+        The pool is zeroed before each run — so KV comparisons never see
+        stale pages — unless ``zero_pool`` is False (state-poisoning tests
+        prepare the pool themselves).
         """
         batch, seq, _ = qkv.shape
         pool = self._get_pool()
-        pool.zero_()
+        if zero_pool:
+            pool.zero_()
         page_table = self._make_page_table(batch)
         kv_start = torch.zeros((self.batch, ), dtype=torch.int32, device=DEV)
-        attn_out = attention_output
-        if attn_out is None:
-            attn_out = torch.empty((batch, seq, NUM_Q_HEADS, HEAD_SIZE),
-                                   dtype=torch.float16,
-                                   device=DEV)
+        attn_out = torch.empty((batch, seq, NUM_Q_HEADS, HEAD_SIZE),
+                               dtype=torch.float16,
+                               device=DEV)
         tensors = {
             "qkv": qkv,
             "index_qk": index_qk,
@@ -745,15 +874,16 @@ class QsaPluginRunner:
             "attention_output": attn_out,
             "present_key_value": pool,  # aliased in-place to the pool binding
         }
-        self.runner.execute(tensors,
-                            {"kvcache_start_index": tuple(kv_start_shape)})
+        self.runner.execute(tensors, {"kvcache_start_index": (0, )})
         return attn_out
 
     def gather_kv(self, batch, length):
         """Gather the paged pool through the page table into token-major K/V.
 
-        Returns (k, v) FP16 [batch, length, Hkv, D] — roped K and raw V as
-        the plugin stores them.
+        Returns (k, v) FP16 [batch, length, Hkv, HEAD_SIZE] — roped K and raw
+        V as the plugin stores them. Only the HEAD_SIZE prefix of each
+        widened pool row is K/V; the [HEAD_SIZE:POOL_HEAD_DIM) tails hold
+        indexer state and are excluded here.
         """
         pool = self._get_pool()
         page_table = self._make_page_table(batch)
@@ -766,9 +896,86 @@ class QsaPluginRunner:
                 k_page = int(page_table[bi, 0, lp])
                 v_page = int(page_table[bi, 1, lp]) - self.num_pages
                 begin = lp * PAGE_SIZE
-                k[bi, begin:begin + PAGE_SIZE] = pool[0, k_page]
-                v[bi, begin:begin + PAGE_SIZE] = pool[1, v_page]
+                k[bi, begin:begin + PAGE_SIZE] = pool[0,
+                                                      k_page][..., :HEAD_SIZE]
+                v[bi, begin:begin + PAGE_SIZE] = pool[1,
+                                                      v_page][..., :HEAD_SIZE]
         return k[:, :length], v[:, :length]
+
+    def run_decode(self,
+                   qkv,
+                   index_qk,
+                   context_lengths,
+                   rope_table,
+                   kv_start=None,
+                   attention_output=None,
+                   synchronize=True):
+        """Execute one decode step. Returns the [B, 1, Hq, D] FP16 output.
+
+        The pool is NOT zeroed: decode appends to the state left by the
+        preceding prefill / decode enqueues. ``context_lengths`` holds the
+        TOTAL lengths including the token being decoded; ``kv_start``
+        (shape [B] selects decode mode) defaults to context_lengths - 1 —
+        the past lengths, whose values the plugin never dereferences.
+        ``synchronize=False`` supports CUDA-graph capture with static
+        bindings (pass ``kv_start`` and ``attention_output`` explicitly so
+        nothing is allocated during capture).
+        """
+        batch = qkv.shape[0]
+        pool = self._get_pool()
+        page_table = self._make_page_table(batch)
+        if kv_start is None:
+            kv_start = context_lengths - 1
+        attn_out = attention_output
+        if attn_out is None:
+            attn_out = torch.empty(
+                (batch, qkv.shape[1], NUM_Q_HEADS, HEAD_SIZE),
+                dtype=torch.float16,
+                device=DEV)
+        tensors = {
+            "qkv": qkv,
+            "index_qk": index_qk,
+            "past_key_value": pool,
+            "context_lengths": context_lengths,
+            "rope_rotary_cos_sin": rope_table,
+            "kvcache_start_index": kv_start,
+            "kv_page_table": page_table,
+            "attention_output": attn_out,
+            "present_key_value": pool,  # aliased in-place to the pool binding
+        }
+        self.runner.execute(tensors, synchronize=synchronize)
+        return attn_out
+
+    def gather_tails(self, batch):
+        """Gather the widened rows' indexer-state tails through the page
+        table.
+
+        Returns (k_tail, v_tail) FP16 [batch, cap, Hkv, INDEXER_HEAD_DIM]:
+        columns [HEAD_SIZE:POOL_HEAD_DIM) of every pool row, token-major.
+        Per the QsaIndexerPoolState contract only head 0 holds state — the
+        V-plane tail of token 4g the block's kbar, the K-plane tail of a
+        token its raw index-K only while that token's block is incomplete —
+        but both heads are returned so tests can also assert the untouched
+        regions.
+        """
+        pool = self._get_pool()
+        page_table = self._make_page_table(batch)
+        k_tail = torch.empty((batch, self.cap, NUM_KV_HEADS, INDEXER_HEAD_DIM),
+                             dtype=torch.float16,
+                             device=DEV)
+        v_tail = torch.empty_like(k_tail)
+        for bi in range(batch):
+            for lp in range(self.mpps):
+                k_page = int(page_table[bi, 0, lp])
+                v_page = int(page_table[bi, 1, lp]) - self.num_pages
+                begin = lp * PAGE_SIZE
+                k_tail[bi, begin:begin + PAGE_SIZE] = pool[0,
+                                                           k_page][...,
+                                                                   HEAD_SIZE:]
+                v_tail[bi, begin:begin + PAGE_SIZE] = pool[1,
+                                                           v_page][...,
+                                                                   HEAD_SIZE:]
+        return k_tail, v_tail
 
 
 def _plugin_case(batch,
@@ -887,18 +1094,6 @@ def test_plugin_kv_write_through():
 
 
 @requires_gpu
-def test_plugin_decode_shape_rejected():
-    """v1 is prefill-only: a decode-shaped kvcache_start_index ([B] instead
-    of the [0] prefill sentinel) must fail the enqueue cleanly."""
-    _require_qsa_plugin()
-    batch, seq = 1, 16
-    runner, _, qkv, index_qk, _, _, rope = _plugin_case(batch, seq, seed=555)
-    ctx = torch.full((batch, ), seq, dtype=torch.int32, device=DEV)
-    with pytest.raises(RuntimeError, match="execute_async_v3 returned False"):
-        runner.run(qkv, index_qk, ctx, rope, kv_start_shape=(batch, ))
-
-
-@requires_gpu
 def test_plugin_determinism():
     """Two identical sparse prefills produce bitwise-identical outputs and KV
     (cub sort + gather kernels must be run-to-run deterministic)."""
@@ -919,3 +1114,368 @@ def test_plugin_determinism():
         "K cache write is not deterministic"
     assert torch.equal(v1.view(torch.int16), v2.view(torch.int16)), \
         "V cache write is not deterministic"
+
+
+# =========================================================================== #
+# D. Decode reference self-tests — pure torch on CPU, no plugin / CUDA
+# =========================================================================== #
+def _assert_index_sets_match(case,
+                             ref_row,
+                             dec_idx,
+                             block_scores,
+                             tie_tol=1e-4):
+    """Index SET equality between a prefill reference row and a decode row.
+
+    Disagreements are tolerated only as whole-block swaps whose FP32 scores
+    tie (within ``tie_tol``) at the top-512 selection boundary — the two
+    references reduce the score dot in different orders, so exact-cutoff
+    ties may resolve differently (measure-zero for continuous random
+    inputs, but kept as the documented tolerance). Anything else fails.
+    """
+    dec_list = dec_idx.tolist()
+    dec_set = set(dec_list)
+    assert len(dec_set) == len(dec_list), f"{case}: duplicate decode indices"
+    ref_set = set(ref_row[ref_row >= 0].tolist())
+    if ref_set == dec_set:
+        return
+    ratio, budget = INDEXER_COMPRESS_RATIO, INDEXER_BLOCK_TOPK
+    only_ref = ref_set - dec_set
+    only_dec = dec_set - ref_set
+    blocks_ref = {t // ratio for t in only_ref}
+    blocks_dec = {t // ratio for t in only_dec}
+    assert (len(only_ref) == ratio * len(blocks_ref)
+            and len(only_dec) == ratio * len(blocks_dec)
+            and len(blocks_ref) == len(blocks_dec)), \
+        f"{case}: index sets differ beyond whole-block swaps"
+    assert block_scores is not None and block_scores.numel() > budget, \
+        f"{case}: index sets differ below the top-{budget} boundary"
+    cutoff = float(torch.topk(block_scores, budget).values[-1])
+    for g in blocks_ref | blocks_dec:
+        assert abs(float(block_scores[g]) - cutoff) <= tie_tol, \
+            f"{case}: swapped block {g} does not tie at the top-{budget} " \
+            f"cutoff"
+
+
+@requires_torch
+def test_reference_decode_step_matches_prefill_rows():
+    """Decode-reference invariant: the step at ctx == prefill row ctx - 1.
+
+    Short regime (n_vis <= 512): exact index-set equality plus fp32-allclose
+    attention for every decode step of a prefill(44) + 17-step sequence.
+    Long regime (n_vis > 512): index sets compared with the top-512 tie
+    tolerance (the decode row's attention math is already pinned by the
+    short regime; the long rows only add the budget cutoff).
+    """
+    gen = torch.Generator().manual_seed(20260901)
+    ref = QsaTorchReference()
+
+    # -- short regime: 44 prefill tokens + 17 decode rows, attention gated --
+    length, l0 = 61, 44
+    q_g, k_g, iq_g, ik_g = _make_gammas(gen)
+    qkv, index_qk = _make_activations(1, length, gen)
+    table = make_qsa_rope_table(max(length, ROTARY_DIM))
+    prefill_out, prefill_idx, _, _ = ref.forward(
+        qkv, index_qk, q_g, k_g, iq_g, ik_g, table,
+        torch.tensor([length], dtype=torch.int32))
+    dec = QsaDecodeTorchReference(ref, qkv, index_qk, q_g, k_g, iq_g, ik_g,
+                                  table)
+    for ctx in range(l0 + 1, length + 1):
+        out, idx = dec.step_output(0, ctx)
+        n_vis = ctx // INDEXER_COMPRESS_RATIO
+        assert idx.numel() == (
+            min(INDEXER_BLOCK_TOPK, n_vis) * INDEXER_COMPRESS_RATIO + ctx -
+            n_vis * INDEXER_COMPRESS_RATIO)
+        _assert_index_sets_match(f"short ctx={ctx}", prefill_idx[0, ctx - 1],
+                                 idx, dec.block_scores(0, ctx))
+        torch.testing.assert_close(out,
+                                   prefill_out[0, ctx - 1],
+                                   rtol=1e-4,
+                                   atol=1e-4)
+
+    # -- long regime: n_vis > 512 exercises the budget cutoff (2100//4=525) --
+    length = 2104
+    qkv, index_qk = _make_activations(1, length, gen)
+    table = make_qsa_rope_table(length)
+    prefill_idx = ref.build_indices(index_qk, iq_g, ik_g, table,
+                                    torch.tensor([length], dtype=torch.int32))
+    dec = QsaDecodeTorchReference(ref, qkv, index_qk, q_g, k_g, iq_g, ik_g,
+                                  table)
+    for ctx in (2100, 2101, 2103, 2104):
+        idx = dec.step_indices(0, ctx)
+        assert ctx // INDEXER_COMPRESS_RATIO > INDEXER_BLOCK_TOPK
+        assert idx.numel() == (INDEXER_BLOCK_TOPK * INDEXER_COMPRESS_RATIO +
+                               ctx % INDEXER_COMPRESS_RATIO)
+        _assert_index_sets_match(f"long ctx={ctx}", prefill_idx[0, ctx - 1],
+                                 idx, dec.block_scores(0, ctx))
+
+
+# =========================================================================== #
+# E. Plugin decode tests (TensorRT engine on CUDA)
+# =========================================================================== #
+def _decode_case(l0s, steps, seed, *, build_seq, flip_page_table=False):
+    """Runner + stateful decode reference + pregenerated full history.
+
+    Row t of the [B, build_seq] random history is sequence b's token t:
+    prefill consumes rows [0, l0s[b]) and decode step s consumes row
+    l0s[b] + s — a shorter sequence's later rows double as (masked) prefill
+    padding first and as its real decode tokens afterwards.
+    """
+    assert max(l0s) + steps <= build_seq
+    runner, ref, qkv, index_qk, gammas, table, rope = _plugin_case(
+        len(l0s), build_seq, seed=seed, flip_page_table=flip_page_table)
+    q_g, k_g, iq_g, ik_g = gammas
+    dec = QsaDecodeTorchReference(ref, qkv, index_qk, q_g, k_g, iq_g, ik_g,
+                                  table)
+    return runner, ref, dec, qkv, index_qk, gammas, table, rope
+
+
+def _run_prefill(runner, qkv, index_qk, l0s, rope, zero_pool=True):
+    """Prefill rows [0, l0s[b]) of the history; returns the plugin output."""
+    s0 = max(l0s)
+    ctx0 = torch.tensor(l0s, dtype=torch.int32, device=DEV)
+    return runner.run(qkv[:, :s0].contiguous(),
+                      index_qk[:, :s0].contiguous(),
+                      ctx0,
+                      rope,
+                      zero_pool=zero_pool)
+
+
+def _decode_step_inputs(qkv, index_qk, l0s, step):
+    """S=1 bindings for decode step ``step``: sequence b decodes token row
+    l0s[b] + step; context_lengths are the TOTAL lengths including it."""
+    rows = [l0 + step for l0 in l0s]
+    qkv_s = torch.stack([qkv[b, r] for b, r in enumerate(rows)])[:, None]
+    iq_s = torch.stack([index_qk[b, r] for b, r in enumerate(rows)])[:, None]
+    ctx = torch.tensor([r + 1 for r in rows],
+                       dtype=torch.int32,
+                       device=qkv.device)
+    return qkv_s.contiguous(), iq_s.contiguous(), ctx
+
+
+@requires_gpu
+def test_plugin_decode_ragged_batch():
+    """B=2 ragged decode: different prefill lengths, both sequences advance
+    one token per step, and sequence 0 crosses the 128-token page boundary
+    mid-decode (ctx 120 -> 136 with maxPagesPerSeq = 2)."""
+    _require_qsa_plugin()
+    l0s, steps = [120, 87], 16
+    runner, ref, dec, qkv, index_qk, gammas, table, rope = _decode_case(
+        l0s, steps, seed=8802, build_seq=256)
+    _run_prefill(runner, qkv, index_qk, l0s, rope)
+    for s in range(steps):
+        qkv_s, iq_s, ctx_t = _decode_step_inputs(qkv, index_qk, l0s, s)
+        out = runner.run_decode(qkv_s, iq_s, ctx_t, rope)
+        for bi, l0 in enumerate(l0s):
+            ctx = l0 + s + 1
+            ref_out, _ = dec.step_output(bi, ctx)
+            assert_close(f"qsa_decode_ragged[b{bi} ctx{ctx}]", ref_out, out[bi,
+                                                                            0])
+
+
+def _raw_key_rows(ctx, l0):
+    """Boolean mask over rows [0, ctx): the tokens whose raw index-K the
+    kernels persist — every token that arrived into an incomplete block
+    (never the block-completing token, t % 4 == 3) and, from the prefill,
+    only its trailing incomplete block (t >= l0 - l0 % 4)."""
+    rows = torch.arange(ctx, device=DEV)
+    return rows, (
+        (rows >= l0 - l0 % INDEXER_COMPRESS_RATIO)
+        & (rows % INDEXER_COMPRESS_RATIO != INDEXER_COMPRESS_RATIO - 1))
+
+
+@requires_gpu
+def test_plugin_decode_pool_tail_state():
+    """Persisted indexer state in the widened pool tails.
+
+    After prefill (L0=120) + 16 decode steps (final ctx=136 — block-aligned
+    so every V-tail row within ctx is asserted — crossing the page boundary,
+    with a flipped page table to exercise the paged addressing): the V-plane
+    tail of every token 4g holds the block's kbar (fp16 chain) within 2e-3;
+    the K-plane tail of every decode-era token that arrived into an
+    incomplete block (t >= 120, t % 4 != 3) holds its raw index-K columns
+    [512:640) BIT-EXACTLY; every other tail row is untouched (still zero) —
+    in particular the K-tails of the blocks prefill completed (L0 % 4 == 0,
+    so prefill stores no raw keys) and of every block-completing token.
+    """
+    _require_qsa_plugin()
+    l0s, steps = [120], 16
+    runner, ref, dec, qkv, index_qk, gammas, table, rope = _decode_case(
+        l0s, steps, seed=8803, build_seq=256, flip_page_table=True)
+    _run_prefill(runner, qkv, index_qk, l0s, rope)
+    out = None
+    for s in range(steps):
+        qkv_s, iq_s, ctx_t = _decode_step_inputs(qkv, index_qk, l0s, s)
+        out = runner.run_decode(qkv_s, iq_s, ctx_t, rope)
+    ctx = l0s[0] + steps  # 136
+    ref_out, _ = dec.step_output(0, ctx)
+    assert_close(f"qsa_tail_state[ctx{ctx}]", ref_out, out[0, 0])
+
+    k_tail, v_tail = runner.gather_tails(1)
+    # K tails: bit-exact raw index-K for exactly the tokens whose block was
+    # incomplete when they arrived (decode era only: L0 is block-aligned).
+    rows, raw = _raw_key_rows(ctx, l0s[0])
+    expect_k = index_qk[0, rows[raw], INDEXER_N_HEADS * INDEXER_HEAD_DIM:]
+    assert torch.equal(
+        k_tail[0, rows[raw], 0].contiguous().view(torch.int16),
+        expect_k.contiguous().view(torch.int16)), \
+        "K-plane tails must hold the raw index-K bit-exactly"
+    assert (k_tail[0, rows[~raw], 0] == 0).all(), \
+        "K tails of completed blocks / block-completing tokens must stay untouched"
+    # V tails at rows 4g: the kbar of every complete block.
+    kbar_err = (v_tail[0, 0:ctx:INDEXER_COMPRESS_RATIO, 0].float() -
+                dec.kbar[0, :ctx // INDEXER_COMPRESS_RATIO]).abs().max()
+    assert float(kbar_err) <= 2e-3, \
+        f"V-plane kbar tails off by {float(kbar_err):.5f} (limit 2e-3)"
+    # Untouched regions: rows at/after ctx (pool was zeroed pre-prefill),
+    # V-tail rows off the 4g grid, and head 1 everywhere.
+    assert (k_tail[0, ctx:] == 0).all(), "K tails beyond ctx were touched"
+    assert (v_tail[0, ctx:] == 0).all(), "V tails beyond ctx were touched"
+    off_grid = rows[rows % INDEXER_COMPRESS_RATIO != 0]
+    assert (v_tail[0, off_grid, 0] == 0).all(), \
+        "V tails off the 4g grid were touched"
+    assert (k_tail[0, :, 1] == 0).all() and (v_tail[0, :, 1] == 0).all(), \
+        "indexer state must live in head 0 tails only"
+
+
+@requires_gpu
+def test_plugin_decode_nan_tail_poisoning():
+    """NaN-poisoned tails never leak: the attention path must not read the
+    pool tails, and the indexer must overwrite every tail it later reads.
+
+    All tails start as NaN. Prefill + decode outputs must stay finite and
+    match the reference (assert_close rejects non-finite actuals), while
+    never-written tail rows must keep their NaN — pinning that both reads
+    and writes stay exactly on the contracted state locations. L0 = 43 is
+    NOT block-aligned, so the prefill scatter's positive path (raw keys of
+    the trailing block 40..42, consumed by the ctx = 44 compress) is covered
+    at the plugin level too; the final ctx = 60 is block-aligned.
+    """
+    _require_qsa_plugin()
+    l0, steps = 43, 17
+    runner, ref, dec, qkv, index_qk, gammas, table, rope = _decode_case(
+        [l0], steps, seed=8804, build_seq=64)
+    pool = runner._get_pool()
+    pool.zero_()
+    pool[..., HEAD_SIZE:] = float("nan")
+    out0 = _run_prefill(runner, qkv, index_qk, [l0], rope, zero_pool=False)
+    q_g, k_g, _, _ = gammas
+    ctx0 = torch.tensor([l0], dtype=torch.int32, device=DEV)
+    assert_close("qsa_nan_tails_prefill",
+                 ref.dense_forward(qkv[:, :l0], q_g, k_g, table, ctx0), out0)
+    for s in range(steps):
+        qkv_s, iq_s, ctx_t = _decode_step_inputs(qkv, index_qk, [l0], s)
+        out = runner.run_decode(qkv_s, iq_s, ctx_t, rope)
+        ctx = l0 + s + 1
+        ref_out, _ = dec.step_output(0, ctx)
+        assert_close(f"qsa_nan_tails[ctx{ctx}]", ref_out, out[0, 0])
+    # Written tails lost their poison, never-written tails kept it (ctx = 60
+    # is block-aligned: every 4g row within ctx was completed).
+    ctx = l0 + steps
+    k_tail, v_tail = runner.gather_tails(1)
+    rows, raw = _raw_key_rows(ctx, l0)
+    assert not torch.isnan(k_tail[0, rows[raw], 0]).any(), \
+        "prefill/decode must overwrite the K tail of every incomplete-block token"
+    assert torch.isnan(k_tail[0, rows[~raw], 0]).all(), \
+        "K tails of completed blocks / block-completing tokens must keep the poison"
+    on_grid = rows[rows % INDEXER_COMPRESS_RATIO == 0]
+    assert not torch.isnan(v_tail[0, on_grid, 0]).any(), \
+        "every complete block's kbar tail must be overwritten"
+    assert torch.isnan(v_tail[0, rows[rows % INDEXER_COMPRESS_RATIO != 0],
+                              0]).all(), \
+        "V tails off the 4g grid must keep the poison (never written)"
+    assert torch.isnan(k_tail[0, ctx:]).all() \
+        and torch.isnan(v_tail[0, ctx:]).all(), \
+        "tails beyond ctx must keep the poison (never written)"
+    assert torch.isnan(k_tail[0, :, 1]).all() \
+        and torch.isnan(v_tail[0, :, 1]).all(), \
+        "head 1 tails must keep the poison (state lives in head 0)"
+
+
+@requires_gpu
+def test_plugin_decode_s_gt1_rejected():
+    """Decode mode (kvcache_start_index shape [B]) requires S == 1: S = 4
+    must fail the enqueue cleanly (no crash), and the execution context must
+    stay usable — the surrounding valid decode steps still match."""
+    _require_qsa_plugin()
+    l0 = 44
+    runner, ref, dec, qkv, index_qk, gammas, table, rope = _decode_case(
+        [l0], 8, seed=8805, build_seq=64)
+    _run_prefill(runner, qkv, index_qk, [l0], rope)
+    qkv_s, iq_s, ctx_t = _decode_step_inputs(qkv, index_qk, [l0], 0)
+    out = runner.run_decode(qkv_s, iq_s, ctx_t, rope)
+    ref_out, _ = dec.step_output(0, l0 + 1)
+    assert_close("qsa_s_gt1[pre]", ref_out, out[0, 0])
+    # S=4 with a decode-shaped start index: rejected before any launch.
+    with pytest.raises(RuntimeError, match="execute_async_v3 returned False"):
+        runner.run_decode(qkv[:, l0 + 1:l0 + 5].contiguous(),
+                          index_qk[:, l0 + 1:l0 + 5].contiguous(), ctx_t + 1,
+                          rope)
+    # The failure consumed nothing: the next valid step still matches.
+    qkv_s, iq_s, ctx_t = _decode_step_inputs(qkv, index_qk, [l0], 1)
+    out = runner.run_decode(qkv_s, iq_s, ctx_t, rope)
+    ref_out, _ = dec.step_output(0, l0 + 2)
+    assert_close("qsa_s_gt1[post]", ref_out, out[0, 0])
+
+
+@requires_gpu
+def test_plugin_decode_graph_capture_smoke():
+    """One decode step captured into a CUDA graph replays bit-identically.
+
+    The decode path is contractually graph-safe (no cub, no allocation,
+    in-enqueue split-counter zeroing) and idempotent for a fixed ctx (it
+    rewrites the same pool rows with the same values), so warmup + capture
+    + N replays of the same step are equivalent. The output buffer is
+    zeroed before each replay so a silently empty graph cannot pass.
+    """
+    _require_qsa_plugin()
+    l0 = 44
+    runner, ref, dec, qkv, index_qk, gammas, table, rope = _decode_case(
+        [l0], 4, seed=8806, build_seq=64)
+    _run_prefill(runner, qkv, index_qk, [l0], rope)
+    # One eager step so capture starts from a realistic mid-decode state.
+    qkv_s, iq_s, ctx_t = _decode_step_inputs(qkv, index_qk, [l0], 0)
+    runner.run_decode(qkv_s, iq_s, ctx_t, rope)
+    # Static bindings for the captured step (ctx = l0 + 2): everything is
+    # allocated here so nothing allocates during capture.
+    ctx = l0 + 2
+    qkv_s, iq_s, ctx_t = _decode_step_inputs(qkv, index_qk, [l0], 1)
+    kv_start = ctx_t - 1
+    static_out = torch.empty((1, 1, NUM_Q_HEADS, HEAD_SIZE),
+                             dtype=torch.float16,
+                             device=DEV)
+
+    def enqueue():
+        runner.run_decode(qkv_s,
+                          iq_s,
+                          ctx_t,
+                          rope,
+                          kv_start=kv_start,
+                          attention_output=static_out,
+                          synchronize=False)
+
+    # TensorRT wants one enqueue before capture (lazy resource init); the
+    # side stream keeps the warmup out of the ambient capture stream, per
+    # torch's CUDA-graph usage pattern.
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        enqueue()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        enqueue()
+
+    replays = []
+    for _ in range(2):
+        static_out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        replays.append(static_out.clone())
+    assert (replays[0] != 0).any(), "graph replay produced no output"
+    assert torch.equal(replays[0].view(torch.int16),
+                       replays[1].view(torch.int16)), \
+        "graph replays are not bitwise identical"
+    ref_out, _ = dec.step_output(0, ctx)
+    assert_close("qsa_graph_decode", ref_out, replays[1][0, 0])

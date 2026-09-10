@@ -2177,14 +2177,15 @@ _gemma4_audio_attention_plugin_schema = OpSchema(
 )
 
 # ---------------------------------------------------------------------------
-# trt_edgellm::QsaAttentionPlugin (Qwen Sparse Attention, prefill-only v1)
+# trt_edgellm::QsaAttentionPlugin (Qwen Sparse Attention, prefill + decode)
 # ---------------------------------------------------------------------------
 
 _qsa_attention_plugin_schema = OpSchema(
     name="QsaAttentionPlugin",
     domain="trt_edgellm",
     since_version=_SCHEMA_SINCE_VERSION,
-    doc="Qwen Sparse Attention (QSA) plugin, prefill-only v1. A weight-free "
+    doc="Qwen Sparse Attention (QSA) plugin: normal prefill or single-token "
+    "decode, selected by the kvcache_start_index runtime shape. A weight-free "
     "block-compressed indexer selects the top-`indexer_budget` KV blocks of "
     "`indexer_compress_ratio` tokens per query token, and a sparse GQA "
     "attention attends only the listed tokens (no causal mask in the kernel; "
@@ -2210,12 +2211,16 @@ _qsa_attention_plugin_schema = OpSchema(
         OpSchema.FormalParameter(
             name="past_key_value",
             description=
-            "Paged KV cache pool [2, num_pages, KV_PAGE_SIZE, H_kv, D]",
+            "Paged KV cache pool [2, num_pages, KV_PAGE_SIZE, H_kv, D + "
+            "indexer_head_dim]; the leading D columns of each row are K/V, "
+            "the tail persists QSA indexer state",
             type_str="T_KV",
         ),
         OpSchema.FormalParameter(
             name="context_lengths",
-            description="Per-request valid token counts [B]",
+            description=
+            "Per-request valid token counts [B]; in decode the TOTAL length "
+            "including the token being decoded",
             type_str="tensor(int32)",
         ),
         OpSchema.FormalParameter(
@@ -2229,8 +2234,9 @@ _qsa_attention_plugin_schema = OpSchema(
         OpSchema.FormalParameter(
             name="kvcache_start_index",
             description=
-            "KV cache start index tensor [kv_batch]; runtime shape [0] is "
-            "the prefill sentinel (the only mode supported by v1)",
+            "KV cache start index tensor [kv_batch]; runtime shape [0] "
+            "selects prefill, [B] selects single-token decode (S == 1); the "
+            "values are the past lengths and are not read",
             type_str="tensor(int32)",
         ),
         OpSchema.FormalParameter(
@@ -2280,7 +2286,8 @@ _qsa_attention_plugin_schema = OpSchema(
         OpSchema.FormalParameter(
             name="present_key_value",
             description=
-            "Updated KV cache pool (aliased in-place to past_key_value)",
+            "Updated KV cache pool (aliased in-place to past_key_value; same "
+            "widened layout, indexer-state tails included)",
             type_str="T_KV",
         ),
     ],

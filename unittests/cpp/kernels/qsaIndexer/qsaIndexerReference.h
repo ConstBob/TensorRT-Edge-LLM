@@ -24,11 +24,14 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cuda_fp16.h>
 #include <numeric>
+#include <random>
 #include <vector>
 
 namespace qsa_ref
@@ -225,6 +228,154 @@ inline std::vector<int32_t> refExpandRow(std::vector<int32_t> const& sortedIds, 
         out[numSelected * kRatio + j] = numVisible * kRatio + j;
     }
     return out;
+}
+
+// ---------------------------------------------------------------------------------------
+// Paged-pool / decode references (see QsaIndexerPoolState in qsaIndexerKernels.h for the
+// addressing contract these mirror).
+// ---------------------------------------------------------------------------------------
+
+constexpr int32_t kTokensPerPage = 128;
+
+//! Element offset of (page, rowInPage, head, col) in a pool [2*numPages, 128, numKVHeads,
+//! poolHeadDim].
+inline int64_t poolOffset(
+    int32_t page, int32_t rowInPage, int32_t head, int32_t col, int32_t numKVHeads, int32_t poolHeadDim)
+{
+    return (static_cast<int64_t>(page) * kTokensPerPage + rowInPage) * numKVHeads * poolHeadDim
+        + static_cast<int64_t>(head) * poolHeadDim + col;
+}
+
+//! Page id of `token` on `plane` (0 = K, 1 = V) in a table [batchSize, 2, maxPagesPerSeq].
+inline int32_t pageOf(
+    std::vector<int32_t> const& pageTable, int32_t maxPagesPerSeq, int32_t b, int32_t plane, int32_t token)
+{
+    return pageTable[(static_cast<int64_t>(b) * 2 + plane) * maxPagesPerSeq + token / kTokensPerPage];
+}
+
+//! Permuted NON-IDENTITY page table [batchSize, 2, maxPagesPerSeq]: the first pagesUsed
+//! slots of every sequence get distinct page ids drawn from independently shuffled
+//! K-plane / V-plane permutations of [0, numPages) (re-shuffled if the draw came out
+//! sorted, so the mapping is never the identity); V ids are pre-offset +numPages; all
+//! remaining slots are -1 (kUNUSED_PAGE_ENTRY). Requires batchSize * pagesUsed <= numPages
+//! and numPages >= 2.
+inline std::vector<int32_t> makePermutedPageTable(
+    int32_t batchSize, int32_t maxPagesPerSeq, int32_t pagesUsed, int32_t numPages, uint32_t seed)
+{
+    std::vector<int32_t> table(static_cast<size_t>(batchSize) * 2 * maxPagesPerSeq, -1);
+    std::mt19937 rng(seed);
+    std::vector<int32_t> kPerm(numPages);
+    std::vector<int32_t> vPerm(numPages);
+    std::iota(kPerm.begin(), kPerm.end(), 0);
+    std::iota(vPerm.begin(), vPerm.end(), 0);
+    do
+    {
+        std::shuffle(kPerm.begin(), kPerm.end(), rng);
+    } while (std::is_sorted(kPerm.begin(), kPerm.end()));
+    do
+    {
+        std::shuffle(vPerm.begin(), vPerm.end(), rng);
+    } while (std::is_sorted(vPerm.begin(), vPerm.end()));
+    for (int32_t b = 0; b < batchSize; ++b)
+    {
+        for (int32_t p = 0; p < pagesUsed; ++p)
+        {
+            table[(static_cast<int64_t>(b) * 2 + 0) * maxPagesPerSeq + p] = kPerm[b * pagesUsed + p];
+            table[(static_cast<int64_t>(b) * 2 + 1) * maxPagesPerSeq + p] = vPerm[b * pagesUsed + p] + numPages;
+        }
+    }
+    return table;
+}
+
+//! B1 phase-1 reference: q-prep of ONE decode row [640] at an explicit rope position;
+//! returns [4, 128] pre-final-cast FP32 values.
+inline std::vector<float> refQPrepDecodeRow(float const* indexQkRow, std::vector<float> const& cosSin, int32_t position,
+    std::vector<float> const& wQ, float eps)
+{
+    std::vector<float> out(kQRowWidth);
+    for (int32_t h = 0; h < kNumHeads; ++h)
+    {
+        std::vector<double> head(indexQkRow + h * kHeadDim, indexQkRow + (h + 1) * kHeadDim);
+        applyGemmaNorm(head, wQ, eps);
+        applyNeoxRope(head, cosSin, position);
+        for (int32_t d = 0; d < kHeadDim; ++d)
+        {
+            out[h * kHeadDim + d] = static_cast<float>(head[d]);
+        }
+    }
+    return out;
+}
+
+//! K1b reference over four explicit half-rounded raw key rows [4][128] (the pool K-tails
+//! of tokens firstToken .. firstToken + 2 plus the completing token's key from indexQk);
+//! returns kbar [128] pre-final-cast FP32 values.
+//! The fixed-order FP32 mean and the intermediate FP16 cast follow the kernel bit-for-bit.
+inline std::vector<float> refKCompressGroup(std::array<float const*, kRatio> const& rawK,
+    std::vector<float> const& cosSin, int32_t firstToken, std::vector<float> const& wK, float eps)
+{
+    std::vector<double> head(kHeadDim);
+    for (int32_t d = 0; d < kHeadDim; ++d)
+    {
+        float acc = rawK[0][d];
+        acc = acc + rawK[1][d];
+        acc = acc + rawK[2][d];
+        acc = acc + rawK[3][d];
+        acc = acc * 0.25f;
+        head[d] = __half2float(__float2half(acc));
+    }
+    applyGemmaNorm(head, wK, eps);
+    applyNeoxRope(head, cosSin, firstToken);
+    std::vector<float> out(kHeadDim);
+    for (int32_t d = 0; d < kHeadDim; ++d)
+    {
+        out[d] = static_cast<float>(head[d]);
+    }
+    return out;
+}
+
+//! B2 reference: double-precision logits [numVisible] of one decode query row [4, 128]
+//! against densely gathered kbar rows [numVisible, 128] (both half-rounded FP32).
+inline std::vector<double> refLogitsDecodeRow(
+    std::vector<float> const& qRow, std::vector<float> const& kbarRows, int32_t numVisible)
+{
+    std::vector<double> logits(numVisible);
+    for (int32_t g = 0; g < numVisible; ++g)
+    {
+        double sum = 0.0;
+        for (int32_t h = 0; h < kNumHeads; ++h)
+        {
+            double dot = 0.0;
+            for (int32_t d = 0; d < kHeadDim; ++d)
+            {
+                dot += static_cast<double>(qRow[h * kHeadDim + d]) * kbarRows[static_cast<int64_t>(g) * kHeadDim + d];
+            }
+            sum += std::max(0.0, dot); // relu PER HEAD, then sum over heads
+        }
+        logits[g] = sum / std::sqrt(static_cast<double>(kHeadDim)); // scale AFTER the sum
+    }
+    return logits;
+}
+
+//! Monotone orderable key of an FP32 logit: the exact total order the device radix select
+//! and cub's float radix sort use (orders -0.0f < +0.0f; NaNs by payload).
+inline uint32_t orderKey(float v)
+{
+    uint32_t bits = 0;
+    std::memcpy(&bits, &v, sizeof(bits));
+    return (bits & 0x80000000U) != 0U ? ~bits : (bits | 0x80000000U);
+}
+
+//! Top-k block ids of logits[0:numVisible) under the radix order, stable descending —
+//! ascending block id among equal keys, i.e. cub::DeviceSegmentedRadixSort descending over
+//! ascending-id-filled values (the prefill tie behavior the decode select must match).
+inline std::vector<int32_t> refTopKBlocks(std::vector<float> const& logits, int32_t numVisible, int32_t k)
+{
+    std::vector<int32_t> ids(numVisible);
+    std::iota(ids.begin(), ids.end(), 0);
+    std::stable_sort(
+        ids.begin(), ids.end(), [&logits](int32_t a, int32_t b) { return orderKey(logits[a]) > orderKey(logits[b]); });
+    ids.resize(std::min(k, numVisible));
+    return ids;
 }
 
 } // namespace qsa_ref

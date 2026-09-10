@@ -218,11 +218,11 @@ void TestRopeWriteKvPrefill(int32_t const batchSize, AttnParams const& attnParam
         }
     }
 
-    std::cout << "TestRopeWriteKvPrefill [FP16 KV cache] "
-              << "BatchSize: " << batchSize << " QHeadNum: " << numQHeads << " KVHeadNum: " << numKVHeads
-              << " HeadSize: " << headDim << " RotaryDim: " << rotaryDim << " KVCacheCapacity: " << kvCacheCapacity
-              << " qSeqLen: " << qSeqLen << " cosSinCacheBatchSize: " << cosSinCacheBatchSize
-              << " cosSinCacheSeqLen: " << cosSinCacheSeqLen << std::endl;
+    std::cout << "TestRopeWriteKvPrefill [FP16 KV cache] " << "BatchSize: " << batchSize << " QHeadNum: " << numQHeads
+              << " KVHeadNum: " << numKVHeads << " HeadSize: " << headDim << " RotaryDim: " << rotaryDim
+              << " KVCacheCapacity: " << kvCacheCapacity << " qSeqLen: " << qSeqLen
+              << " cosSinCacheBatchSize: " << cosSinCacheBatchSize << " cosSinCacheSeqLen: " << cosSinCacheSeqLen
+              << std::endl;
 
 #if SUPPORTS_FP8
     if (enableFp8Check)
@@ -312,11 +312,11 @@ void TestRopeWriteKvPrefill(int32_t const batchSize, AttnParams const& attnParam
             }
         }
 
-        std::cout << "TestRopeWriteKvPrefill [FP8 KV cache] "
-                  << "BatchSize: " << batchSize << " QHeadNum: " << numQHeads << " KVHeadNum: " << numKVHeads
-                  << " HeadSize: " << headDim << " RotaryDim: " << rotaryDim << " KVCacheCapacity: " << kvCacheCapacity
-                  << " qSeqLen: " << qSeqLen << " cosSinCacheBatchSize: " << cosSinCacheBatchSize
-                  << " cosSinCacheSeqLen: " << cosSinCacheSeqLen << std::endl;
+        std::cout << "TestRopeWriteKvPrefill [FP8 KV cache] " << "BatchSize: " << batchSize
+                  << " QHeadNum: " << numQHeads << " KVHeadNum: " << numKVHeads << " HeadSize: " << headDim
+                  << " RotaryDim: " << rotaryDim << " KVCacheCapacity: " << kvCacheCapacity << " qSeqLen: " << qSeqLen
+                  << " cosSinCacheBatchSize: " << cosSinCacheBatchSize << " cosSinCacheSeqLen: " << cosSinCacheSeqLen
+                  << std::endl;
     }
 #else
     (void) enableFp8Check;
@@ -507,13 +507,12 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
         }
     }
 
-    std::cout << "TestRopeWriteKvDecode [FP16 KV cache] "
-              << "BatchSize: " << batchSize << " QHeadNum: " << numQHeads << " KVHeadNum: " << numKVHeads
-              << " HeadSize: " << headDim << " RotaryDim: " << rotaryDim << " KVCacheCapacity: " << kvCacheCapacity
-              << " QLength: " << qLen << " Total Sequence Lengths (including past KVcache): " << fullSeqLens
-              << " RopeScale: " << ropeScale << " RopeTheta: " << ropeTheta
-              << " cosSinCacheBatchSize: " << cosSinCacheBatchSize << " cosSinCacheSeqLen: " << cosSinCacheSeqLen
-              << std::endl;
+    std::cout << "TestRopeWriteKvDecode [FP16 KV cache] " << "BatchSize: " << batchSize << " QHeadNum: " << numQHeads
+              << " KVHeadNum: " << numKVHeads << " HeadSize: " << headDim << " RotaryDim: " << rotaryDim
+              << " KVCacheCapacity: " << kvCacheCapacity << " QLength: " << qLen
+              << " Total Sequence Lengths (including past KVcache): " << fullSeqLens << " RopeScale: " << ropeScale
+              << " RopeTheta: " << ropeTheta << " cosSinCacheBatchSize: " << cosSinCacheBatchSize
+              << " cosSinCacheSeqLen: " << cosSinCacheSeqLen << std::endl;
 
 #if SUPPORTS_FP8
     if (enableFp8Check)
@@ -610,13 +609,12 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
             }
         }
 
-        std::cout << "TestRopeWriteKvDecode [FP8 KV cache] "
-                  << "BatchSize: " << batchSize << " QHeadNum: " << numQHeads << " KVHeadNum: " << numKVHeads
-                  << " HeadSize: " << headDim << " RotaryDim: " << rotaryDim << " KVCacheCapacity: " << kvCacheCapacity
-                  << " QLength: " << qLen << " Total Sequence Lengths (including past KVcache): " << fullSeqLens
-                  << " RopeScale: " << ropeScale << " RopeTheta: " << ropeTheta
-                  << " cosSinCacheBatchSize: " << cosSinCacheBatchSize << " cosSinCacheSeqLen: " << cosSinCacheSeqLen
-                  << std::endl;
+        std::cout << "TestRopeWriteKvDecode [FP8 KV cache] " << "BatchSize: " << batchSize << " QHeadNum: " << numQHeads
+                  << " KVHeadNum: " << numKVHeads << " HeadSize: " << headDim << " RotaryDim: " << rotaryDim
+                  << " KVCacheCapacity: " << kvCacheCapacity << " QLength: " << qLen
+                  << " Total Sequence Lengths (including past KVcache): " << fullSeqLens << " RopeScale: " << ropeScale
+                  << " RopeTheta: " << ropeTheta << " cosSinCacheBatchSize: " << cosSinCacheBatchSize
+                  << " cosSinCacheSeqLen: " << cosSinCacheSeqLen << std::endl;
     }
 #else
     (void) enableFp8Check;
@@ -1206,6 +1204,114 @@ TEST(RopePackedFusedNorm, PostRopeAccuracy)
     TestRopePackedFusedNorm(2, {8, 2, 128, 128}, 16, 7, /*scramblePages=*/false, /*postRopeNorm=*/true);
     TestRopePackedFusedNorm(2, {4, 2, 96, 96}, 16, 5, /*scramblePages=*/false, /*postRopeNorm=*/true);
     TestRopePackedFusedNorm(1, {4, 2, 80, 80}, 16, 3, /*scramblePages=*/false, /*postRopeNorm=*/true);
+}
+
+//! Widened-pool contract of launchApplyRopeFromPackedToSplit: the pool head dimension may
+//! exceed the packed-QKV head dimension. Verifies (a) K/V land at the widened row strides
+//! (against the token-major K/V scratch mirrors of the same launch) and (b) the row tails
+//! [headDim, poolHeadDim) keep a pre-poisoned sentinel.
+TEST(RopePackedWidenedPool, WritesHeadDimPrefixAndPreservesTails)
+{
+    cudaStream_t stream{nullptr};
+    int32_t constexpr batchSize = 2;
+    int32_t constexpr qSeqLen = 130; // spans a page boundary
+    int32_t constexpr numQHeads = 4;
+    int32_t constexpr numKVHeads = 2;
+    int32_t constexpr headDim = 64;
+    int32_t constexpr rotaryDim = 64;
+    int32_t constexpr poolHeadDim = headDim + 128;
+    int32_t constexpr combinedHeads = numQHeads + 2 * numKVHeads;
+    int32_t constexpr kvCacheCapacity = 256;
+    int32_t const maxPagesPerSeq = getMaxPagesPerSeq(kvCacheCapacity);
+    int32_t const numPages = batchSize * maxPagesPerSeq;
+
+    rt::Tensor cosSinCacheTensor(
+        rt::Coords{1, kvCacheCapacity, rotaryDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    initializeNormalRopeCosSin(
+        cosSinCacheTensor.dataPointer<float>(), 10000.0F, 1.0F, 1.0F, rotaryDim, kvCacheCapacity, stream);
+
+    std::vector<half> packedInput(static_cast<size_t>(batchSize) * qSeqLen * combinedHeads * headDim);
+    uniformFloatInitialization(packedInput);
+    rt::Tensor packedTensor(
+        rt::Coords{batchSize, qSeqLen, combinedHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    copyHostToDevice(packedTensor, packedInput);
+
+    rt::Tensor qScratchTensor(
+        rt::Coords{batchSize, qSeqLen, numQHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor kMirrorTensor(
+        rt::Coords{batchSize, qSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor vMirrorTensor(
+        rt::Coords{batchSize, qSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    half const sentinel = __float2half(777.0F);
+    std::vector<half> const widenedPoolInit(
+        static_cast<size_t>(2) * numPages * kPageSize * numKVHeads * poolHeadDim, sentinel);
+    rt::Tensor widenedPoolTensor(
+        rt::Coords{2, numPages, kPageSize, numKVHeads, poolHeadDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    copyHostToDevice(widenedPoolTensor, widenedPoolInit);
+
+    std::vector<int32_t> const pageTableHost = makeIdentityPageTable(batchSize, maxPagesPerSeq);
+    rt::Tensor pageTableTensor(
+        rt::Coords{batchSize, 2, maxPagesPerSeq}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice(pageTableTensor, pageTableHost);
+
+    launchApplyRopeFromPackedToSplit(cosSinCacheTensor, std::nullopt, std::nullopt, packedTensor, qScratchTensor,
+        widenedPoolTensor, 1.0F, 1.0F, stream, pageTableTensor.dataPointer<int32_t>(), maxPagesPerSeq,
+        kMirrorTensor.rawPointer(), vMirrorTensor.rawPointer());
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+
+    auto const kMirror = copyDeviceToHost<half>(kMirrorTensor);
+    auto const vMirror = copyDeviceToHost<half>(vMirrorTensor);
+    auto const widenedPool = copyDeviceToHost<half>(widenedPoolTensor);
+
+    for (int32_t b = 0; b < batchSize; ++b)
+    {
+        for (int32_t s = 0; s < qSeqLen; ++s)
+        {
+            int32_t const page = b * maxPagesPerSeq + s / kPageSize;
+            for (int32_t hkv = 0; hkv < numKVHeads; ++hkv)
+            {
+                int64_t const mirrorBase
+                    = (static_cast<int64_t>(b) * qSeqLen + s) * numKVHeads * headDim + hkv * headDim;
+                for (int32_t d = 0; d < headDim; ++d)
+                {
+                    float const kRef = __half2float(kMirror[mirrorBase + d]);
+                    float const vRef = __half2float(vMirror[mirrorBase + d]);
+                    // (a) Widened pool holds the mirrors' K/V at poolHeadDim row strides.
+                    ASSERT_EQ(__half2float(widenedPool[pagedKvIndex(
+                                  /*cachePlane=*/0, page, s % kPageSize, hkv, d, numPages, numKVHeads, poolHeadDim)]),
+                        kRef)
+                        << "widened K mismatch b=" << b << " s=" << s << " h=" << hkv << " d=" << d;
+                    ASSERT_EQ(__half2float(widenedPool[pagedKvIndex(
+                                  /*cachePlane=*/1, page, s % kPageSize, hkv, d, numPages, numKVHeads, poolHeadDim)]),
+                        vRef)
+                        << "widened V mismatch b=" << b << " s=" << s << " h=" << hkv << " d=" << d;
+                }
+            }
+        }
+        // (b) Row tails keep the sentinel on every slot — written or not — in both planes;
+        // rows past the written sequence additionally keep their K/V prefix untouched.
+        for (int32_t slot = 0; slot < kvCacheCapacity; ++slot)
+        {
+            int32_t const page = b * maxPagesPerSeq + slot / kPageSize;
+            for (int32_t plane = 0; plane < 2; ++plane)
+            {
+                for (int32_t hkv = 0; hkv < numKVHeads; ++hkv)
+                {
+                    int32_t const dBegin = slot < qSeqLen ? headDim : 0;
+                    for (int32_t d = dBegin; d < poolHeadDim; ++d)
+                    {
+                        ASSERT_EQ(__half2float(widenedPool[pagedKvIndex(
+                                      plane, page, slot % kPageSize, hkv, d, numPages, numKVHeads, poolHeadDim)]),
+                            777.0F)
+                            << "clobbered tail b=" << b << " plane=" << plane << " slot=" << slot << " h=" << hkv
+                            << " d=" << d;
+                    }
+                }
+            }
+        }
+    }
 }
 
 TEST(RopeWriteKvPrefill, Accuracy)

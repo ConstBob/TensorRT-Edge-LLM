@@ -208,7 +208,7 @@ def _attention_plugin_dispatch(
 
 
 # ---------------------------------------------------------------------------
-# QSA attention plugin translation (Qwen Sparse Attention, prefill-only v1)
+# QSA attention plugin translation (Qwen Sparse Attention, prefill + decode)
 # ---------------------------------------------------------------------------
 
 
@@ -235,7 +235,7 @@ def _qsa_attention_plugin_translation(
     indexer_q_norm_gamma: Sequence[float],
     indexer_k_norm_gamma: Sequence[float],
 ) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16]:
-    """QSA plugin: block-compressed indexer + sparse GQA prefill attention.
+    """QSA plugin: block-compressed indexer + sparse GQA attention (prefill and decode).
 
     Signature order matches ``trt::qsa_attention_plugin`` positionally (the
     FX graph normalizes every kwarg into a positional arg). All 11 ONNX

@@ -149,7 +149,8 @@ std::vector<int32_t> runPrefill(QsaIndexerHarness const& h)
         {static_cast<int64_t>(h.batch) * h.seqLen, kWidth}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "outIdx");
     kernel::runQsaIndexerPrefill<half>(outIdx.dataPointer<int32_t>(), h.dIndexQk.dataPointer<half>(),
         h.dCosSin.dataPointer<float>(), h.dLens.dataPointer<int32_t>(), h.dWQ.dataPointer<half>(),
-        h.dWK.dataPointer<half>(), h.rmsEps, workspace.rawPointer(), workspaceBytes, h.batch, h.seqLen, nullptr);
+        h.dWK.dataPointer<half>(), h.rmsEps, workspace.rawPointer(), workspaceBytes, h.batch, h.seqLen,
+        /* poolState = */ nullptr, /* stream = */ nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
     return copyDeviceToHost<int32_t>(outIdx);
 }
