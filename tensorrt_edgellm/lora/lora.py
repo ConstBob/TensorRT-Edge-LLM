@@ -108,8 +108,8 @@ def _linear_consumers_after_dq(quantize_node: gs.Node, max_hops: int = 3):
     fan out to several linear consumers (Q/K/V share one dequantized hidden
     state). Walks through ``max_hops`` levels of transparent ops
     (``Cast``/``Reshape``/``Identity``) between DQ and the linear op so a future
-    modelopt emit pattern with intermediate ops keeps binding correctly
-    instead of silently dropping the LoRA slot (Greptile P2)."""
+    modelopt emit pattern with intermediate ops keeps binding correctly instead
+    of silently dropping the LoRA slot."""
     for dq in list(quantize_node.outputs[0].outputs):
         if dq.op != "DequantizeLinear":
             continue

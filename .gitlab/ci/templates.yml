@@ -21,6 +21,14 @@
   variables:
     GIT_SUBMODULE_PATHS: "3rdParty/googletest 3rdParty/nlohmannJson 3rdParty/xgrammar"
 
+.cpu_runner_retry:
+  retry:
+    max: 2
+    when:
+      - api_failure
+      - runner_system_failure
+      - stuck_or_timeout_failure
+
 # ==============================================================================
 # RULE TEMPLATES
 # ==============================================================================
@@ -81,13 +89,13 @@
         --environment-file "$L0_STORAGE_ENV_FILE"
       . "$L0_STORAGE_ENV_FILE"
 
-.l0_blackwell_exports:
+.l0_onnx_exports_1:
   variables:
-    L0_ONNX_CACHE_RELATIVE_PATH: "checkpoint_export/onnx"
+    L0_ONNX_CACHE_RELATIVE_PATH: "onnx_export_1/onnx"
 
-.l0_ampere_exports:
+.l0_onnx_exports_2:
   variables:
-    L0_ONNX_CACHE_RELATIVE_PATH: "checkpoint_export_ampere/onnx"
+    L0_ONNX_CACHE_RELATIVE_PATH: "onnx_export_2/onnx"
 
 .cleanup_engine_storage:
   # Add [retain engines] to the commit message to preserve engine output.
@@ -105,11 +113,8 @@
         fi
       fi
 
-.l0_a30_trtrtx_exports:
-  variables:
-    L0_ONNX_CACHE_RELATIVE_PATH: "checkpoint_export_a30_trtrtx/onnx"
-
 .l0_storage_lifecycle:
+  extends: .cpu_runner_retry
   image:
     name: "$L0_STORAGE_IMAGE"
     entrypoint: [""]
@@ -195,7 +200,7 @@
         echo "git unavailable — exporting."
       else
         PREV_SHA="$(cat "$META")"
-        EXPORT_CACHE_INPUTS="tensorrt_edgellm tests/defs/config.py tests/defs/test_checkpoint_export.py tests/defs/utils/checkpoint_export_helpers.py tests/test_lists/${PRIORITY}.yml .gitlab/ci/templates.yml"
+        EXPORT_CACHE_INPUTS="tensorrt_edgellm tests/defs/config.py tests/defs/test_checkpoint_export.py tests/defs/utils/checkpoint_export_helpers.py tests/test_lists/${PRIORITY}.yml .gitlab/ci/l0-jobs.yml .gitlab/ci/templates.yml"
         if [ -z "$CACHE_COMMIT_SHA" ]; then
           echo "Current cache commit is unavailable — exporting."
         elif ! git cat-file -e "${PREV_SHA}^{commit}" 2>/dev/null; then
@@ -255,8 +260,7 @@
     - |
       if [ "${ONNX_REUSE:-0}" = "1" ]; then
         echo "Invalidating cached ONNX before re-export"
-        rm -f "$META" "$META.tmp"
-        rm -rf "$ONNX_DIR"/*
+        find "$ONNX_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
         mkdir -p "$ONNX_DIR"
       fi
     - echo "Running checkpoint export tests with pytest. Time:$(date)"
@@ -266,6 +270,7 @@
         python3 -m pytest tests \
         --priority="$PRIORITY" \
         -v \
+        --maxfail=1 \
         --color=yes \
         --html="$TEST_LOG_DIR/test_report_$PRIORITY.html" \
         --self-contained-html \
@@ -320,7 +325,7 @@
     - >-
       bash .gitlab/ci/scripts/ci_run.sh "$CI_JOB_PHASE_TIMEOUT_SECONDS"
       "Run pipeline tests" -- python3 -m pytest tests/ --priority=$PRIORITY
-      -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html
+      -v --maxfail=1 --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html
       --self-contained-html
       --junitxml="$CI_PROJECT_DIR/.ci-reports/test_report_$PRIORITY.xml"
     - echo "HTML report saved to $TEST_LOG_DIR; JUnit report saved to $CI_PROJECT_DIR/.ci-reports"
@@ -401,7 +406,7 @@
       exit "$pytest_status"
     - echo "Pipeline end time:$(date)"
 
-.x86_unit_test_template:
+.python_unit_test_template:
   extends:
     - .ci_test_submodules
     - .gitlab_junit_report
@@ -431,11 +436,12 @@
     # Fail loudly if the runner env is broken (no torch/TRT/GPU); otherwise the
     # harness skips every test at the module level and the job goes green empty.
     - python3 -c "import tensorrt, torch; assert torch.cuda.is_available(), 'CUDA not available'"
-    - echo "Running unit tests with pytest. Time:$(date)"
+    - echo "Running Python unit tests with pytest. Time:$(date)"
     # Test selection is driven by the tests/test_lists/$PRIORITY.yml list.
     - >-
       bash .gitlab/ci/scripts/ci_run.sh "$CI_JOB_PHASE_TIMEOUT_SECONDS"
-      "Run unit tests" -- python3 -m pytest tests/ --priority=$PRIORITY -v
+      "Run Python unit tests" -- python3 -m pytest tests/ --priority=$PRIORITY -v
+      --maxfail=1
       --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html
       --self-contained-html
       --junitxml="$CI_PROJECT_DIR/.ci-reports/test_report_$PRIORITY.xml"
@@ -470,8 +476,6 @@
     - mkdir -p $TEST_LOG_DIR "$CI_PROJECT_DIR/.ci-reports"
     - rm -rf $TEST_LOG_DIR/*
     - chmod -R 777 $TEST_LOG_DIR
-    - echo "Copying password to device scripts"
-    - sed -i -e "s/{BOARDPASSWORD}/${BOARD_PASSWORD_NVKS}/g" .gitlab/ci/scripts/device_init.sh
     - ': "${ENGINE_DIR:?Device pipeline jobs must define ENGINE_DIR}"'
     - |
       case "$REMOTE_WORKSPACE" in
@@ -483,7 +487,13 @@
     - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "umask 0000 && rm -rf -- '$REMOTE_WORKSPACE' && mkdir -p '$REMOTE_CI_SCRIPT_DIR' '$ENGINE_DIR'"
     - sshpass -p "$BOARD_PASSWORD_NVKS" scp -o StrictHostKeyChecking=no .gitlab/ci/scripts/ci_apt.sh .gitlab/ci/scripts/ci_run.sh "$BOARD_USER@$BOARD_IP:$REMOTE_CI_SCRIPT_DIR/"
     - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "chmod 755 '$REMOTE_CI_SCRIPT_DIR/ci_apt.sh' '$REMOTE_CI_SCRIPT_DIR/ci_run.sh'"
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "REMOTE_WORKSPACE='$REMOTE_WORKSPACE' CI_APT_SCRIPT='$REMOTE_CI_SCRIPT_DIR/ci_apt.sh' bash -s" < .gitlab/ci/scripts/device_init.sh
+    - |
+      {
+        printf 'BOARD_PASSWORD=%q\nexport BOARD_PASSWORD\n' "$BOARD_PASSWORD_NVKS"
+        cat .gitlab/ci/scripts/device_init.sh
+      } | sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no \
+        "$BOARD_USER@$BOARD_IP" \
+        "REMOTE_WORKSPACE='$REMOTE_WORKSPACE' CI_APT_SCRIPT='$REMOTE_CI_SCRIPT_DIR/ci_apt.sh' bash -s"
     - if [ $? -ne 0 ]; then echo "Error occurred during initializing"; exit 1; fi
     - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
     - echo "Syncing repo from host to $REMOTE_WORKSPACE"
@@ -502,7 +512,7 @@
       "Run remote pipeline tests" -- python3 -m pytest tests/
       --priority=$PRIORITY --execution-mode=remote --remote-host=$BOARD_IP
       --remote-user=$BOARD_USER --remote-password="$BOARD_PASSWORD_NVKS"
-      --remote-workspace=$REMOTE_WORKSPACE -v --color=yes
+      --remote-workspace=$REMOTE_WORKSPACE -v --maxfail=1 --color=yes
       --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html
       --junitxml="$CI_PROJECT_DIR/.ci-reports/test_report_$PRIORITY.xml"
     - echo "HTML report saved to $TEST_LOG_DIR; JUnit report saved to $CI_PROJECT_DIR/.ci-reports"
@@ -515,19 +525,44 @@
     - !reference [.cleanup_engine_storage, after_script]
     - !reference [.record_runner_usage, after_script]
 
-# Plugin python unit tests on an aarch64 board. Unlike .device_test_template
-# (pytest on the host driving the board over ssh), the unit tests call the
-# TensorRT Python API and torch CUDA directly, so pytest itself runs on the
-# board (see .gitlab/ci/scripts/device_unit_tests.sh).
-.device_unit_test_template:
+# Native C++ unit tests, optionally followed by Python plugin tests, using the
+# same full CuTe DSL build.
+.cpp_unit_test_template:
+  extends:
+    - .ci_test_submodules
+    - .gitlab_junit_report
+  script:
+    - echo "Pipeline start time:$(date)"
+    - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
+    - test -d "$TRT_PACKAGE_DIR"
+    - >-
+      bash .gitlab/ci/scripts/ci_run.sh "$CI_JOB_PHASE_TIMEOUT_SECONDS"
+      "Build and run C++ unit tests" --
+      bash .gitlab/ci/scripts/run_cpp_unit_tests.sh
+    - |
+      if [[ "${RUN_PYTHON_PLUGIN_TESTS:-0}" == "1" ]]; then
+        REMOTE_WORKSPACE="$CI_PROJECT_DIR" \
+        PRIORITY="${PYTHON_PLUGIN_PRIORITY:-l0_python_ut}" \
+        JUNIT_PREFIX="$CI_JOB_NAME_SLUG" \
+        PYTHON_PLUGIN_REPORT_DIR="$CI_PROJECT_DIR/.ci-reports" \
+        PYTHON_PLUGIN_USE_SYSTEM_SITE_PACKAGES="${PYTHON_PLUGIN_USE_SYSTEM_SITE_PACKAGES:-0}" \
+        bash .gitlab/ci/scripts/device_unit_tests.sh
+      fi
+    - echo "Pipeline end time:$(date)"
+
+.device_cpp_unit_test_template:
   extends:
     - .device_controller_environment
     - .ci_test_submodules
     - .gitlab_junit_report
   variables:
-    REMOTE_WORKSPACE: "/home/${BOARD_USER}/tensorrt-edge-llm-ut-${CI_JOB_ID}"
+    REMOTE_WORKSPACE: "/home/${BOARD_USER}/tensorrt-edge-llm-cpp-ut-${CI_JOB_ID}"
+    CPP_UNIT_BUILD_JOBS: "16"
+    CPP_UNIT_TEST_JOBS: "2"
+    PYTHON_PLUGIN_PRIORITY: l0_python_ut
   script:
     - ': "${BOARD_USER:?Device jobs must define BOARD_USER}"'
+    - ': "${EMBEDDED_TARGET:?Device C++ unit jobs must define EMBEDDED_TARGET}"'
     - echo "Pipeline start time:$(date)"
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
     - export BOARD_IP=${BOARD_IP:-192.168.55.1}
@@ -541,15 +576,46 @@
         /home/$BOARD_USER/tensorrt-edge-llm*) ;;
         *) echo "Unsafe REMOTE_WORKSPACE=$REMOTE_WORKSPACE"; exit 1 ;;
       esac
-    - echo "Creating isolated remote workspace $REMOTE_WORKSPACE and syncing repo from host to board"
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "rm -rf '$REMOTE_WORKSPACE' && mkdir -p '$REMOTE_WORKSPACE'"
-    - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -a -e "ssh -o StrictHostKeyChecking=no" $LLM_SDK_DIR/ $BOARD_USER@$BOARD_IP:$REMOTE_WORKSPACE/
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "chmod -R 755 $REMOTE_WORKSPACE"
-    - echo "Running plugin unit tests on the board. Time:$(date)"
+    - export REMOTE_CI_SCRIPT_DIR="$REMOTE_WORKSPACE/.gitlab/ci/scripts"
+    - >-
+      sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no
+      "$BOARD_USER@$BOARD_IP"
+      "test ! -e '$REMOTE_WORKSPACE' && umask 0022 && mkdir -p '$REMOTE_CI_SCRIPT_DIR'"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" scp -o StrictHostKeyChecking=no .gitlab/ci/scripts/ci_apt.sh .gitlab/ci/scripts/ci_run.sh "$BOARD_USER@$BOARD_IP:$REMOTE_CI_SCRIPT_DIR/"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no "$BOARD_USER@$BOARD_IP" "chmod 755 '$REMOTE_CI_SCRIPT_DIR/ci_apt.sh' '$REMOTE_CI_SCRIPT_DIR/ci_run.sh'"
+    - |
+      {
+        printf 'BOARD_PASSWORD=%q\nexport BOARD_PASSWORD\n' "$BOARD_PASSWORD_NVKS"
+        cat .gitlab/ci/scripts/device_init.sh
+      } | sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no \
+        "$BOARD_USER@$BOARD_IP" \
+        "REMOTE_WORKSPACE='$REMOTE_WORKSPACE' CI_APT_SCRIPT='$REMOTE_CI_SCRIPT_DIR/ci_apt.sh' bash -s"
+    - echo "Syncing source and CuTe DSL artifacts to $REMOTE_WORKSPACE"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -a -e "ssh -o StrictHostKeyChecking=no" "$CI_PROJECT_DIR/" "$BOARD_USER@$BOARD_IP:$REMOTE_WORKSPACE/"
+    - >-
+      sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no
+      "$BOARD_USER@$BOARD_IP"
+      "TRT_PACKAGE_DIR='$TRT_PACKAGE_DIR'
+      CUDA_CTK_VERSION='$CUDA_CTK_VERSION'
+      EMBEDDED_TARGET='$EMBEDDED_TARGET'
+      CPP_UNIT_BUILD_JOBS='$CPP_UNIT_BUILD_JOBS'
+      CPP_UNIT_TEST_JOBS='$CPP_UNIT_TEST_JOBS'
+      CPP_UNIT_REPORT_DIR='$REMOTE_WORKSPACE/logs'
+      bash '$REMOTE_WORKSPACE/.gitlab/ci/scripts/run_cpp_unit_tests.sh'"
+    - echo "Running Python plugin unit tests on $BOARD_IP"
     - |
       sshpass -p "$BOARD_PASSWORD_NVKS" \
-        ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP \
-        "REMOTE_WORKSPACE='$REMOTE_WORKSPACE' TRT_PACKAGE_DIR='$TRT_PACKAGE_DIR' PRIORITY='$PRIORITY' JUNIT_PREFIX='$CI_JOB_NAME_SLUG' CI_JOB_ID='$CI_JOB_ID' CI_TELEMETRY_ENABLED='${CI_TELEMETRY_ENABLED:-1}' CI_TELEMETRY_DIR='$REMOTE_WORKSPACE/.ci-telemetry' CI_PIP_INSTALL_TIMEOUT_SECONDS='$CI_PIP_INSTALL_TIMEOUT_SECONDS' CI_JOB_PHASE_TIMEOUT_SECONDS='$CI_JOB_PHASE_TIMEOUT_SECONDS' bash -s" \
+        ssh -o StrictHostKeyChecking=no "$BOARD_USER@$BOARD_IP" \
+        "REMOTE_WORKSPACE='$REMOTE_WORKSPACE' \
+        TRT_PACKAGE_DIR='$TRT_PACKAGE_DIR' \
+        TRT_LIBRARY_DIR='${TRT_LIBRARY_DIR:-}' \
+        TRT_PYTHON_VERSION='${TRT_PYTHON_VERSION:-}' \
+        PRIORITY='$PYTHON_PLUGIN_PRIORITY' \
+        JUNIT_PREFIX='$CI_JOB_NAME_SLUG' \
+        CI_JOB_ID='$CI_JOB_ID' \
+        CI_PIP_INSTALL_TIMEOUT_SECONDS='$CI_PIP_INSTALL_TIMEOUT_SECONDS' \
+        CI_JOB_PHASE_TIMEOUT_SECONDS='$CI_JOB_PHASE_TIMEOUT_SECONDS' \
+        bash -s" \
         < .gitlab/ci/scripts/device_unit_tests.sh
   after_script:
     - if [ -f "$L0_STORAGE_ENV_FILE" ]; then . "$L0_STORAGE_ENV_FILE"; fi
@@ -587,7 +653,7 @@
           -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
           -DEMBEDDED_TARGET=$EMBEDDED_TARGET \
           -DCUDA_CTK_VERSION=$CUDA_VERSION \
-          -DENABLE_CUTE_DSL=${ENABLE_CUTE_DSL:-fmha}
+          -DENABLE_CUTE_DSL=${ENABLE_CUTE_DSL:-ALL}
     - echo "Building the project"
     - >-
       bash "$CI_PROJECT_DIR/.gitlab/ci/scripts/ci_run.sh"

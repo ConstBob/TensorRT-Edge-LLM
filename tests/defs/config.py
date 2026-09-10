@@ -340,6 +340,9 @@ MODEL_NAME_TO_DFLASH_DRAFT_MODELS_MAP = {
     "Qwen3.5-27B": {
         "zlab": "Qwen3.5-27B-DFlash",
     },
+    "Qwen3.8-27B": {
+        "zlab": "z-lab/Qwen3.8-27B-DFlash2",
+    },
     # MoE models: NVFP4 base + FP16 DFlash draft, except
     # Qwen3.5-35B-A3B which is currently supported as GPTQ-Int4 base.
     "Qwen3.5-35B-A3B-GPTQ-Int4": {
@@ -449,6 +452,7 @@ class TestConfig:
     is_jetspec: Optional[bool] = None
     is_jetspec_tree: Optional[bool] = None
     is_dspark: Optional[bool] = None
+    is_dspark_tree: Optional[bool] = None
 
     # Directory paths
     llm_models_dir: Optional[str] = None
@@ -662,6 +666,12 @@ class TestConfig:
                       is_required=False),
         ParameterSpec("is_dspark",
                       "dspark", {
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
+                          TaskType.INFERENCE
+                      }, {ModelType.LLM},
+                      is_required=False),
+        ParameterSpec("is_dspark_tree",
+                      "ddtree", {
                           TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
                       }, {ModelType.LLM},
@@ -998,7 +1008,12 @@ class TestConfig:
                 else:
                     parsed_params['draft_llm_precision'] = llm_precision
             elif part == "ddtree":
-                parsed_params['is_dflash_tree'] = True
+                if parsed_params.get('is_jetspec'):
+                    parsed_params['is_jetspec_tree'] = True
+                elif parsed_params.get('is_dspark'):
+                    parsed_params['is_dspark_tree'] = True
+                else:
+                    parsed_params['is_dflash_tree'] = True
             elif part == "eagle":
                 parsed_params['is_eagle'] = True
                 # Parse eagle-{draft_id}-{draft_precision}[-lm{draft_lm_head}]
@@ -1242,6 +1257,8 @@ class TestConfig:
                     self.is_jetspec_tree = False
                 if self.is_dspark is None:
                     self.is_dspark = False
+                if self.is_dspark_tree is None:
+                    self.is_dspark_tree = False
                 if self.draft_llm_precision is not None and self.draft_lm_head_precision is None:
                     self.draft_lm_head_precision = "fp16"
                 if self.reduced_vocab_size is not None:
@@ -1289,6 +1306,8 @@ class TestConfig:
                     self.is_jetspec_tree = False
                 if self.is_dspark is None:
                     self.is_dspark = False
+                if self.is_dspark_tree is None:
+                    self.is_dspark_tree = False
                 if self.draft_llm_precision is not None and self.draft_lm_head_precision is None:
                     self.draft_lm_head_precision = "fp16"
                 if self.eagle_draft_top_k is None:
@@ -1382,27 +1401,26 @@ class TestConfig:
         # Set defaults after validation
         set_defaults()
 
-        if self.is_jetspec and self.is_dflash_tree:
-            self.is_jetspec_tree = True
-            self.is_dflash_tree = False
-
         if self.is_dflash_tree and not self.is_dflash:
             raise ValueError("ddtree can only be used with DFlash tests")
         if self.is_jetspec_tree and not self.is_jetspec:
             raise ValueError("ddtree can only be used with JetSpec tests")
-        if ((self.is_dflash_tree or self.is_jetspec_tree)
+        if self.is_dspark_tree and not self.is_dspark:
+            raise ValueError("ddtree can only be used with DSpark tests")
+        if ((self.is_dflash_tree or self.is_jetspec_tree
+             or self.is_dspark_tree)
                 and self.task_type in (TaskType.CHECKPOINT_BUILD,
                                        TaskType.E2E_BENCH, TaskType.INFERENCE)
                 and self.eagle_draft_top_k <= 1):
             raise ValueError(
-                "DFlash/JetSpec DDTree runtime tests require edtk > 1; "
+                "DFlash/JetSpec/DSpark DDTree runtime tests require edtk > 1; "
                 "use linear mode without ddtree for edtk=1")
 
     def check_trt_native_attn(self) -> None:
         """Skip -trt11 tests when TRT < 11.
 
-        l0_jedha and l0_jedha_trt11 share the same test list but run
-        different TRT versions. The CI job sets TRT_VERSION.
+        Some CI jobs share test definitions while selecting different runtime
+        versions through TRT_VERSION.
         """
         if not self.trt_native_attn:
             return
@@ -1721,21 +1739,14 @@ class TestConfig:
                 f"Available: {', '.join(draft_models.keys())}")
 
         model_dir_name = draft_models[self.draft_model_id]
-        model_dir = _find_directory(self.llm_models_dir,
-                                    model_dir_name,
-                                    5,
-                                    require_files=_HF_CHECKPOINT_FILES)
-        if not model_dir:
-            model_dir = _find_directory(self.edgellm_data_dir,
-                                        model_dir_name,
-                                        5,
-                                        require_files=_HF_CHECKPOINT_FILES)
-        if not model_dir:
-            raise ValueError(
-                f"DFlash draft model directory not found: '{model_dir_name}' under "
-                f"{self.llm_models_dir} or {self.edgellm_data_dir} with search depth 5 "
-                f"(requiring config.json + *.safetensors)")
-        return model_dir
+        candidates = list(
+            dict.fromkeys([
+                f"source_models/{model_dir_name}",
+                model_dir_name,
+                os.path.basename(model_dir_name),
+            ]))
+        return self._resolve_draft_model_dir(candidates,
+                                             self._draft_torch_search_roots())
 
     def _jetspec_draft_models_for_base(self) -> Optional[dict]:
         """Resolve JetSpec draft map for fp16 or pre-quant base model names."""
@@ -1990,7 +2001,8 @@ class TestConfig:
             mode = "ddtree" if self.is_jetspec_tree else "linear"
             prefix = f"llm-base-jetspec-{mode}"
         elif self.is_dspark:
-            prefix = "llm-base-dspark"
+            mode = "ddtree" if self.is_dspark_tree else "linear"
+            prefix = f"llm-base-dspark-{mode}"
         elif self.is_eagle:
             prefix = "llm-base"
         else:
@@ -2182,7 +2194,10 @@ class TestConfig:
             if self.draft_llm_precision is None:
                 raise ValueError(
                     "draft_llm_precision not set for DSpark engine")
-            prefix = f"llm-dspark-{self.draft_model_id}-{self.draft_llm_precision}"
+            mode = "ddtree" if self.is_dspark_tree else "linear"
+            prefix = (
+                f"llm-dspark-{mode}-{self.draft_model_id}-{self.draft_llm_precision}"
+            )
         elif self.is_eagle:
             if self.draft_model_id is None:
                 raise ValueError("draft_model_id not set for EAGLE engine")

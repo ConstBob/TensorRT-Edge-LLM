@@ -59,8 +59,8 @@ make -j$(nproc) && cd ..
 ### 4. Run Tests
 ```bash
 # Run specific test suite
-pytest --priority=l0_pipeline_a30 -v
-pytest --priority=l0_checkpoint_export_ampere -v
+pytest --priority=l0_e2e_a30 -v
+pytest --priority=l0_e2e_orin -v
 ```
 
 ## Test Structure
@@ -72,14 +72,15 @@ pytest --priority=l0_checkpoint_export_ampere -v
 - **Common Tests** (`test_common.py`) - Build and unit tests
 
 ### Available Test Suites
-- `l0_checkpoint_export_ampere.yml` - Checkpoint export tests (Ampere GPUs)
-- `l0_checkpoint_export.yml` - Checkpoint export tests (Blackwell/Thor models)
-- `l0_pipeline_a30.yml` - Pipeline tests (A30 GPU)
-- `l0_pipeline_orin.yml` - Pipeline tests (Jetson Orin)
-- `l0_pipeline_rtx5080.yml` - Pipeline tests (RTX 5080)
-- `l0_pipeline_thor_1.yml` - Pipeline tests (Drive Thor 1)
-- `l0_pipeline_thor_2.yml` - Pipeline tests (Drive Thor 2, EAGLE)
-- `l0_pipeline_jedha.yml` - Pipeline tests (Jedha, large models + accuracy + EAGLE)
+- `l0_onnx_export_1.yml` - Shared small-model checkpoint-to-ONNX exports
+- `l0_onnx_export_2.yml` - Parallel 4B speculative checkpoint-to-ONNX exports
+- `l0_e2e_a30.yml` - Audio, direct builds, few-layer validation, and speculative decoding on A30
+- `l0_e2e_a30_trtrtx.yml` - TensorRT RTX engine and runtime checks on A30
+- `l0_e2e_orin.yml` - INT4 VLM checks on Jetson Orin
+- `l0_e2e_drive_thor.yml` - VLM server, MTP, and EAGLE checks on DRIVE Thor
+- `l0_e2e_spark.yml` - DFlash checks on DGX Spark
+- `l0_e2e_b100.yml` - MTP, DSpark, and MoE validation on B100
+- `l0_e2e_rtx5090.yml` - JetSpec and few-layer validation on RTX 5090
 
 ## Parameter Format
 
@@ -189,7 +190,7 @@ tests/
 Tests support remote execution on target devices (e.g., Jetson Orin):
 
 ```bash
-pytest --priority=l0_pipeline_orin \
+pytest --priority=l0_e2e_orin \
        --execution-mode=remote \
        --remote-host=192.168.55.1 \
        --remote-user=nvidia \

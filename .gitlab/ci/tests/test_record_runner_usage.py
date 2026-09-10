@@ -103,16 +103,16 @@ def test_merged_result_preserves_tested_source_and_target_revisions(tmp_path):
         tmp_path,
         {
             "CI_PIPELINE_SOURCE": "merge_request_event",
-            "CI_COMMIT_REF_NAME": "refs/merge-requests/1288/merge",
+            "CI_COMMIT_REF_NAME": "merged-results/test",
             "CI_COMMIT_SHA": "merged-result-sha",
-            "CI_MERGE_REQUEST_IID": "1288",
+            "CI_MERGE_REQUEST_IID": "0",
             "CI_MERGE_REQUEST_EVENT_TYPE": "merged_result",
             "CI_MERGE_REQUEST_SOURCE_BRANCH_SHA": "source-sha",
             "CI_MERGE_REQUEST_TARGET_BRANCH_SHA": "target-sha",
         },
     )
 
-    assert record["merge_request_iid"] == "1288"
+    assert record["merge_request_iid"] == "0"
     assert record["merge_request_event_type"] == "merged_result"
     assert record["commit_sha"] == "merged-result-sha"
     assert record["source_commit_sha"] == "source-sha"
@@ -125,7 +125,7 @@ def test_detached_merge_request_uses_tested_revision_as_source(tmp_path):
         {
             "CI_PIPELINE_SOURCE": "merge_request_event",
             "CI_COMMIT_SHA": "source-sha",
-            "CI_MERGE_REQUEST_IID": "1288",
+            "CI_MERGE_REQUEST_IID": "0",
             "CI_MERGE_REQUEST_EVENT_TYPE": "detached",
         },
     )

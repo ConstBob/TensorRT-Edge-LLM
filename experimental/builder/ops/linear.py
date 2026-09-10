@@ -232,6 +232,11 @@ class DynamicLinear(Module):
         self.in_features = in_features
 
     def forward(self, hidden_states, weight):
-        weight = weight.reshape((1, -1, self.in_features))
+        if hidden_states.rank < 2:
+            raise ValueError(
+                "DynamicLinear input must have at least two dimensions")
+        weight_shape = ((1, ) * (hidden_states.rank - 2) +
+                        (-1, self.in_features))
+        weight = weight.reshape(weight_shape)
         return hidden_states.matmul(weight,
                                     rhs_op=trt.MatrixOperation.TRANSPOSE)

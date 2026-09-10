@@ -32,7 +32,7 @@ def resolve_dspark_config(draft: dict,
                 "causal_head",
                 draft.get("dflash_query_causal",
                           draft.get("causal", legacy.get("causal", False))))))
-    use_swa = bool(value("use_swa", True))
+    use_swa = bool(value("use_swa", draft.get("use_sliding_window", True)))
     if sliding_window_size is None:
         default_window = draft.get("sliding_window",
                                    legacy.get("swa_window_size", -1))

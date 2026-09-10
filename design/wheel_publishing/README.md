@@ -26,9 +26,7 @@ limitations under the License.
 | Field | Value |
 |---|---|
 | Status | Implemented and validated with a non-publishing rehearsal |
-| Tracking issue | GitLab issue 700 |
 | Last validated | 2026-08-27 |
-| Validation pipeline | [64935968](https://gitlab-master.nvidia.com/TensorRT/tensorrt-edge-llm/tensorrt-edge-llm/-/pipelines/64935968) |
 | Public package | `tensorrt-edgellm` |
 | Kitmaker project | `tensorrt-edgellm` (`5413`) |
 
@@ -255,8 +253,9 @@ fails closed and requires escalation rather than resubmission.
    redacted evidence, and `wheel_release_publish` is absent.
 6. Do not merge the rehearsal-only version change.
 
-Pipeline 64935968 validated this flow with `0.10.0.dev2`: all 26 jobs passed,
-Kitmaker read and validated all six wheels, and no registry was modified.
+A non-publishing rehearsal validated this flow with `0.10.0.dev2`: all jobs
+passed, Kitmaker read and validated all six wheels, and no registry was
+modified.
 
 ### 5.2 Production authorization
 

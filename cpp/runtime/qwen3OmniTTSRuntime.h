@@ -24,10 +24,10 @@
 #include "runtime/config/deploymentConfig.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/exec/engineExecutor.h"
+#include "runtime/exec/raggedBatchBuilder.h"
 #include "runtime/exec/tensorMap.h"
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
-#include "runtime/preprocess/stepPreparer.h"
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
 #include "tokenizer/tokenizer.h"
@@ -502,7 +502,7 @@ private:
     bool executeTalkerPrefillStep(rt::Tensor const& inputEmbeds, rt::Tensor& outputLogits,
         rt::Tensor& outputHiddenStates, cudaStream_t stream, std::vector<int64_t> const& perBatchContextLengths = {});
 
-    //! Run a single Talker vanilla decoding step. Wraps TensorMap binding + StepPreparer + EngineExecutor.
+    //! Run a single Talker vanilla decoding step with the shared ragged decoder ABI.
     //! inputEmbeds shape must be [batch, 1, talkerHiddenSize]; outputLogits is auto-reshaped to [batch, vocab].
     bool executeTalkerDecodingStep(
         rt::Tensor const& inputEmbeds, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, cudaStream_t stream);
@@ -904,9 +904,11 @@ private:
     LLMEngineConfig mTalkerLLMConfig;                  //!< Talker LLM configuration (parsed from config.json)
     std::unique_ptr<EngineExecutor> mTalkerExec;       //!< Talker engine executor
     std::unique_ptr<SharedResources> mTalkerSharedRes; //!< Talker cache managers + RoPE pool + zero buffer
-    std::unique_ptr<PipelineIO> mTalkerPipelineIO; //!< Talker per-step pipeline buffers (selectTokenIdx, contextLen)
-    TensorMap mTalkerTensorMap;                    //!< Talker engine binding map (set once, mutated per-step)
-    std::unique_ptr<StepPreparer> mTalkerStepPreparer; //!< Talker prefill/decode metadata preparer
+    std::unique_ptr<PipelineIO> mTalkerPipelineIO;     //!< Talker per-step pipeline buffers
+    TensorMap mTalkerTensorMap;                        //!< Talker engine binding map (set once, mutated per-step)
+    RaggedExecutionBatch mTalkerRaggedBatch;           //!< Reused Talker ragged-metadata scratch
+    std::vector<int32_t> mTalkerQueryLengths;          //!< Active Talker query lengths on the host
+    std::vector<int32_t> mTalkerPastLengths;           //!< Committed Talker cache lengths on the host
 
     // CodePredictor engine — migrated to EngineExecutor + supporting state
     LLMEngineConfig mCodePredictorConfig;                     //!< CodePredictor LLM configuration
@@ -914,7 +916,9 @@ private:
     std::unique_ptr<SharedResources> mCodePredictorSharedRes; //!< CodePredictor cache + RoPE + zero buffer
     std::unique_ptr<PipelineIO> mCodePredictorPipelineIO;     //!< CodePredictor per-step pipeline buffers
     TensorMap mCodePredictorTensorMap;                        //!< CodePredictor engine binding map (step-invariant)
-    std::unique_ptr<StepPreparer> mCodePredictorStepPreparer; //!< CodePredictor prefill/decode metadata preparer
+    RaggedExecutionBatch mCodePredictorRaggedBatch;           //!< Reused CodePredictor ragged-metadata scratch
+    std::vector<int32_t> mCodePredictorQueryLengths;          //!< Active CodePredictor query lengths on the host
+    std::vector<int32_t> mCodePredictorPastLengths;           //!< Committed CodePredictor cache lengths on the host
 
     //! Shared GPU execution context memory for Talker and CodePredictor (kUSER_MANAGED).
     rt::Tensor mSharedExecContextMemory;

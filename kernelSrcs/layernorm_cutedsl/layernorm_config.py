@@ -33,7 +33,7 @@ The schedule is a property of the *target* SM, which must be passed in
 explicitly. It is deliberately not derived from the local device: the CuTe DSL
 AOT export runs on the build host, which is an x86 GPU for every cross-compiled
 aarch64 artifact, so a device query here resolves the wrong architecture. See
-``SCHEDULE_BY_SM`` and issue #778.
+``SCHEDULE_BY_SM``.
 """
 
 from dataclasses import dataclass
@@ -77,14 +77,13 @@ SHARED_MEMORY_PER_BLOCK_OPTIN = {
 # where the kernel has never been measured, and SM 80/100/120 are exactly where
 # the L0 numerical tests execute.
 #
-# Issue #778 measured the plugin against the decomposed TensorRT graph on the
-# three edge targets only. Every other SM keeps the vendored W schedule.
+# The plugin was measured against the decomposed TensorRT graph on the three
+# edge targets only. Every other SM keeps the vendored W schedule.
 #
-# The sealed #697-size rerun validated this selection against the decomposed
-# TensorRT path. The figures compare the earlier wide-source implementation
-# with the selected-source implementation, not a controlled same-source S/W
-# experiment, so they are validation outcomes rather than isolated schedule
-# attribution:
+# A full-size rerun validated this selection against the decomposed TensorRT
+# path. The figures compare the earlier wide-source implementation with the
+# selected-source implementation, not a controlled same-source S/W experiment,
+# so they are validation outcomes rather than isolated schedule attribution:
 #
 #   SM87  Orin  board plugin/decomposed 1.095 -> 0.498 with S
 #   SM110 Thor  board plugin/decomposed 1.204 -> 0.788 with S

@@ -677,6 +677,8 @@ def test_checkpoint_dspark_export(test_param: str, test_logger,
 
     tmp_base = tempfile.mkdtemp(prefix="dspark_base_export_")
     tmp_draft = tempfile.mkdtemp(prefix="dspark_draft_export_")
+    use_tree_base = config.is_dspark_tree
+    base_export_flag = "--dspark-tree-base" if use_tree_base else "--dspark-base"
 
     try:
         base_cmd = [
@@ -685,7 +687,7 @@ def test_checkpoint_dspark_export(test_param: str, test_logger,
             "tensorrt_edgellm.scripts.export",
             base_torch_dir,
             tmp_base,
-            "--dspark-base",
+            base_export_flag,
             "--dspark-draft-dir",
             draft_torch_dir,
         ]
@@ -729,6 +731,8 @@ def test_checkpoint_dspark_export(test_param: str, test_logger,
     base_onnx = os.path.join(llm_onnx_dir, "model.onnx")
     if not os.path.exists(base_onnx):
         pytest.fail(f"DSpark base ONNX not found: {base_onnx}")
+    if use_tree_base:
+        _verify_tree_base_inputs("DSpark", base_onnx, base_torch_dir)
 
     draft_onnx = os.path.join(draft_onnx_dir, "model.onnx")
     if not os.path.exists(draft_onnx):
@@ -742,7 +746,7 @@ def test_checkpoint_dspark_export(test_param: str, test_logger,
 
 def test_checkpoint_mtp_export(test_param: str, test_logger,
                                env_config: EnvironmentConfig):
-    """Export MTP base + draft from a single checkpoint via --mtp flag."""
+    """Export an MTP base and its embedded or paired assistant draft."""
 
     config = TestConfig.from_param_string(
         test_param, infer_checkpoint_export_model_type(test_param),

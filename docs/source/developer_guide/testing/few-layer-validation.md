@@ -112,7 +112,8 @@ that token's logits ~0.999 cosine; a few stacking along a token's path reach ~0.
 Which tokens flip is not reproducible, since neither side is bit-reproducible across runs
 (TensorRT re-picks tactics per build, and the reference MoE sums experts with an atomic
 `index_add`). It lands almost entirely in the logits: KV and recurrent state stay above
-0.9999, because one token's flip is diluted across the whole cache tensor. Hence `0.98`.
+0.99, because one token's flip is diluted across the whole cache tensor. Recipe-specific
+MoE gates therefore range from `0.95` to `0.98`; wide-vocabulary GPTQ logits use `0.96`.
 
 ---
 

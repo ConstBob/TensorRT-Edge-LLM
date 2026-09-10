@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ci_telemetry_cleanup:
+  extends: .cpu_runner_retry
   stage: setup
   image:
     name: python:3.12-alpine
@@ -20,6 +21,7 @@ ci_telemetry_cleanup:
       --root "$RUNNER_USAGE_DIR" --max-age-days 30 --active-grace-hours 24
 
 ci_telemetry_report:
+  extends: .cpu_runner_retry
   stage: report
   image:
     name: python:3.12-slim-bookworm

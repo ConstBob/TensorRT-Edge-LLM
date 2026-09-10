@@ -46,6 +46,48 @@ from .command_generation import (generate_build_commands,
 
 _ALPAMAYO_DATASET_PLACEHOLDER = "$ALPAMAYO_DATASET_DIR"
 
+_SPEC_DECODE_COMMON_PERF_COLUMNS = frozenset({
+    'spec_decode_avg_accept_length',
+    'spec_decode_acceptance_rate',
+    'spec_decode_avg_tokens_per_run',
+    'spec_decode_overall_tokens_per_second (tokens/s)',
+    'spec_decode_draft_proposal_avg_time (ms)',
+    'spec_decode_base_model_verification_avg_time (ms)',
+})
+
+_SPEC_DECODE_DRAFT_PREFILL_COLUMN = (
+    'spec_decode_draft_model_prefill_avg_time (ms)')
+_SPEC_DECODE_ACCEPTANCE_RATE_COLUMN = 'spec_decode_acceptance_rate'
+_LLM_BASIC_ACCEPTANCE_RATE_THRESHOLD = 0.30
+
+# These values prove that the runtime exercised the expected path and remain in
+# the baseline report. One-shot prefill and component timings are not stable
+# regression gates for a single request. End-to-end speculative throughput and
+# average accept length remain gated at 15%. Dataset acceptance rate uses the
+# same threshold; the one-prompt llm_basic smoke test allows 30% variance.
+_SPEC_DECODE_INFORMATIONAL_PERF_COLUMNS = frozenset({
+    'llm_prefill_avg_time_per_run (ms)',
+    'llm_prefill_avg_time_per_token (ms)',
+    'llm_prefill_tokens_per_second (tokens/s)',
+    _SPEC_DECODE_DRAFT_PREFILL_COLUMN,
+    'spec_decode_avg_tokens_per_run',
+    'spec_decode_draft_proposal_avg_time (ms)',
+    'spec_decode_base_model_verification_avg_time (ms)',
+})
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, '').strip().lower() in ('1', 'true')
+
+
+def _required_spec_decode_perf_columns(config: TestConfig) -> set[str]:
+    required = set(_SPEC_DECODE_COMMON_PERF_COLUMNS)
+    native_mtp = (config.is_mtp
+                  and not config.model_name.lower().startswith('gemma-'))
+    if (config.is_eagle and not config.is_mtp) or native_mtp:
+        required.add(_SPEC_DECODE_DRAFT_PREFILL_COLUMN)
+    return required
+
 
 def _engine_files(directory):
     if not directory or not os.path.isdir(directory):
@@ -464,8 +506,7 @@ def _try_save_baseline(config: TestConfig, test_func: str,
     entries are reported (see caller) but never written, so baselines are
     not silently polluted by ad-hoc test runs.
     """
-    if os.environ.get('BASELINE_AUTOSAVE',
-                      '').strip().lower() not in ('1', 'true'):
+    if not _env_flag('BASELINE_AUTOSAVE'):
         return
     csv_path = os.environ.get('BASELINE_CSV', 'logs/baseline.csv')
     if not result.get('success', False):
@@ -507,28 +548,36 @@ def _check_baseline_regression(config: TestConfig,
     When baseline is found, threshold_failure is cleared since baseline takes priority.
     If no baseline exists, the current result is NOT written back — baseline
     CSVs are managed externally. Set BASELINE_AUTOSAVE=1 to opt in to seeding.
+    BASELINE_REQUIRED=1 makes a missing file, entry, or required speculative
+    metric a test failure.
 
     Args:
         check_perf: only True for benchmark tests; inference skips perf comparison.
     """
     baseline = get_baseline()
     if baseline is None:
+        message = f"Required baseline file is unavailable for [{config.param_str}]"
         if logger:
             logger.info(
                 "No baseline loaded for [%s]; skipping regression check",
                 config.param_str)
         _try_save_baseline(config, test_func, result, logger)
+        if _env_flag('BASELINE_REQUIRED'):
+            result.setdefault('baseline_regressions', []).append(message)
         return False
 
     entry = baseline.find_by_param(config.param_str,
                                    test_func,
                                    model_type_value=config.model_type.value)
     if entry is None:
+        message = f"Required baseline entry is missing for [{config.param_str}]"
         if logger:
             logger.info(
                 "No baseline entry for [%s]; skipping regression check",
                 config.param_str)
         _try_save_baseline(config, test_func, result, logger)
+        if _env_flag('BASELINE_REQUIRED'):
+            result.setdefault('baseline_regressions', []).append(message)
         return False
 
     regressions = []
@@ -554,9 +603,35 @@ def _check_baseline_regression(config: TestConfig,
         # only looks at columns in PERF_LOWER/HIGHER_IS_BETTER, so extras
         # (e.g. rouge scores) are naturally ignored.
         current_perf.update(current_acc)
+        if (_env_flag('BASELINE_REQUIRED') and any(
+            (config.is_eagle, config.is_mtp, config.is_dflash,
+             config.is_jetspec, config.is_dspark))):
+            required_metrics = _required_spec_decode_perf_columns(config)
+            missing_baseline = sorted(required_metrics - entry.keys())
+            missing_current = sorted(required_metrics - current_perf.keys())
+            if missing_baseline:
+                regressions.append(
+                    "Required speculative metrics are missing from the baseline: "
+                    + ", ".join(missing_baseline))
+            if missing_current:
+                regressions.append(
+                    "Required speculative metrics are missing from the current run: "
+                    + ", ".join(missing_current))
         if current_perf:
+            is_spec_decode = any(
+                (config.is_eagle, config.is_mtp, config.is_dflash,
+                 config.is_jetspec, config.is_dspark))
+            report_only = (_SPEC_DECODE_INFORMATIONAL_PERF_COLUMNS
+                           if is_spec_decode else frozenset())
+            threshold_overrides = ({
+                _SPEC_DECODE_ACCEPTANCE_RATE_COLUMN:
+                _LLM_BASIC_ACCEPTANCE_RATE_THRESHOLD,
+            } if is_spec_decode and config.test_case == 'llm_basic' else None)
             perf_reg, perf_sum = baseline.check_perf_regression(
-                entry, current_perf)
+                entry,
+                current_perf,
+                report_only_columns=report_only,
+                threshold_overrides=threshold_overrides)
             regressions.extend(perf_reg)
             all_summaries.extend(perf_sum)
 

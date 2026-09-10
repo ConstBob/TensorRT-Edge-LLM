@@ -18,6 +18,7 @@ set -euo pipefail
 
 : "${REMOTE_WORKSPACE:?REMOTE_WORKSPACE must be set}"
 : "${CI_APT_SCRIPT:?CI_APT_SCRIPT must be set}"
+: "${BOARD_PASSWORD:?BOARD_PASSWORD must be set}"
 
 case "$REMOTE_WORKSPACE" in
   "$HOME"/tensorrt-edge-llm*) ;;
@@ -36,7 +37,7 @@ fi
 trap 'rm -rf -- "$ci_script_dir"' EXIT
 
 echo "Setting up device environment on $HOME directory"
-board_password={BOARDPASSWORD}
+board_password="$BOARD_PASSWORD"
 
 # Clean up stale tensorrt-edge-llm workspaces from previous CI runs.
 # Only remove directories older than 120 minutes to preserve workspaces

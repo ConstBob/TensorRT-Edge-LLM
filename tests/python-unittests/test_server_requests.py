@@ -802,8 +802,8 @@ def test_tool_call_delta_does_not_wait_for_native_stream_end(tmp_path):
 
 
 def test_streaming_with_tools_keeps_plain_text_incremental(client_and_llm):
-    # #719 regression: tools + tool_choice=auto + stream must not buffer a
-    # plain-text answer until generation ends.
+    # Tools with automatic selection must not buffer a plain-text streaming
+    # answer until generation ends.
     client, llm = client_and_llm
 
     def word_stream(_messages, _params, **_kwargs):
@@ -1104,9 +1104,8 @@ def _stream_logprob_request(client, case, extra):
                          ids=["off", "on", "on+top"])
 def test_streaming_logprobs_hold_across_tool_and_thinking_combos(
         client_and_llm, case, extra):
-    # #719 follow-up: both streaming paths dropped the logprobs of any delta
-    # whose bytes the tool or reasoning parser withheld, while the
-    # non-streaming path returned them for the same request.
+    # Both streaming paths must retain logprobs for deltas whose bytes the tool
+    # or reasoning parser withholds, matching the non-streaming response.
     client, llm = client_and_llm
     pieces = _LOGPROB_CASES[case]
     llm.generate_stream = _stream_with_logprobs(pieces)

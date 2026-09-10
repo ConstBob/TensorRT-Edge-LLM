@@ -4,6 +4,7 @@
 
 # Main pages job for main and release branches
 pages:
+  extends: .cpu_runner_retry
   image: 
     name: python:3.12-bookworm
     entrypoint: ['/bin/bash']

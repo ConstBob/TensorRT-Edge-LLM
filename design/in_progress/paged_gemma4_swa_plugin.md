@@ -9,9 +9,8 @@ Keeping the engine's maximum sequence length for every SWA KV cache wastes
 memory because attention never reads tokens older than the window `W`.
 
 This design adds a bounded paged-KV policy to the existing `AttentionPlugin`.
-It replaces the dense SWA cache from commit `8b2638aa` with persistent storage
-bounded by `W`, without copying or compacting the complete window each token.
-It addresses `#310`, `#367`, and `#571`.
+It replaces the dense SWA cache with persistent storage bounded by `W`, without
+copying or compacting the complete window each token.
 
 ## Support Boundary
 
@@ -83,7 +82,7 @@ The responsibilities are intentionally separate:
 | `AttentionPlugin` | Attention computation and K/V reads/writes through prepared mappings |
 
 `ManagedKVCacheRequest` is the runtime facade over the two current request
-backends. They are mutually exclusive in this MR: context reuse selects full
+backends. They are mutually exclusive in this implementation: context reuse selects full
 storage, while bounded storage is selected only when context reuse is off. The
 facade keeps prefill, decode, compaction, and finish ordering in one runtime
 lifecycle without making context reuse the owner of SWA rotation.
@@ -211,8 +210,8 @@ vision-block attention, and KV sharing. Export tests verify that one
 eligible FP16 engine carries both runtime policies, all nodes use
 `AttentionPlugin`, and FP8/speculative modes retain the full-cache fallback.
 
-Thor acceptance validation must use the current MR SHA and one Gemma4 FP16
-engine with context reuse disabled and enabled. It checks output and
+Thor acceptance validation must use the current source revision and one Gemma4
+FP16 engine with context reuse disabled and enabled. It checks output and
 benchmark-score parity, exact KV-pool allocation, runtime-ready CUDA memory,
 and five-run median decode latency. Acceptance requires material KV-pool
 savings, no functional degradation, no full-window copy per decode token, and

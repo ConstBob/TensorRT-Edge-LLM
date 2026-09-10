@@ -18,7 +18,7 @@ import json
 import os
 import shutil
 import sys
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import pytest
 from conftest import EnvironmentConfig
@@ -27,7 +27,8 @@ from pytest_helpers import run_with_trt_env, timer_context
 from .config import (ModelType, TaskType, TestConfig,
                      infer_checkpoint_export_model_type)
 from .utils.accuracy import check_accuracy_with_dataset
-from .utils.command_execution import check_result_failures
+from .utils.command_execution import (_check_baseline_regression,
+                                      check_result_failures)
 
 
 def _engine_dir(config: TestConfig) -> str:
@@ -52,6 +53,11 @@ def _speculative_build_args(config: TestConfig) -> List[str]:
         return [
             "--spec-type", "jetspec", "--draft-model-dir",
             config.get_jetspec_draft_model_dir()
+        ]
+    if config.is_dspark:
+        return [
+            "--spec-type", "dspark", "--draft-model-dir",
+            config.get_dspark_draft_model_dir()
         ]
     if config.is_eagle:
         return [
@@ -104,6 +110,9 @@ def _build_command(config: TestConfig,
         str(config.max_time_steps or 6000),
     ]
     command.extend(_speculative_build_args(config))
+    if (config.is_dflash_tree or config.is_jetspec_tree
+            or config.is_dspark_tree):
+        command.append("--tree-base")
     if tp_size > 1:
         command.extend(["--tp-size", str(tp_size), "--tp-rank", str(tp_rank)])
     if config.fp8_embedding:
@@ -113,13 +122,41 @@ def _build_command(config: TestConfig,
     return command
 
 
+def _runtime_input_file(config: TestConfig, test_logger) -> str:
+    source = config.get_test_case_file()
+    requires_greedy = (config.is_eagle or config.is_dflash_tree
+                       or config.is_jetspec_tree or config.is_dspark_tree)
+    if not requires_greedy:
+        return source
+
+    with open(source, encoding="utf-8") as stream:
+        request = json.load(stream)
+    if request.get("top_k") == 1:
+        return source
+
+    request["top_k"] = 1
+    output_json = config.get_output_json_file()
+    output_dir = os.path.dirname(output_json)
+    os.makedirs(output_dir, exist_ok=True)
+    output = f"{os.path.splitext(output_json)[0]}.input.json"
+    temporary = f"{output}.tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        json.dump(request, stream, indent=4)
+        stream.write("\n")
+    os.replace(temporary, output)
+    test_logger.info(
+        "Using greedy sampling input for speculative decoding: %s", output)
+    return output
+
+
 def _runtime_command(config: TestConfig,
                      model_dir: str,
                      engine_dir: str,
                      executables: Dict[str, str],
+                     input_file: str,
                      tp_size: int = 1) -> List[str]:
     common = [
-        f"--inputFile={config.get_test_case_file()}",
+        f"--inputFile={input_file}",
         f"--outputFile={config.get_output_json_file()}",
         "--dumpProfile",
     ]
@@ -150,13 +187,33 @@ def _runtime_command(config: TestConfig,
     ]
     if config.model_type in (ModelType.VLM, ModelType.ASR, ModelType.OMNI):
         command.append(f"--multimodalEngineDir={engine_dir}")
-    if config.is_eagle or config.is_mtp or config.is_dflash or config.is_jetspec:
+    if (config.is_eagle or config.is_mtp or config.is_dflash
+            or config.is_jetspec or config.is_dspark):
         command.extend([
             "--specDecode",
             f"--specDraftTopK={config.eagle_draft_top_k}",
             f"--specDraftStep={config.eagle_draft_step}",
             f"--specVerifySize={config.max_verify_tree_size}",
         ])
+        if config.is_dspark:
+            command.append(
+                f"--dsparkMaxProposalLen={config.max_draft_tree_size}")
+        if config.is_mtp:
+            draft_checkpoint = (config.get_gemma4_mtp_assistant_model_dir() if
+                                config.model_name.lower().startswith("gemma-")
+                                else None)
+        elif config.is_dflash:
+            draft_checkpoint = config.get_dflash_draft_model_dir()
+        elif config.is_jetspec:
+            draft_checkpoint = config.get_jetspec_draft_model_dir()
+        elif config.is_dspark:
+            draft_checkpoint = config.get_dspark_draft_model_dir()
+        elif config.is_eagle:
+            draft_checkpoint = config.get_eagle_draft_checkpoint_dir()
+        else:
+            draft_checkpoint = None
+        if draft_checkpoint:
+            command.append(f"--draftCheckpointDir={draft_checkpoint}")
     talker_dir = os.path.join(engine_dir, "talker")
     if (config.model_type == ModelType.OMNI
             and os.path.isfile(os.path.join(talker_dir, "llm.engine"))):
@@ -184,7 +241,7 @@ def _assert_component_engines(model_dir: str,
 
     bundle = BundleConfig.from_pretrained(model_dir)
     speculative = bool(config.is_eagle or config.is_mtp or config.is_dflash
-                       or config.is_jetspec)
+                       or config.is_jetspec or config.is_dspark)
     expected = []
     if tp_size > 1:
         # A tensor-parallel build emits the LLM component alone, one per rank.
@@ -267,12 +324,13 @@ def _assert_runtime_contract(config: TestConfig, engine_dir: str,
 
 
 def _run(command: List[str], name: str, timeout: int, env_config,
-         test_logger) -> None:
+         test_logger) -> Dict[str, Any]:
     test_logger.info("Starting %s", name)
     result = run_with_trt_env(command, None, timeout, test_logger, env_config)
     if not result["success"]:
         pytest.fail(
             f"{name} failed: {result.get('error') or result['output']}")
+    return result
 
 
 def test_build_and_run(test_param: str, executable_files: Dict[str, str],
@@ -285,7 +343,7 @@ def test_build_and_run(test_param: str, executable_files: Dict[str, str],
     config.check_trt_native_attn()
     tp_size = config.tp_size or 1
     if tp_size > 1 and (config.is_eagle or config.is_mtp or config.is_dflash
-                        or config.is_jetspec):
+                        or config.is_jetspec or config.is_dspark):
         pytest.fail(
             "Tensor-parallel direct builds do not support speculative decoding."
         )
@@ -307,10 +365,12 @@ def test_build_and_run(test_param: str, executable_files: Dict[str, str],
                 test_logger)
         _assert_component_engines(model_dir, engine_dir, config, tp_size)
 
-        _run(
+        input_file = _runtime_input_file(config, test_logger)
+        runtime_result = _run(
             _runtime_command(config, model_dir, engine_dir, executable_files,
-                             tp_size), "single end-to-end runtime execution",
-            6000, env_config, test_logger)
+                             input_file, tp_size),
+            "single end-to-end runtime execution", 6000, env_config,
+            test_logger)
 
     output_file = config.get_output_json_file()
     with open(output_file, encoding="utf-8") as stream:
@@ -320,4 +380,12 @@ def test_build_and_run(test_param: str, executable_files: Dict[str, str],
     reference = config.get_reference_json_file() or config.get_test_case_file()
     accuracy = check_accuracy_with_dataset(output_file, reference,
                                            config.test_case, test_logger)
-    check_result_failures(accuracy)
+    runtime_result.update(accuracy)
+    if (config.is_eagle or config.is_mtp or config.is_dflash
+            or config.is_jetspec or config.is_dspark):
+        _check_baseline_regression(config,
+                                   "test_build_and_run",
+                                   runtime_result,
+                                   test_logger,
+                                   check_perf=True)
+    check_result_failures(runtime_result)

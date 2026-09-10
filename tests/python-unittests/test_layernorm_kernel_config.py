@@ -161,9 +161,9 @@ def test_measured_edge_targets_use_the_selected_staged_schedule(
         target_sm, hidden_size):
     """Orin and Thor keep the schedule validated over the full perf matrix.
 
-    Issue #778 compared the selected-source plugin with the decomposed TensorRT
-    path. This pins the validated selection without claiming the cross-source
-    result is a controlled same-source S/W experiment.
+    The selected-source plugin was compared with the decomposed TensorRT path.
+    This pins the validated selection without claiming the cross-source result
+    is a controlled same-source S/W experiment.
     """
     assert layernorm_config.select_schedule(target_sm, hidden_size) == "S"
     assert layernorm_config.layernorm_config(target_sm, _FP16_WIDTH,

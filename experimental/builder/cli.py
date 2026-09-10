@@ -177,7 +177,8 @@ def _speculative_build_plan(args: argparse.Namespace, bundle, components):
             args,
             spec_role=contracts.SpecRole.BASE.value,
             draft_model_dir=(draft_model_dir if args.spec_type
-                             in ("eagle3", "dflash", "dspark") else None),
+                             in ("eagle3", "dflash", "jetspec",
+                                 "dspark") else None),
             target_model_dir=None,
         )
         draft_args = _copy_args(

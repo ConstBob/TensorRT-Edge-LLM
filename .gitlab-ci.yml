@@ -79,6 +79,7 @@ workflow:
   name: "$EDGE_LLM_PIPELINE_NAME"
   auto_cancel:
     on_new_commit: none
+    on_job_failure: all
   rules:
     # Skip draft MRs completely
     - if: $CI_MERGE_REQUEST_TITLE =~ /^(\[Draft\]|\(Draft\)|Draft:)/
@@ -152,6 +153,7 @@ stages:
 - setup
 - wheel-build
 - wheel-assemble
+- l0_unit
 - l0_test
 - l1_test
 - sonar

@@ -633,6 +633,9 @@ PUBLIC_CHECKPOINTS_BY_HF_ID = {
                 "VITFP8",
                 "VITFP8-FP8-KV",
             ),
+            "paths": {
+                "NVFP4": ("models/Qwen3-VL-2B-Instruct-NVFP4", ),
+            },
         },
     },
     "Qwen/Qwen3-VL-4B-Instruct": {

@@ -25,19 +25,14 @@
 
 get-sonar-scanner:
   stage: sonar
-  extends: .sonar_root_job
+  extends:
+    - .sonar_root_job
+    - .cpu_runner_retry
   image:
     name: artifactory.nvidia.com/docker-remote/sonarsource/sonar-scanner-cli:latest
     entrypoint: [""]
   tags:
     - cpu-k8s
-  retry:
-    max: 2
-    when:
-      - api_failure
-      - runner_system_failure
-      - stuck_or_timeout_failure
-
   artifacts:
     when: always
     paths:
@@ -61,7 +56,7 @@ build-sonar:
   # Scanner acquisition and SonarQube outages use EX_TEMPFAIL.
   allow_failure:
     exit_codes: 75
-  timeout: 30 minutes
+  timeout: 45 minutes
   needs:
     - job: pre_commit_checks
       artifacts: false
@@ -74,13 +69,13 @@ build-sonar:
   variables:
     CUDA_VERSION: "13.0"
     TRT_CUDA_VERSION: "13.2"
-    ENABLE_CUTE_DSL: "fmha;gdn"
-    CUTE_DSL_ARTIFACT_TAG: "sm_120"
+    ENABLE_CUTE_DSL: ALL
+    CUTE_DSL_ARTIFACT_TAG: "sm_80"
     CI_PIP_INSTALL_TIMEOUT_SECONDS: "300"
     IMAGE: artifactory.nvidia.com/sw-tensorrt-docker-local/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
   tags:
-    - rtx5080-edgellm-nvks
+    - a30-edgellm-nvks
   image: "$IMAGE"
   artifacts:
     when: always
@@ -102,6 +97,8 @@ build-sonar:
       sh .gitlab/ci/scripts/ci_run.sh "$CI_JOB_PHASE_TIMEOUT_SECONDS"
       "Generate coverage" -- scripts/run_coverage.sh
       --trt-package-dir "$TRT_PACKAGE_DIR" --cuda-version "$CUDA_VERSION"
+      --ctest-regex
+      "^(unitTestCommon|unitTestRuntime|unitTestRuntimeState|unitTestContextCache|unitTestPlugins|unitTestExamples)$"
     - |
       if ! grep -qx ready sonar-scanner.status; then
         echo "WARNING: SonarScanner is unavailable; skipping source analysis"
@@ -116,7 +113,9 @@ build-sonar:
 
 sonar-results:
   stage: sonar
-  extends: .sonar_job
+  extends:
+    - .sonar_job
+    - .cpu_runner_retry
   allow_failure: true
   image: python:3.12-slim-bookworm
   timeout: 10 minutes
