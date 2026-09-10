@@ -3467,7 +3467,7 @@ bool Qwen3OmniTTSRuntime::encodeVoiceCloneReference(
 
     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
     check::check(mCloneEncoders->speakerEmbeddingDim() == hiddenSize, "speaker encoder dim != talker hidden");
-    if (!mCloneEncoders->extractSpeakerEmbedding(pcm.samples, mVoiceCloneXVector, stream))
+    if (!mCloneEncoders->extractSpeakerEmbedding(*pcm.samples, mVoiceCloneXVector, stream))
     {
         return false;
     }
@@ -3482,7 +3482,7 @@ bool Qwen3OmniTTSRuntime::encodeVoiceCloneReference(
         "ICL cloning needs speech_tokenizer_encoder.engine with matching code groups");
 
     int32_t numFrames = 0;
-    if (!mCloneEncoders->encodeReferenceCodes(pcm.samples, numFrames, stream))
+    if (!mCloneEncoders->encodeReferenceCodes(*pcm.samples, numFrames, stream))
     {
         return false;
     }

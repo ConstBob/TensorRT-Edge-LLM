@@ -30,10 +30,10 @@ namespace rt
 namespace audioUtils
 {
 
-//! Audio input container. Holds raw mono FP32 PCM (host) decoded from
-//! ``.wav`` / ``.mp3`` / ``.flac`` by ``audioLoader``. The audio runner
-//! reads ``pcm``, extracts mel internally per its ``audio/config.json``,
-//! and consumes the resulting GPU mel.
+//! Audio input container. Holds raw mono FP32 PCM (host), either decoded
+//! from ``.wav`` / ``.mp3`` / ``.flac`` by ``audioLoader`` or wrapped around
+//! samples the caller holds. The audio runner reads ``pcm``, extracts mel
+//! internally per its ``audio/config.json``, and consumes the resulting GPU mel.
 //!
 //! TTS-side output fields (``waveform`` / ``codebookCodes``) are
 //! documented inline.
@@ -71,6 +71,18 @@ bool loadAudioDataFromBytes(uint8_t const* bytes, size_t size, int32_t targetSam
 //!
 //! On failure ``out.pcm`` is left null, including when ``out`` arrived holding an earlier decode.
 bool loadAudioDataFromFile(std::filesystem::path const& path, int32_t targetSampleRate, AudioData& out);
+
+//! Wrap mono FP32 PCM the caller already holds. Decodes, copies and resamples
+//! nothing. Mirrors ``imageUtils::wrapImageBuffer``.
+//!
+//! The samples shall stay valid and unwritten until ``handleRequest`` returns;
+//! page-locked memory lets the online GPU fbank upload transfer asynchronously.
+//!
+//! \param samples ``[N]`` Float host tensor, owning or not, 1 <= N <= INT32_MAX.
+//! \param sampleRate Rate of the samples; the audio runner rejects a clip whose
+//!                   rate differs from its own configuration.
+//! \throws std::runtime_error if \p samples is not that, or \p sampleRate is not positive.
+AudioData wrapPcm(std::shared_ptr<rt::Tensor> samples, int32_t sampleRate);
 
 } // namespace audioUtils
 } // namespace rt

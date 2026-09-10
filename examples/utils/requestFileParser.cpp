@@ -499,7 +499,7 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                                         "Failed to decode audio file: %s (unsupported container or corrupt bytes)",
                                         audioPath.c_str()));
                                 }
-                                size_t const numSamples = audio.pcm->samples.size();
+                                int64_t const numSamples = audio.pcm->numSamples();
                                 audioBuffers.push_back(std::move(audio));
                                 LOG_INFO("Decoded audio (PCM): %s (%ld samples @ %d Hz)", audioPath.c_str(),
                                     static_cast<long>(numSamples), kTargetSampleRate);

@@ -723,9 +723,7 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readwrite("sample_rate", &audioUtils::AudioData::sampleRate)
         .def_property_readonly(
             "num_samples",
-            [](audioUtils::AudioData const& audio) {
-                return audio.pcm ? static_cast<int64_t>(audio.pcm->samples.size()) : int64_t{0};
-            },
+            [](audioUtils::AudioData const& audio) { return audio.pcm ? audio.pcm->numSamples() : int64_t{0}; },
             "Number of decoded PCM samples (0 when no PCM is attached)");
 
     m.def("load_audio_buffer_from_bytes", &loadAudioBufferFromBytes, py::arg("data"),

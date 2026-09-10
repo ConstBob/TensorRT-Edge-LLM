@@ -50,11 +50,13 @@ bool uploadHostMelFp32ToFp16Gpu(
 //! the clip length within its pre-allocated capacity; initFbankResources sizes
 //! it for the longest PCM the engine kMAX profile can consume, and
 //! tryOnlineGpuFbank gates clip length against that bound before calling.
-//! @param hostPcm Mono FP32 PCM in [-1, 1] (typically ``AudioPCM::samples``).
+//! @param hostPcm ``[N]`` Float host tensor of mono PCM in [-1, 1] (typically
+//!                ``*AudioPCM::samples``). Page-locked memory transfers
+//!                asynchronously; pageable memory is staged by the driver.
 //! @param devOut  Pre-allocated GPU tensor, Float; reshaped to ``[N]``.
 //! @param stream  CUDA stream for the async H2D copy.
-//! @return true on success, false on empty input or insufficient capacity.
-bool uploadHostPcmF32ToGpu(std::vector<float> const& hostPcm, rt::Tensor& devOut, cudaStream_t stream);
+//! @return true on success, false on empty or non-host-Float input, or insufficient capacity.
+bool uploadHostPcmF32ToGpu(rt::Tensor const& hostPcm, rt::Tensor& devOut, cudaStream_t stream);
 
 //! Cast a host FP32 mel filter ``[nMel, nFreq]`` (row-major) into the
 //! ``[nMel, kPad]`` Half K-major layout the CuTe DSL mel GEMM A-matrix

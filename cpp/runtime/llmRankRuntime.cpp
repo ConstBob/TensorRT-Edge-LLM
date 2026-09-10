@@ -2632,10 +2632,11 @@ bool LLMRankRuntime::multiModalRuntimePreprocess(LLMGenerationRequest const& req
             {
                 for (auto const& audio : req.audioBuffers)
                 {
-                    if (audio.pcm && !audio.pcm->samples.empty())
+                    if (audio.pcm && audio.pcm->numSamples() > 0)
                     {
-                        auto const* rawPtr = reinterpret_cast<char const*>(audio.pcm->samples.data());
-                        size_t const rawBytes = audio.pcm->samples.size() * sizeof(float);
+                        rt::Tensor const& samples = *audio.pcm->samples;
+                        auto const* rawPtr = reinterpret_cast<char const*>(samples.dataPointer<float>());
+                        size_t const rawBytes = static_cast<size_t>(audio.pcm->numSamples()) * sizeof(float);
                         audioHashes.push_back(hashOpaqueIdentity(std::string_view(rawPtr, rawBytes), stream, false));
                     }
                     else

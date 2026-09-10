@@ -82,10 +82,11 @@ std::vector<Hash128> buildPerPositionMediaHash(std::vector<int32_t> const& token
     audioHashes.reserve(audioBuffers.size());
     for (auto const& audio : audioBuffers)
     {
-        if (audio.pcm && !audio.pcm->samples.empty())
+        if (audio.pcm && audio.pcm->numSamples() > 0)
         {
-            size_t const totalBytes = audio.pcm->samples.size() * sizeof(float);
-            std::string_view const bytes(reinterpret_cast<char const*>(audio.pcm->samples.data()), totalBytes);
+            Tensor const& samples = *audio.pcm->samples;
+            size_t const totalBytes = static_cast<size_t>(audio.pcm->numSamples()) * sizeof(float);
+            std::string_view const bytes(reinterpret_cast<char const*>(samples.dataPointer<float>()), totalBytes);
             audioHashes.push_back(hashOpaqueIdentity(bytes, stream, false));
         }
         else
