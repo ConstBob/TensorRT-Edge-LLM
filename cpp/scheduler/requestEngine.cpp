@@ -154,9 +154,8 @@ RequestEngine::RequestEngine(std::unique_ptr<LLMInferenceRuntime> runtime, cudaS
         "maxBatchSize " + std::to_string(config.maxBatchSize) + " exceeds the engine's built batch size "
             + std::to_string(mRuntime->maxBatchSize()) + ".");
 
-    LLMInferenceRuntime* const runtimePtr = mRuntime.get();
-    mBeginStepped = [runtimePtr](LLMGenerationRequest& request, cudaStream_t stream) {
-        return runtimePtr->beginStepped(request, stream);
+    mBeginStepped = [this](LLMGenerationRequest& request, cudaStream_t stream) {
+        return mRuntime->beginStepped(request, mResidentRecord->id, stream);
     };
     start();
 }
@@ -745,7 +744,7 @@ void RequestEngine::runResidentSteppedRequest()
                     bool admitted = false;
                     try
                     {
-                        AdmissionResult const decision = execution.admit(*head.request, index);
+                        AdmissionResult const decision = execution.admit(*head.request, index, head.record->id);
                         if (decision.status == AdmissionResult::Status::kNoCapacity)
                         {
                             // Transient pressure: the head keeps its place and is offered again next tick.
