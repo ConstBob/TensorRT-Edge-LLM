@@ -84,6 +84,7 @@ and action models on NVIDIA edge platforms.
 
    developer_guide/models/cosmos3.md
    developer_guide/models/nemotron3_5_asr.md
+   developer_guide/models/pi05.md
 
 .. toctree::
    :maxdepth: 2

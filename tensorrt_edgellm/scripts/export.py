@@ -350,6 +350,12 @@ def _is_cosmos3_checkpoint(model_dir: str) -> bool:
     return isinstance(class_name, str) and class_name.startswith("Cosmos3")
 
 
+def _is_pi05_checkpoint(model_dir: str) -> bool:
+    """Detect a converted openpi pi0.5 checkpoint."""
+    from ..models.pi05.weights import is_pi05_checkpoint
+    return is_pi05_checkpoint(model_dir)
+
+
 def _get_llm_text_config(config: dict) -> dict:
     """Return the promoted text/LLM config dict when present."""
     for key in ("text_config", "llm_config", "language_config"):
@@ -3985,8 +3991,35 @@ def main() -> None:
          "exports every component the checkpoint supports. Recognized values: "
          "thinker, mtp_draft, talker, code_predictor, visual, audio, "
          "code2wav, action; for Cosmos3 checkpoints: und_prefill, gen, "
-         "vae_encoder. Useful for re-running a single stage, e.g. "
-         "``--components code_predictor`` to refresh only the CodePredictor."),
+         "vae_encoder; for pi0.5 checkpoints: visual, prefix, action. Useful "
+         "for re-running a single stage, e.g. ``--components code_predictor`` "
+         "to refresh only the CodePredictor."),
+    )
+    p.add_argument(
+        "--pi05-hoist-adarms-cond",
+        dest="pi05_hoist_adarms_cond",
+        action="store_true",
+        default=True,
+        help=("pi0.5 only: hoist the AdaRMS modulation out of the per-step "
+              "action graph into a one-shot ``cond`` component, so the 37 "
+              "modulation Dense weights are read once per schedule "
+              "configuration instead of once per denoise step. On by default; "
+              "kept for existing scripts."),
+    )
+    p.add_argument(
+        "--no-pi05-hoist-adarms-cond",
+        dest="pi05_hoist_adarms_cond",
+        action="store_false",
+        help=("pi0.5 only: keep the modulation inside the per-step action "
+              "graph and export no ``cond`` component."),
+    )
+    p.add_argument(
+        "--pi05-denoise-steps",
+        type=int,
+        default=None,
+        help=("pi0.5 only: number of flow-matching denoise steps to export "
+              "for. Overrides the checkpoint's num_inference_steps; when "
+              "omitted the checkpoint value is used."),
     )
     p.add_argument(
         "--task",
@@ -4458,6 +4491,20 @@ def main() -> None:
                     "cosmos3_edge",
                     dtype,
                     model_config=load_model_config(model_dir))
+        return
+
+    # pi0.5 checkpoints carry no ``model_type``, share their variant fields with pi0, and
+    # lack the standard LLM config fields, so the architecture is resolved from the weight
+    # signature and dispatched here rather than through ModelConfig.
+    if _is_pi05_checkpoint(model_dir):
+        from ..models.pi05.export import export_pi05_components
+        requested = [c for c in args.components.split(",") if c] or None
+        export_pi05_components(model_dir,
+                               args.output_dir,
+                               components=requested,
+                               dtype=dtype,
+                               num_denoise_steps=args.pi05_denoise_steps,
+                               hoist_adarms_cond=args.pi05_hoist_adarms_cond)
         return
 
     has_mtp_draft = _has_mtp(config)

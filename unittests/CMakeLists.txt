@@ -205,6 +205,21 @@ edgellm_add_unit_test(
 edgellm_add_unit_test(NAME unitTestCuteDslKernels DIRS
                       kernelSrcs/int4_fp16_gemm_cutedsl)
 
+# The pi0.5 runtime lives outside edgellmCore and is only configured when
+# BUILD_EXPERIMENTAL_MODELS is on. Register the directory either way, so the
+# orphan sweep below does not flag tests this configuration deliberately skips.
+if(TARGET pi05Experimental)
+  edgellm_add_unit_test(NAME unitTestPi05 DIRS experimental_models/pi05)
+  # edgellmBuilder is not part of edgellmCore, and the export-identity tests
+  # reach the pi0.5 component builder.
+  target_link_libraries(unitTestPi05 PRIVATE pi05Experimental edgellmBuilder)
+  target_include_directories(
+    unitTestPi05 PRIVATE ${CMAKE_SOURCE_DIR}/experimental_models/pi05/cpp)
+else()
+  set_property(GLOBAL APPEND PROPERTY EDGELLM_REGISTERED_TEST_DIRS
+                                      experimental_models/pi05)
+endif()
+
 edgellm_add_unit_test(NAME unitTestExamples DIRS examples/utils)
 target_include_directories(unitTestExamples
                            PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
