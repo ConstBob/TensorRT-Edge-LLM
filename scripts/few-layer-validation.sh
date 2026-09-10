@@ -108,6 +108,7 @@ RTOL=2e-2
 # golden has tokenized them (see "engine bounds" below).
 MAX_INPUT_LEN=0
 MAX_KV_CACHE_CAPACITY=0
+MAX_KV_CACHE_CAPACITY_OVERRIDDEN=0
 VERBOSE=0
 QUANTIZE_ACTIVATIONS=1
 MTP=0
@@ -135,7 +136,7 @@ while [[ $# -gt 0 ]]; do
     --atol)        ATOL="$2"; shift 2 ;;
     --rtol)        RTOL="$2"; shift 2 ;;
     --max-input-len)          MAX_INPUT_LEN="$2"; shift 2 ;;
-    --max-kv-cache-capacity)  MAX_KV_CACHE_CAPACITY="$2"; shift 2 ;;
+    --max-kv-cache-capacity)  MAX_KV_CACHE_CAPACITY="$2"; MAX_KV_CACHE_CAPACITY_OVERRIDDEN=1; shift 2 ;;
     --mtp)         MTP=1; shift ;;
     --context-reuse) CONTEXT_REUSE=1; shift ;;
     --spec-draft-step) SPEC_DRAFT_STEP="$2"; shift 2 ;;
@@ -324,6 +325,32 @@ stage_begin "2/5 EdgeLLM export"
   ${WEIGHT_ONLY_ARGS[@]+"${WEIGHT_ONLY_ARGS[@]}"} \
   ${MTP_EXPORT_ARGS[@]+"${MTP_EXPORT_ARGS[@]}"}
 stage_end
+
+# A sliding-window model (e.g. Gemma4) can bake a per-layer kv_cache_capacity into the
+# export that exceeds the prompt-derived bound above -- llmBuilder.cpp rejects any layer
+# whose capacity is greater than --maxKVCacheCapacity. Raise the bound to cover it rather
+# than truncating the model's native window, unless the caller explicitly pinned a value.
+if [[ "${MAX_KV_CACHE_CAPACITY_OVERRIDDEN}" -eq 0 ]]; then
+  NATIVE_KV_CACHE_CAPACITY="$("${PYBIN}" - "${EXPORT_DIR}/llm/config.json" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    cfg = json.load(f)
+layers = cfg.get("kv_layer_configs") or []
+capacities = [lc.get("kv_cache_capacity", 0) for lc in layers if lc]
+print(max(capacities, default=0))
+PY
+  )"
+  if (( NATIVE_KV_CACHE_CAPACITY >= MAX_KV_CACHE_CAPACITY )); then
+    # A page of headroom beyond the native capacity, not just up to it: the exported graph
+    # bakes in swa_kv_page_table / swa_kv_cache_mode inputs whenever any layer's capacity is
+    # bounded, and llmBuilder.cpp requires those markers to agree with the engine actually
+    # having a *reduced* (strictly smaller than max) pool -- an exact match reads as "no
+    # reduction" and the graph/builder markers disagree.
+    MAX_KV_CACHE_CAPACITY="$(( $(round_up "${NATIVE_KV_CACHE_CAPACITY}" 128) + 128 ))"
+    echo "[few-layer] raised maxKVCacheCapacity to ${MAX_KV_CACHE_CAPACITY} to fit the" \
+      "export's native per-layer kv_cache_capacity=${NATIVE_KV_CACHE_CAPACITY}"
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # 3. EdgeLLM build
