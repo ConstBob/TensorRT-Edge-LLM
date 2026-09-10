@@ -114,6 +114,14 @@ _FEW_LAYER_MODELS = {
         "needs_cutedsl": True,
         "timeout": 3600,
     },
+    # Gemma4 dense. First 4 layers are sliding-window attention, run through the
+    # CuTe DSL FMHA-v2 vision-block kernel (validated at cos 0.99972).
+    "gemma-4-12B-it": {
+        "dir_name": "gemma/gemma-4-12B-it",
+        "num_layers": 4,
+        "cos_threshold": 0.99,
+        "needs_cutedsl": True,
+    },
 }
 
 

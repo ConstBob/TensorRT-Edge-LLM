@@ -20,6 +20,7 @@ tests:
   # managed context cache.
   - tests/defs/test_few_layer_validation.py::test_few_layer_validation[Qwen3.5-0.8B-MTP]
   - tests/defs/test_few_layer_validation.py::test_few_layer_validation[Qwen3.5-0.8B-ContextReuse]
+  - tests/defs/test_few_layer_validation.py::test_few_layer_validation[gemma-4-12B-it]
 
   - tests/defs/test_llm_pipeline.py::test_engine_build[NVIDIA-Nemotron-3-Nano-4B-NVFP4-nvfp4-mxsl4096-mxbs2-mxil2048]
   - tests/defs/test_llm_pipeline.py::test_inference[NVIDIA-Nemotron-3-Nano-4B-NVFP4-nvfp4-mxsl4096-mxbs2-mxil2048-llm_basic]

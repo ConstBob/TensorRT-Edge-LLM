@@ -101,6 +101,16 @@ DEFAULT_INPUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 _ADD_GENERATION_PROMPT = True
 _ENABLE_THINKING = False
 
+# Gemma4's HF chat template appends an empty thought-channel stub
+# ("<|channel>thought\n<channel|>") to the generation prompt whenever
+# enable_thinking=False. EdgeLLM's exported chat template intentionally omits
+# it (see tensorrt_edgellm/chat_templates/gemma4.json), so the golden must
+# strip it too or the two sides' prefill lengths diverge.
+_GEMMA4_MODEL_TYPES = {
+    "gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text"
+}
+_GEMMA4_THOUGHT_STUB = "<|channel>thought\n<channel|>"
+
 _ATTENTION_BLOCK_TYPES = {
     "full_attention", "sliding_attention", "chunked_attention"
 }
@@ -194,7 +204,22 @@ _DTYPE_MAP = {
 }
 
 
-def _tokenize_request(tokenizer, messages: list, opts: dict) -> list[int]:
+def _is_gemma4_family(ckpt: str) -> bool:
+    """Detect Gemma4 (incl. unified multimodal) checkpoints via config.json::model_type."""
+    try:
+        with open(os.path.join(ckpt, "config.json"), encoding="utf-8") as f:
+            root = json.load(f)
+    except (OSError, ValueError):
+        return False
+    model_type = root.get("model_type") or root.get("text_config",
+                                                    {}).get("model_type")
+    return model_type in _GEMMA4_MODEL_TYPES
+
+
+def _tokenize_request(tokenizer,
+                      messages: list,
+                      opts: dict,
+                      strip_gemma4_thought_stub: bool = False) -> list[int]:
     """Tokenize one request's messages the way EdgeLLM's applyChatTemplate would.
 
     ``opts`` carries the input JSON's ``apply_chat_template`` / ``add_generation_prompt`` /
@@ -231,7 +256,13 @@ def _tokenize_request(tokenizer, messages: list, opts: dict) -> list[int]:
             tokenize=True)
     if hasattr(res, "keys"):  # BatchEncoding / dict -> take input_ids
         res = res["input_ids"]
-    return list(res)
+    ids = list(res)
+    if strip_gemma4_thought_stub:
+        stub = tokenizer(_GEMMA4_THOUGHT_STUB,
+                         add_special_tokens=False)["input_ids"]
+        if stub and ids[-len(stub):] == stub:
+            ids = ids[:-len(stub)]
+    return ids
 
 
 def main() -> None:
@@ -272,9 +303,10 @@ def main() -> None:
         "enable_thinking":
         bool(req_cfg.get("enable_thinking", _ENABLE_THINKING)),
     }
+    strip_gemma4_thought_stub = _is_gemma4_family(ckpt)
     id_lists = [
-        _tokenize_request(tokenizer, r["messages"], template_opts)
-        for r in requests
+        _tokenize_request(tokenizer, r["messages"], template_opts,
+                          strip_gemma4_thought_stub) for r in requests
     ]
     enc = tokenizer.pad({"input_ids": id_lists},
                         padding=True,
