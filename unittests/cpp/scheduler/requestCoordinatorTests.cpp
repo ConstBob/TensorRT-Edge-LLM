@@ -45,7 +45,7 @@ public:
         return {};
     }
 
-    AdmissionResult admit(LLMGenerationRequest const&, int32_t) override
+    AdmissionResult admit(LLMGenerationRequest const&, int32_t, RequestId) override
     {
         return {AdmissionResult::Status::kRejected, {}, "not under test"};
     }
@@ -70,6 +70,8 @@ public:
         response.outputIds = {result.tokenIds};
         return response;
     }
+
+    void abort() noexcept override {}
 
     bool finish(LLMGenerationResponse&) override
     {

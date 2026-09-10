@@ -147,6 +147,7 @@ struct FakeScript
 
     std::atomic<int32_t> batches{0};
     std::atomic<int32_t> admissions{0};
+    std::atomic<RequestId> lastAdmittedRequestId{kInvalidRequestId};
     std::atomic<int32_t> completed{0};
     std::atomic<int32_t> decodes{0};
 };
@@ -174,7 +175,7 @@ public:
         return refs;
     }
 
-    AdmissionResult admit(LLMGenerationRequest const& request, int32_t) override
+    AdmissionResult admit(LLMGenerationRequest const& request, int32_t, RequestId requestId) override
     {
         if (mScript.refusalsLeft > 0)
         {
@@ -186,6 +187,7 @@ public:
             return {AdmissionResult::Status::kRejected, {}, "the fake batch rejects joiners"};
         }
         mScript.admissions.fetch_add(1);
+        mScript.lastAdmittedRequestId.store(requestId);
         return {AdmissionResult::Status::kAdmitted, seat(request, /*joiner=*/true), {}};
     }
 
@@ -256,6 +258,11 @@ public:
         response.outputTexts.push_back(prompt == mPrompts.end() ? "materialized" : prompt->second);
         response.finishReasons.push_back(result.terminalReason);
         return response;
+    }
+
+    void abort() noexcept override
+    {
+        mResidents.clear();
     }
 
     bool finish(LLMGenerationResponse&) override
@@ -1115,6 +1122,7 @@ TEST(RequestEngineTests, AdmitsAQueuedRequestMidFlightAndPublishesItsResult)
     EXPECT_EQ(script.batches.load(), 1) << "the joiner shared the founder's batch";
     EXPECT_EQ(script.admissions.load(), 1);
     EXPECT_EQ(engine.metrics().admittedMidFlight, 1U);
+    EXPECT_EQ(script.lastAdmittedRequestId.load(), joiner.id());
 }
 
 TEST(RequestEngineTests, AnEvictedFounderIsPublishedBeforeTheBatchDrains)
