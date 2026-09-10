@@ -18,6 +18,7 @@
 #pragma once
 
 #include "common/pagedKvTypes.h"
+#include "runtime/exec/scheduledStep.h"
 
 #include <cuda_runtime_api.h>
 
@@ -56,6 +57,7 @@ inline bool operator==(SwaPageBinding const& lhs, SwaPageBinding const& rhs) noe
 //! but it does not own window rotation.
 struct SwaKVCacheState
 {
+    ResidentRef resident;
     int32_t pageSizeTokens{};
     int32_t windowSizeTokens{};
     int32_t exactResidentTokenCount{};
@@ -115,7 +117,7 @@ public:
     BoundedSwaKVPageManager(BoundedSwaKVPageManager const&) = delete;
     BoundedSwaKVPageManager& operator=(BoundedSwaKVPageManager const&) = delete;
 
-    BeginRequestResult beginRequest(int32_t batchSize, cudaStream_t stream);
+    BeginRequestResult beginRequest(std::vector<ResidentRef> const& residents, cudaStream_t stream);
     SwaKVCacheStatus preparePrefill(RequestHandle& request, std::vector<int32_t> const& inputLengths);
     SwaKVCacheStatus completePrefill(RequestHandle& request);
     SwaKVCacheStatus prepareDecodeStep(RequestHandle& request);

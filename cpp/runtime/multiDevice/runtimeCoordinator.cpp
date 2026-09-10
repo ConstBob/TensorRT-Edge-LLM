@@ -984,8 +984,9 @@ bool RuntimeCoordinator::supportsSteppedExecution() const noexcept
 }
 
 std::unique_ptr<SteppedExecution> RuntimeCoordinator::beginStepped(
-    LLMGenerationRequest const& request, bool enableProfiling, cudaStream_t stream)
+    LLMGenerationRequest const& request, RequestId requestId, bool enableProfiling, cudaStream_t stream)
 {
+    ELLM_CHECK(requestId != 0, "Stepped execution requires a nonzero request ID.");
     if (mInlineSingleRank)
     {
         int32_t const rank = mLocalRanks.front();
@@ -1003,7 +1004,7 @@ std::unique_ptr<SteppedExecution> RuntimeCoordinator::beginStepped(
             LOG_ERROR("[stepped] Failed to prepare request: %s", e.what());
             return nullptr;
         }
-        return SteppedRequest::begin(*mRuntimes[rank], std::move(prepared), executionStream);
+        return SteppedRequest::begin(*mRuntimes[rank], std::move(prepared), requestId, executionStream);
     }
 
     ELLM_CHECK(false,

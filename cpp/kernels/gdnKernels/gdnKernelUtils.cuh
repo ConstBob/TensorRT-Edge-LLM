@@ -50,4 +50,16 @@ cudaError_t launchGdnL2NormQKFusedSm12x(
  *  numBlocks = n * hv,  dim = head_dim (128). */
 void launchGdnStateTranspose(void const* src, void* dst, int32_t numBlocks, int32_t dim, cudaStream_t stream);
 
+/** Gather selected resident rows while transposing each state matrix from K-major to V-major. */
+void launchGdnStateGatherTranspose(void const* src, void* dst, void const* stateIndices, int32_t batchSize,
+    int32_t statePoolRows, int32_t numHeads, int32_t dim, cudaStream_t stream);
+
+/** Gather selected resident state rows without changing matrix layout. */
+void launchGdnStateGather(void const* src, void* dst, void const* stateIndices, int32_t batchSize, int32_t numHeads,
+    int32_t statePoolRows, int32_t kDim, int32_t vDim, cudaStream_t stream);
+
+/** Transpose selected resident state matrices in place with paired shared-memory tiles. */
+void launchGdnStateIndexedTransposeInPlace(void* state, void const* stateIndices, int32_t batchSize,
+    int32_t statePoolRows, int32_t numHeads, int32_t dim, cudaStream_t stream);
+
 } // namespace trt_edgellm

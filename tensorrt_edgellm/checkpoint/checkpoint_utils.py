@@ -535,9 +535,9 @@ def build_runtime_llm_config_dict(
             },
         })
 
-    attention_layer_types = (getattr(config, "attention_layer_types", [])
-                             if str(config.model_type).startswith("gemma4")
-                             else [])
+    attention_layer_types = (getattr(config, "attention_layer_types", []) if
+                             (str(config.model_type).startswith("gemma4")
+                              or config.is_diffusion_gemma) else [])
 
     # Heterogeneous head dimensions (e.g. Gemma4: sliding=256, global=512)
     if config.global_head_dim and config.global_head_dim != config.head_dim:

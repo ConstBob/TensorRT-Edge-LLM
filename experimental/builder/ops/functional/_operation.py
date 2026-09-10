@@ -30,11 +30,6 @@ def operation_attributes(name: str) -> frozenset[str]:
     return current_net().operation_attributes(name)
 
 
-def supports_operation_attribute(name: str, attribute: str) -> bool:
-    """Whether the active operation implementation accepts ``attribute``."""
-    return attribute in operation_attributes(name)
-
-
 def parameter(name: str, value, consumer: str, *, recipe=None) -> Tensor:
     """Create an externalized parameter input for one operation.
 

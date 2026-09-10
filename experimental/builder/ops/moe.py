@@ -409,7 +409,8 @@ class NonGatedNvfp4Experts(Module):
 
         if padded_hidden != hidden_size:
             hidden_states = F.pad_last_dim(hidden_states,
-                                           padded_hidden - hidden_size, 3)
+                                           padded_hidden - hidden_size,
+                                           hidden_states.ndim)
         output = F.nvfp4_moe(router_logits,
                              hidden_states,
                              weights,
@@ -427,5 +428,5 @@ class NonGatedNvfp4Experts(Module):
                              weight_prefix=self.prefix,
                              weight_bindings=bindings)
         if padded_hidden != hidden_size:
-            output = F.slice_last_dim(output, 0, hidden_size, 3)
+            output = F.slice_last_dim(output, 0, hidden_size, output.ndim)
         return output

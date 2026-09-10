@@ -19,6 +19,7 @@ import tensorrt as trt
 
 from ...ops import Linear, Module, RMSNorm
 from ...ops import functional as F
+from ...ops.ragged import RaggedDecoderInputs
 from ..dflash.modeling_dflash_draft import (DFlashDecoderLayer,
                                             DFlashDraftModel,
                                             DFlashTargetProjection)
@@ -44,6 +45,13 @@ def _drop_anchor_token(hidden, hidden_size: int):
     one = F.constant(np.asarray([1], dtype=np.int32), "one")
     return F.dynamic_slice(hidden, (0, one, 0),
                            (batch, block - one, hidden_size))
+
+
+def _to_block_major(hidden, query_lengths, hidden_size: int):
+    physical_tokens = F.shape_of(hidden)[0:1]
+    batch = F.shape_of(query_lengths)[0:1]
+    block = physical_tokens / batch
+    return F.dynamic_reshape(hidden, (batch, block, hidden_size))
 
 
 class DFlash2GroupedConv(Module):
@@ -102,23 +110,27 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
                                                  self.key("attention_conv"))
         self.mlp_conv = DFlash2GroupedConv(ctx, self.key("mlp_conv"))
 
-    def forward(self, hidden, hidden_delta, past, rope, context_lengths,
-                cache_start, kv_page_table, delta_lengths, attention_mask,
+    def forward(self, hidden, hidden_delta, past, rope, ragged, delta_rope,
+                delta_positions, delta_token_to_sequence, attention_mask,
                 attention_pos_id):
+        hidden_size = self.cfg.hidden_size
+        hidden = _to_block_major(hidden, ragged.query_lengths, hidden_size)
         attention_input = self.input_norm(hidden)
         attention_input, attention_post = self.attention_conv.prepare(
             attention_input)
-        attention, present = self.attention(attention_input, hidden_delta,
-                                            past, rope, context_lengths,
-                                            cache_start, kv_page_table,
-                                            delta_lengths, attention_mask,
-                                            attention_pos_id)
+        attention, present = self.attention(
+            F.dynamic_reshape(attention_input, (-1, hidden_size)),
+            hidden_delta, past, rope, ragged, delta_rope, delta_positions,
+            delta_token_to_sequence, attention_mask, attention_pos_id)
+        attention = _to_block_major(attention, ragged.query_lengths,
+                                    hidden_size)
         hidden = self.attention_conv.finish(attention, attention_post, hidden)
 
         mlp_input = self.post_norm(hidden)
         mlp_input, mlp_post = self.mlp_conv.prepare(mlp_input)
         feed_forward = self.mlp(mlp_input)
-        return self.mlp_conv.finish(feed_forward, mlp_post, hidden), present
+        hidden = self.mlp_conv.finish(feed_forward, mlp_post, hidden)
+        return F.dynamic_reshape(hidden, (-1, hidden_size)), present
 
 
 class DFlash2DraftModel(DFlashDraftModel):
@@ -141,23 +153,24 @@ class DFlash2DraftModel(DFlashDraftModel):
         self.selector_projection = Linear(
             ctx, "candidate_selector.hidden_projection", tensor_parallel=False)
 
-    def forward(self, inputs_embeds, past_key_values, rope, context_lengths,
-                cache_start, kv_page_table, base_hidden, attention_pos_id,
-                attention_mask, delta_lengths):
+    def forward(self, **io):
         # The official BF16 checkpoint's residual stream exceeds FP16 range.
         # Keep it in FP32; RMSNorm returns FP16 activations for the heavy ops.
-        hidden = inputs_embeds.cast(trt.float32)
-        delta = self.hidden_norm(self.fc(base_hidden))
+        hidden = io["inputs_embeds"].cast(trt.float32)
+        delta = self.hidden_norm(self.fc(io["base_hidden"]))
+        ragged = RaggedDecoderInputs.from_dict(io)
         present = []
         for index, layer in enumerate(self.layers):
-            hidden, cache = layer(hidden, delta, past_key_values[index], rope,
-                                  context_lengths, cache_start, kv_page_table,
-                                  delta_lengths, attention_mask,
-                                  attention_pos_id)
+            hidden, cache = layer(hidden, delta, io["past_key_values"][index],
+                                  io["rope"], ragged, io["delta_rope"],
+                                  io["delta_positions"],
+                                  io["delta_token_to_sequence"],
+                                  io["attention_mask"], io["attention_pos_id"])
             present.append(cache)
 
-        prediction_hidden = _drop_anchor_token(self.norm(hidden),
-                                               self.cfg.hidden_size)
+        hidden = _to_block_major(self.norm(hidden), ragged.query_lengths,
+                                 self.cfg.hidden_size)
+        prediction_hidden = _drop_anchor_token(hidden, self.cfg.hidden_size)
         projected = self.selector_projection(prediction_hidden).cast(
             trt.float16)
         unary_logits = self.lm_head(prediction_hidden).cast(trt.float32)

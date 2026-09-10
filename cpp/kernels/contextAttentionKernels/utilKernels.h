@@ -20,6 +20,7 @@
 #include "common/tensor.h"
 
 #include "common/cudaMacros.h"
+#include <cstddef>
 #include <cstdint>
 #include <cuda_runtime_api.h>
 
@@ -39,6 +40,20 @@ namespace kernel
 //! buffers.
 void launchBuildVisionBlockRanges(int32_t const* visionBlockIds, int32_t const* contextLengths, int32_t* blockBegin,
     int32_t* blockEnd, int32_t batchSize, int32_t seqLen, cudaStream_t stream);
+
+//! Gather token-aligned RoPE rows from a shared cache or a resident-slot cache.
+//!
+//! `sourceRows == 1` broadcasts the standard RoPE cache. Otherwise sequence
+//! `i` resolves its source row through `stateIndices[i]`. Only rows in the
+//! query intervals are gathered; padding remains zero.
+void launchGatherTokenAlignedRope(float const* source, float* output, int32_t const* positions,
+    int32_t const* queryStartOffsets, int32_t const* queryLengths, int32_t const* stateIndices, int32_t numTokens,
+    int32_t numSequences, int32_t sourceRows, int32_t cacheCapacity, int32_t rotaryDim, cudaStream_t stream);
+
+//! Scatter contiguous active rows into a resident-slot tensor using a device-side row map.
+//! Invalid resident rows are ignored.
+void launchScatterActiveRows(void const* source, void* destination, int32_t const* stateIndices, int32_t activeRows,
+    int32_t residentRows, size_t rowBytes, cudaStream_t stream);
 
 //! \brief Host-side wrapper that launches a lightweight CUDA kernel to compute prefix-sum of sequence lengths
 //! and KV cache end indices.

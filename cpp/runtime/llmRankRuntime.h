@@ -208,7 +208,8 @@ public:
         //! response. Harvested at every boundary by whoever drives the loop.
         std::unordered_map<int32_t, BatchResult> takeCompletedAtOrAbove(int32_t firstIndex) override;
 
-        AdmitDecision admitRequest(LLMGenerationRequest const& request, int32_t originalIndex) override;
+        AdmitDecision admitRequest(
+            LLMGenerationRequest const& request, int32_t originalIndex, RequestId requestId) override;
 
         LLMGenerationResponse materializeResult(
             BatchResult const& result, std::vector<std::string> const& stopStrings) const override;
@@ -227,12 +228,15 @@ public:
         struct AdmissionIntent
         {
             SlotSeed seed;
+            RequestId requestId{0};
+            std::optional<ResidentRef> resident;
         };
 
         //! Stage one: validate the request shape and produce the intent (tokenize, or run the
         //! encoder preprocess for media). Throws on requests the batch rejects outright; resident
         //! state is untouched on every path.
-        AdmissionIntent buildAdmissionIntent(LLMGenerationRequest const& request, int32_t originalIndex);
+        AdmissionIntent buildAdmissionIntent(
+            LLMGenerationRequest const& request, int32_t originalIndex, RequestId requestId);
 
         //! Stage two: reserve what the sequence needs before it owns a slot -- the generate-budget
         //! check, and under a context cache the page lease (setting the intent's prefillStart).
@@ -263,7 +267,7 @@ public:
         //! row. Throws propagate after retracting a context-cache lease, exactly as seatAdmission
         //! did. The stepped control plane calls this from admit(); the seated prefill becomes the
         //! next prefill tick.
-        PendingSeat seatSlot(SlotSeed seed);
+        PendingSeat seatSlot(AdmissionIntent intent);
 
         //! The second half: the seated batch-1 prefill, the context-cache ledger finalize, and the
         //! lookahead-token pipeline. On failure the slot is terminal from birth, exactly as in the
@@ -352,7 +356,7 @@ public:
     //! where handleRequest threw. @p request must outlive the returned object.
     std::unique_ptr<SteppedGeneration> beginGeneration(LLMGenerationRequest const& request,
         LLMGenerationResponse& response, cudaStream_t stream, bool outputThinkerEmbeddings,
-        TokenBroadcastFn tokenBroadcast, int32_t parallelRank);
+        TokenBroadcastFn tokenBroadcast, int32_t parallelRank, RequestId founderRequestId = 0);
 
     //! Everything handleRequest does after the loop: the drained-batch check, the context-cache
     //! finish, metrics, and response assembly from whatever the loop's harvests left in
@@ -466,9 +470,8 @@ public:
     //! @brief Whether this deployment can take boundary admissions via prefillSlotInPlace.
     //!
     //! False for the static refusals prefillSlotInPlace would otherwise throw on mid-request:
-    //! draft (speculative) engines, diffusion backbones, and hybrid deployments whose Mamba
-    //! state is not relocatable between batch rows. Probed once at RequestEngine construction so
-    //! an unsupported deployment falls back to the blocking path instead of failing admissions.
+    //! draft (speculative) engines, diffusion backbones, and bounded-SWA deployments. Probed once at RequestEngine
+    //! construction so an unsupported deployment falls back to the blocking path instead of failing admissions.
     bool supportsSeatedAdmission() const noexcept;
 
     //! @brief The batch dimension the engine was built with: the physical bound on how many
@@ -478,22 +481,17 @@ public:
 private:
     //! @brief Prefill one slot of a running batch without recomputing or disturbing the others.
     //!
-    //! The paged kernels use the batch position as the page-table row, so a pass over n slots can
-    //! only reach rows [0, n) -- and prefill pads every row's query to the batch's longest prompt,
-    //! so widening the pass to reach a higher row would cost every resident a full prompt's worth
-    //! of compute per admission. Instead the slot is seated at index zero for the duration of one
-    //! batch-1 prefill: host bookkeeping, page-table rows and the device KV length are exchanged
-    //! with slot zero, the ordinary prefill machinery runs, and the same exchanges restore the
-    //! seating. The restores run on failure too, so a failed prefill leaves the batch intact.
+    //! The sequence is projected to execution row zero for one batch-one prefill. Its ResidentRef
+    //! remains attached, so state_indices gathers its stable physical page-table and recurrent rows.
+    //! Only transient host bookkeeping is exchanged and restored; resident state never moves.
     //!
-    //! The kvcache_start_index binding reads the device KV lengths directly, so the seated slot
-    //! prefills from @p prefillStart down the ordinary chunked-prefill path; nothing about the
-    //! pass knows it is an admission. A non-zero start is a context-cache prefix hit: the
+    //! The execution length projection seeds kvcache_start_index from @p prefillStart. A non-zero
+    //! start is a context-cache prefix hit: the
     //! coordinator leased the slot's pages (shared prefix included) and bound its row before this
     //! call, so the pass computes only the tail the cache did not cover.
     //!
     //! @throws std::runtime_error if the deployment carries a draft engine (draft-side state has
-    //!         no swap yet) or if @p prefillStart is non-zero without a context cache to have
+    //!         no batch-one projection yet) or if @p prefillStart is non-zero without a context cache to have
     //!         leased the pages behind it.
     bool prefillSlotInPlace(DecodingInferenceContext& context, int32_t slot, int32_t prefillStart = 0,
         SlotSeed const* mediaPayload = nullptr);
@@ -544,12 +542,10 @@ private:
     std::unique_ptr<BoundedSwaKVPageManager> mBoundedSwaKVPageManager;
 
     //! Admission-scoped MRope staging ([1, maxKVCacheCapacity, rotaryDim]): the admission
-    //! preprocess writes here so the resident batch's rope rows stay intact until the seating
-    //! copies the row into place. Allocated on the first multimodal admission of an MRope
-    //! deployment; other deployments never pay for it.
+    //! preprocess writes here until the batch-one execution copies it to active-row scratch.
+    //! The ordinary ragged scatter then publishes it to the admitted ResidentRef. Allocated on the first multimodal
+    //! admission of an MRope deployment; other deployments never pay for it.
     Tensor mAdmissionMropeStage;
-    //! Row scratch for the seated prefill's MRope row exchange ([maxKVCacheCapacity, rotaryDim]).
-    Tensor mMropeRowSwapScratch;
     //! Declared after SharedResources so context-cache ownership is released before the physical buffers.
     std::unique_ptr<ContextCacheCoordinator> mContextCache;
     std::unique_ptr<PipelineIO> mPipelineIO; //!< Per-pipeline I/O tensors
@@ -609,12 +605,11 @@ private:
     rt::Tensor mHostCancellationStates; //!< Pinned host staging paired with mDeviceCancellationStates.
 
     // [4] Host pinned memory tensors for optimized CPU-GPU memory transfers
-    rt::Tensor mHostPackedTokenIds;      //!< Host pinned memory for packed token IDs
+    rt::Tensor mHostDecoderTokenIds;     //!< Pinned staging for specialized decoder token inputs
     rt::Tensor mHostSelectedTokenIds;    //!< Host pinned memory for selected token IDs from sampling
     rt::Tensor mHostOutputSpaceIds;      //!< Host pinned copy of the sampled indices taken before reduced-vocab remap
     rt::Tensor mHostSamplingUniforms;    //!< Host pinned request-stable uniforms for prefill sampling
     rt::Tensor mHostReuseKVCacheLengths; //!< Host pinned memory for reuse KV cache lengths
-
     // [5] Multimodal support tensors for audio/image token indexing
     rt::Tensor mMultimodalIndices;     //!< GPU [batchSize, seqLen] multimodal embedding indices
     rt::Tensor mHostMultimodalIndices; //!< Host pinned [batchSize, seqLen] staging for CPU-computed indices
@@ -645,12 +640,6 @@ private:
 
     //! @brief Allocate or grow logprobs tensors/workspace to cover a request that enabled numLogprobs.
     void ensureLogprobsCapacity(int32_t logprobsRows, int32_t topK);
-
-    //! @brief Restore recurrent/conv states from a cached system prompt.
-    void restoreRecurrentStates(int32_t batchIdx, SystemPromptKVCache const& cachedStates, cudaStream_t stream);
-
-    //! @brief Zero all recurrent/conv states for a given batch index.
-    void zeroRecurrentStates(int32_t batchIdx, cudaStream_t stream);
 
     // Key functions to drive the runtime, defined in a consumer-producer pattern.
     // Consume tokenized IDS as input and produce hidden states for the whole sequence and first generated token.

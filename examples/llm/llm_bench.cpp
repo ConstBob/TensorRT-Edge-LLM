@@ -24,6 +24,7 @@
 #include "common/logger.h"
 #include "common/tensor.h"
 #include "common/trtUtils.h"
+#include "kernels/speculative/dflashRuntimeKernels.h"
 #include "kernels/speculative/eagleUtilKernels.h"
 #include "multimodal/common/multimodalRunner.h"
 #include "profiling/layerProfiler.h"
@@ -32,6 +33,7 @@
 #include "runtime/config/inferencePhase.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/exec/engineExecutor.h"
+#include "runtime/exec/raggedBatchBuilder.h"
 #include "runtime/exec/tensorMap.h"
 #include "runtime/features/deepstackBinding.h"
 #include "runtime/preprocess/stepPreparer.h"
@@ -851,6 +853,7 @@ int main(int argc, char** argv)
     rt::Tensor diffusionPrevSelfConditioningEmbeds;
     rt::Tensor diffusionNextSelfConditioningEmbeds;
     rt::Tensor diffusionSelfConditioningTemperature;
+    bool useRaggedBindings{false};
 
     // Visual mode uses MultimodalRunner (unchanged from legacy)
     std::unique_ptr<rt::MultimodalRunner> visualRunner;
@@ -1146,6 +1149,7 @@ int main(int argc, char** argv)
             }
 
             rt::validateAgainstEngine(activeCfg, *executor, useDraftEngine ? "draft" : "base");
+            useRaggedBindings = executor->hasIOTensor(binding_names::kQueryStartOffsets);
 
             if (layerProfiler::LayerProfiler::getInstance().isEnabled())
             {
@@ -1168,8 +1172,12 @@ int main(int argc, char** argv)
                 resources = rt::SharedResources::createForSpecDecode(deployment, maxBatch, emptyLoraMap, stream);
                 // The bench drives no Talker, but TensorRegistry::bindAll fails on any
                 // engine I/O missing from the map, so the buffer must follow the engine.
-                io = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForSpecDecode(
-                    deployment, maxBatch, stream, executor->hasIOTensor(binding_names::kAcceptHiddenStates)));
+                bool const hasTreeParentIds = executor->hasIOTensor(binding_names::kTreeParentIds);
+                bool const hasTreeDepths = executor->hasIOTensor(binding_names::kTreeDepths);
+                ELLM_CHECK(hasTreeParentIds == hasTreeDepths,
+                    "Speculative engine must expose both tree_parent_ids and tree_depths, or neither.");
+                io = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForSpecDecode(deployment, maxBatch, stream,
+                    executor->hasIOTensor(binding_names::kAcceptHiddenStates), hasTreeParentIds && hasTreeDepths));
             }
             else
             {
@@ -1307,6 +1315,47 @@ int main(int argc, char** argv)
     int32_t const B = args.batchSize;
     bool const useDraftEngine = isDraftEngineMode(args.mode);
     int32_t const kvCacheIndex = useDraftEngine ? 1 : 0;
+    rt::LLMEngineConfig const* activeCfg
+        = needsExecutor(args.mode) ? &(useDraftEngine ? *deployment.draft : deployment.base) : nullptr;
+    std::unique_ptr<rt::RaggedBatchBuilder> raggedBatchBuilder;
+    rt::RaggedExecutionBatch raggedBatch;
+    rt::ScheduledStep raggedStep;
+    std::vector<int32_t> raggedTokens;
+    int32_t raggedPastLength{0};
+    if (useRaggedBindings)
+    {
+        rt::RaggedEngineContract const contract{rt::TokenLayoutBackend::kEntryPaddedCompatibility,
+            activeCfg->maxNumSequences, activeCfg->maxQueryLength, activeCfg->maxPhysicalTokens,
+            activeCfg->recurrentPoolRows, /*mixedStepSupported=*/false};
+        raggedBatchBuilder = std::make_unique<rt::RaggedBatchBuilder>(contract);
+        raggedBatchBuilder->reserve(raggedBatch);
+    }
+    auto prepareRaggedBenchBindings = [&](rt::SequenceWork work, int32_t queryLength) {
+        check::check(useRaggedBindings && raggedBatchBuilder != nullptr, "Ragged benchmark state is not initialized");
+        check::check(
+            B > 0 && B <= activeCfg->maxNumSequences && queryLength > 0 && queryLength <= activeCfg->maxQueryLength,
+            "Invalid ragged benchmark shape");
+        int64_t const physicalTokens = static_cast<int64_t>(B) * queryLength;
+        check::check(physicalTokens <= activeCfg->maxPhysicalTokens, "Ragged benchmark token count exceeds profile");
+        raggedTokens.assign(static_cast<size_t>(physicalTokens), 0);
+        raggedStep.id++;
+        raggedStep.sequences.resize(static_cast<size_t>(B));
+        for (int32_t batchIdx = 0; batchIdx < B; ++batchIdx)
+        {
+            raggedStep.sequences[static_cast<size_t>(batchIdx)] = rt::ScheduledSequence{
+                rt::SequenceIdentity{static_cast<rt::RequestId>(batchIdx) + 1, rt::ResidentRef{batchIdx, 1}}, work,
+                queryLength, raggedPastLength,
+                rt::HostTokenRange{raggedTokens.data(), static_cast<int32_t>(raggedTokens.size()),
+                    batchIdx * queryLength, queryLength},
+                true};
+        }
+        raggedBatchBuilder->buildInto(raggedStep, raggedBatch);
+        rt::prepareRaggedExecutionBindings(*io, *resources, *activeCfg, raggedBatch, kvCacheIndex, stream);
+        check::check(io->inputsEmbeds.reshape({raggedBatch.shape.physicalTokens, activeCfg->hiddenSize}),
+            "Ragged benchmark inputsEmbeds reshape failed");
+        check::check(io->outputLogits.reshape({raggedBatch.shape.numLogits, activeCfg->outputVocabSize}),
+            "Ragged benchmark outputLogits reshape failed");
+    };
     // DDTree build owns its own scratch; DFlash draft modes share one scratch struct
     // whose Tensors must outlive the tensorMap (which stores raw pointers into them).
     std::unique_ptr<DDTreeBuildScratch> ddtreeScratch;
@@ -1324,8 +1373,9 @@ int main(int argc, char** argv)
         LOG_INFO("Prefill mode: InputLen=%d, ReuseKVLen=%d", args.inputLen, args.reuseKVLen);
 
         // Reshape inputsEmbeds for this bench config
-        check::check(
-            io->inputsEmbeds.reshape({B, args.inputLen, deployment.base.hiddenSize}), "inputsEmbeds reshape failed");
+        check::check(io->inputsEmbeds.reshape(useRaggedBindings ? rt::Coords{B * args.inputLen, activeCfg->hiddenSize}
+                                                                : rt::Coords{B, args.inputLen, activeCfg->hiddenSize}),
+            "inputsEmbeds reshape failed");
         if (deployment.base.isDiffusionBackbone)
         {
             check::check(
@@ -1363,13 +1413,21 @@ int main(int argc, char** argv)
         }
 
         bool const kvCacheAllEmpty = (args.reuseKVLen == 0);
-        auto const dims = deployment.base.prefillDims(B, args.inputLen, kvCacheAllEmpty);
+        rt::ExecutionPhase const phase = deployment.base.isDiffusionBackbone
+            ? rt::ExecutionPhase::kDiffusionCommit
+            : (kvCacheAllEmpty ? rt::ExecutionPhase::kContextPrefill : rt::ExecutionPhase::kContextChunk);
+        auto const dims = deployment.base.prefillDims(B, args.inputLen, phase);
 
         resetState = [&]() {
+            raggedPastLength = args.reuseKVLen;
             std::memcpy(reuseKVCacheLengths.rawPointer(), reuseKVLenVec.data(), reuseKVLenVec.size() * sizeof(int32_t));
             resources->cacheManagers[kvCacheIndex]->resetForNewSequences(reuseKVCacheLengths, stream);
         };
         step = [&, dims]() {
+            if (useRaggedBindings)
+            {
+                prepareRaggedBenchBindings(rt::SequenceWork::kContext, args.inputLen);
+            }
             stepPreparer->prepare(
                 rt::InferencePhase::kPrefill, B, *resources->cacheManagers[kvCacheIndex], *io, stream);
             if (!executor->prepare(kPrefillProfile, dims, tensorMap, stream))
@@ -1387,17 +1445,24 @@ int main(int argc, char** argv)
         LOG_INFO("OSL=%d: will run %d decode steps for E2E timing", osl, decodeTokens);
         LOG_INFO(args.noCudaGraph ? "CUDA graph disabled; using non-CUDA-graph execution" : "CUDA graph enabled");
 
-        check::check(io->inputsEmbeds.reshape({B, 1, deployment.base.hiddenSize}), "inputsEmbeds reshape failed");
+        check::check(io->inputsEmbeds.reshape(useRaggedBindings ? rt::Coords{B, activeCfg->hiddenSize}
+                                                                : rt::Coords{B, 1, activeCfg->hiddenSize}),
+            "inputsEmbeds reshape failed");
 
         pastKVLenVec.assign(B, args.pastKVLen);
 
         auto const dims = deployment.base.decodeDims(B);
 
         resetState = [&]() {
+            raggedPastLength = args.pastKVLen;
             std::memcpy(reuseKVCacheLengths.rawPointer(), pastKVLenVec.data(), pastKVLenVec.size() * sizeof(int32_t));
             resources->cacheManagers[kvCacheIndex]->resetForNewSequences(reuseKVCacheLengths, stream);
         };
         step = [&, dims]() {
+            if (useRaggedBindings)
+            {
+                prepareRaggedBenchBindings(rt::SequenceWork::kDecode, /*queryLength=*/1);
+            }
             stepPreparer->prepare(rt::InferencePhase::kDecode, B, *resources->cacheManagers[kvCacheIndex], *io, stream);
             if (!executor->prepare(kDecodeProfile, dims, tensorMap, stream))
                 return false;
@@ -1405,6 +1470,10 @@ int main(int argc, char** argv)
         };
         captureGraph = [&, dims]() {
             resetState();
+            if (useRaggedBindings)
+            {
+                prepareRaggedBenchBindings(rt::SequenceWork::kDecode, /*queryLength=*/1);
+            }
             stepPreparer->prepare(rt::InferencePhase::kDecode, B, *resources->cacheManagers[kvCacheIndex], *io, stream);
             if (!executor->prepare(kDecodeProfile, dims, tensorMap, stream))
                 return false;
@@ -1415,6 +1484,13 @@ int main(int argc, char** argv)
         {
             useSequentialE2E = true;
             decodeSteps = decodeTokens;
+            if (useRaggedBindings)
+            {
+                postStep = [&](int32_t) {
+                    resources->cacheManagers[kvCacheIndex]->commitSequenceLength(/*increment=*/1, stream);
+                    ++raggedPastLength;
+                };
+            }
         }
     }
     else if (args.mode == BenchMode::kEAGLE_VERIFY)
@@ -1624,7 +1700,9 @@ int main(int argc, char** argv)
         reuseKVLenVec.assign(B, args.reuseKVLen);
 
         bool const kvCacheAllEmpty = (args.reuseKVLen == 0);
-        auto const dims = deployment.draft->prefillDims(B, args.inputLen, kvCacheAllEmpty);
+        rt::ExecutionPhase const phase
+            = kvCacheAllEmpty ? rt::ExecutionPhase::kContextPrefill : rt::ExecutionPhase::kContextChunk;
+        auto const dims = deployment.draft->prefillDims(B, args.inputLen, phase);
 
         resetState = [&]() {
             std::memcpy(reuseKVCacheLengths.rawPointer(), reuseKVLenVec.data(), reuseKVLenVec.size() * sizeof(int32_t));
@@ -1647,27 +1725,14 @@ int main(int argc, char** argv)
 
         pastKVLenVec.assign(B, args.pastKVLen);
 
-        tensorMap = rt::TensorMap{};
         DFlashDraftBenchParams const draftParams{/*.batchSize=*/B, /*.blockSize=*/args.blockSize,
             /*.deltaLen=*/args.draftDeltaLen, /*.pastKVLen=*/args.pastKVLen, /*.seed=*/args.seed};
-        buildDFlashDraftTensorMap(deployment, draftParams, *resources->cacheManagers[kvCacheIndex], *resources, *io,
-            dflashDraftScratch, tensorMap);
-        fillDFlashDraftInputs(*io, *resources->cacheManagers[kvCacheIndex], dflashDraftScratch, draftParams, stream);
+        buildDFlashDraftTensorMap(
+            deployment, draftParams, *resources->cacheManagers[kvCacheIndex], *io, dflashDraftScratch, tensorMap);
+        fillDFlashDraftInputs(deployment, *io, *resources->cacheManagers[kvCacheIndex], *resources, dflashDraftScratch,
+            draftParams, stream);
 
-        rt::InferenceDims const dims{
-            /*.batch=*/B,
-            /*.seqLen=*/args.blockSize,
-            /*.kvLen=*/deployment.draft->maxKVCacheCapacity,
-            /*.selectLen=*/args.draftDeltaLen,
-            /*.attnMaskSeqLen=*/args.blockSize,
-            /*.ropeBatch=*/1,
-            /*.packedMaskLen=*/static_cast<int64_t>(divUp(args.blockSize, 32)),
-            /*.contextMaskSelectorLen=*/0,
-            /*.startIndexLen=*/B,
-            /*.specVerifyPhaseLen=*/0,
-            /*.skipSoftmaxScaleLen=*/0,
-            /*.swaKVCacheModeLen=*/0,
-        };
+        auto const dims = deployment.draft->proposalDims(B, args.blockSize, args.draftDeltaLen);
 
         resetState = [&]() {
             std::memcpy(reuseKVCacheLengths.rawPointer(), pastKVLenVec.data(), pastKVLenVec.size() * sizeof(int32_t));
@@ -1705,27 +1770,14 @@ int main(int argc, char** argv)
                 + ") to fit the draft KV cache maximum sequence length ("
                 + std::to_string(draftCacheConfig.maxSequenceLength) + ")");
 
-        tensorMap = rt::TensorMap{};
         DFlashDraftBenchParams const draftParams{/*.batchSize=*/B, /*.blockSize=*/args.blockSize,
             /*.deltaLen=*/args.inputLen, /*.pastKVLen=*/0, /*.seed=*/args.seed};
-        buildDFlashDraftTensorMap(deployment, draftParams, *resources->cacheManagers[kvCacheIndex], *resources, *io,
-            dflashDraftScratch, tensorMap);
-        fillDFlashDraftInputs(*io, *resources->cacheManagers[kvCacheIndex], dflashDraftScratch, draftParams, stream);
+        buildDFlashDraftTensorMap(
+            deployment, draftParams, *resources->cacheManagers[kvCacheIndex], *io, dflashDraftScratch, tensorMap);
+        fillDFlashDraftInputs(deployment, *io, *resources->cacheManagers[kvCacheIndex], *resources, dflashDraftScratch,
+            draftParams, stream);
 
-        rt::InferenceDims const dims{
-            /*.batch=*/B,
-            /*.seqLen=*/args.blockSize,
-            /*.kvLen=*/deployment.draft->maxKVCacheCapacity,
-            /*.selectLen=*/args.inputLen,
-            /*.attnMaskSeqLen=*/args.blockSize,
-            /*.ropeBatch=*/1,
-            /*.packedMaskLen=*/static_cast<int64_t>(divUp(args.blockSize, 32)),
-            /*.contextMaskSelectorLen=*/0,
-            /*.startIndexLen=*/B,
-            /*.specVerifyPhaseLen=*/0,
-            /*.skipSoftmaxScaleLen=*/0,
-            /*.swaKVCacheModeLen=*/0,
-        };
+        auto const dims = deployment.draft->proposalDims(B, args.blockSize, args.inputLen);
 
         resetState = [&]() {
             std::memcpy(reuseKVCacheLengths.rawPointer(), pastKVLenVec.data(), pastKVLenVec.size() * sizeof(int32_t));
@@ -1749,6 +1801,14 @@ int main(int argc, char** argv)
         LOG_INFO("DFlash Verify mode: VerifyTreeSize=%d, PastKVLen=%d", args.verifyTreeSize, args.pastKVLen);
         LOG_INFO(args.noCudaGraph ? "CUDA graph disabled; using non-CUDA-graph execution" : "CUDA graph enabled");
 
+        check::check(B > 0 && B <= activeCfg->maxNumSequences && args.verifyTreeSize <= activeCfg->maxQueryLength
+                && B <= activeCfg->recurrentPoolRows,
+            "DFlash verify shape exceeds engine capacity");
+        int64_t const physicalTokens64 = static_cast<int64_t>(B) * args.verifyTreeSize;
+        check::check(
+            physicalTokens64 <= activeCfg->maxPhysicalTokens && physicalTokens64 <= std::numeric_limits<int32_t>::max(),
+            "DFlash verify token count exceeds engine capacity");
+        int32_t const physicalTokens = static_cast<int32_t>(physicalTokens64);
         pastKVLenVec.assign(B, args.pastKVLen);
 
         check::check(io->inputsEmbeds.reshape({B, args.verifyTreeSize, deployment.base.hiddenSize}),
@@ -1773,18 +1833,48 @@ int main(int argc, char** argv)
         resetState = [&]() {
             std::memcpy(reuseKVCacheLengths.rawPointer(), pastKVLenVec.data(), pastKVLenVec.size() * sizeof(int32_t));
             resources->cacheManagers[kvCacheIndex]->resetForNewSequences(reuseKVCacheLengths, stream);
+            if (useRaggedBindings)
+            {
+                raggedBatch.shape = {B, physicalTokens, physicalTokens, args.verifyTreeSize, 0, 0, physicalTokens};
+                raggedBatch.positions.resize(static_cast<size_t>(physicalTokens));
+                raggedBatch.queryStartOffsets.resize(static_cast<size_t>(B) + 1);
+                raggedBatch.queryLengths.assign(static_cast<size_t>(B), args.verifyTreeSize);
+                raggedBatch.pastLengths.assign(static_cast<size_t>(B), args.pastKVLen);
+                raggedBatch.attentionSequenceLengths.assign(
+                    static_cast<size_t>(B), args.pastKVLen + args.verifyTreeSize);
+                raggedBatch.stateIndices.resize(static_cast<size_t>(B));
+                raggedBatch.logitsIndices.resize(static_cast<size_t>(physicalTokens));
+                for (int32_t batchIdx = 0; batchIdx < B; ++batchIdx)
+                {
+                    int32_t const start = batchIdx * args.verifyTreeSize;
+                    raggedBatch.queryStartOffsets[static_cast<size_t>(batchIdx)] = start;
+                    raggedBatch.stateIndices[static_cast<size_t>(batchIdx)] = batchIdx;
+                    for (int32_t tokenIdx = 0; tokenIdx < args.verifyTreeSize; ++tokenIdx)
+                    {
+                        int32_t const token = start + tokenIdx;
+                        raggedBatch.positions[static_cast<size_t>(token)] = args.pastKVLen + tokenIdx;
+                        raggedBatch.logitsIndices[static_cast<size_t>(token)] = token;
+                    }
+                }
+                raggedBatch.queryStartOffsets[static_cast<size_t>(B)] = physicalTokens;
+                rt::prepareRaggedExecutionBindings(*io, *resources, *activeCfg, raggedBatch, kvCacheIndex, stream);
+                check::check(io->inputsEmbeds.reshape({physicalTokens, activeCfg->hiddenSize}),
+                    "Ragged DFlash verify inputsEmbeds reshape failed");
+                check::check(io->outputLogits.reshape({physicalTokens, activeCfg->outputVocabSize}),
+                    "Ragged DFlash verify outputLogits reshape failed");
+            }
+            kernel::launchDFlashPrepareBaseVerifyInputs(
+                resources->cacheManagers[kvCacheIndex]->getKVCacheLengths().dataPointer<int32_t>(), args.verifyTreeSize,
+                io->packedAttentionMask.dataPointer<int32_t>(), io->specDecodePositionIds.dataPointer<int32_t>(),
+                io->selectTokenIndices.dataPointer<int64_t>(), io->contextLengths.dataPointer<int32_t>(), B, stream);
+            if (!io->specTreeParentIds.isEmpty())
+            {
+                check::check(io->specTreeParentIds.reshape({B, args.verifyTreeSize}), "Tensor reshape failed");
+                check::check(io->specTreeDepths.reshape({B, args.verifyTreeSize}), "Tensor reshape failed");
+                kernel::launchDFlashBuildLinearTreeMetadata(io->specTreeParentIds.dataPointer<int32_t>(),
+                    io->specTreeDepths.dataPointer<int32_t>(), B, args.verifyTreeSize, stream);
+            }
         };
-
-        // Prepare valid verification metadata once, outside the timed loop.  A
-        // linear causal tree is a safe deterministic tree for both linear and
-        // DDTree-capable engines, and the production kernel supplies identity
-        // INT64 select indices plus matching positions, mask, and context lengths.
-        resetState();
-        kernel::launchDFlashPrepareBaseVerifyInputs(
-            resources->cacheManagers[kvCacheIndex]->getKVCacheLengths().dataPointer<int32_t>(), args.verifyTreeSize,
-            io->packedAttentionMask.dataPointer<int32_t>(), io->specDecodePositionIds.dataPointer<int32_t>(),
-            io->selectTokenIndices.dataPointer<int64_t>(), io->contextLengths.dataPointer<int32_t>(), B, stream);
-        CUDA_CHECK(cudaStreamSynchronize(stream));
 
         step = [&, dims]() {
             if (!executor->prepare(kDecodeProfile, dims, tensorMap, stream))

@@ -73,12 +73,13 @@ std::set<int32_t> parseLeadingLayers(std::string const& spec)
     return out;
 }
 
-//! Copy the first @p activeBatchSize rows (batch is the outermost dim) of a device tensor into a
-//! fresh host tensor of the same inner shape. Used for fixed-size recurrent / conv state, which —
-//! unlike the KV cache — has no sequence dimension, so the active batch is a contiguous prefix.
-Tensor copyBatchPrefix(Tensor const& src, int32_t activeBatchSize, std::string const& name)
+//! Gather persistent rows into execution order for a fixed-size recurrent or convolution state.
+Tensor copyResidentRows(Tensor const& src, std::vector<ResidentRef> const& residents, int32_t activeBatchSize,
+    std::string const& name, cudaStream_t stream)
 {
     Coords const s = src.getShape();
+    ELLM_CHECK(static_cast<int32_t>(residents.size()) >= activeBatchSize,
+        "LayerDebugger: resident mapping is smaller than the active batch");
     std::vector<int64_t> dims;
     dims.reserve(s.getNumDims());
     dims.push_back(activeBatchSize);
@@ -90,59 +91,88 @@ Tensor copyBatchPrefix(Tensor const& src, int32_t activeBatchSize, std::string c
     }
     nvinfer1::DataType const dtype = src.getDataType();
     Tensor host(Coords(dims), DeviceType::kCPU, dtype, name);
-    size_t const bytes = static_cast<size_t>(activeBatchSize) * inner * utils::getTypeSize(dtype);
-    CUDA_CHECK(cudaMemcpy(host.rawPointer(), src.rawPointer(), bytes, cudaMemcpyDeviceToHost));
+    size_t const rowBytes = static_cast<size_t>(inner) * utils::getTypeSize(dtype);
+    for (int32_t row = 0; row < activeBatchSize; ++row)
+    {
+        int32_t const slot = residents[static_cast<size_t>(row)].slot;
+        ELLM_CHECK(slot >= 0 && slot < s[0], "LayerDebugger: resident state slot is out of range");
+        auto const* source = static_cast<char const*>(src.rawPointer()) + static_cast<size_t>(slot) * rowBytes;
+        auto* destination = static_cast<char*>(host.rawPointer()) + static_cast<size_t>(row) * rowBytes;
+        CUDA_CHECK(cudaMemcpyAsync(destination, source, rowBytes, cudaMemcpyDeviceToHost, stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     return host;
 }
 
-//! Copy the first @p activeBatchSize slots of an attention layer's KV cache into a host tensor
-//! shaped [activeBatch, 2, kvHeads, capPadded, headDim] — the dump contract the comparison tool
-//! expects (matching HF's [B, heads, seq, dim] KV layout after the K/V split).
+//! Gather an attention layer's resident rows into a host tensor shaped
+//! [activeBatch, 2, kvHeads, capPadded, headDim].
 //!
-//! The KV cache is stored as a paged NHD pool of [numPages, kTOKENS_PER_PAGE, kvHeads, headDim].
-//! A slot's tokens are contiguous only while the page table is the identity, which context reuse
-//! breaks by handing a sequence pages that belong to an earlier request, so each slot is gathered
-//! page by page and transposed [seq, head, dim] -> [head, seq, dim].
-Tensor copyKVCacheAsHND(HybridCacheManager& cacheManager, KVPageTable const& pageTable, int32_t layer,
-    int32_t activeBatchSize, std::string const& name)
+//! Full and reduced SWA layers use distinct physical pools and page tables. Both are gathered page
+//! by page and transposed [seq, head, dim] -> [head, seq, dim].
+Tensor copyKVCacheAsHND(HybridCacheManager& cacheManager, KVPageTable const& fullPageTable,
+    KVPageTable const* swaPageTable, int32_t layer, std::vector<ResidentRef> const& residents, int32_t activeBatchSize,
+    std::string const& name, cudaStream_t stream)
 {
-    auto const [kView, vView] = cacheManager.getSeparateKVCache(layer);
-    Coords const s = kView.getShape(); // [maxBatch, capPadded, kvHeads, headDim]
-    int64_t const cap = s[1];
-    int64_t const heads = s[2];
-    int64_t const dim = s[3];
-    nvinfer1::DataType const dtype = kView.getDataType();
+    KVLayerStorageMetadata const storage = cacheManager.getKVLayerStorageMetadata(layer);
+    KVPageTable const* pageTable = &fullPageTable;
+    if (storage.kind == KVCacheStorageKind::kReducedSwa)
+    {
+        ELLM_CHECK(swaPageTable != nullptr, "LayerDebugger: reduced SWA layer has no sparse page table");
+        pageTable = swaPageTable;
+    }
+    ELLM_CHECK(pageTable->maxBatch() == cacheManager.getKVCacheManager().getConfig().maxBatchSize,
+        "LayerDebugger: page-table resident capacity does not match the KV pool");
+    ELLM_CHECK(pageTable->maxPagesPerSeq() == storage.logicalPagesPerSequence,
+        "LayerDebugger: page-table logical width does not match the KV pool contract");
+    ELLM_CHECK(pageTable->numPages() == storage.physicalPages,
+        "LayerDebugger: page-table physical namespace does not match the KV pool");
+
+    Tensor const& pool = cacheManager.getCombinedKVCache(layer);
+    Coords const poolShape = pool.getShape();
+    ELLM_CHECK(poolShape.getNumDims() == 5 && poolShape[0] == 2 && poolShape[1] == storage.physicalPages
+            && poolShape[2] == kTOKENS_PER_PAGE && poolShape[3] == storage.numKVHeads
+            && poolShape[4] == storage.headDim,
+        "LayerDebugger: KV pool shape does not match its storage metadata");
+    int64_t const cap = static_cast<int64_t>(storage.logicalPagesPerSequence) * kTOKENS_PER_PAGE;
+    int64_t const heads = storage.numKVHeads;
+    int64_t const dim = storage.headDim;
+    nvinfer1::DataType const dtype = pool.getDataType();
     size_t const elemSize = utils::getTypeSize(dtype);
     size_t const slotBytes = static_cast<size_t>(cap) * heads * dim * elemSize;
     size_t const rowBytes = static_cast<size_t>(dim) * elemSize;
     size_t const pageBytes = static_cast<size_t>(kTOKENS_PER_PAGE) * heads * dim * elemSize;
 
-    // The [maxBatch, capPadded, H, D] view is a reinterpretation of the page pool
-    // [numPages, kTOKENS_PER_PAGE, H, D]; a slot's tokens are contiguous only while the page table
-    // is the identity. Context reuse hands a sequence pages that belong to an earlier request, so
-    // gather each slot page by page instead of reading its slot-sized span. kPoolPtr / vPoolPtr
-    // already carry their half's offset, so the K page id indexes both.
-    int32_t const maxPagesPerSeq = pageTable.maxPagesPerSeq();
-    size_t const poolBytes = static_cast<size_t>(pageTable.numPages()) * pageBytes;
-    std::vector<std::byte> staging(2 * poolBytes);
-    std::byte* const kStage = staging.data();
-    std::byte* const vStage = staging.data() + poolBytes;
-    CUDA_CHECK(cudaMemcpy(kStage, kView.rawPointer(), poolBytes, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(vStage, vView.rawPointer(), poolBytes, cudaMemcpyDeviceToHost));
+    int32_t const maxPagesPerSeq = pageTable->maxPagesPerSeq();
+    size_t const poolBytes = static_cast<size_t>(storage.physicalPages) * pageBytes;
+    ELLM_CHECK(static_cast<int32_t>(residents.size()) >= activeBatchSize,
+        "LayerDebugger: resident mapping is smaller than the active batch");
+    Tensor staging(
+        {static_cast<int64_t>(2 * poolBytes)}, DeviceType::kCPU, nvinfer1::DataType::kINT8, name + ".staging");
+    std::byte* const kStage = static_cast<std::byte*>(staging.rawPointer());
+    std::byte* const vStage = kStage + poolBytes;
+    auto const* poolBase = static_cast<std::byte const*>(pool.rawPointer());
+    CUDA_CHECK(cudaMemcpyAsync(kStage, poolBase, poolBytes, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(vStage, poolBase + poolBytes, poolBytes, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 
     Tensor host({activeBatchSize, 2, heads, cap, dim}, DeviceType::kCPU, dtype, name);
     std::byte* const out = static_cast<std::byte*>(host.rawPointer());
     std::memset(out, 0, static_cast<size_t>(activeBatchSize) * 2 * slotBytes);
     for (int64_t b = 0; b < activeBatchSize; ++b)
     {
-        int32_t const* const pages = pageTable.hostRow(static_cast<int32_t>(b));
+        int32_t const slot = residents[static_cast<size_t>(b)].slot;
+        ELLM_CHECK(slot >= 0 && slot < pageTable->maxBatch(), "LayerDebugger: resident KV slot is out of range");
+        int32_t const* const pages = pageTable->hostRow(slot);
         for (int32_t lp = 0; lp < maxPagesPerSeq; ++lp)
         {
             int32_t const page = pages[lp];
-            if (page < 0)
+            if (page == kUNUSED_PAGE_ENTRY)
             {
                 continue; // unused logical page; leave it zeroed
             }
+            ELLM_CHECK(page >= 0 && page < storage.physicalPages, "LayerDebugger: KV page exceeds the physical pool");
+            ELLM_CHECK(static_cast<int64_t>(lp + 1) * kTOKENS_PER_PAGE <= cap,
+                "LayerDebugger: logical KV page exceeds the dump shape");
             for (int64_t kv = 0; kv < 2; ++kv)
             {
                 std::byte const* const src = (kv == 0 ? kStage : vStage) + static_cast<size_t>(page) * pageBytes;
@@ -195,8 +225,9 @@ std::unique_ptr<LayerDebugger> LayerDebugger::fromEnv()
     return std::unique_ptr<LayerDebugger>(new LayerDebugger(std::move(layers), dirEnv, std::move(forcedTokens)));
 }
 
-void LayerDebugger::dumpRound(HybridCacheManager& cacheManager, KVPageTable const& pageTable, Tensor const& logits,
-    std::vector<int32_t> const& validLengths, std::vector<int32_t> const& originalIndices,
+void LayerDebugger::dumpRound(HybridCacheManager& cacheManager, KVPageTable const& pageTable,
+    KVPageTable const* swaPageTable, Tensor const& logits, std::vector<int32_t> const& validLengths,
+    std::vector<int32_t> const& originalIndices, std::vector<ResidentRef> const& residentRefs,
     int32_t const* generatedTokenIds, int32_t activeBatchSize, cudaStream_t stream)
 {
     // The KV cache / logits are produced asynchronously on this stream; synchronise
@@ -218,9 +249,8 @@ void LayerDebugger::dumpRound(HybridCacheManager& cacheManager, KVPageTable cons
     }
 
     // ---- per-layer state, by layer type ----
-    // Every per-layer tensor is dumped as-is over the active-batch prefix (a plain contiguous
-    // copy); no sequence-length truncation happens here. The comparison tool slices each sequence
-    // to its valid length in PyTorch (using the dumped context_lengths), keeping this side simple.
+    // Resident rows are gathered into execution order. Sequence-length truncation is deferred to
+    // the comparison tool, which uses the dumped context_lengths.
     //   Attention layers   -> full KV cache [activeBatch, 2, kvHeads, capPadded, headDim].
     //   Mamba / Gated-DeltaNet -> fixed-size recurrent + conv state (no sequence dim).
     int32_t const numLayers = cacheManager.numLayers();
@@ -236,14 +266,16 @@ void LayerDebugger::dumpRound(HybridCacheManager& cacheManager, KVPageTable cons
         {
             // Mamba / Gated DeltaNet: fixed-size recurrent state [B, heads, headDim, stateSize] and
             // conv state [B, convDim, convKernel].
-            mTensors.push_back(
-                copyBatchPrefix(cacheManager.getRecurrentState(layer), activeBatchSize, lp + "recurrent_state"));
-            mTensors.push_back(copyBatchPrefix(cacheManager.getConvState(layer), activeBatchSize, lp + "conv_state"));
+            mTensors.push_back(copyResidentRows(
+                cacheManager.getRecurrentState(layer), residentRefs, activeBatchSize, lp + "recurrent_state", stream));
+            mTensors.push_back(copyResidentRows(
+                cacheManager.getConvState(layer), residentRefs, activeBatchSize, lp + "conv_state", stream));
             continue;
         }
         // Attention: KV cache dumped as [activeBatch, 2, kvHeads, capPadded, headDim] (transposed
         // out of the NHD pool storage; capPadded >= maxSeqLen, the comparison tool slices).
-        mTensors.push_back(copyKVCacheAsHND(cacheManager, pageTable, layer, activeBatchSize, lp + "kv"));
+        mTensors.push_back(copyKVCacheAsHND(
+            cacheManager, pageTable, swaPageTable, layer, residentRefs, activeBatchSize, lp + "kv", stream));
     }
 
     // ---- per-sequence valid lengths ----

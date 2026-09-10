@@ -57,7 +57,6 @@ model.norm.weight
 lm_head.weight
 """
 
-import itertools
 import logging
 from typing import List, Tuple
 
@@ -65,12 +64,12 @@ import torch
 import torch.nn as nn
 
 from ...config import QUANT_FP16, QUANT_NVFP4, QUANT_NVFP4_A16, ModelConfig
-from ..default.modeling_default import (MLP, Attention, OnnxSpec, RMSNorm,
-                                        _make_flat_wrapper)
+from ..default.modeling_default import (MLP, Attention, CausalLM, OnnxSpec,
+                                        RMSNorm)
 from ..linear import FP16Linear, make_linear
-from ..ops import (KV_PAGE_SIZE, fp16_moe_plugin, int4_moe_plugin,
-                   nvfp4_a16_moe_plugin, nvfp4_moe_plugin,
-                   nvfp4_moe_plugin_geforce, use_geforce_nvfp4_moe)
+from ..ops import (fp16_moe_plugin, int4_moe_plugin, nvfp4_a16_moe_plugin,
+                   nvfp4_moe_plugin, nvfp4_moe_plugin_geforce,
+                   use_geforce_nvfp4_moe)
 
 logger = logging.getLogger(__name__)
 
@@ -91,11 +90,6 @@ _NVFP4_MOE_N_GROUP_FLAT = 1
 _NVFP4_MOE_TOPK_GROUP_FLAT = 1
 
 # ONNX export dummy-input dims.
-_BATCH_SIZE = 1
-_SEQ_LEN = 1
-_PAST_LEN = 1
-_MAX_POS = 4096
-
 __all__ = [
     "Qwen3MoERouter",
     "Qwen3MoEExperts",
@@ -589,13 +583,15 @@ class Qwen3SparseMoeBlock(nn.Module):
         return torch.sigmoid(gate_logits) * shared_out
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        batch, seq_len, hidden_dim = hidden_states.shape
+        hidden_dim = hidden_states.shape[-1]
         hidden_flat = hidden_states.reshape(-1, hidden_dim)
+        plugin_hidden_states = (hidden_states if hidden_states.ndim == 3 else
+                                hidden_flat.unsqueeze(0))
         router_logits = self.gate_linear(hidden_flat).float()
         if self._use_fp16_moe:
             routed = fp16_moe_plugin(
                 router_logits,
-                hidden_states,
+                plugin_hidden_states,
                 self.fc1_weights,
                 self.fc2_weights,
                 self.num_experts,
@@ -605,14 +601,14 @@ class Qwen3SparseMoeBlock(nn.Module):
                 self.activation_type,
                 1,
                 self.max_routed_rows,
-            )
+            ).reshape_as(hidden_states)
             if self._has_shared_expert:
                 routed = routed + self._shared_expert_forward(hidden_states)
             return routed
         if self._use_nvfp4_a16_moe:
             routed = nvfp4_a16_moe_plugin(
                 router_logits,
-                hidden_states,
+                plugin_hidden_states,
                 self.fc1_qweights,
                 self.fc1_block_scales,
                 self.fc1_global_scales,
@@ -631,7 +627,7 @@ class Qwen3SparseMoeBlock(nn.Module):
                 1.0,
                 _NVFP4_ROUTING_MODE_SOFTMAX_TOPK,
                 self.max_routed_rows,
-            )
+            ).reshape_as(hidden_states)
             if self._has_shared_expert:
                 routed = routed + self._shared_expert_forward(hidden_states)
             return routed
@@ -640,7 +636,7 @@ class Qwen3SparseMoeBlock(nn.Module):
                       if use_geforce_nvfp4_moe() else nvfp4_moe_plugin)
             routed = moe_op(
                 router_logits,
-                hidden_states,
+                plugin_hidden_states,
                 self.fc1_qweights,
                 self.fc1_blocks_scale,
                 self.fc1_alpha,
@@ -663,13 +659,13 @@ class Qwen3SparseMoeBlock(nn.Module):
                 self.backend,
                 self.io_dtype,
                 self.max_routed_rows,
-            )
+            ).reshape_as(hidden_states)
             if self._has_shared_expert:
                 routed = routed + self._shared_expert_forward(hidden_states)
             return routed
         routed = int4_moe_plugin(
             router_logits,
-            hidden_states,
+            plugin_hidden_states,
             self.fc_gate_up_qweights,
             self.fc_gate_up_scales,
             self.fc_down_qweights,
@@ -680,7 +676,7 @@ class Qwen3SparseMoeBlock(nn.Module):
             self.moe_intermediate_size,
             self.activation_type,
             self.group_size,
-        )
+        ).reshape_as(hidden_states)
         if self._has_shared_expert:
             routed = routed + self._shared_expert_forward(hidden_states)
         return routed
@@ -740,6 +736,16 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states = residual + self.mlp(
             self.post_attention_layernorm(hidden_states))
 
+        return hidden_states, present_key_value
+
+    def forward_ragged(self, hidden_states: torch.Tensor, **kwargs) -> Tuple:
+        residual = hidden_states
+        attn_output, present_key_value = self.self_attn.forward_ragged(
+            self.input_layernorm(hidden_states), **kwargs)
+        hidden_states = residual + attn_output
+        residual = hidden_states
+        hidden_states = residual + self.mlp(
+            self.post_attention_layernorm(hidden_states))
         return hidden_states, present_key_value
 
 
@@ -850,6 +856,36 @@ class Qwen3MoeTransformer(nn.Module):
 
         return normed, tuple(present_key_values_list)
 
+    def forward_ragged(
+        self,
+        inputs_embeds: torch.Tensor,
+        past_key_values: Tuple[torch.Tensor, ...],
+        deepstack_embeds: Tuple[torch.Tensor, ...] = (),
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        hidden_states = inputs_embeds
+        present_key_values = []
+        target_layer = self.accept_hidden_layer
+        captured: "torch.Tensor | None" = None
+        for layer_index, layer in enumerate(self.layers):
+            hidden_states, present_kv = layer.forward_ragged(
+                hidden_states,
+                past_key_value=past_key_values[layer_index],
+                **kwargs)
+            present_key_values.append(present_kv)
+            if layer_index < len(deepstack_embeds):
+                hidden_states = hidden_states + deepstack_embeds[layer_index]
+            if target_layer >= 1 and layer_index == target_layer - 1:
+                captured = hidden_states
+
+        self.last_pre_norm_hidden_states = (captured if captured is not None
+                                            else hidden_states)
+        normed = self.norm(hidden_states)
+        self.emitted_hidden_states = (self.last_pre_norm_hidden_states
+                                      if target_layer >= 1
+                                      and captured is not None else normed)
+        return normed, tuple(present_key_values)
+
 
 # ---------------------------------------------------------------------------
 # CausalLM
@@ -900,119 +936,50 @@ class Qwen3MoeCausalLM(nn.Module):
                                            requires_grad=False)
 
     def onnx_export_spec(self) -> OnnxSpec:
-        """Return all model-specific parameters needed for ONNX export."""
-        config = self.config
-        Na = config.num_hidden_layers
-        # Multimodal MoE Thinker variants (e.g. Qwen3-Omni MoE) inject
-        # ``num_deepstack_features`` visual embeddings post-layer at the
-        # first N layers; match modeling_default.Transformer.
-        Nd = config.num_deepstack_features
-        device = next(itertools.chain(self.parameters(),
-                                      self.buffers())).device
-        dtype16 = torch.float16
-        batch_size, seq_len, past_len, max_pos = (_BATCH_SIZE, _SEQ_LEN,
-                                                  _PAST_LEN, _MAX_POS)
+        """Return the unified token-major ONNX export contract."""
+        return CausalLM._token_major_onnx_export_spec(self)
 
-        inputs_embeds = torch.zeros(batch_size,
-                                    seq_len,
-                                    config.hidden_size,
-                                    dtype=dtype16,
-                                    device=device)
-        kv_dtype = (torch.float8_e4m3fn
-                    if config.quant.kv_cache_quant == "fp8" else dtype16)
-        # Paged KV pool binding: [2, num_pages, KV_PAGE_SIZE, num_kv_heads, head_dim].
-        # num_pages is a dummy placeholder for export; the builder sets the real fixed
-        # value (see llmBuilder.cpp setupKVCacheProfiles).
-        past_key_values_list: List[torch.Tensor] = [
-            torch.zeros(2,
-                        1,
-                        KV_PAGE_SIZE,
-                        config.num_key_value_heads,
-                        config.head_dim,
-                        dtype=kv_dtype,
-                        device=device) for _ in range(Na)
-        ]
-        rotary_dim = int(config.head_dim * config.partial_rotary_factor)
-        rope_rotary_cos_sin = torch.zeros(batch_size,
-                                          max_pos,
-                                          rotary_dim,
-                                          dtype=torch.float32,
-                                          device=device)
-        context_lengths = torch.zeros(batch_size,
-                                      dtype=torch.int32,
-                                      device=device)
-        kvcache_start_index = torch.zeros(batch_size,
-                                          dtype=torch.int32,
-                                          device=device)
-        kv_page_table = torch.zeros(batch_size,
-                                    2,
-                                    1,
-                                    dtype=torch.int32,
-                                    device=device)
-        last_token_ids = torch.zeros(batch_size,
-                                     1,
-                                     dtype=torch.int64,
-                                     device=device)
-
-        deepstack_embeds_list: List[torch.Tensor] = [
-            torch.zeros(batch_size,
-                        seq_len,
-                        config.hidden_size,
-                        dtype=dtype16,
-                        device=device) for _ in range(Nd)
-        ]
-
-        skip_softmax_scale = torch.zeros(1, dtype=torch.int8, device=device)
-        args = (inputs_embeds, *past_key_values_list, rope_rotary_cos_sin,
-                context_lengths, kvcache_start_index, kv_page_table,
-                last_token_ids, *deepstack_embeds_list, skip_softmax_scale)
-
-        input_names = (
-            ["inputs_embeds"] + [f"past_key_values_{i}" for i in range(Na)] + [
-                "rope_rotary_cos_sin", "context_lengths",
-                "kvcache_start_index", "kv_page_table", "last_token_ids"
-            ] + [f"deepstack_embeds_{i}"
-                 for i in range(Nd)] + ["skip_softmax_scale"])
-        output_names = (["logits"] +
-                        [f"present_key_values_{i}" for i in range(Na)])
-        if self.emit_hidden_states:
-            output_names = (["logits", "hidden_states"] +
-                            [f"present_key_values_{i}" for i in range(Na)])
-
-        batch = torch.export.Dim("batch", min=1, max=256)
-        seq = torch.export.Dim("seq_len", min=1, max=32768)
-        pos = torch.export.Dim("max_pos", min=1, max=32768)
-        rope_batch = torch.export.Dim("rope_batch", min=1, max=256)
-        kv_batch = torch.export.Dim("kv_batch", min=1, max=256)
-        page_batch = torch.export.Dim("page_batch", min=1, max=256)
-        max_pages = torch.export.Dim("max_pages_per_seq", min=1, max=32768)
-        num_pages = torch.export.Dim("num_pages", min=1, max=1048576)
-        skip_dim = torch.export.Dim("skip_softmax_scale_len",
-                                    min=0,
-                                    max=1048576)
-
-        all_shapes: list = [{0: batch, 1: seq}]  # inputs_embeds
-        for _ in range(Na):
-            all_shapes.append({1:
-                               num_pages})  # past_key_values_i (pool-shaped)
-        all_shapes.append({0: rope_batch, 1: pos})  # rope_rotary_cos_sin
-        all_shapes.append({0: batch})  # context_lengths
-        all_shapes.append({0: kv_batch})  # kvcache_start_index
-        all_shapes.append({0: page_batch, 2: max_pages})  # kv_page_table
-        all_shapes.append({0: batch})  # last_token_ids
-        for _ in range(Nd):
-            all_shapes.append({0: batch, 1: seq})  # deepstack_embeds_i
-        all_shapes.append({0: skip_dim})  # skip_softmax_scale
-
-        wrapped = _make_flat_wrapper(
-            self, Na, Nd, emit_hidden_states=self.emit_hidden_states)
-        wrapped.eval()
-
-        return OnnxSpec(wrapped=wrapped,
-                        args=args,
-                        input_names=input_names,
-                        output_names=output_names,
-                        dynamic_shapes=all_shapes)
+    def forward_ragged(
+        self,
+        inputs_embeds: torch.Tensor,
+        past_key_values: Tuple[torch.Tensor, ...],
+        rope_rotary_cos_sin: torch.Tensor,
+        positions: torch.Tensor,
+        query_start_offsets: torch.Tensor,
+        query_lengths: torch.Tensor,
+        past_lengths: torch.Tensor,
+        attention_sequence_lengths: torch.Tensor,
+        state_indices: torch.Tensor,
+        execution_phase_marker: torch.Tensor,
+        context_sequence_count_carrier: torch.Tensor,
+        kv_page_table: torch.Tensor,
+        logits_indices: torch.Tensor,
+        deepstack_embeds: Tuple[torch.Tensor, ...] = (),
+        skip_softmax_scale: "torch.Tensor | None" = None,
+        **kwargs,
+    ) -> Tuple:
+        hidden_states, present_key_values = self.model.forward_ragged(
+            inputs_embeds,
+            past_key_values,
+            rope_rotary_cos_sin=rope_rotary_cos_sin,
+            positions=positions,
+            query_start_offsets=query_start_offsets,
+            query_lengths=query_lengths,
+            past_lengths=past_lengths,
+            attention_sequence_lengths=attention_sequence_lengths,
+            state_indices=state_indices,
+            execution_phase_marker=execution_phase_marker,
+            context_sequence_count_carrier=context_sequence_count_carrier,
+            kv_page_table=kv_page_table,
+            deepstack_embeds=deepstack_embeds,
+            skip_softmax_scale=skip_softmax_scale,
+            **kwargs)
+        selected_hidden_states = torch.index_select(hidden_states, 0,
+                                                    logits_indices)
+        logits = self.lm_head(selected_hidden_states).to(torch.float32)
+        emitted_hidden = (self.model.emitted_hidden_states
+                          if self.emit_hidden_states else None)
+        return logits, emitted_hidden, present_key_values
 
     def forward(
         self,

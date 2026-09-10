@@ -76,12 +76,63 @@ static void* allocCuSeqlens(void* d_context_lengths, int32_t n, cudaStream_t str
     void* d_cu = nullptr;
     CUDA_CHECK(cudaMalloc(&d_cu, static_cast<size_t>(n + 1) * sizeof(int32_t)));
     launchGdnCalCuSeqLens(d_context_lengths, d_cu, n, stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
     return d_cu;
 }
 
 namespace
 {
+
+template <typename T>
+class PinnedBuffer
+{
+public:
+    explicit PinnedBuffer(size_t const count)
+        : mCount(count)
+    {
+        CUDA_CHECK(cudaMallocHost(&mData, count * sizeof(T)));
+    }
+
+    explicit PinnedBuffer(std::vector<T> const& values)
+        : PinnedBuffer(values.size())
+    {
+        std::copy(values.begin(), values.end(), mData);
+    }
+
+    ~PinnedBuffer()
+    {
+        if (mData != nullptr)
+        {
+            (void) cudaFreeHost(mData);
+        }
+    }
+
+    PinnedBuffer(PinnedBuffer const&) = delete;
+    PinnedBuffer& operator=(PinnedBuffer const&) = delete;
+
+    T* data() const noexcept
+    {
+        return mData;
+    }
+
+    size_t size() const noexcept
+    {
+        return mCount;
+    }
+
+    T* begin() const noexcept
+    {
+        return mData;
+    }
+
+    T& operator[](size_t const index) const noexcept
+    {
+        return mData[index];
+    }
+
+private:
+    T* mData{};
+    size_t mCount{};
+};
 
 static inline float halfToFloat(__half h)
 {
@@ -588,6 +639,7 @@ void runGDNPrefillTest()
     params.o = d_o;
     params.n = n;
     params.seq_len = seq_len;
+    params.use_prefill = true;
     params.h = h;
     params.hv = hv;
     params.k_dim = k;
@@ -784,6 +836,7 @@ void runGDNPrefillPaddingTest()
     params.o = d_o;
     params.n = n;
     params.seq_len = seq_len;
+    params.use_prefill = true;
     params.h = h;
     params.hv = hv;
     params.k_dim = k;
@@ -854,6 +907,254 @@ void runGDNPrefillPaddingTest()
     if (d_tensormap_scratch)
         CUDA_CHECK(cudaFree(d_tensormap_scratch));
     CUDA_CHECK(cudaFree(d_o));
+}
+
+void runGDNIndexedStateTest(
+    int32_t seqLen, bool usePrefill, std::vector<int32_t> const& stateIndices, int32_t statePoolRows)
+{
+    int32_t const n = static_cast<int32_t>(stateIndices.size());
+    int32_t constexpr h = 1;
+    int32_t constexpr hv = 2;
+    int32_t constexpr dim = 128;
+    size_t const qkLen = static_cast<size_t>(n) * seqLen * h * dim;
+    size_t const valueLen = static_cast<size_t>(n) * seqLen * hv * dim;
+    size_t const abLen = static_cast<size_t>(n) * seqLen * hv;
+    size_t const stateStride = static_cast<size_t>(hv) * dim * dim;
+    size_t const stateLen = static_cast<size_t>(statePoolRows) * stateStride;
+
+    uint32_t seed = 0x127u;
+    std::vector<float> qHost(qkLen), kHost(qkLen), valueHost(valueLen), aHost(abLen), bHost(abLen);
+    for (float& value : qHost)
+    {
+        value = lcgStep(seed) * 0.2F;
+    }
+    for (float& value : kHost)
+    {
+        value = lcgStep(seed) * 0.2F;
+    }
+    for (float& value : valueHost)
+    {
+        value = lcgStep(seed) * 0.2F;
+    }
+    for (float& value : aHost)
+    {
+        value = lcgStep(seed) * 0.5F;
+    }
+    for (float& value : bHost)
+    {
+        value = lcgStep(seed) * 0.5F;
+    }
+    std::vector<float> logA(hv), dtBiasHost(hv);
+    for (int32_t head = 0; head < hv; ++head)
+    {
+        logA[static_cast<size_t>(head)] = -2.0F + 0.25F * (head % 4);
+        dtBiasHost[static_cast<size_t>(head)] = 0.02F * (head + 1);
+    }
+    auto toHalf = [](std::vector<float> const& input) {
+        std::vector<half> output(input.size());
+        std::transform(input.begin(), input.end(), output.begin(), [](float value) { return __float2half(value); });
+        return output;
+    };
+    std::vector<half> const q = toHalf(qHost);
+    std::vector<half> const k = toHalf(kHost);
+    std::vector<half> const values = toHalf(valueHost);
+    std::vector<half> const a = toHalf(aHost);
+    std::vector<half> const b = toHalf(bHost);
+    std::vector<half> const dtBias = toHalf(dtBiasHost);
+    auto roundTripHalf = [](std::vector<half> const& input, std::vector<float>& output) {
+        std::transform(input.begin(), input.end(), output.begin(), [](half value) { return __half2float(value); });
+    };
+    roundTripHalf(q, qHost);
+    roundTripHalf(k, kHost);
+    roundTripHalf(values, valueHost);
+    roundTripHalf(a, aHost);
+    roundTripHalf(b, bHost);
+    roundTripHalf(dtBias, dtBiasHost);
+    std::vector<int32_t> queryLengths(n, seqLen);
+    for (int32_t row = 0; row < n; ++row)
+    {
+        queryLengths[row] = std::max(1, seqLen - row);
+    }
+    std::vector<float> state(stateLen);
+    for (int32_t slot = 0; slot < statePoolRows; ++slot)
+    {
+        size_t const begin = static_cast<size_t>(slot) * stateStride;
+        for (size_t element = 0; element < stateStride; ++element)
+        {
+            state[begin + element] = 0.01F * (slot + 1) + 1e-6F * element;
+        }
+    }
+
+    PinnedBuffer<half> const qPinned(q);
+    PinnedBuffer<half> const kPinned(k);
+    PinnedBuffer<half> const valuesPinned(values);
+    PinnedBuffer<half> const aPinned(a);
+    PinnedBuffer<half> const bPinned(b);
+    PinnedBuffer<float> const logAPinned(logA);
+    PinnedBuffer<half> const dtBiasPinned(dtBias);
+    PinnedBuffer<float> const statePinned(state);
+    PinnedBuffer<int32_t> const queryLengthsPinned(queryLengths);
+    PinnedBuffer<int32_t> const stateIndicesPinned(stateIndices);
+    std::vector<half> const outputSentinel(values.size(), __float2half(1.0F));
+    PinnedBuffer<half> const outputSentinelPinned(outputSentinel);
+
+    cudaStream_t stream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+
+    void *dQ{}, *dK{}, *dV{}, *dA{}, *dB{}, *dLogA{}, *dDtBias{}, *dState{}, *dLengths{}, *dIndices{}, *deviceOutput{},
+        *deviceScratch{}, *deviceCuSeqlens{}, *deviceTensorMapScratch{};
+    CUDA_CHECK(cudaMalloc(&dQ, q.size() * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&dK, k.size() * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&dV, values.size() * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&dA, a.size() * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&dB, b.size() * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&dLogA, logA.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dDtBias, dtBias.size() * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&dState, state.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dLengths, queryLengths.size() * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&dIndices, stateIndices.size() * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&deviceOutput, values.size() * sizeof(half)));
+    CUDA_CHECK(cudaMemcpyAsync(dQ, qPinned.data(), q.size() * sizeof(half), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(dK, kPinned.data(), k.size() * sizeof(half), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(dV, valuesPinned.data(), values.size() * sizeof(half), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(dA, aPinned.data(), a.size() * sizeof(half), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(dB, bPinned.data(), b.size() * sizeof(half), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(dLogA, logAPinned.data(), logA.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(dDtBias, dtBiasPinned.data(), dtBias.size() * sizeof(half), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(dState, statePinned.data(), state.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        dLengths, queryLengthsPinned.data(), queryLengths.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        dIndices, stateIndicesPinned.data(), stateIndices.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(deviceOutput, outputSentinelPinned.data(), outputSentinel.size() * sizeof(half),
+        cudaMemcpyHostToDevice, stream));
+
+    GDNParams params{};
+    params.q = dQ;
+    params.k = dK;
+    params.v = dV;
+    params.a = dA;
+    params.b = dB;
+    params.A_log = dLogA;
+    params.dt_bias = dDtBias;
+    params.h0_source = dState;
+    params.context_lengths = dLengths;
+    params.state_indices = dIndices;
+    params.o = deviceOutput;
+    params.n = n;
+    params.seq_len = seqLen;
+    params.use_prefill = usePrefill;
+    params.h = h;
+    params.hv = hv;
+    params.k_dim = dim;
+    params.v_dim = dim;
+    params.state_pool_rows = statePoolRows;
+    params.smVersion = getSMVersion();
+    if (params.seq_len > 1 && (params.smVersion == 100 || params.smVersion == 101 || params.smVersion == 110))
+    {
+        CUDA_CHECK(cudaMalloc(&deviceScratch, static_cast<size_t>(n) * stateStride * sizeof(float)));
+        deviceCuSeqlens = allocCuSeqlens(dLengths, n, stream);
+        params.h0_scratch = deviceScratch;
+        params.cu_seqlens = deviceCuSeqlens;
+    }
+    if (params.seq_len > 1 && isBlackwellGeforceSM(params.smVersion))
+    {
+        deviceTensorMapScratch = allocTensorMapScratch(params.smVersion);
+        params.tensormap_scratch = deviceTensorMapScratch;
+    }
+
+    CuteDslGDNRunner runner;
+    ASSERT_EQ(runner.run(params, stream), 0);
+    PinnedBuffer<float> const actual(stateLen);
+    PinnedBuffer<half> const output(values.size());
+    CUDA_CHECK(cudaMemcpyAsync(actual.data(), dState, actual.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(output.data(), deviceOutput, output.size() * sizeof(half), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<float> activeState(static_cast<size_t>(n) * stateStride, 0.0F);
+    std::vector<float> expectedState(state);
+    for (int32_t row = 0; row < n; ++row)
+    {
+        int32_t const slot = stateIndices[static_cast<size_t>(row)];
+        if (slot >= 0 && slot < statePoolRows)
+        {
+            std::copy_n(state.begin() + static_cast<size_t>(slot) * stateStride, stateStride,
+                activeState.begin() + static_cast<size_t>(row) * stateStride);
+        }
+    }
+    std::vector<float> outputReference(valueLen, 0.0F);
+    if (usePrefill)
+    {
+        gdnPrefillReference(qHost.data(), kHost.data(), valueHost.data(), aHost.data(), bHost.data(), logA.data(),
+            dtBiasHost.data(), activeState.data(), outputReference.data(), n, seqLen, h, hv, dim, dim,
+            queryLengths.data());
+    }
+    else
+    {
+        gdnDecodeReference(qHost.data(), kHost.data(), valueHost.data(), aHost.data(), bHost.data(), logA.data(),
+            dtBiasHost.data(), activeState.data(), outputReference.data(), n, h, hv, dim, dim);
+    }
+    for (int32_t row = 0; row < n; ++row)
+    {
+        int32_t const slot = stateIndices[static_cast<size_t>(row)];
+        if (slot >= 0 && slot < statePoolRows)
+        {
+            std::copy_n(activeState.begin() + static_cast<size_t>(row) * stateStride, stateStride,
+                expectedState.begin() + static_cast<size_t>(slot) * stateStride);
+        }
+    }
+    bool const datacenterBlackwellPrefill = CuteDslGDNRunner::selectBackend(params) == GDNBackend::kPrefillBlackwell;
+    float const outputTolerance = datacenterBlackwellPrefill ? 5e-2F : 1e-4F;
+    float const stateTolerance = datacenterBlackwellPrefill ? 5e-2F : 1e-4F;
+    for (size_t element = 0; element < output.size(); ++element)
+    {
+        EXPECT_TRUE(isclose(__half2float(output[element]), outputReference[element], outputTolerance, outputTolerance))
+            << "Output mismatch at element " << element;
+    }
+    for (int32_t slot = 0; slot < statePoolRows; ++slot)
+    {
+        auto const begin = static_cast<size_t>(slot) * stateStride;
+        if (std::find(stateIndices.begin(), stateIndices.end(), slot) != stateIndices.end())
+        {
+            for (size_t element = 0; element < stateStride; ++element)
+            {
+                EXPECT_NEAR(actual[begin + element], expectedState[begin + element], stateTolerance)
+                    << "Resident state mismatch for slot " << slot << " at element " << element;
+            }
+        }
+        else
+        {
+            EXPECT_TRUE(std::equal(actual.begin() + begin, actual.begin() + begin + stateStride, state.begin() + begin))
+                << "Unselected resident slot changed: " << slot;
+        }
+    }
+
+    CUDA_CHECK(cudaFree(dQ));
+    CUDA_CHECK(cudaFree(dK));
+    CUDA_CHECK(cudaFree(dV));
+    CUDA_CHECK(cudaFree(dA));
+    CUDA_CHECK(cudaFree(dB));
+    CUDA_CHECK(cudaFree(dLogA));
+    CUDA_CHECK(cudaFree(dDtBias));
+    CUDA_CHECK(cudaFree(dState));
+    CUDA_CHECK(cudaFree(dLengths));
+    CUDA_CHECK(cudaFree(dIndices));
+    CUDA_CHECK(cudaFree(deviceOutput));
+    if (deviceScratch)
+    {
+        CUDA_CHECK(cudaFree(deviceScratch));
+    }
+    if (deviceCuSeqlens)
+    {
+        CUDA_CHECK(cudaFree(deviceCuSeqlens));
+    }
+    if (deviceTensorMapScratch)
+    {
+        CUDA_CHECK(cudaFree(deviceTensorMapScratch));
+    }
+    CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
 // ---------------------------------------------------------------------------
@@ -1176,6 +1477,145 @@ TEST(GDNCuteDsl, PrefillPadding)
     runGDNPrefillPaddingTest();
 }
 
+TEST(GDNCuteDsl, IndexedResidentDecode)
+{
+    runGDNIndexedStateTest(1, false, {2, 0}, 4);
+}
+
+TEST(GDNCuteDsl, IndexedResidentPaddedPrefill)
+{
+    runGDNIndexedStateTest(3, true, {3, 1}, 5);
+}
+
+TEST(GDNCuteDsl, InvalidIndexedResidentPaddedPrefill)
+{
+#ifdef CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED
+    if (!isBlackwellGeforceSM(getSMVersion()))
+    {
+        GTEST_SKIP() << "Defensive invalid-index behavior is specific to SM120/121";
+    }
+    runGDNIndexedStateTest(3, true, {-1, 5}, 5);
+#else
+    GTEST_SKIP() << "SM120/121 optimized GDN prefill is not compiled";
+#endif
+}
+
+TEST(GDNCuteDsl, IndexedStateTranspose)
+{
+    int32_t constexpr poolRows = 5;
+    int32_t constexpr batchSize = 2;
+    int32_t constexpr numHeads = 1;
+    int32_t constexpr dim = 4;
+    std::vector<int32_t> const indices{3, 1};
+    std::vector<float> source(static_cast<size_t>(poolRows) * numHeads * dim * dim);
+    for (int32_t slot = 0; slot < poolRows; ++slot)
+    {
+        for (int32_t row = 0; row < dim; ++row)
+        {
+            for (int32_t col = 0; col < dim; ++col)
+            {
+                source[(static_cast<size_t>(slot) * dim + row) * dim + col]
+                    = static_cast<float>(slot * 100 + row * 10 + col);
+            }
+        }
+    }
+
+    float *deviceSource{}, *deviceGathered{};
+    int32_t* deviceIndices{};
+    CUDA_CHECK(cudaMalloc(&deviceSource, source.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&deviceGathered, static_cast<size_t>(batchSize) * numHeads * dim * dim * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&deviceIndices, indices.size() * sizeof(int32_t)));
+    CUDA_CHECK(cudaMemcpy(deviceSource, source.data(), source.size() * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(deviceIndices, indices.data(), indices.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+
+    launchGdnStateGatherTranspose(
+        deviceSource, deviceGathered, deviceIndices, batchSize, poolRows, numHeads, dim, nullptr);
+    std::vector<float> gathered(static_cast<size_t>(batchSize) * numHeads * dim * dim);
+    CUDA_CHECK(cudaMemcpy(gathered.data(), deviceGathered, gathered.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    for (int32_t batch = 0; batch < batchSize; ++batch)
+    {
+        for (int32_t row = 0; row < dim; ++row)
+        {
+            for (int32_t col = 0; col < dim; ++col)
+            {
+                EXPECT_EQ(gathered[(static_cast<size_t>(batch) * dim + row) * dim + col],
+                    source[(static_cast<size_t>(indices[batch]) * dim + col) * dim + row]);
+            }
+        }
+    }
+
+    launchGdnStateIndexedTransposeInPlace(deviceSource, deviceIndices, batchSize, poolRows, numHeads, dim, nullptr);
+    std::vector<float> transposed(source.size());
+    CUDA_CHECK(cudaMemcpy(transposed.data(), deviceSource, transposed.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    for (int32_t slot = 0; slot < poolRows; ++slot)
+    {
+        bool const selected = std::find(indices.begin(), indices.end(), slot) != indices.end();
+        for (int32_t row = 0; row < dim; ++row)
+        {
+            for (int32_t col = 0; col < dim; ++col)
+            {
+                float const expected = selected ? source[(static_cast<size_t>(slot) * dim + col) * dim + row]
+                                                : source[(static_cast<size_t>(slot) * dim + row) * dim + col];
+                EXPECT_EQ(transposed[(static_cast<size_t>(slot) * dim + row) * dim + col], expected);
+            }
+        }
+    }
+
+    CUDA_CHECK(cudaFree(deviceSource));
+    CUDA_CHECK(cudaFree(deviceGathered));
+    CUDA_CHECK(cudaFree(deviceIndices));
+}
+
+TEST(GDNCuteDsl, IndexedStateGather)
+{
+    int32_t constexpr poolRows = 4;
+    int32_t constexpr batchSize = 4;
+    int32_t constexpr rowElements = 8;
+    std::vector<int32_t> const indices{2, -1, 0, poolRows};
+    std::vector<float> source(static_cast<size_t>(poolRows) * rowElements);
+    std::vector<float> dense(static_cast<size_t>(batchSize) * rowElements);
+    for (size_t index = 0; index < source.size(); ++index)
+    {
+        source[index] = static_cast<float>(index);
+    }
+    PinnedBuffer<float> const sourcePinned(source);
+    PinnedBuffer<int32_t> const indicesPinned(indices);
+    PinnedBuffer<float> const densePinned(dense.size());
+
+    float *deviceSource{}, *deviceDense{};
+    int32_t* deviceIndices{};
+    cudaStream_t stream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaMalloc(&deviceSource, source.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&deviceDense, dense.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&deviceIndices, indices.size() * sizeof(int32_t)));
+    CUDA_CHECK(cudaMemcpyAsync(
+        deviceSource, sourcePinned.data(), source.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        deviceIndices, indicesPinned.data(), indices.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+
+    launchGdnStateGather(deviceSource, deviceDense, deviceIndices, batchSize, 1, poolRows, 1, rowElements, stream);
+    CUDA_CHECK(
+        cudaMemcpyAsync(densePinned.data(), deviceDense, dense.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (int32_t batch = 0; batch < batchSize; ++batch)
+    {
+        for (int32_t element = 0; element < rowElements; ++element)
+        {
+            int32_t const residentRow = indices[batch];
+            float const expected = residentRow >= 0 && residentRow < poolRows
+                ? source[static_cast<size_t>(residentRow) * rowElements + element]
+                : 0.0F;
+            EXPECT_EQ(densePinned[static_cast<size_t>(batch) * rowElements + element], expected);
+        }
+    }
+
+    CUDA_CHECK(cudaFree(deviceSource));
+    CUDA_CHECK(cudaFree(deviceDense));
+    CUDA_CHECK(cudaFree(deviceIndices));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
 /**
  * GDN prefill with the exact Qwen3.5-4B parameters: n=1, h=16, hv=32, seq_len=164.
  * This configuration triggers grouped value attention (h_r=2) and tail masking on optimized Blackwell paths.
@@ -1284,6 +1724,7 @@ void runGDNPrefillQwen35Test(float atol = 5e-2f, float rtol = 5e-2f, bool enable
     params.o = d_o;
     params.n = n;
     params.seq_len = seq_len;
+    params.use_prefill = true;
     params.h = h;
     params.hv = hv;
     params.k_dim = k;
@@ -1898,6 +2339,7 @@ GdnPdlRunResult runGdnPdlCase(int32_t seqLen, bool enablePdl, GdnPdlExecutionMod
     params.tensormap_scratch = dTensorMapScratch;
     params.o = dOutput;
     params.enablePdl = enablePdl;
+    params.use_prefill = true;
     params.n = n;
     params.seq_len = seqLen;
     params.h = h;
@@ -2351,6 +2793,7 @@ void runGDNBlackwellVsSequentialTest()
     bwParams.o = d_o_bw;
     bwParams.n = n;
     bwParams.seq_len = seq_len;
+    bwParams.use_prefill = true;
     bwParams.h = h;
     bwParams.hv = hv;
     bwParams.k_dim = k;
@@ -2381,6 +2824,7 @@ void runGDNBlackwellVsSequentialTest()
     seqParams.o = d_o_seq;
     seqParams.n = n;
     seqParams.seq_len = seq_len;
+    seqParams.use_prefill = true;
     seqParams.h = h;
     seqParams.hv = hv;
     seqParams.k_dim = k;
@@ -2466,6 +2910,48 @@ TEST(GDNCuteDsl, CanImplement)
     EXPECT_TRUE(CuteDslGDNRunner::canImplement(128, 128, 89));
     EXPECT_FALSE(CuteDslGDNRunner::canImplement(64, 128, 80));
     EXPECT_FALSE(CuteDslGDNRunner::canImplement(128, 128, 70));
+}
+
+TEST(GDNCuteDsl, BackendSelection)
+{
+    GDNParams params{};
+    params.h = 16;
+    params.hv = 32;
+    params.smVersion = 120;
+    int32_t stateIndex{};
+    params.state_indices = &stateIndex;
+
+    params.use_mtp = true;
+    EXPECT_EQ(CuteDslGDNRunner::selectBackend(params), GDNBackend::kDecodeMTP);
+
+    params.use_mtp = false;
+    params.use_prefill = false;
+    EXPECT_EQ(CuteDslGDNRunner::selectBackend(params), GDNBackend::kDecode);
+
+    params.use_prefill = true;
+    params.smVersion = 87;
+    EXPECT_EQ(CuteDslGDNRunner::selectBackend(params), GDNBackend::kPrefill);
+
+#ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
+    params.smVersion = 110;
+    EXPECT_EQ(CuteDslGDNRunner::selectBackend(params), GDNBackend::kPrefillBlackwell);
+#else
+    params.smVersion = 110;
+    EXPECT_EQ(CuteDslGDNRunner::selectBackend(params), GDNBackend::kPrefill);
+#endif
+
+#ifdef CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED
+    params.smVersion = 120;
+    EXPECT_EQ(CuteDslGDNRunner::selectBackend(params), GDNBackend::kPrefillBlackwellGeforce);
+    params.smVersion = 121;
+    EXPECT_EQ(CuteDslGDNRunner::selectBackend(params), GDNBackend::kPrefillBlackwellGeforce);
+#else
+    params.smVersion = 120;
+    EXPECT_EQ(CuteDslGDNRunner::selectBackend(params), GDNBackend::kPrefill);
+#endif
+
+    params.h = 0;
+    EXPECT_EQ(CuteDslGDNRunner::selectBackend(params), GDNBackend::kPrefill);
 }
 
 /**

@@ -19,6 +19,7 @@
 
 #include "common/tensor.h"
 #include "runtime/hybridCacheManager.h"
+#include "runtime/state/residentSlotPool.h"
 
 #include <cstdint>
 #include <memory>
@@ -49,9 +50,8 @@ class KVPageTable;
 //!
 //! The two variables are XOR-coupled: setting exactly one is an error.
 //!
-//! Per-layer tensors are dumped full-length over the active-batch prefix (no truncation here);
-//! the comparison tool slices each sequence to its valid length in PyTorch using the dumped
-//! context_lengths.
+//! Per-layer tensors are gathered from resident slots into execution order. The comparison tool
+//! slices each sequence to its valid length in PyTorch using the dumped context_lengths.
 //!
 //! Safetensors layout (single file, all rounds):
 //!   round_{r}.logits               [activeBatch, vocab]                          (native dtype)
@@ -83,21 +83,20 @@ public:
     //!
     //! Synchronises @p stream first, so the KV cache and logits are final.
     //! @param cacheManager       Base-model KV cache manager.
-    //! @param pageTable          Base-model KV page table; the KV pool is gathered through it.
+    //! @param pageTable          Full-capacity base-model KV page table.
+    //! @param swaPageTable       Independent sparse page table for reduced SWA layers, or nullptr.
     //! @param logits             Device logits tensor [activeBatch, vocab].
     //! @param validLengths       Per-sequence valid KV/sequence length this round.
+    //! @param originalIndices    Execution row -> original request row mapping used for reporting.
+    //! @param residentRefs       Execution row -> persistent resident slot mapping used to gather state.
     //! @param generatedTokenIds  Host int32 [activeBatch] tokens sampled this round
     //!                           (may be nullptr to skip).
-    //! @param originalIndices    ``context.batchIndexMapping``: active slot -> original request
-    //!                           row. Anything this class keys by sequence is keyed by the
-    //!                           original row, because the runtime compacts its own per-slot
-    //!                           vectors when a sequence finishes and the debugger is not part
-    //!                           of that compaction.
     //! @param activeBatchSize    Number of active sequences this round.
     //! @param stream             CUDA stream.
-    void dumpRound(HybridCacheManager& cacheManager, KVPageTable const& pageTable, Tensor const& logits,
-        std::vector<int32_t> const& validLengths, std::vector<int32_t> const& originalIndices,
-        int32_t const* generatedTokenIds, int32_t activeBatchSize, cudaStream_t stream);
+    void dumpRound(HybridCacheManager& cacheManager, KVPageTable const& pageTable, KVPageTable const* swaPageTable,
+        Tensor const& logits, std::vector<int32_t> const& validLengths, std::vector<int32_t> const& originalIndices,
+        std::vector<ResidentRef> const& residentRefs, int32_t const* generatedTokenIds, int32_t activeBatchSize,
+        cudaStream_t stream);
 
     //! @brief Record how much of each sequence was restored from the context cache instead of
     //! executed. Call once from prefill, before the first dumpRound().

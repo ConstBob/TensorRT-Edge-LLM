@@ -1315,6 +1315,8 @@ bool Qwen3OmniTTSRuntime::executeTalkerPrefillStep(rt::Tensor const& inputEmbeds
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::executeTalkerPrefillStep", nvtx_colors::PURPLE);
 
+    mTalkerPipelineIO->waitForStepHostStaging();
+
     auto inputShape = inputEmbeds.getShape();
     if (inputShape.getNumDims() != 3)
     {
@@ -1373,9 +1375,11 @@ bool Qwen3OmniTTSRuntime::executeTalkerPrefillStep(rt::Tensor const& inputEmbeds
     // Prepare per-step metadata (selectTokenIndices, contextLengths, kvcache_start_index sentinel).
     mTalkerStepPreparer->prepare(
         rt::InferencePhase::kPrefill, static_cast<int32_t>(batchSize), talkerCacheMgr, *mTalkerPipelineIO, stream);
+    mTalkerPipelineIO->recordStepHostUploads(stream);
 
     bool const kvAllEmpty = talkerCacheMgr.getKVCacheAllEmpty();
-    auto const prefillDims = mTalkerLLMConfig.prefillDims(batchSize, seqLen, kvAllEmpty);
+    auto const prefillDims = mTalkerLLMConfig.prefillDims(
+        batchSize, seqLen, kvAllEmpty ? ExecutionPhase::kContextPrefill : ExecutionPhase::kContextChunk);
     if (!mTalkerExec->prepare(/*prefillProfile=*/0, prefillDims, mTalkerTensorMap, stream))
     {
         LOG_ERROR("Talker prefill prepare failed");
@@ -1430,6 +1434,8 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorPrefillStep(rt::Tensor const& inpu
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::executeCodePredictorPrefillStep", nvtx_colors::ORANGE);
 
+    mCodePredictorPipelineIO->waitForStepHostStaging();
+
     // Batch dim is implicit in input shape — same pattern as executeTalkerPrefillStep / spec decode.
     auto inputShape = inputsEmbeds.getShape();
     check::check(inputShape.getNumDims() == 3,
@@ -1462,22 +1468,22 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorPrefillStep(rt::Tensor const& inpu
 
     mCodePredictorStepPreparer->prepare(
         rt::InferencePhase::kPrefill, static_cast<int32_t>(batchSize), cpCacheMgr, *mCodePredictorPipelineIO, stream);
+    mCodePredictorPipelineIO->recordStepHostUploads(stream);
 
-    // The CP prefill is only kCodePredictorPrefillSeqLen positions, so a wide enough
-    // generation profile lets it run on the decode profile and pick up the same cheap
-    // kernel set the decode steps use. Older engines reject the shape; fall back then.
+    // The short CP prefill fits the widened generation profile. Keep its context
+    // phase and ragged metadata intact when selecting that optimization profile.
     bool prepared = false;
     if (mCpPrefillOnDecodeProfile)
     {
-        auto decodeDims = mCodePredictorConfig.decodeDims(batchSize);
-        decodeDims.seqLen = seqLen;
-        prepared = mCodePredictorExec->prepare(/*decodeProfile=*/1, decodeDims, mCodePredictorTensorMap, stream);
+        auto const dims = mCodePredictorConfig.prefillDims(batchSize, seqLen, ExecutionPhase::kContextPrefill);
+        prepared = mCodePredictorExec->prepare(/*decodeProfile=*/1, dims, mCodePredictorTensorMap, stream);
     }
     mCpBoundSeqLen = -1;
     if (!prepared)
     {
         bool const kvAllEmpty = cpCacheMgr.getKVCacheAllEmpty();
-        auto const prefillDims = mCodePredictorConfig.prefillDims(batchSize, seqLen, kvAllEmpty);
+        auto const prefillDims = mCodePredictorConfig.prefillDims(
+            batchSize, seqLen, kvAllEmpty ? ExecutionPhase::kContextPrefill : ExecutionPhase::kContextChunk);
         prepared = mCodePredictorExec->prepare(/*prefillProfile=*/0, prefillDims, mCodePredictorTensorMap, stream);
     }
     if (!prepared)
@@ -3081,6 +3087,8 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorVerifyStep(rt::Tensor const& input
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::executeCodePredictorVerifyStep", nvtx_colors::ORANGE);
 
+    mCodePredictorPipelineIO->waitForStepHostStaging();
+
     auto const inputShape = inputsEmbeds.getShape();
     check::check(inputShape.getNumDims() == 3, "executeCodePredictorVerifyStep: inputsEmbeds must be 3D");
     int64_t const seqLen = inputShape[1];
@@ -3116,14 +3124,13 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorVerifyStep(rt::Tensor const& input
     std::fill_n(hostSelect, activeBatchSize, seqLen - 1);
     CUDA_CHECK(cudaMemcpyAsync(mCodePredictorPipelineIO->selectTokenIndices.rawPointer(), hostSelect,
         activeBatchSize * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
+    mCodePredictorPipelineIO->recordStepHostUploads(stream);
 
-    // Verification runs on the decode profile, which the builder widens for CodePredictor
-    // engines. The prefill profile would make TensorRT select the FMHA/GEMM kernel set rather
-    // than the decode XQA path, costing more than the autoregressive steps a pass stands in for.
+    // Verification uses the widened generation profile while retaining context-chunk
+    // semantics for its multi-token query.
     if (shapeChanged)
     {
-        auto dims = mCodePredictorConfig.decodeDims(activeBatchSize);
-        dims.seqLen = seqLen;
+        auto const dims = mCodePredictorConfig.prefillDims(activeBatchSize, seqLen, ExecutionPhase::kContextChunk);
         if (!mCodePredictorExec->prepare(/*decodeProfile=*/1, dims, mCodePredictorTensorMap, stream))
         {
             LOG_ERROR("CodePredictor verify prepare failed (seqLen=%ld)", static_cast<long>(seqLen));

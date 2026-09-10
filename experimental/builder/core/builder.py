@@ -34,7 +34,7 @@ from tensorrt_edgellm.dflash import DFlashVersion
 
 from ..ops.backend import Net
 from ..ops.functional.attention import KV_PAGE_SIZE
-from . import contracts, quantization, weight_policy
+from . import contracts, quantization, ragged, weight_policy
 from .bundle import LLM_COMPONENTS, BundleConfig
 from .config import DeviceConfig
 from .weight_policy import WeightPolicy
@@ -512,11 +512,11 @@ def _setup_diffusion_profiles(builder, config, network, cfg: DeviceConfig,
     diffusion = builder.create_optimization_profile()
 
     max_batch = args.max_batch_size
-    max_input = args.max_input_len
-    max_kv = args.max_kv_cache_capacity
-    canvas = int(cfg.raw_root.get("canvas_length", 256))
-    pages_per_sequence = (max_kv + KV_PAGE_SIZE - 1) // KV_PAGE_SIZE
-    pool_pages = max_batch * pages_per_sequence
+    canvas = ragged.diffusion_canvas_length(cfg.raw_root, args.model_dir)
+    prefill_range, diffusion_range = ragged.decoder_profile_ranges(
+        args, canvas)
+    pages_per_sequence, pool_pages = ragged.checked_kv_pool_pages(
+        max_batch, args.max_kv_cache_capacity)
     inputs = {
         network.get_input(index).name: network.get_input(index)
         for index in range(network.num_inputs)
@@ -536,36 +536,35 @@ def _setup_diffusion_profiles(builder, config, network, cfg: DeviceConfig,
         diffusion.set_shape(name, *diffusion_shapes)
 
     hidden = fixed_dim("inputs_embeds", -1, cfg.hidden_size)
-    prefill_sequence = ((1, 1, hidden), (max_batch, max(1, max_input // 2),
-                                         hidden), (max_batch, max_input,
-                                                   hidden))
-    diffusion_sequence = ((1, 1, hidden), (max_batch, canvas, hidden),
-                          (max_batch, canvas, hidden))
     for name in ("inputs_embeds", "prev_self_conditioning_embeds"):
-        set_shapes(name, prefill_sequence, diffusion_sequence)
+        set_shapes(name, prefill_range.token(hidden),
+                   diffusion_range.token(hidden))
 
-    prefill_tokens = ((1, 1), (max_batch, max(1, max_input // 2)), (max_batch,
-                                                                    max_input))
-    diffusion_tokens = ((1, 1), (max_batch, canvas), (max_batch, canvas))
-    set_shapes("canvas_ids", prefill_tokens, diffusion_tokens)
+    for name in ("canvas_ids", "positions"):
+        set_shapes(name, prefill_range.token(), diffusion_range.token())
 
-    batch_vector = ((1, ), (max_batch, ), (max_batch, ))
-    for name in ("phase_is_encoder", "context_lengths", "kvcache_start_index"):
-        set_shapes(name, batch_vector, batch_vector)
+    for name in ("query_lengths", "past_lengths", "attention_sequence_lengths",
+                 "state_indices"):
+        set_shapes(name, prefill_range.sequence(), diffusion_range.sequence())
+    set_shapes("query_start_offsets", prefill_range.offsets(),
+               diffusion_range.offsets())
+    set_shapes("context_sequence_count_carrier", ragged.fixed_shape((0, )),
+               ragged.fixed_shape((0, )))
+    set_shapes("phase_is_encoder", ragged.fixed_shape((1, )),
+               ragged.fixed_shape((1, )))
+    set_shapes("select_token_indices", prefill_range.token(),
+               diffusion_range.token())
+    set_shapes("execution_phase_marker", ragged.phase_shapes(7),
+               ragged.phase_shapes(6))
 
-    set_shapes("select_token_indices",
-               ((1, 1), (max_batch, 1), (max_batch, 1)),
-               ((1, 1), (max_batch, canvas), (max_batch, canvas)))
-    set_shapes("context_mask_selector", ((0, ), (0, ), (0, )),
+    set_shapes("context_mask_selector", ((0, ), (max_batch, ), (max_batch, )),
                ((0, ), (max_batch, ), (max_batch, )))
 
     for rope_name in ("rope_rotary_cos_sin", "rope_rotary_cos_sin_sliding",
                       "rope_rotary_cos_sin_full"):
         rotary_dim = fixed_dim(rope_name, -1, cfg.rotary_dim)
-        rope_shapes = ((1, max_kv, rotary_dim),
-                       (max_batch, max_kv, rotary_dim), (max_batch, max_kv,
-                                                         rotary_dim))
-        set_shapes(rope_name, rope_shapes, rope_shapes)
+        set_shapes(rope_name, prefill_range.token(rotary_dim),
+                   diffusion_range.token(rotary_dim))
 
     for index in range(cfg.num_hidden_layers):
         name = f"past_key_values_{index}"
@@ -586,18 +585,61 @@ def _setup_diffusion_profiles(builder, config, network, cfg: DeviceConfig,
 
 def _setup_llm_profiles(builder, config, network, cfg: DeviceConfig,
                         args: BuildArgs) -> None:
+    """Create token-major prefill and generation profiles for one decoder."""
     ctx_prof = builder.create_optimization_profile()
     gen_prof = builder.create_optimization_profile()
 
-    maxB = args.max_batch_size
-    maxIn = args.max_input_len
-    maxKV = args.max_kv_cache_capacity
+    max_sequences = args.max_batch_size
     page_size = KV_PAGE_SIZE
-    pages_per_sequence = (maxKV + page_size - 1) // page_size
-    pool_pages = maxB * pages_per_sequence
-    H = cfg.hidden_size
-    Hkv = cfg.num_key_value_heads
-    D = cfg.head_dim
+    pages_per_sequence, pool_pages = ragged.checked_kv_pool_pages(
+        max_sequences, args.max_kv_cache_capacity)
+    hidden_size = cfg.hidden_size
+    num_kv_heads = cfg.num_key_value_heads
+    head_dim = cfg.head_dim
+    prefill_range, generation_range = ragged.decoder_profile_ranges(args)
+    block_draft = (args.resolved_spec_role == contracts.SpecRole.DRAFT
+                   and args.spec_type in ("dflash", "jetspec", "dspark"))
+    dflash_v2_draft = (args.resolved_spec_role == contracts.SpecRole.DRAFT
+                       and args.spec_type == "dflash"
+                       and getattr(args, "dflash_version",
+                                   DFlashVersion.V1) == DFlashVersion.V2)
+    if dflash_v2_draft:
+        maximum_tokens = generation_range.physical_tokens[2]
+        optimum_width = min(cfg.dflash2_block_size, args.max_draft_tree_size)
+        generation_range = ragged.DecoderProfileRange(
+            generation_range.num_sequences,
+            (2, ragged.checked_physical_tokens(max_sequences,
+                                               optimum_width), maximum_tokens),
+            generation_range.query_offsets, generation_range.logits_rows)
+    if (args.resolved_spec_role == contracts.SpecRole.DRAFT
+            and args.spec_type == "dspark"
+            and not cfg.dspark_sample_from_anchor):
+        proposal_width = args.max_draft_tree_size + 1
+        proposal_tokens = tuple(
+            ragged.checked_physical_tokens(sequences, proposal_width)
+            for sequences in generation_range.num_sequences)
+        generation_range = ragged.DecoderProfileRange(
+            generation_range.num_sequences, proposal_tokens,
+            generation_range.query_offsets, proposal_tokens)
+    proposal_context_range = generation_range if block_draft else prefill_range
+
+    delta_context_tokens = (
+        1,
+        ragged.checked_physical_tokens(max_sequences,
+                                       max(1, args.max_input_len // 2)),
+        ragged.checked_physical_tokens(max_sequences, args.max_input_len),
+    )
+    delta_generation_tokens = (
+        1,
+        ragged.checked_physical_tokens(max_sequences,
+                                       args.max_draft_tree_size + 1),
+        ragged.checked_physical_tokens(max_sequences,
+                                       args.max_draft_tree_size + 1),
+    )
+
+    def token_shapes(extents, width=0):
+        return tuple(
+            (tokens, width) if width else (tokens, ) for tokens in extents)
 
     names = {network.get_input(i).name for i in range(network.num_inputs)}
     inputs = {
@@ -612,221 +654,158 @@ def _setup_llm_profiles(builder, config, network, cfg: DeviceConfig,
         value = int(tensor.shape[axis])
         return fallback if value < 0 else value
 
-    def set_profile_shapes(name,
-                           context_min,
-                           context_opt,
-                           context_max,
-                           generation_min=None,
-                           generation_opt=None,
-                           generation_max=None):
+    def set_profile_shapes(name, context_shapes, generation_shapes=None):
         if name not in names:
             return
-        ctx_prof.set_shape(name, context_min, context_opt, context_max)
-        gen_prof.set_shape(name, generation_min or context_min, generation_opt
-                           or context_opt, generation_max or context_max)
+        generation_shapes = generation_shapes or context_shapes
+        ctx_prof.set_shape(name, *context_shapes)
+        gen_prof.set_shape(name, *generation_shapes)
 
-    # inputs_embeds [B, S, H]
-    embed_width = fixed_dim("inputs_embeds", -1, H)
-    generation_sequence_max = args.profile_limits.generation_sequence_max(
-        args.resolved_spec_role)
-    dflash_v2_draft = (args.resolved_spec_role == contracts.SpecRole.DRAFT
-                       and args.spec_type == "dflash"
-                       and args.dflash_version == DFlashVersion.V2)
-    if (args.resolved_spec_role == contracts.SpecRole.DRAFT
-            and args.spec_type in ("dflash", "jetspec", "dspark")):
-        draft = args.max_draft_tree_size
-        draft_min = 2 if dflash_v2_draft else 1
-        draft_opt = (min(cfg.dflash2_block_size, draft)
-                     if dflash_v2_draft else draft)
-        set_profile_shapes("inputs_embeds", (1, draft_min, embed_width),
-                           (maxB, draft_opt, embed_width),
-                           (maxB, draft, embed_width),
-                           generation_min=(1, draft_min, embed_width),
-                           generation_opt=(maxB, draft_opt, embed_width),
-                           generation_max=(maxB, draft, embed_width))
-    else:
-        set_profile_shapes("inputs_embeds", (1, 1, embed_width),
-                           (maxB, max(1, maxIn // 2), embed_width),
-                           (maxB, maxIn, embed_width),
-                           generation_min=(1, 1, embed_width),
-                           generation_opt=(maxB, 1, embed_width),
-                           generation_max=(maxB, generation_sequence_max,
-                                           embed_width))
+    token_inputs = (
+        "positions",
+        "vision_block_ids",
+        "attention_position_ids",
+        "tree_parent_ids",
+        "tree_depths",
+    )
+    for name in token_inputs:
+        set_profile_shapes(name, proposal_context_range.token(),
+                           generation_range.token())
+    for name in ("dflash_delta_positions", "dflash_delta_token_to_sequence"):
+        set_profile_shapes(name, token_shapes(delta_context_tokens),
+                           token_shapes(delta_generation_tokens))
 
-    # last_token_ids [B, T]
-    if (args.resolved_spec_role == contracts.SpecRole.DRAFT
-            and args.spec_type == "eagle3"):
-        set_profile_shapes("last_token_ids", (1, 1), (maxB, 1), (maxB, 1),
-                           generation_min=(1, 1),
-                           generation_opt=(maxB, 1),
-                           generation_max=(maxB, generation_sequence_max))
-    else:
-        selected_tokens = (args.max_verify_tree_size if args.resolved_spec_role
-                           == contracts.SpecRole.BASE else 1)
-        set_profile_shapes("last_token_ids", (1, 1), (maxB, 1),
-                           (maxB, selected_tokens))
+    sequence_inputs = (
+        "query_lengths",
+        "past_lengths",
+        "attention_sequence_lengths",
+        "state_indices",
+        "valid_tree_counts",
+        "dflash_delta_lengths",
+    )
+    for name in sequence_inputs:
+        set_profile_shapes(name, prefill_range.sequence(),
+                           generation_range.sequence())
+    set_profile_shapes("query_start_offsets", prefill_range.offsets(),
+                       generation_range.offsets())
+    context_carrier_shapes = (ragged.fixed_shape(
+        (0, )) if block_draft else prefill_range.sequence())
+    set_profile_shapes("context_sequence_count_carrier",
+                       context_carrier_shapes, ragged.fixed_shape((0, )))
 
-    # context_lengths [B]
-    set_profile_shapes("context_lengths", (1, ), (maxB, ), (maxB, ))
+    logits_context = tuple((rows, ) for rows in prefill_range.logits_rows)
+    logits_generation = tuple(
+        (rows, ) for rows in generation_range.logits_rows)
+    set_profile_shapes("logits_indices", logits_context, logits_generation)
 
-    # Cached-block drafts update target K/V through a plugin whose delta and
-    # page-table inputs are always batch-shaped, including their context MIN.
-    # Ordinary base-model prefill keeps the zero-length cache-start binding.
-    cached_block_draft = (args.resolved_spec_role == contracts.SpecRole.DRAFT
-                          and args.spec_type
-                          in ("dflash", "jetspec", "dspark"))
-    context_cache_min = (1, ) if cached_block_draft else (0, )
-    set_profile_shapes("kvcache_start_index",
-                       context_cache_min, (maxB, ), (maxB, ),
-                       generation_min=(1, ),
-                       generation_opt=(maxB, ),
-                       generation_max=(maxB, ))
+    generation_phase = 3
+    if args.resolved_spec_role == contracts.SpecRole.DRAFT:
+        generation_phase = 4
+    elif args.resolved_spec_role == contracts.SpecRole.BASE:
+        generation_phase = 5
+    context_phase = 4 if block_draft else 1
+    set_profile_shapes("execution_phase_marker",
+                       ragged.phase_shapes(context_phase),
+                       ragged.phase_shapes(generation_phase))
 
-    # rope cos/sin [ropeB, maxpos, rotary] -- both profiles identical
+    token_aligned_widths = {
+        "inputs_embeds": hidden_size,
+        "hidden_states": hidden_size,
+        "hidden_states_from_draft": hidden_size,
+        "hidden_states_input": hidden_size,
+    }
+    for name, fallback in token_aligned_widths.items():
+        width = fixed_dim(name, -1, fallback)
+        context_range = (proposal_context_range
+                         if name == "inputs_embeds" else prefill_range)
+        set_profile_shapes(name, context_range.token(width),
+                           generation_range.token(width))
+
+    delta_hidden_width = fixed_dim("dflash_target_hidden_concat", -1,
+                                   hidden_size)
+    set_profile_shapes(
+        "dflash_target_hidden_concat",
+        token_shapes(delta_context_tokens, delta_hidden_width),
+        token_shapes(delta_generation_tokens, delta_hidden_width))
+
     for rope_name in ("rope_rotary_cos_sin", "rope_rotary_cos_sin_sliding",
                       "rope_rotary_cos_sin_full"):
         rotary_dim = fixed_dim(rope_name, -1, cfg.rotary_dim)
-        set_profile_shapes(rope_name, (1, maxKV, rotary_dim),
-                           (maxB, maxKV, rotary_dim),
-                           (maxB, maxKV, rotary_dim))
+        set_profile_shapes(rope_name, proposal_context_range.token(rotary_dim),
+                           generation_range.token(rotary_dim))
+    delta_rotary_dim = fixed_dim("dflash_delta_rope_cos_sin", -1,
+                                 cfg.rotary_dim)
+    set_profile_shapes("dflash_delta_rope_cos_sin",
+                       token_shapes(delta_context_tokens, delta_rotary_dim),
+                       token_shapes(delta_generation_tokens, delta_rotary_dim))
 
-    # Paged KV pool [2, numPages, 128, Hkv, D] -- both profiles identical.
     for i in range(
             cfg.num_attn_layers if cfg.is_hybrid else cfg.num_hidden_layers):
         name = f"past_key_values_{i}"
-        layer_heads = fixed_dim(name, 3, Hkv)
-        layer_dim = fixed_dim(name, 4, D)
+        layer_heads = fixed_dim(name, 3, num_kv_heads)
+        layer_dim = fixed_dim(name, 4, head_dim)
         pool_shape = (2, pool_pages, page_size, layer_heads, layer_dim)
-        set_profile_shapes(name, pool_shape, pool_shape, pool_shape)
+        set_profile_shapes(name, ragged.fixed_shape(pool_shape))
 
-    set_profile_shapes("kv_page_table", (1, 2, pages_per_sequence),
-                       (maxB, 2, pages_per_sequence),
-                       (maxB, 2, pages_per_sequence))
+    page_shapes = ((1, 2, pages_per_sequence), (max_sequences, 2,
+                                                pages_per_sequence),
+                   (max_sequences, 2, pages_per_sequence))
+    set_profile_shapes("kv_page_table", page_shapes)
 
-    # Mamba recurrent + conv states (hybrid only)
     if cfg.mamba_cfg is not None:
         mc = cfg.mamba_cfg
         for m in range(cfg.num_mamba_layers):
+            conv_shape = (max_sequences, mc.conv_dim, mc.conv_kernel)
             set_profile_shapes(f"conv_state_{m}",
-                               (1, mc.conv_dim, mc.conv_kernel),
-                               (maxB, mc.conv_dim, mc.conv_kernel),
-                               (maxB, mc.conv_dim, mc.conv_kernel))
-            set_profile_shapes(
-                f"recurrent_state_{m}",
-                (1, mc.num_heads, mc.head_dim, mc.ssm_state_size),
-                (maxB, mc.num_heads, mc.head_dim, mc.ssm_state_size),
-                (maxB, mc.num_heads, mc.head_dim, mc.ssm_state_size))
+                               ragged.fixed_shape(conv_shape))
+            state_shape = (max_sequences, mc.num_heads, mc.head_dim,
+                           mc.ssm_state_size)
+            set_profile_shapes(f"recurrent_state_{m}",
+                               ragged.fixed_shape(state_shape))
 
     if cfg.gdn_cfg is not None:
         gc = cfg.gdn_cfg
         for index in range(cfg.num_gdn_layers):
+            conv_shape = (max_sequences, gc.conv_dim, gc.conv_kernel)
             set_profile_shapes(f"conv_state_{index}",
-                               (1, gc.conv_dim, gc.conv_kernel),
-                               (maxB, gc.conv_dim, gc.conv_kernel),
-                               (maxB, gc.conv_dim, gc.conv_kernel))
-            set_profile_shapes(
-                f"recurrent_state_{index}",
-                (1, gc.num_value_heads, gc.key_head_dim, gc.value_head_dim),
-                (maxB, gc.num_value_heads, gc.key_head_dim, gc.value_head_dim),
-                (maxB, gc.num_value_heads, gc.key_head_dim, gc.value_head_dim))
+                               ragged.fixed_shape(conv_shape))
+            state_shape = (max_sequences, gc.num_value_heads, gc.key_head_dim,
+                           gc.value_head_dim)
+            set_profile_shapes(f"recurrent_state_{index}",
+                               ragged.fixed_shape(state_shape))
 
     for index in range(cfg.num_deepstack_features):
-        set_profile_shapes(f"deepstack_embeds_{index}", (1, 1, H),
-                           (maxB, max(1, maxIn // 2), H), (maxB, maxIn, H),
-                           generation_min=(1, 1, H),
-                           generation_opt=(maxB, 1, H),
-                           generation_max=(maxB, generation_sequence_max, H))
+        set_profile_shapes(f"deepstack_embeds_{index}",
+                           prefill_range.token(hidden_size),
+                           generation_range.token(hidden_size))
 
-    verify = args.max_verify_tree_size
-    tree_size = (args.max_draft_tree_size if args.resolved_spec_role
-                 == contracts.SpecRole.DRAFT else verify)
-    position_min = 2 if dflash_v2_draft else 1
-    position_opt = (min(cfg.dflash2_block_size, tree_size)
-                    if dflash_v2_draft else position_min)
-    set_profile_shapes("attention_pos_id", (1, position_min),
-                       (maxB, position_opt), (maxB, tree_size))
-    if (args.resolved_spec_role == contracts.SpecRole.DRAFT
-            and args.spec_type in ("dflash", "jetspec", "dspark")):
-        draft = args.max_draft_tree_size
-        mask_min_seq = 2 if dflash_v2_draft else 1
-        mask_min_width = (mask_min_seq + 31) // 32
-        mask_opt_seq = min(cfg.dflash2_block_size,
-                           draft) if dflash_v2_draft else max(1, draft // 2)
-        mask_opt_width = max(1, (mask_opt_seq + 31) // 32)
-        set_profile_shapes("attention_mask", (1, mask_min_seq, mask_min_width),
-                           (maxB, mask_opt_seq, mask_opt_width),
-                           (maxB, draft, (draft + 31) // 32))
-    else:
-        set_profile_shapes("attention_mask", (1, 1, 1), (maxB, 1, 1),
-                           (maxB, tree_size, maxKV + tree_size))
-    set_profile_shapes("hidden_states", (1, 1, H), (maxB, 1, H),
-                       (maxB, tree_size, H))
-    if (args.resolved_spec_role == contracts.SpecRole.DRAFT
-            and args.spec_type in ("eagle3", "mtp")):
-        set_profile_shapes("hidden_states_from_draft", (1, 1, H),
-                           (maxB, max(1, maxIn // 2), H), (maxB, maxIn, H),
-                           generation_min=(1, 1, H),
-                           generation_opt=(maxB, 1, H),
-                           generation_max=(maxB, generation_sequence_max, H))
-    else:
-        set_profile_shapes("hidden_states_from_draft", (1, 1, H), (maxB, 1, H),
-                           (maxB, verify, H))
-    set_profile_shapes("lm_head_weight", (1, H), (cfg.vocab_size, H),
-                       (cfg.vocab_size, H))
-    set_profile_shapes("tree_parent_ids", (1, 1), (maxB, 1), (maxB, tree_size))
-    set_profile_shapes("tree_depths", (1, 1), (maxB, 1), (maxB, tree_size))
-    set_profile_shapes("spec_verify_phase_marker", (0, ), (0, ), (0, ),
-                       generation_min=(0, ),
-                       generation_opt=(1, ),
-                       generation_max=(1, ))
-    set_profile_shapes("dflash_delta_lengths", (1, ), (maxB, ), (maxB, ))
-    # dim0 is the runtime S override; a meaningful S is below the context
-    # length, hence <= maxKV.
-    set_profile_shapes("skip_softmax_scale", (0, ), (0, ), (maxKV, ))
-    dflash_width = fixed_dim("dflash_target_hidden_concat", -1, H)
-    if (args.resolved_spec_role == contracts.SpecRole.DRAFT
-            and args.spec_type in ("dflash", "dspark")):
-        generation_hidden = args.max_draft_tree_size
-        if args.spec_type == "dspark":
-            generation_hidden = args.max_verify_tree_size
-        set_profile_shapes("dflash_target_hidden_concat", (1, 1, dflash_width),
-                           (maxB, max(1, maxIn // 2), dflash_width),
-                           (maxB, maxIn, dflash_width),
-                           generation_min=(1, 1, dflash_width),
-                           generation_opt=(maxB, generation_hidden,
-                                           dflash_width),
-                           generation_max=(maxB, generation_hidden,
-                                           dflash_width))
-    else:
-        set_profile_shapes("dflash_target_hidden_concat", (1, 1, dflash_width),
-                           (maxB, 1, dflash_width),
-                           (maxB, verify, dflash_width))
-    assistant_width = fixed_dim("hidden_states_input", -1, H)
-    if (cfg.shares_target_kv
-            or (args.resolved_spec_role == contracts.SpecRole.DRAFT
-                and args.spec_type in ("eagle3", "mtp", "gemma4_mtp"))):
-        set_profile_shapes("hidden_states_input", (1, 1, assistant_width),
-                           (maxB, max(1, maxIn // 2), assistant_width),
-                           (maxB, maxIn, assistant_width),
-                           generation_min=(1, 1, assistant_width),
-                           generation_opt=(maxB, 1, assistant_width),
-                           generation_max=(maxB, generation_sequence_max,
-                                           assistant_width))
-    else:
-        set_profile_shapes("hidden_states_input", (1, 1, assistant_width),
-                           (maxB, 1, assistant_width),
-                           (maxB, verify, assistant_width))
+    max_tree_size = (args.max_draft_tree_size
+                     if args.resolved_spec_role == contracts.SpecRole.DRAFT
+                     else args.max_verify_tree_size)
+    packed_width = max(1, (max_tree_size + 31) // 32)
+    context_widths = (1, packed_width, packed_width) if block_draft else (1, 1,
+                                                                          1)
+    packed_context = tuple((tokens, width) for tokens, width in zip(
+        proposal_context_range.physical_tokens, context_widths))
+    packed_generation = tuple(
+        (tokens, width)
+        for tokens, width in zip(generation_range.physical_tokens, (
+            1, packed_width, packed_width)))
+    set_profile_shapes("packed_attention_mask", packed_context,
+                       packed_generation)
+
+    lm_head_width = fixed_dim("lm_head_weight", -1, hidden_size)
+    set_profile_shapes("lm_head_weight",
+                       ((1, lm_head_width), (cfg.vocab_size, lm_head_width),
+                        (cfg.vocab_size, lm_head_width)))
+    set_profile_shapes("skip_softmax_scale",
+                       ((0, ), (0, ), (args.max_kv_cache_capacity, )))
 
     for index in range(cfg.num_hidden_layers):
         name = f"ple_token_embeds_{index}"
         width = fixed_dim(name, -1, cfg.hidden_size_per_layer_input)
-        set_profile_shapes(name, (1, 1, width),
-                           (maxB, max(1, maxIn // 2), width),
-                           (maxB, maxIn, width),
-                           generation_min=(1, 1, width),
-                           generation_opt=(maxB, 1, width),
-                           generation_max=(maxB, generation_sequence_max,
-                                           width))
+        set_profile_shapes(name, prefill_range.token(width),
+                           generation_range.token(width))
 
     for input_index in range(network.num_inputs):
         tensor = network.get_input(input_index)
@@ -840,7 +819,7 @@ def _setup_llm_profiles(builder, config, network, cfg: DeviceConfig,
             minimum = (0, shape[1])
             maximum = (args.max_lora_rank, shape[1])
         optimum = maximum
-        set_profile_shapes(tensor.name, minimum, optimum, maximum)
+        set_profile_shapes(tensor.name, (minimum, optimum, maximum))
 
     config.add_optimization_profile(ctx_prof)
     config.add_optimization_profile(gen_prof)

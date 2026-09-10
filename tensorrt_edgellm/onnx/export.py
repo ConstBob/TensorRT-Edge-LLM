@@ -22,23 +22,24 @@ attention and Mamba ops expose state as I/O.
 ONNX input / output layout - attention-only model
 --------------------------------------------------
 Inputs:
-    inputs_embeds           [batch, seq_len, hidden_size]            float16
+    inputs_embeds           [physical_tokens, hidden_size]           float16
     past_key_values_0..N    [2, num_pages, 128, num_kv_heads, head_dim] float16 (paged pool)
-    rope_rotary_cos_sin     [batch, max_pos, rotary_dim]  float32
-    context_lengths         [batch]                       int32
-    kvcache_start_index     [batch]                       int32
+    rope_rotary_cos_sin     [physical_tokens, rotary_dim] float32
+    token metadata          token rows [physical_tokens], sequence rows [batch]
+    state_indices           [batch]                       int32
+    execution_phase_marker  [phase_extent]                int32
     kv_page_table           [batch, 2, max_pages_per_seq] int32
-    last_token_ids          [batch, 1]                    int64
+    logits_indices          [selected_tokens]             int64
 
 Outputs:
-    logits                  [batch, seq_len, vocab_size]             float32
+    logits                  [selected_tokens, vocab_size]            float32
     present_key_values_0..N [2, num_pages, 128, num_kv_heads, head_dim] float16 (aliases past)
 
 Additional I/O for hybrid (Mamba) models
 -----------------------------------------
 Extra inputs:
-    conv_state_0..M   [batch, conv_dim, conv_kernel-1]        float16
-    ssm_state_0..M    [batch, num_heads, head_dim, ssm_state] float16
+    conv_state_0..M   [resident_rows, conv_dim, conv_kernel]        float16
+    ssm_state_0..M    [resident_rows, num_heads, head_dim, ssm_state] float16
 
 Extra outputs:
     present_conv_0..M   updated conv states
@@ -61,10 +62,6 @@ from ..external_weights import (externalize_model_weights,
 from ..models.default.modeling_default import CausalLM
 from .dynamo_translations import build_custom_translation_table
 
-#: Name of the FP32 learned-attention-sink constant emitted by the AttentionPlugin
-#: translation rule (``attention_sinks_fp32`` in dynamo_translations.py; ONNX appends
-#: ``_2``, ``_3``... per layer). The XQA kernel reads sinks as ``float const*``
-#: (``mergeAttentionSinks`` in mha.cu), so they must not be downgraded to FP16.
 _ATTENTION_SINK_INIT_PREFIX = "attention_sinks_fp32"
 
 logger = logging.getLogger(__name__)
@@ -253,9 +250,8 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
     _ATTENTION_POS_ID_POSITION = 10
     _SKIP_SCALE_POSITION = 11
     _SWA_KV_CACHE_MODE_POSITION = 12
-    # Sinks are emitted after the SWA mode selector in the translation's full
-    # optional layout, so they occupy the next pre-compaction slot.
     _ATTENTION_SINKS_POSITION = 13
+    _TOKEN_METADATA_POSITIONS = range(14, 18)
     model = onnx.load(onnx_path, load_external_data=False)
     changed = 0
     mode_shape_changed = False
@@ -321,7 +317,7 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
                 get_input(_ATTENTION_MASK_POSITION),
                 get_input(_ATTENTION_POS_ID_POSITION),
             ])
-        elif vision_block_attn:
+        if vision_block_attn:
             new_inputs.append(get_input(_ATTENTION_MASK_POSITION))
         # Trailing runtime skip-softmax override carrier (shape-only INT8 input),
         # emitted last by the translation; kept iff skip-softmax is enabled
@@ -352,24 +348,20 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
         elif supports_bounded_attr is not None:
             node.attribute.remove(supports_bounded_attr)
             node_changed = True
-
-        # Learned attention-sink constant, emitted after the SWA mode selector;
-        # kept iff the layer enables sinks. Appended before the single commit
-        # below so a node that needs no compaction still keeps its sink.
         sink_input = get_input(_ATTENTION_SINKS_POSITION)
         if attention_sink:
             if sink_input:
                 new_inputs.append(sink_input)
         elif sink_input:
             dropped_const_tensors.add(sink_input)
-
+        new_inputs.extend(get_input(i) for i in _TOKEN_METADATA_POSITIONS)
         if new_inputs != inputs:
             del node.input[:]
             node.input.extend(new_inputs)
             node_changed = True
         changed += int(node_changed)
 
-    # Prune the gamma / sink Constant/Cast chains that no longer feed any node.
+    # Prune disabled gamma/sink Constant and Cast chains that no longer feed a node.
     if dropped_const_tensors:
         consumed = {i for n in model.graph.node for i in n.input}
         graph_outputs = {o.name for o in model.graph.output}
@@ -628,10 +620,6 @@ def _initializer_dtype_fixup_required(
         if node.op_type == "Fp16MoePlugin" and len(node.input) > 4:
             plugin_fp32_init_names.add(node.input[4])
         if node.op_type == "AttentionPlugin":
-            # Learned attention sinks are read by the XQA kernel as float const* and
-            # must survive the FP32 -> FP16 weight downgrade. Matched by initializer
-            # name rather than input position so the plugin's optional-input list can
-            # grow without silently protecting the wrong tensor.
             plugin_fp32_init_names.update(
                 name for name in node.input
                 if name.startswith(_ATTENTION_SINK_INIT_PREFIX))
@@ -843,13 +831,6 @@ def _capture_qk_norm_gammas_for_export(model: "CausalLM") -> None:
 
 
 def _capture_attention_sinks_for_export(model: "CausalLM") -> None:
-    """Populate learned attention-sink lists on every attention module.
-
-    Same contract as :func:`_capture_qk_norm_gammas_for_export`: raises if a
-    module carries sink weights but nothing was captured, because a dropped
-    sink is a silent change to the softmax denominator rather than a build
-    failure.
-    """
     for module in model.modules():
         if not hasattr(module, "_capture_attention_sink_list"):
             continue
@@ -859,9 +840,8 @@ def _capture_attention_sinks_for_export(model: "CausalLM") -> None:
         if has_sink and not captured:
             raise RuntimeError(
                 "attention sink capture failed for "
-                f"{type(module).__name__}: the module has attention_sink_bias "
-                "weights but no sink values were captured — the export would "
-                "silently drop the learned sink.")
+                f"{type(module).__name__}: sink weights exist but no values were captured"
+            )
 
 
 def _fix_initializer_dtypes(
@@ -954,10 +934,6 @@ def _fix_initializer_dtypes(
         if node.op_type == "Fp16MoePlugin" and len(node.input) > 4:
             plugin_fp32_init_names.add(node.input[4])
         if node.op_type == "AttentionPlugin":
-            # Learned attention sinks are read by the XQA kernel as float const* and
-            # must survive the FP32 -> FP16 weight downgrade. Matched by initializer
-            # name rather than input position so the plugin's optional-input list can
-            # grow without silently protecting the wrong tensor.
             plugin_fp32_init_names.update(
                 name for name in node.input
                 if name.startswith(_ATTENTION_SINK_INIT_PREFIX))

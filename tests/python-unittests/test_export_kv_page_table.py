@@ -17,8 +17,8 @@
 Exports a tiny default-arch (attention-only) model and checks that the
 exported graph carries the paged-KV plugin contract: a required
 ``kv_page_table`` graph input of shape ``[batch, 2, max_pages_per_seq]``,
-AttentionPlugin nodes with six required inputs (no tree-attention optionals for a
-non-tree-attention model), and that the ``past_key_values_i`` KV-cache
+AttentionPlugin nodes with the six fixed inputs plus four ragged metadata
+inputs, and that the ``past_key_values_i`` KV-cache
 binding is declared as the AttentionPlugin's paged-pool contract
 ``[2, num_pages, KV_PAGE_SIZE, num_kv_heads, head_dim]``.
 """
@@ -36,6 +36,7 @@ from tensorrt_edgellm.checkpoint.checkpoint_utils import \
     build_runtime_llm_config_dict
 from tensorrt_edgellm.config import (LAYER_GDN, QUANT_NVFP4, GdnConfig,
                                      ModelConfig, QuantConfig)
+from tensorrt_edgellm.models import ops
 from tensorrt_edgellm.models.default.modeling_default import (
     CausalLM, fuse_qkv_projections)
 from tensorrt_edgellm.models.ops import (KV_PAGE_SIZE,
@@ -46,7 +47,18 @@ from tensorrt_edgellm.onnx.export import (_export_model,
 from tensorrt_edgellm.onnx.onnx_custom_schemas import \
     register_tensorrt_edgellm_onnx_custom_schemas
 
-_NUM_REQUIRED_ATTENTION_INPUTS = 6
+_REQUIRED_ATTENTION_INPUTS = (
+    "query_key_value",
+    "past_key_value",
+    "query_lengths",
+    "rope_rotary_cos_sin",
+    "past_lengths",
+    "kv_page_table",
+    "query_start_offsets",
+    "attention_sequence_lengths",
+    "execution_phase_marker",
+    "context_sequence_count_carrier",
+)
 
 # ``attention_plugin``'s positional signature ends
 # (..., kvcache_start_index, kv_page_table, ...) — with the packed-QKV
@@ -120,7 +132,7 @@ def test_nvfp4_tp_gemm_allreduce_target_export(monkeypatch, tmp_path, target,
     assert op_types.count(expected_op) == 2
     assert unexpected_op not in op_types
     if target == "sm121":
-        assert "MatMul" in op_types
+        assert "Gemm" in op_types
 
 
 def test_nvfp4_fp8_kv_qkv_fusion_preserves_export_scales(tmp_path):
@@ -270,11 +282,12 @@ def test_attention_plugin_nodes_have_required_inputs(tmp_path):
     ]
     assert attention_nodes, "Expected at least one AttentionPlugin node"
     for node in attention_nodes:
-        assert len(node.input) == _NUM_REQUIRED_ATTENTION_INPUTS, (
+        assert len(node.input) == len(_REQUIRED_ATTENTION_INPUTS), (
             f"AttentionPlugin node {node.name!r} has {len(node.input)} "
-            f"inputs, expected {_NUM_REQUIRED_ATTENTION_INPUTS}")
+            f"inputs, expected {len(_REQUIRED_ATTENTION_INPUTS)}")
         assert node.input[5] != "", (
             "AttentionPlugin input index 5 (kv_page_table) must not be empty")
+        assert tuple(node.input[2:]) == _REQUIRED_ATTENTION_INPUTS[2:]
 
 
 def test_kv_cache_graph_input_is_pool_shaped(tmp_path):
@@ -365,9 +378,9 @@ def test_dflash_target_kv_update_requires_page_table_argument():
         "k_delta",
         "v_delta",
         "past_key_value",
-        "rope_cos_sin",
-        "delta_start_positions",
-        "delta_lengths",
+        "token_aligned_rope_cos_sin",
+        "delta_positions",
+        "delta_token_to_sequence",
         "kv_page_table",
     ]
 
@@ -385,9 +398,9 @@ def test_dflash_target_kv_update_schema_keeps_name_and_has_seven_inputs():
         "k_delta",
         "v_delta",
         "past_key_value",
-        "rope_cos_sin",
-        "delta_start_positions",
-        "delta_lengths",
+        "token_aligned_rope_cos_sin",
+        "delta_positions",
+        "delta_token_to_sequence",
         "kv_page_table",
     ]
 
@@ -432,3 +445,17 @@ def test_attention_plugin_direct_call_sites_pass_required_static_flags():
                 f"{path}:{node.lineno}: attention_plugin( direct call is "
                 f"missing required static flag(s): {', '.join(missing)}")
     assert not failures, "\n".join(failures)
+
+
+def test_attention_plugin_rejects_dense_rank_three_input():
+    qkv = torch.zeros(1, 2, 8, dtype=torch.float16)
+    kv_cache = torch.zeros(2, 1, 128, 1, 2, dtype=torch.float16)
+    sequence_lengths = torch.ones(1, dtype=torch.int32)
+    rope = torch.zeros(2, 2, dtype=torch.float32)
+    past_lengths = torch.zeros(1, dtype=torch.int32)
+    page_table = torch.zeros(1, 2, 1, dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="token-major rank-2"):
+        ops.attention_plugin(qkv, kv_cache, sequence_lengths, rope,
+                             past_lengths, page_table, 1, 1, 2, 0, False,
+                             False, 1.0, False, False, 0.0)

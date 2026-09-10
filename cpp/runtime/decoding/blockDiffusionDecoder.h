@@ -94,13 +94,16 @@ private:
         int32_t canvasLen{0};
         int32_t step{0};
         std::vector<int32_t> const* validCanvasLengths{nullptr};
+        std::vector<int32_t> const* committedLengths{nullptr};
+        std::vector<ResidentRef> const* residentRefs{nullptr};
         float selfConditioningTemperature{0.0F};
         cudaStream_t stream{};
     };
 
     bool initializeCanvas(int32_t batchSize, int32_t canvasLen, cudaStream_t stream);
-    bool prepareCanvasMetadata(int32_t batchSize, int32_t canvasLen, bool denoisePhase, cudaStream_t stream,
-        std::vector<int32_t> const* contextLengths = nullptr);
+    bool prepareCanvasMetadata(int32_t batchSize, int32_t canvasLen, InferenceDims const& dims, cudaStream_t stream,
+        std::vector<int32_t> const* queryLengths = nullptr, std::vector<int32_t> const* pastLengths = nullptr,
+        std::vector<ResidentRef> const* residentRefs = nullptr);
     bool updateSelfConditioningTemperature(float temperature, cudaStream_t stream);
     bool prepareUnifiedConditioning(
         int32_t batchSize, int32_t canvasLen, int32_t step, float temperature, cudaStream_t stream);
@@ -138,6 +141,7 @@ private:
     std::vector<int32_t> mRemainingLengthsScratch;
     std::vector<int32_t> mValidCanvasLengthsScratch;
     std::vector<int32_t> mCommitLengthsScratch;
+    RaggedExecutionBatch mCanvasMetadataScratch;
     Tensor* mCurrentDenoiseLogits{nullptr};
     uint64_t mRandomOffset{0};
     int32_t mCanvasLen{0};

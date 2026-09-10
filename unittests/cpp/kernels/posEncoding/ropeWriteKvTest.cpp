@@ -477,7 +477,9 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
     EXPECT_EQ(qOut.size(), qReference.size());
     for (size_t i = 0; i < qOut.size(); ++i)
     {
-        ASSERT_TRUE(isclose(qOut[i], qReference[i], 1e-3, 4e-3));
+        ASSERT_TRUE(isclose(qOut[i], qReference[i], 1e-3, 4e-3))
+            << "Q mismatch at index " << i << ": got " << __half2float(qOut[i]) << ", expected "
+            << __half2float(qReference[i]);
     }
 
     for (int32_t b = 0; b < batchSize; ++b)
@@ -1113,6 +1115,71 @@ TEST(RopePackedSharedKV, ProducesScratchWithoutWritingCache)
     for (half const value : cacheQOnly)
     {
         EXPECT_EQ(__half2float(value), 777.0F);
+    }
+}
+
+TEST(RopePackedRaggedDecode, UsesTokenAlignedRopeAndAbsoluteKvPosition)
+{
+    cudaStream_t stream{nullptr};
+    int32_t constexpr headDim = 64;
+    int32_t constexpr numQHeads = 1;
+    int32_t constexpr numKVHeads = 1;
+    int32_t constexpr combinedHeads = numQHeads + 2 * numKVHeads;
+    int32_t constexpr maxPagesPerSeq = 2;
+
+    std::vector<float> cosSin(headDim);
+    std::fill_n(cosSin.begin(), headDim / 2, 0.25F);
+    std::fill_n(cosSin.begin() + headDim / 2, headDim / 2, 0.75F);
+    rt::Tensor cosSinTensor({1, 1, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    copyHostToDevice(cosSinTensor, cosSin);
+
+    std::vector<half> packed(combinedHeads * headDim);
+    uniformFloatInitialization(packed);
+    rt::Tensor packedTensor({1, 1, combinedHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    copyHostToDevice(packedTensor, packed);
+    rt::Tensor qScratchTensor({1, 1, numQHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    half const sentinel = __float2half(777.0F);
+    std::vector<half> kvInit(static_cast<size_t>(2 * maxPagesPerSeq) * kPageSize * numKVHeads * headDim, sentinel);
+    rt::Tensor kvCacheTensor(
+        {2, maxPagesPerSeq, kPageSize, numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    copyHostToDevice(kvCacheTensor, kvInit);
+
+    rt::Tensor contextLengthTensor({1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice(contextLengthTensor, std::vector<int32_t>{201});
+    auto const pageTable = makeIdentityPageTable(1, maxPagesPerSeq);
+    rt::Tensor pageTableTensor({1, 2, maxPagesPerSeq}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice(pageTableTensor, pageTable);
+
+    launchApplyRopeFromPackedToSplit(cosSinTensor, rt::OptionalInputTensor{contextLengthTensor}, std::nullopt,
+        packedTensor, qScratchTensor, kvCacheTensor, 1.0F, 1.0F, stream, pageTableTensor.dataPointer<int32_t>(),
+        maxPagesPerSeq, nullptr, nullptr, nullptr, 1.0F, nullptr, nullptr, 1e-6F, false, std::nullopt,
+        /*writeKVCache=*/true, /*enablePdl=*/false, /*tokenAlignedRope=*/true);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+
+    std::vector<float> const cos(cosSin.begin(), cosSin.begin() + headDim / 2);
+    std::vector<float> const sin(cosSin.begin() + headDim / 2, cosSin.end());
+    std::vector<half> const qInput(packed.begin(), packed.begin() + headDim);
+    auto const qRef = ropeRefCosSin(qInput, 1, headDim, headDim, cos, sin, /*permuteRope=*/true);
+    auto const qOut = copyDeviceToHost<half>(qScratchTensor);
+    for (int32_t dim = 0; dim < headDim; ++dim)
+    {
+        EXPECT_TRUE(isclose(qOut[dim], qRef[dim], 1e-3, 1e-3)) << "Q mismatch at dim=" << dim;
+    }
+
+    auto const kvOut = copyDeviceToHost<half>(kvCacheTensor);
+    int32_t constexpr tokenPosition = 200;
+    int32_t constexpr page = tokenPosition / kPageSize;
+    int32_t constexpr inPage = tokenPosition % kPageSize;
+    for (int32_t dim = 0; dim < headDim; ++dim)
+    {
+        EXPECT_NE(
+            __half2float(kvOut[pagedKvIndex(0, page, inPage, 0, dim, maxPagesPerSeq, numKVHeads, headDim)]), 777.0F);
+        EXPECT_NE(
+            __half2float(kvOut[pagedKvIndex(1, page, inPage, 0, dim, maxPagesPerSeq, numKVHeads, headDim)]), 777.0F);
+        EXPECT_EQ(__half2float(kvOut[pagedKvIndex(0, 0, 0, 0, dim, maxPagesPerSeq, numKVHeads, headDim)]), 777.0F);
+        EXPECT_EQ(__half2float(kvOut[pagedKvIndex(1, 0, 0, 0, dim, maxPagesPerSeq, numKVHeads, headDim)]), 777.0F);
     }
 }
 

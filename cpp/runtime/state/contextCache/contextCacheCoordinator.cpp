@@ -289,6 +289,7 @@ struct ContextCacheCoordinator::RequestHandle::Impl
     struct SequenceState
     {
         CacheRequestLease lease;
+        ResidentRef resident;
         std::vector<int32_t> tokenIds;
         BlockKeyExtras keyExtras;
         std::vector<Hash128> perPositionMediaHash;
@@ -639,12 +640,13 @@ public:
                 && fullBlockCount < sequence.lease.draftPages().size(),
             "Hybrid+MTP endpoint has no live paired partial pages");
 
-        mCoordinator.mHybridSnapshots->captureRecurrent(reservation->recurrentSnapshotSlot, slot, impl.stream);
+        mCoordinator.mHybridSnapshots->captureRecurrent(
+            reservation->recurrentSnapshotSlot, sequence.resident.slot, impl.stream);
         mCoordinator.mHybridSnapshots->capturePartialKv(*reservation->partialKvSnapshotSlot,
             sequence.lease.basePages()[fullBlockCount], sequence.lease.draftPages()[fullBlockCount], partialTokenCount,
             impl.stream);
         mCoordinator.mHybridSnapshots->captureBoundaryHidden(
-            reservation->recurrentSnapshotSlot, baseHiddenStates, slot, boundaryHiddenRow, impl.stream);
+            reservation->recurrentSnapshotSlot, baseHiddenStates, boundaryHiddenRow, impl.stream);
         impl.markDeviceWorkEnqueued();
 
         size_t const fullTokenCount = fullBlockCount * static_cast<size_t>(kTOKENS_PER_PAGE);
@@ -691,7 +693,7 @@ public:
         ELLM_CHECK(recurrentSnapshot.has_value(),
             "Hybrid+MTP boundary-hidden restore requires a bound recurrent snapshot from the cache hit");
         mCoordinator.mHybridSnapshots->restoreBoundaryHidden(
-            *recurrentSnapshot, baseHiddenStates, slot, destinationRow, impl.stream);
+            *recurrentSnapshot, baseHiddenStates, destinationRow, impl.stream);
         return ContextCacheCoordinatorStatus::kOk;
     }
 };
@@ -1069,6 +1071,7 @@ bool ContextCacheCoordinator::acquireIntoRequest(RequestHandle::Impl& request,
     sequence.lookupPolicy = lookupPolicy;
     sequence.commitPolicy = commitPolicy;
     sequence.replayTailLength = replayTailLength;
+    sequence.resident = admission.resident;
     sequence.committedStateLength = acquired.plan.reuseTokenLength;
     sequence.commonStateLength = acquired.plan.reuseTokenLength;
     request.sequences.push_back(std::move(sequence));
@@ -1117,8 +1120,8 @@ ContextCacheCoordinator::BeginRequestResult ContextCacheCoordinator::beginReques
         "Speculative context-cache request does not match the deployment contract");
     bool const containsMedia = std::any_of(admission.sequences.begin(), admission.sequences.end(),
         [](ContextCacheSequenceAdmission const& sequence) { return !sequence.perPositionMediaHash.empty(); });
-    ContextCacheLookupPolicy const lookupPolicy
-        = admission.speculativeRequest && containsMedia ? ContextCacheLookupPolicy::kBypass : admission.lookupPolicy;
+    bool const forceBatchBypass = admission.lookupPolicy == ContextCacheLookupPolicy::kBypass
+        || (admission.speculativeRequest && containsMedia);
     if (mPoisoned)
     {
         return BeginRequestResult{ContextCacheCoordinatorStatus::kPoisoned, std::nullopt};
@@ -1147,29 +1150,99 @@ ContextCacheCoordinator::BeginRequestResult ContextCacheCoordinator::beginReques
     request->sequences.reserve(admission.sequences.size());
     std::vector<int32_t> prefillStarts;
     prefillStarts.reserve(admission.sequences.size());
+    std::vector<bool> residentSlots(static_cast<size_t>(maxBatchSize), false);
 
     for (ContextCacheSequenceAdmission const& sequenceAdmission : admission.sequences)
     {
-        if (!acquireIntoRequest(*request, sequenceAdmission, lookupPolicy, admission.commitPolicy,
-                admission.replayTailLength, headroom, /*insufficientCapacity=*/nullptr))
+        ContextCacheLookupPolicy const lookupPolicy = forceBatchBypass
+            ? ContextCacheLookupPolicy::kBypass
+            : sequenceAdmission.lookupPolicy.value_or(admission.lookupPolicy);
+        ELLM_CHECK(
+            lookupPolicy == ContextCacheLookupPolicy::kUseCache || lookupPolicy == ContextCacheLookupPolicy::kBypass,
+            "Context cache sequence admission has an invalid lookup policy");
+        ELLM_CHECK(sequenceAdmission.resident.slot >= 0 && sequenceAdmission.resident.slot < maxBatchSize,
+            "Context cache admission resident slot is outside the engine range");
+        ELLM_CHECK(sequenceAdmission.resident.epoch != 0, "Context cache admission resident epoch is invalid");
+        ELLM_CHECK(!residentSlots[static_cast<size_t>(sequenceAdmission.resident.slot)],
+            "Context cache admission contains a duplicate resident slot");
+        residentSlots[static_cast<size_t>(sequenceAdmission.resident.slot)] = true;
+        AcquireSequenceResult acquired
+            = acquireSequence(sequenceAdmission, admission.speculativeRequest, lookupPolicy, headroom);
+        if (acquired.status != AcquireStatus::kAcquired || !acquired.lease.has_value())
         {
             return BeginRequestResult{ContextCacheCoordinatorStatus::kRequestFailed, std::nullopt};
         }
-        prefillStarts.push_back(request->sequences.back().reuseTokenLength);
+
+        RequestHandle::Impl::SequenceState sequence;
+        sequence.lease = std::move(*acquired.lease);
+        sequence.resident = sequenceAdmission.resident;
+        sequence.tokenIds = sequenceAdmission.tokenIds;
+        sequence.keyExtras = sequenceAdmission.keyExtras;
+        sequence.perPositionMediaHash = sequenceAdmission.perPositionMediaHash;
+        sequence.reuseTokenLength = acquired.plan.reuseTokenLength;
+        sequence.lookupPolicy = lookupPolicy;
+        sequence.commitPolicy = admission.commitPolicy;
+        sequence.replayTailLength = admission.replayTailLength;
+        sequence.committedStateLength = acquired.plan.reuseTokenLength;
+        sequence.commonStateLength = acquired.plan.reuseTokenLength;
+        request->sequences.push_back(std::move(sequence));
+        prefillStarts.push_back(acquired.plan.reuseTokenLength);
+        LOG_INFO("Context cache: sequence %zu reuse %d/%zu tokens (%d pages)", request->sequences.size() - 1,
+            acquired.plan.reuseTokenLength, sequenceAdmission.tokenIds.size(),
+            acquired.plan.reuseTokenLength / kTOKENS_PER_PAGE);
+        ++mMetrics.admittedSequences;
+        mMetrics.mediaAwareSequences += static_cast<uint64_t>(!sequenceAdmission.perPositionMediaHash.empty());
+        mMetrics.matchedTokens += static_cast<uint64_t>(acquired.plan.matchedTokenLength);
+        mMetrics.reusedTokens += static_cast<uint64_t>(acquired.plan.reuseTokenLength);
+        mMetrics.hitSequences += static_cast<uint64_t>(acquired.plan.matchedTokenLength > 0);
+        mMetrics.lookupBypassSequences
+            += static_cast<uint64_t>(lookupPolicy == ContextCacheLookupPolicy::kBypass || acquired.forcedCold);
+        if (acquired.forcedCold)
+        {
+            ++mMetrics.forcedColdSequences;
+            if (shouldLogDegradation(mMetrics.forcedColdSequences))
+            {
+                LOG_WARNING("Context cache forced-cold fallback count reached %llu",
+                    static_cast<unsigned long long>(mMetrics.forcedColdSequences));
+            }
+        }
+        switch (acquired.plan.kind)
+        {
+        case ReusePlanKind::kStandard: ++mMetrics.standardPlans; break;
+        case ReusePlanKind::kNoReusablePrefix: ++mMetrics.noReusablePrefixPlans; break;
+        case ReusePlanKind::kFullInputRewind: ++mMetrics.fullInputRewindPlans; break;
+        }
+        mMetrics.specFullPageReplays
+            += static_cast<uint64_t>(acquired.plan.specReplayMode == SpecReplayMode::kFullPage);
     }
 
     AdmissionResult admitted{RequestHandle(std::move(request)), std::move(prefillStarts)};
     return BeginRequestResult{ContextCacheCoordinatorStatus::kOk, std::move(admitted)};
 }
 
-void ContextCacheCoordinator::retractSequenceAdmission(RequestHandle& request)
+bool ContextCacheCoordinator::retractSequenceAdmission(RequestHandle& request) noexcept
 {
-    RequestHandle::Impl& impl = checkedImpl(request);
-    ELLM_CHECK(impl.sequences.size() > 1, "Context cache admission retraction requires an admitted tail sequence");
-    int32_t const slot = static_cast<int32_t>(impl.sequences.size()) - 1;
-    impl.sequences.pop_back(); // The lease releases with the sequence state.
-    mBasePageTable.setRows({KVPageTableRowUpdate{slot, nullptr, 0}});
-    mBasePageTable.upload(impl.stream);
+    try
+    {
+        RequestHandle::Impl& impl = checkedImpl(request);
+        if (impl.sequences.size() <= 1)
+        {
+            mPoisoned = true;
+            return false;
+        }
+        int32_t const residentSlot = impl.sequences.back().resident.slot;
+        impl.sequences.pop_back(); // The lease releases with the sequence state.
+        mBasePageTable.setRows({KVPageTableRowUpdate{residentSlot, nullptr, 0}});
+        mBasePageTable.upload(impl.stream);
+        return true;
+    }
+    catch (...)
+    {
+        // The lease was either released above or remains owned by the request handle. In either
+        // case, refuse further admissions because the device page-table row is not trustworthy.
+        mPoisoned = true;
+        return false;
+    }
 }
 
 ContextCacheCoordinator::AdmitSequenceResult ContextCacheCoordinator::admitSequence(
@@ -1180,7 +1253,7 @@ ContextCacheCoordinator::AdmitSequenceResult ContextCacheCoordinator::admitSeque
         "Context cache sequence admission requires a settled executing request");
     ELLM_CHECK(impl.pendingCompactionBatchSize < 0,
         "Context cache sequence admission cannot interleave a pending batch compaction");
-    // V0 scope: vanilla attention only. Hybrid/MTP admission needs a snapshot restore into a live
+    // Live-admission scope: vanilla attention only. Hybrid/MTP needs a snapshot restore into a live
     // batch and speculative admission a coherent draft path; both arrive with later stages.
     ELLM_CHECK(!impl.speculativeRequest && !usesCheckpointReuse() && deploymentHasAttention(),
         "Context cache sequence admission is limited to vanilla attention deployments");
@@ -1192,6 +1265,12 @@ ContextCacheCoordinator::AdmitSequenceResult ContextCacheCoordinator::admitSeque
     int32_t const maxBatchSize = mBaseCache.getKVCacheManager().getConfig().maxBatchSize;
     ELLM_CHECK(impl.sequences.size() < static_cast<size_t>(maxBatchSize),
         "Context cache sequence admission exceeds the engine batch size");
+    ELLM_CHECK(admission.resident.slot >= 0 && admission.resident.slot < maxBatchSize,
+        "Context cache sequence admission resident slot is outside the engine range");
+    ELLM_CHECK(admission.resident.epoch != 0, "Context cache sequence admission resident epoch is invalid");
+    ELLM_CHECK(std::none_of(impl.sequences.begin(), impl.sequences.end(),
+                   [&](auto const& sequence) { return sequence.resident.slot == admission.resident.slot; }),
+        "Context cache sequence admission resident slot is already in use");
 
     // The batch-wide policies travel with the request: the scheduler admits only requests whose
     // cache policies match the resident batch (BatchCompatibility), so the founder's are the
@@ -1200,6 +1279,7 @@ ContextCacheCoordinator::AdmitSequenceResult ContextCacheCoordinator::admitSeque
     ContextCacheCommitPolicy const commitPolicy = impl.sequences.front().commitPolicy;
     int32_t const replayTailLength = impl.sequences.front().replayTailLength;
 
+    impl.sequences.reserve(impl.sequences.size() + 1);
     bool insufficientCapacity = false;
     if (!acquireIntoRequest(
             impl, admission, lookupPolicy, commitPolicy, replayTailLength, headroom, &insufficientCapacity))
@@ -1210,23 +1290,35 @@ ContextCacheCoordinator::AdmitSequenceResult ContextCacheCoordinator::admitSeque
     // Bind exactly the new row; resident rows keep serving the running batch. The device KV length
     // for the slot is the runtime's business -- its seating sequence owns the cache-manager view.
     auto const& sequence = impl.sequences.back();
-    int32_t const slot = static_cast<int32_t>(impl.sequences.size()) - 1;
-    auto const& pages = sequence.lease.basePages();
+    int32_t const residentSlot = sequence.resident.slot;
+    int32_t const reuseTokenLength = sequence.reuseTokenLength;
     try
     {
-        mBasePageTable.setRows(
-            {KVPageTableRowUpdate{slot, pages.empty() ? nullptr : pages.data(), static_cast<int32_t>(pages.size())}});
+        auto const& pages = sequence.lease.basePages();
+        mBasePageTable.setRows({KVPageTableRowUpdate{
+            residentSlot, pages.empty() ? nullptr : pages.data(), static_cast<int32_t>(pages.size())}});
         mBasePageTable.upload(impl.stream);
     }
     catch (...)
     {
-        // The lease is filed but the runtime never learns of the slot. Release it so the
-        // coordinator's sequences stay aligned with the batch, and let the error that actually
-        // threw reach the caller -- reservation is the stage that may fail, and it fails whole.
         impl.sequences.pop_back();
+        try
+        {
+            mBasePageTable.setRows({KVPageTableRowUpdate{residentSlot, nullptr, 0}});
+            mBasePageTable.upload(impl.stream);
+        }
+        catch (...)
+        {
+            mPoisoned = true;
+        }
         throw;
     }
-    return AdmitSequenceResult{ContextCacheCoordinatorStatus::kOk, false, sequence.reuseTokenLength};
+    return AdmitSequenceResult{ContextCacheCoordinatorStatus::kOk, false, reuseTokenLength};
+}
+
+bool ContextCacheCoordinator::supportsLiveSequenceAdmission() const noexcept
+{
+    return !isSpecDeployment() && !usesCheckpointReuse() && deploymentHasAttention();
 }
 
 ContextCacheCoordinatorStatus ContextCacheCoordinator::finalizeSequenceAdmission(
@@ -1289,14 +1381,14 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::preparePrefill(RequestHan
         if (deploymentHasAttention())
         {
             auto const& pages = sequence.lease.basePages();
-            rows.push_back(KVPageTableRowUpdate{static_cast<int32_t>(slot), pages.empty() ? nullptr : pages.data(),
-                static_cast<int32_t>(pages.size())});
+            rows.push_back(KVPageTableRowUpdate{
+                sequence.resident.slot, pages.empty() ? nullptr : pages.data(), static_cast<int32_t>(pages.size())});
         }
         if (runsPairedDraftWorkingSet(impl))
         {
             auto const& pages = sequence.lease.draftPages();
-            draftRows.push_back(KVPageTableRowUpdate{static_cast<int32_t>(slot), pages.empty() ? nullptr : pages.data(),
-                static_cast<int32_t>(pages.size())});
+            draftRows.push_back(KVPageTableRowUpdate{
+                sequence.resident.slot, pages.empty() ? nullptr : pages.data(), static_cast<int32_t>(pages.size())});
         }
         reuseLengths[slot] = sequence.reuseTokenLength;
     }
@@ -1321,11 +1413,11 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::preparePrefill(RequestHan
             std::optional<int32_t> const recurrentSnapshot = sequence.lease.recurrentSnapshotSlot();
             if (!recurrentSnapshot.has_value())
             {
-                mHybridSnapshots->zeroRecurrent(static_cast<int32_t>(slot), impl.stream);
+                mHybridSnapshots->zeroRecurrent(sequence.resident.slot, impl.stream);
                 continue;
             }
 
-            mHybridSnapshots->restoreRecurrent(*recurrentSnapshot, static_cast<int32_t>(slot), impl.stream);
+            mHybridSnapshots->restoreRecurrent(*recurrentSnapshot, sequence.resident.slot, impl.stream);
             if (std::optional<int32_t> const partialSnapshot = sequence.lease.partialKvSnapshotSlot();
                 partialSnapshot.has_value())
             {
@@ -1403,10 +1495,8 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::applyAdvances(
         if (delta.acceptedTokenCount == 0
             && delta.committedStateLength == ContextCacheSequenceAdvance::kHoldCommittedStateLength)
         {
-            continue; // A hold: the ledger stays exactly where it is (a slot cancelled at the top of a step).
+            continue;
         }
-        // Otherwise a zero-token advance still commits state -- a fully committed prefill records the
-        // whole prompt without a sampled token -- and is checked like any other.
         size_t const acceptedCount = static_cast<size_t>(delta.acceptedTokenCount);
         ELLM_CHECK(sequence.tokenIds.size() <= static_cast<size_t>(std::numeric_limits<int32_t>::max()) - acceptedCount,
             "Context cache token history exceeds int32");
@@ -1423,10 +1513,13 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::applyAdvances(
         if (delta.acceptedTokenCount == 0
             && delta.committedStateLength == ContextCacheSequenceAdvance::kHoldCommittedStateLength)
         {
-            continue; // A hold; validation accepted the sentinel.
+            continue;
         }
-        sequence.tokenIds.insert(sequence.tokenIds.end(), delta.acceptedTokenIds,
-            delta.acceptedTokenIds + static_cast<std::ptrdiff_t>(delta.acceptedTokenCount));
+        if (delta.acceptedTokenCount > 0)
+        {
+            sequence.tokenIds.insert(sequence.tokenIds.end(), delta.acceptedTokenIds,
+                delta.acceptedTokenIds + static_cast<std::ptrdiff_t>(delta.acceptedTokenCount));
+        }
         sequence.committedStateLength = delta.committedStateLength;
     }
     return ContextCacheCoordinatorStatus::kOk;
@@ -1486,7 +1579,7 @@ void ContextCacheCoordinator::enqueueHybridCaptures(RequestHandle::Impl& request
         }
         auto const& staged = *sequence.stagedHybridPublication;
         mHybridSnapshots->captureRecurrent(
-            staged.snapshots.recurrentSnapshotSlot, static_cast<int32_t>(slot), request.stream);
+            staged.snapshots.recurrentSnapshotSlot, sequence.resident.slot, request.stream);
         if (staged.snapshots.partialKvSnapshotSlot.has_value())
         {
             int32_t const validTokenCount = staged.checkpoint.exactLength % kTOKENS_PER_PAGE;
@@ -1751,20 +1844,20 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::finalizePrefillPublicatio
 ContextCacheCoordinatorStatus ContextCacheCoordinator::publishHybridMtpEndpoint(RequestHandle& request, int32_t slot,
     int32_t residentStateLength, Tensor const& baseHiddenStates, int32_t boundaryHiddenRow)
 {
-    RequestHandle::Impl& impl = checkedImpl(request);
+    checkedImpl(request);
     ELLM_CHECK(mProfile.isHybrid() && mProfile.isSpeculative() && mHybridSnapshots != nullptr,
         "Hybrid+MTP endpoint publication requires a Hybrid+MTP deployment with snapshot storage");
-    return impl.publicationPolicy->publishMtpBoundary(
+    return checkedImpl(request).publicationPolicy->publishMtpBoundary(
         request, slot, residentStateLength, baseHiddenStates, boundaryHiddenRow);
 }
 
 ContextCacheCoordinatorStatus ContextCacheCoordinator::restoreHybridMtpBoundaryHidden(
     RequestHandle& request, int32_t slot, Tensor& baseHiddenStates, int32_t destinationRow)
 {
-    RequestHandle::Impl& impl = checkedImpl(request);
+    checkedImpl(request);
     ELLM_CHECK(mProfile.isHybrid() && mProfile.isSpeculative() && mHybridSnapshots != nullptr,
         "Hybrid+MTP boundary-hidden restore requires a Hybrid+MTP deployment with snapshot storage");
-    return impl.publicationPolicy->restoreMtpBoundary(request, slot, baseHiddenStates, destinationRow);
+    return checkedImpl(request).publicationPolicy->restoreMtpBoundary(request, slot, baseHiddenStates, destinationRow);
 }
 
 ContextCacheCoordinatorStatus ContextCacheCoordinator::prepareDecodeStep(
@@ -1827,13 +1920,13 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::prepareDecodeStep(
             {
                 auto const& basePages = sequence.lease.basePages();
                 baseRows.push_back(KVPageTableRowUpdate{
-                    static_cast<int32_t>(slot), basePages.data(), static_cast<int32_t>(basePages.size())});
+                    sequence.resident.slot, basePages.data(), static_cast<int32_t>(basePages.size())});
             }
             if (draftGrowth > 0)
             {
                 auto const& draftPages = sequence.lease.draftPages();
                 draftRows.push_back(KVPageTableRowUpdate{
-                    static_cast<int32_t>(slot), draftPages.data(), static_cast<int32_t>(draftPages.size())});
+                    sequence.resident.slot, draftPages.data(), static_cast<int32_t>(draftPages.size())});
             }
         }
         impl.markDeviceWorkEnqueued();
@@ -1884,7 +1977,7 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::prepareDecodeStep(
             {
                 auto const& pages = sequence.lease.basePages();
                 rows.push_back(
-                    KVPageTableRowUpdate{static_cast<int32_t>(slot), pages.data(), static_cast<int32_t>(pages.size())});
+                    KVPageTableRowUpdate{sequence.resident.slot, pages.data(), static_cast<int32_t>(pages.size())});
             }
         }
         if (!rows.empty())
@@ -1923,7 +2016,6 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::beginBatchCompaction(
         "Context cache compaction preparation requires terminal model work");
     int32_t const oldBatchSize = static_cast<int32_t>(impl.sequences.size());
     validateCompactionMapping(oldToNew, oldBatchSize, newBatchSize);
-
     impl.markDeviceWorkEnqueued();
     impl.pendingCompactionMapping = oldToNew;
     impl.pendingCompactionBatchSize = newBatchSize;
@@ -1970,22 +2062,50 @@ ContextCacheCoordinatorStatus ContextCacheCoordinator::compactBatch(RequestHandl
                    }),
         "Context cache cannot compact a batch with an unpublished staged endpoint");
 
+    std::vector<int32_t> retiredResidentSlots;
+    for (int32_t oldSlot = 0; oldSlot < oldBatchSize; ++oldSlot)
+    {
+        if (oldToNew[static_cast<size_t>(oldSlot)] < 0)
+        {
+            retiredResidentSlots.push_back(impl.sequences[static_cast<size_t>(oldSlot)].resident.slot);
+        }
+    }
+
     if (deploymentHasAttention())
     {
-        mBasePageTable.compactRows(oldToNew, newBatchSize);
+        std::vector<KVPageTableRowUpdate> clearedRows;
+        clearedRows.reserve(retiredResidentSlots.size());
+        for (int32_t const residentSlot : retiredResidentSlots)
+        {
+            clearedRows.push_back(KVPageTableRowUpdate{residentSlot, nullptr, 0});
+        }
+        mBasePageTable.setRows(clearedRows);
         mBasePageTable.upload(impl.stream);
     }
-    // Any request that grew a paired draft page path at decode (EAGLE or Hybrid+MTP) must compact the draft page table
-    // and draft cache alongside the base side; otherwise the draft rows/state desynchronize from the survivor batch.
+    // Paired draft state must follow the same resident-slot policy as base state.
     if (runsPairedDraftWorkingSet(impl))
     {
-        mDraftPageTable->compactRows(oldToNew, newBatchSize);
+        std::vector<KVPageTableRowUpdate> clearedRows;
+        clearedRows.reserve(retiredResidentSlots.size());
+        for (int32_t const residentSlot : retiredResidentSlots)
+        {
+            clearedRows.push_back(KVPageTableRowUpdate{residentSlot, nullptr, 0});
+        }
+        mDraftPageTable->setRows(clearedRows);
         mDraftPageTable->upload(impl.stream);
     }
-    mBaseCache.compactBatchSlotState(deviceBatchMapping, oldBatchSize, newBatchSize, impl.stream);
+    mBaseCache.compactKVCacheLengths(deviceBatchMapping, oldBatchSize, newBatchSize, impl.stream);
     if (runsPairedDraftWorkingSet(impl))
     {
-        mDraftCache->compactBatchSlotState(deviceBatchMapping, oldBatchSize, newBatchSize, impl.stream);
+        mDraftCache->compactKVCacheLengths(deviceBatchMapping, oldBatchSize, newBatchSize, impl.stream);
+    }
+    for (int32_t const residentSlot : retiredResidentSlots)
+    {
+        mBaseCache.clearResidentSlot(residentSlot, impl.stream);
+        if (runsPairedDraftWorkingSet(impl))
+        {
+            mDraftCache->clearResidentSlot(residentSlot, impl.stream);
+        }
     }
     ContextCacheCoordinatorStatus const syncStatus = synchronizeRequest(request);
     if (syncStatus != ContextCacheCoordinatorStatus::kOk)

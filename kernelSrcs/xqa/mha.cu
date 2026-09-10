@@ -1574,6 +1574,7 @@ CUBIN_EXPORT __global__
 #if SPEC_DEC
         uint32_t const qSeqLen, uint32_t const nbKHeads, uint32_t const headGrpSize,
         SeqLenDataType const* __restrict__ qCuSeqLens, // [nbReq + 1]
+        SeqLenDataType const* __restrict__ qSeqLens,   // [nbReq]
 #else
         uint32_t const nbKHeads,
 #endif
@@ -1622,7 +1623,9 @@ CUBIN_EXPORT __global__
 #if SPEC_DEC
     // Variable query sequence length support.
     bool const variableQSeqLen = qCuSeqLens != nullptr;
-    uint32_t const actualQSeqLen = variableQSeqLen ? uint32_t(qCuSeqLens[idxReq + 1] - qCuSeqLens[idxReq]) : qSeqLen;
+    uint32_t const actualQSeqLen = qSeqLens != nullptr
+        ? uint32_t(qSeqLens[idxReq])
+        : (variableQSeqLen ? uint32_t(qCuSeqLens[idxReq + 1] - qCuSeqLens[idxReq]) : qSeqLen);
     // Same as idxReq * qSeqLen if all sequences all the same.
     // Take different beams as different requests/sequences currently.
     uint32_t const reqSeqOffset = variableQSeqLen ? uint32_t(qCuSeqLens[idxReq]) : (qSeqLen * idxReq);
@@ -3082,6 +3085,7 @@ CUBIN_EXPORT __device__ constexpr XQAKernelType kernelType = XQAKernelType::kAMP
 CUBIN_EXPORT __global__ __launch_bounds__(ctaSize, nbCtaPerSM) void kernel_mha(
 #if SPEC_DEC
     uint32_t const qSeqLen, uint32_t const nbKHeads, uint32_t const headGrpSize, SeqLenDataType const* qCuSeqLens,
+    SeqLenDataType const* qSeqLens,
 #else
     uint32_t const nbKHeads,
 #endif
@@ -3109,7 +3113,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(ctaSize, nbCtaPerSM) void kernel_mha(
     uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr)
 {
 #if SPEC_DEC
-    kernel_mha_impl(qSeqLen, nbKHeads, headGrpSize, qCuSeqLens,
+    kernel_mha_impl(qSeqLen, nbKHeads, headGrpSize, qCuSeqLens, qSeqLens,
 #else
     kernel_mha_impl(nbKHeads,
 #endif
@@ -3178,6 +3182,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SPEC_DEC
     auto const qSeqLen = specDecParams.qSeqLen;
     auto const qCuSeqLens = specDecParams.qCuSeqLens;
+    auto const qSeqLens = specDecParams.qSeqLens;
     auto const mask = specDecParams.mask;
 #endif
 #if USE_INPUT_KV
@@ -3231,7 +3236,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #endif
     cudaLaunchKernelEx(&launchCfg, kernel_mha,
 #if SPEC_DEC
-        qSeqLen, nbKHeads, headGrpSize, qCuSeqLens,
+        qSeqLen, nbKHeads, headGrpSize, qCuSeqLens, qSeqLens,
 #else
         nbKHeads,
 #endif
@@ -3259,7 +3264,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     cudaLaunchKernelEx(&launchCfg, &kernel_mha,
 #endif
 #if SPEC_DEC
-        qSeqLen, nbKHeads, headGrpSize, qCuSeqLens,
+        qSeqLen, nbKHeads, headGrpSize, qCuSeqLens, qSeqLens,
 #else
         nbKHeads,
 #endif

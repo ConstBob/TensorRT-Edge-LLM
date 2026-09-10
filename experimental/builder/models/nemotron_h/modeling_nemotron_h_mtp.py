@@ -19,7 +19,8 @@ from typing import Dict
 import numpy as np
 import tensorrt as trt
 
-from ...ops import GroupedSigmoidRouter, Linear, Module, NetworkModule, RMSNorm
+from ...ops import (GroupedSigmoidRouter, Linear, Module, NetworkModule,
+                    RaggedDecoderInputs, RMSNorm, add_ragged_decoder_inputs)
 from ...ops import functional as F
 from . import weights as weight_conversion
 from .modeling_nemotron_h import NemotronHAttention
@@ -35,7 +36,7 @@ class _BiasFreeLayerNorm(Module):
     def forward(self, hidden_states):
         weight = self.weights.fp16_parameter(self.key("weight"))
         bias = np.zeros(self.cfg.hidden_size, dtype=np.float16)
-        return F.layer_norm(hidden_states, weight, bias, self.eps, rank=3)
+        return F.layer_norm(hidden_states, weight, bias, self.eps, rank=2)
 
 
 class _Relu2MLP(Module):
@@ -107,15 +108,13 @@ class _MtpAttentionLayer(Module):
         self.norm = RMSNorm(ctx, self.key("norm"), eps)
         self.mixer = NemotronHAttention(ctx, self.key("mixer"))
 
-    def forward(self, inputs_embeds, hidden_states, past, rope,
-                context_lengths, cache_start, kv_page_table, attention_mask,
-                attention_pos_id):
+    def forward(self, inputs_embeds, hidden_states, past, rope, ragged,
+                attention_mask, attention_pos_id):
         merged = F.concatenate(
-            (self.enorm(inputs_embeds), self.hnorm(hidden_states)), 2)
+            (self.enorm(inputs_embeds), self.hnorm(hidden_states)), 1)
         hidden_states = self.eh_proj(merged)
         attention, present = self.mixer(self.norm(hidden_states), past, rope,
-                                        context_lengths, cache_start,
-                                        kv_page_table, attention_mask,
+                                        ragged, attention_mask,
                                         attention_pos_id)
         return hidden_states + attention, present
 
@@ -152,47 +151,42 @@ class NemotronHMtpDraftModel(NetworkModule):
         cfg = self.cfg
         kv_dtype = (trt.DataType.FP8
                     if cfg.kv_cache_quant == "fp8" else trt.float16)
-        return {
+        io = {
             "inputs_embeds":
             self.add_input("inputs_embeds", trt.float16,
-                           (-1, -1, cfg.hidden_size)),
+                           (-1, cfg.hidden_size)),
             "past":
             self.add_input("past_key_values_0", kv_dtype,
                            (2, -1, F.KV_PAGE_SIZE, cfg.num_key_value_heads,
                             cfg.head_dim)),
             "rope":
             self.add_input("rope_rotary_cos_sin", trt.float32,
-                           (-1, -1, cfg.rotary_dim)),
-            "context_lengths":
-            self.add_input("context_lengths", trt.int32, (-1, )),
-            "cache_start":
-            self.add_input("kvcache_start_index", trt.int32, (-1, )),
-            "kv_page_table":
-            self.add_input("kv_page_table", trt.int32, (-1, 2, -1)),
-            "last_token_ids":
-            self.add_input("last_token_ids", trt.int64, (-1, 1)),
+                           (-1, cfg.rotary_dim)),
             "base_hidden":
             self.add_input("hidden_states_input", trt.float16,
-                           (-1, -1, cfg.hidden_size)),
+                           (-1, cfg.hidden_size)),
             "draft_hidden":
             self.add_input("hidden_states_from_draft", trt.float16,
-                           (-1, -1, cfg.hidden_size)),
+                           (-1, cfg.hidden_size)),
             "attention_pos_id":
-            self.add_input("attention_pos_id", trt.int32, (-1, -1)),
+            self.add_input("attention_position_ids", trt.int32, (-1, )),
             "attention_mask":
-            self.add_input("attention_mask", trt.int32, (-1, -1, -1)),
+            self.add_input("packed_attention_mask", trt.int32, (-1, -1)),
         }
+        io.update(add_ragged_decoder_inputs(self.add_input).as_dict())
+        return io
 
     def forward(self, **io):
+        ragged = RaggedDecoderInputs.from_dict(io)
         source = io["base_hidden"] + io["draft_hidden"]
-        hidden, present = self.attention(
-            io["inputs_embeds"], source, io["past"], io["rope"],
-            io["context_lengths"], io["cache_start"], io["kv_page_table"],
-            io["attention_mask"], io["attention_pos_id"])
+        hidden, present = self.attention(io["inputs_embeds"], source,
+                                         io["past"], io["rope"], ragged,
+                                         io["attention_mask"],
+                                         io["attention_pos_id"])
         hidden = self.moe(hidden)
-        selected = F.gather_last_tokens(hidden, io["last_token_ids"])
+        selected = F.gather_token_rows(hidden, ragged.logits_indices)
         selected = self.moe.final_norm(selected)
-        logits = self.lm_head(selected).cast(trt.float32).log_softmax(2)
+        logits = self.lm_head(selected).cast(trt.float32).log_softmax(1)
         return {
             "logits": logits,
             "hidden_states": selected,

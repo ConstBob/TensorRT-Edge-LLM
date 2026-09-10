@@ -619,7 +619,8 @@ __global__ void __launch_bounds__(kNUM_THREADS)
 //      writeback.
 __global__ void __launch_bounds__(kNUM_THREADS) treeReplayCommitBatchedKernel(MtpLayerInfo const* __restrict__ infos,
     size_t stashBatchStrideBytes, int32_t const* __restrict__ acceptedIndices,
-    int32_t const* __restrict__ acceptLengths, int32_t maxAcceptLen, int32_t numNodes, int32_t H, int32_t HV)
+    int32_t const* __restrict__ acceptLengths, int32_t const* __restrict__ stateIndices, int32_t residentPoolRows,
+    int32_t maxAcceptLen, int32_t numNodes, int32_t H, int32_t HV)
 {
     constexpr int32_t kTILE_V{32};
     constexpr int32_t kNUM_V_TILES{kTILE_K / kTILE_V}; // 4
@@ -628,20 +629,45 @@ __global__ void __launch_bounds__(kNUM_THREADS) treeReplayCommitBatchedKernel(Mt
     int32_t const layer = blockIdx.y;
     int32_t const stateIdx = blockIdx.x;
     int32_t const iN = stateIdx / HV;
+    int32_t const residentIdx = stateIndices[iN];
+    if (residentIdx < 0 || residentIdx >= residentPoolRows)
+    {
+        return;
+    }
     int32_t const iHv = stateIdx % HV;
     int32_t const iH = iHv / (HV / H);
     int32_t const tid = threadIdx.x;
-    int32_t const L = min(acceptLengths[iN], min(maxAcceptLen, kGDN_TREE_CHUNK_MAX_ACCEPT));
+
+    // Every CTA for a sequence must reject the same malformed path before touching its resident
+    // state. A declared length outside the carrier capacity is invalid rather than truncatable.
+    __shared__ int32_t acceptedPathLength;
+    if (tid == 0)
+    {
+        int32_t const length = acceptLengths[iN];
+        bool valid = length >= 0 && length <= maxAcceptLen && length <= kGDN_TREE_CHUNK_MAX_ACCEPT;
+        for (int32_t i = 0; valid && i < length; ++i)
+        {
+            int32_t const node = acceptedIndices[static_cast<int64_t>(iN) * maxAcceptLen + i];
+            valid = node >= 0 && node < numNodes;
+        }
+        acceptedPathLength = valid ? length : -1;
+    }
+    __syncthreads();
+    if (acceptedPathLength < 0)
+    {
+        return;
+    }
+    int32_t const L = acceptedPathLength;
 
     float* h0 = static_cast<float*>(infos[layer].recurrentDst);
     char const* stash = static_cast<char const*>(infos[layer].recurrentSrc);
 
     // Double-buffered h-tile (32KB), k/g/beta from stash (8KB), v pre-cache (4KB).
-    __shared__ float sH[kNUM_STAGES][kTILE_K * kTILE_V];          // 2×16KB = 32KB
-    __shared__ float sKvec[kGDN_TREE_CHUNK_MAX_ACCEPT * kTILE_K]; // 8KB
-    __shared__ float sG[kGDN_TREE_CHUNK_MAX_ACCEPT];
-    __shared__ float sBetaS[kGDN_TREE_CHUNK_MAX_ACCEPT];
-    __shared__ __half sV[kGDN_TREE_CHUNK_MAX_ACCEPT * kTILE_K]; // 4KB — v pre-cache
+    __shared__ __align__(16) float sH[kNUM_STAGES][kTILE_K * kTILE_V]; // 2×16KB = 32KB
+    __shared__ __align__(16) float sKvec[kGDN_TREE_CHUNK_MAX_ACCEPT * kTILE_K];
+    __shared__ __align__(16) float sG[kGDN_TREE_CHUNK_MAX_ACCEPT];
+    __shared__ __align__(16) float sBetaS[kGDN_TREE_CHUNK_MAX_ACCEPT];
+    __shared__ __align__(16) __half sV[kGDN_TREE_CHUNK_MAX_ACCEPT * kTILE_K];
 
     StashOffsets const so = stashOffsets(H, HV);
     char const* nodeBase = stash + static_cast<size_t>(iN) * stashBatchStrideBytes;
@@ -687,8 +713,8 @@ __global__ void __launch_bounds__(kNUM_THREADS) treeReplayCommitBatchedKernel(Mt
         {                                                                                                              \
             int32_t const _kk = _i4 / _kV4;                                                                            \
             int32_t const _v4 = (_i4 % _kV4) * 4;                                                                      \
-            float const* _src                                                                                          \
-                = h0 + ((static_cast<int64_t>(iN) * HV + iHv) * kTILE_K + _kk) * kTILE_K + (vt_) * kTILE_V + _v4;      \
+            float const* _src = h0 + ((static_cast<int64_t>(residentIdx) * HV + iHv) * kTILE_K + _kk) * kTILE_K        \
+                + (vt_) * kTILE_V + _v4;                                                                               \
             uint32_t _dst = __cvta_generic_to_shared(&sH[(stage_)][_kk * kTILE_V + _v4]);                              \
             asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(_dst), "l"(_src));                          \
         }                                                                                                              \
@@ -758,7 +784,7 @@ __global__ void __launch_bounds__(kNUM_THREADS) treeReplayCommitBatchedKernel(Mt
             int32_t const kk = i4 / (kTILE_V / 4);
             int32_t const v4 = (i4 % (kTILE_V / 4)) * 4;
             *reinterpret_cast<float4*>(
-                &h0[((static_cast<int64_t>(iN) * HV + iHv) * kTILE_K + kk) * kTILE_K + vt * kTILE_V + v4])
+                &h0[((static_cast<int64_t>(residentIdx) * HV + iHv) * kTILE_K + kk) * kTILE_K + vt * kTILE_V + v4])
                 = *reinterpret_cast<float4 const*>(&sH[stage][kk * kTILE_V + v4]);
         }
         // No barrier here: the next iteration's post-cp.async __syncthreads
@@ -859,8 +885,9 @@ cudaError_t gdnTreeVerifyChunk(float const* h0, __half const* q, __half const* k
 }
 
 cudaError_t gdnTreeReplayCommitBatched(MtpLayerInfo const* deviceLayerInfos, int32_t numLayers,
-    size_t stashBatchStrideBytes, int32_t const* acceptedIndices, int32_t const* acceptLengths, int32_t batch,
-    int32_t maxAcceptLen, int32_t numNodes, int32_t h, int32_t hv, cudaStream_t stream)
+    size_t stashBatchStrideBytes, int32_t const* acceptedIndices, int32_t const* acceptLengths,
+    int32_t const* stateIndices, int32_t batch, int32_t residentPoolRows, int32_t maxAcceptLen, int32_t numNodes,
+    int32_t h, int32_t hv, cudaStream_t stream)
 {
     static bool const kTimeCommit = (std::getenv("EDGELLM_GDN_TIME_COMMIT") != nullptr);
     static int64_t sCallCount = 0;
@@ -874,8 +901,8 @@ cudaError_t gdnTreeReplayCommitBatched(MtpLayerInfo const* deviceLayerInfos, int
     }
 
     dim3 const grid(batch * hv, numLayers);
-    treeReplayCommitBatchedKernel<<<grid, kNUM_THREADS, 0, stream>>>(
-        deviceLayerInfos, stashBatchStrideBytes, acceptedIndices, acceptLengths, maxAcceptLen, numNodes, h, hv);
+    treeReplayCommitBatchedKernel<<<grid, kNUM_THREADS, 0, stream>>>(deviceLayerInfos, stashBatchStrideBytes,
+        acceptedIndices, acceptLengths, stateIndices, residentPoolRows, maxAcceptLen, numNodes, h, hv);
     cudaError_t const launchErr = gdnTreeTraceLaunch("treeReplayCommitBatched");
 
     if (kTimeCommit)

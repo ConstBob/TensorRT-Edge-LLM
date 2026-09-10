@@ -88,12 +88,6 @@ public:
     //! @throws std::runtime_error without changing any row if any update is invalid
     void setRows(std::vector<KVPageTableRowUpdate> const& updates);
 
-    //! @brief Compact logical slots according to one immutable old-to-new mapping.
-    //!        Every destination in `[0, newBatch)` must appear exactly once; `-1`
-    //!        retires an old slot. This changes page-table rows only and never copies KV data.
-    //! @throws std::runtime_error without changing any row if the mapping is invalid
-    void compactRows(std::vector<int32_t> const& oldToNew, int32_t newBatch);
-
     //! @brief Set one logical mapping and its derived V mapping.
     //! @throws std::runtime_error if `slot`, `logicalPage`, or `kPageId` is out of range
     void setEntry(int32_t slot, int32_t logicalPage, int32_t kPageId);
@@ -101,20 +95,6 @@ public:
     //! @brief Clear one logical K/V mapping to the unused-page sentinel.
     //! @throws std::runtime_error if `slot` or `logicalPage` is out of range
     void clearEntry(int32_t slot, int32_t logicalPage);
-
-    //! @brief Exchange the page lists of two slots. Self-inverse.
-    //!
-    //! Exists because the paged kernels use the batch index as the page-table row directly, so a
-    //! forward pass covering `n` slots only ever reads rows `[0, n)`. Running a pass for one slot
-    //! that lives further up the table therefore needs its row brought down, and put back after.
-    //! Being its own inverse is the point: the same call restores the table, with no copy of the
-    //! displaced row to keep and no way to restore it wrongly.
-    //!
-    //! Only page ids move. The KV itself is addressed by page number out of the shared pool, so
-    //! nothing is copied on the device -- a row is `2 * maxPagesPerSeq` int32s.
-    //!
-    //! @throws std::runtime_error if either slot is outside `[0, maxBatch)`
-    void swapRows(int32_t slotA, int32_t slotB);
 
     //! @brief Validate the host table: every K id is the sentinel or in `[0, numPages)`,
     //!        and every V id is derived from its K id. Dense rows reject live mappings after
@@ -149,6 +129,11 @@ public:
         return mLastUploadRangeCount;
     }
 
+    //! Gather resident rows into an active-step table without changing resident ownership or moving KV payload.
+    //! `destination` must have fixed storage for at least `[numRows, 2, maxPagesPerSeq]` INT32 values.
+    void gatherRows(
+        rt::Tensor& destination, rt::Tensor const& residentSlots, int32_t numRows, cudaStream_t stream) const;
+
     //! @brief The device tensor consumed by the paged kernels: int32 `[maxBatch, 2, maxPagesPerSeq]`.
     rt::Tensor const& kernelView() const;
 
@@ -163,6 +148,11 @@ public:
     int32_t maxPagesPerSeq() const
     {
         return mMaxPagesPerSeq;
+    }
+
+    int32_t maxBatch() const
+    {
+        return mMaxBatch;
     }
 
     int32_t numPages() const
@@ -188,9 +178,8 @@ private:
     int32_t mNumPages{};
     Mode mMode{Mode::kDense};
     bool mIsIdentity{false};
-    std::vector<int32_t> mHost;        //!< [maxBatch, 2, maxPagesPerSeq], row-major.
-    std::vector<int32_t> mHostScratch; //!< Preallocated row-compaction scratch.
-    std::vector<uint8_t> mDirtyRows;   //!< One bit-like byte per logical slot.
+    std::vector<int32_t> mHost;      //!< [maxBatch, 2, maxPagesPerSeq], row-major.
+    std::vector<uint8_t> mDirtyRows; //!< One bit-like byte per logical slot.
     std::vector<int32_t> mUploadedHost;
     //! Ordered changed entries permit O(changes) upload and adjacent-range coalescing.
     std::set<size_t> mDirtyIndices;

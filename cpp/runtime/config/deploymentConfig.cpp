@@ -19,6 +19,7 @@
 
 #include "common/checkMacros.h"
 #include "common/pagedKvTypes.h"
+#include "kernels/gdnKernels/gdnTreeChunkKernels.h"
 #include "kernels/speculative/ddtreeKernels.h"
 
 #include "common/logger.h"
@@ -137,6 +138,42 @@ void validateKVPoolMode(DeploymentConfig const& deployment)
             requireMinimumActiveKVPool(*deployment.draft, "draft engine");
         }
     }
+}
+
+void validateMRopeGeometry(DeploymentConfig const& deployment)
+{
+    if (!deployment.draft.has_value())
+    {
+        return;
+    }
+    LLMEngineConfig const& base = deployment.base;
+    LLMEngineConfig const& draft = *deployment.draft;
+    bool const baseUsesMRope = base.ropeConfig.type == RopeType::kMRope;
+    bool const draftUsesMRope = draft.ropeConfig.type == RopeType::kMRope;
+    if (!draftUsesMRope)
+    {
+        return;
+    }
+    ELLM_CHECK(baseUsesMRope, "SpecDecode MRoPE draft requires the base engine to use MRoPE.");
+    ELLM_CHECK(base.rotaryDim == draft.rotaryDim && base.maxKVCacheCapacity == draft.maxKVCacheCapacity
+            && base.recurrentPoolRows == draft.recurrentPoolRows
+            && base.ropeConfig.mropeSection == draft.ropeConfig.mropeSection
+            && base.ropeConfig.rotaryTheta == draft.ropeConfig.rotaryTheta
+            && base.ropeConfig.rotaryScale == draft.ropeConfig.rotaryScale
+            && base.ropeConfig.partialRotaryFactor == draft.ropeConfig.partialRotaryFactor,
+        "SpecDecode base/draft MRoPE geometry is incompatible; rotary dimension, resident rows, KV capacity, "
+        "frequency partition, theta, scale, and partial rotary factor must match.");
+}
+
+void validateDraftRopeBindings(DeploymentConfig const& deployment)
+{
+    if (!deployment.draft.has_value() || !deployment.draft->useDualRope)
+    {
+        return;
+    }
+    SpecDecodeMode const mode = deployment.base.specDecodeType;
+    ELLM_CHECK(!isCachedBlockDraftMode(mode) && mode != SpecDecodeMode::kDSpark,
+        std::string(specDecodeModeName(mode)) + " draft engines require a single RoPE binding.");
 }
 
 void validateGemma4MTPConfig(LLMEngineConfig const& base, LLMEngineConfig& draft)
@@ -342,6 +379,8 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
         cfg.draft = parseDraftEngineConfig(*draftConfigPath);
     }
 
+    validateMRopeGeometry(cfg);
+    validateDraftRopeBindings(cfg);
     validateKVPoolMode(cfg);
 
     if (cfg.base.specDecodeType == SpecDecodeMode::kEAGLE && cfg.draft.has_value())
@@ -527,6 +566,13 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
                     std::string(modeName) + " dflashBlockSize=" + std::to_string(specConfig.dflashBlockSize)
                         + " exceeds Qwen3.5 GDN/causal-conv intermediate-state depth limit of "
                         + std::to_string(kDFlashJetSpecHybridMaxBlockSize) + ".");
+                if (useBranchingTree)
+                {
+                    ELLM_CHECK(specConfig.verifySize <= kernel::kGDN_TREE_CHUNK_MAX_NODES,
+                        std::string(modeName) + " hybrid DDTree verifySize=" + std::to_string(specConfig.verifySize)
+                            + " exceeds the GDN/causal-conv transactional verify node limit of "
+                            + std::to_string(kernel::kGDN_TREE_CHUNK_MAX_NODES) + ".");
+                }
             }
         }
         else
@@ -613,6 +659,13 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
                         "MTP max accept depth (draftingStep+1)=" + std::to_string(maxAcceptDepth)
                             + " exceeds Qwen3.5 GDN/causal-conv intermediate-state depth limit of "
                             + std::to_string(kMTPHybridMaxProposalDepth) + ".");
+                    if (useTree)
+                    {
+                        ELLM_CHECK(specConfig.verifySize <= kernel::kGDN_TREE_CHUNK_MAX_NODES,
+                            "MTP hybrid DDTree verifySize=" + std::to_string(specConfig.verifySize)
+                                + " exceeds the GDN/causal-conv transactional verify node limit of "
+                                + std::to_string(kernel::kGDN_TREE_CHUNK_MAX_NODES) + ".");
+                    }
                 }
             }
         }

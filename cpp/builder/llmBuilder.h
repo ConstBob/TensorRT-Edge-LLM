@@ -29,6 +29,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 using Json = nlohmann::json;
 
@@ -54,6 +55,21 @@ inline bool isDFlashV2DraftConfig(Json const& config)
         && dflashConfig->value("version", 1) == 2;
 }
 
+struct RaggedProfilePoint
+{
+    int64_t numSequences;
+    int64_t physicalTokens;
+    int64_t queryOffsets;
+    int64_t logitsRows;
+};
+
+struct RaggedProfileRange
+{
+    RaggedProfilePoint min;
+    RaggedProfilePoint opt;
+    RaggedProfilePoint max;
+};
+
 //! Configuration structure for LLM model building.
 //! Contains all parameters needed to configure the TensorRT engine building process
 //! for Large Language Models, including standard and speculative-decoding engines.
@@ -71,6 +87,81 @@ struct LLMBuilderConfig
     //! Exact physical K-page count for the engine's KV pool. Zero selects the minimum active pages.
     //! Kept after the original aggregate fields so existing positional initializers remain source-compatible.
     int64_t maxKVPoolPages{0};
+    std::string raggedBackend{"entry_padded_compatibility"};
+    //! Additional model-role query width (for example, a diffusion canvas). Zero selects role-derived sizing.
+    int64_t maxQueryLength{0};
+
+    int64_t resolvedRoleQueryLength() const
+    {
+        ELLM_CHECK(maxInputLen > 0 && maxInputLen <= std::numeric_limits<int32_t>::max(),
+            "LLMBuilderConfig: maxInputLen must fit a positive int32.");
+        ELLM_CHECK(maxQueryLength >= 0 && maxQueryLength <= std::numeric_limits<int32_t>::max(),
+            "LLMBuilderConfig: maxQueryLength must be zero or fit a positive int32.");
+        int64_t result = std::max<int64_t>(1, maxQueryLength);
+        if (specDraft)
+        {
+            ELLM_CHECK(maxDraftTreeSize > 0 && maxDraftTreeSize <= std::numeric_limits<int32_t>::max(),
+                "LLMBuilderConfig: maxDraftTreeSize must fit a positive int32.");
+            result = std::max(result, maxDraftTreeSize);
+        }
+        if (specBase)
+        {
+            ELLM_CHECK(maxVerifyTreeSize > 0 && maxVerifyTreeSize <= std::numeric_limits<int32_t>::max(),
+                "LLMBuilderConfig: maxVerifyTreeSize must fit a positive int32.");
+            result = std::max(result, maxVerifyTreeSize);
+        }
+        return result;
+    }
+
+    int64_t resolvedMaxQueryLength() const
+    {
+        return std::max(maxInputLen, resolvedRoleQueryLength());
+    }
+
+    int64_t checkedPhysicalTokens(int64_t queryLength) const
+    {
+        ELLM_CHECK(maxBatchSize > 0 && maxBatchSize <= std::numeric_limits<int32_t>::max(),
+            "LLMBuilderConfig: maxBatchSize must fit a positive int32.");
+        ELLM_CHECK(queryLength > 0 && queryLength <= std::numeric_limits<int32_t>::max(),
+            "LLMBuilderConfig: query length must fit a positive int32.");
+        ELLM_CHECK(maxBatchSize <= std::numeric_limits<int32_t>::max() / queryLength,
+            "LLMBuilderConfig: ragged physical-token capacity exceeds int32.");
+        return maxBatchSize * queryLength;
+    }
+
+    int64_t resolvedMaxPhysicalTokens() const
+    {
+        return checkedPhysicalTokens(resolvedMaxQueryLength());
+    }
+
+    RaggedProfileRange raggedPrefillProfileRange() const
+    {
+        int64_t const maxTokens = checkedPhysicalTokens(maxInputLen);
+        int64_t const optQueryLength = std::max<int64_t>(1, maxInputLen / 2);
+        int64_t const optTokens = maxBatchSize * optQueryLength;
+        return RaggedProfileRange{{1, 1, 2, 1}, {maxBatchSize, optTokens, maxBatchSize + 1, maxBatchSize},
+            {maxBatchSize, maxTokens, maxBatchSize + 1, maxBatchSize}};
+    }
+
+    RaggedProfileRange raggedDecodeProfileRange() const
+    {
+        resolvedMaxPhysicalTokens();
+        return RaggedProfileRange{{1, 1, 2, 1}, {maxBatchSize, maxBatchSize, maxBatchSize + 1, maxBatchSize},
+            {maxBatchSize, maxBatchSize, maxBatchSize + 1, maxBatchSize}};
+    }
+
+    RaggedProfileRange raggedMultiTokenGenerationProfileRange(int64_t maxTokensPerSequence) const
+    {
+        ELLM_CHECK(maxBatchSize > 0 && maxBatchSize <= std::numeric_limits<int32_t>::max(),
+            "LLMBuilderConfig: maxBatchSize must fit a positive int32.");
+        ELLM_CHECK(maxTokensPerSequence > 0 && maxTokensPerSequence <= std::numeric_limits<int32_t>::max(),
+            "LLMBuilderConfig: generation tokens per sequence must fit a positive int32.");
+        ELLM_CHECK(maxBatchSize <= std::numeric_limits<int32_t>::max() / maxTokensPerSequence,
+            "LLMBuilderConfig: generation physical-token capacity exceeds int32.");
+        int64_t const maxTokens = maxBatchSize * maxTokensPerSequence;
+        return RaggedProfileRange{{1, 1, 2, 1}, {maxBatchSize, maxTokens, maxBatchSize + 1, maxTokens},
+            {maxBatchSize, maxTokens, maxBatchSize + 1, maxTokens}};
+    }
 
     //! Resolve the exact physical K-page count serialized into the engine binding shape.
     //! @return `maxKVPoolPages`, or the minimum active pages when it is zero
@@ -154,6 +245,7 @@ struct LLMBuilderConfig
         json["max_lora_rank"] = maxLoraRank;
         json["max_kv_cache_capacity"] = maxKVCacheCapacity;
         json["max_kv_pool_pages"] = resolvedKVPoolPages();
+        json["ragged_backend"] = raggedBackend;
         json["tp_size"] = tpSize;
         if (numSwaPages > 0)
         {
@@ -218,6 +310,7 @@ struct LLMBuilderConfig
         {
             config.numSwaPages = json["num_swa_pages"];
         }
+        config.raggedBackend = json.value("ragged_backend", config.raggedBackend);
         if (json.contains("max_verify_tree_size"))
         {
             config.maxVerifyTreeSize = json["max_verify_tree_size"];
@@ -327,13 +420,15 @@ private:
     bool setupRopeProfiles(nvinfer1::IOptimizationProfile& contextProfile,
         nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
 
+    std::pair<RaggedProfileRange, RaggedProfileRange> tokenAlignedProfileRanges() const;
+
     //! Set up optimization profiles for vanilla LLM models.
     //! Configures input IDs and last token IDs for standard transformer models.
     //! @param contextProfile Optimization profile for context processing
     //! @param generationProfile Optimization profile for generation processing
     //! @return true if setup was successful, false otherwise
-    bool setupVanillaProfiles(
-        nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
+    bool setupVanillaProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
 
     //! Effective opt-shape token count for a generation-time optimization profile.
     //!
@@ -360,8 +455,8 @@ private:
     //! @param contextProfile Optimization profile for context processing
     //! @param generationProfile Optimization profile for generation processing
     //! @return true if setup was successful, false otherwise
-    bool setupSpecDecodeProfiles(
-        nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
+    bool setupSpecDecodeProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
 
     //! Set up optimization profiles for the DiffusionGemma backbone engine.
     //! Configures full-canvas denoise shapes and finalized-token commit shapes.

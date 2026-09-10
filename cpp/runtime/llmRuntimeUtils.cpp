@@ -403,6 +403,13 @@ RopeConfig collectRopeConfig(nlohmann::json const& config)
                 // `Qwen2_5_VLVisionConfig` convention ("default" + mrope_section).
                 // Talker uses same config (3D position_ids + interleaved MRoPE) as in PyTorch.
                 ropeConfig.type = RopeType::kMRope;
+                if (mropeSectionIt != ropeScalingIt->end())
+                {
+                    check::check(mropeSectionIt->is_array(), "rope_scaling.mrope_section must be an array");
+                    ropeConfig.mropeSection = mropeSectionIt->get<std::vector<int32_t>>();
+                    check::check(ropeConfig.mropeSection.size() >= 3,
+                        "rope_scaling.mrope_section must contain temporal, height, and width partitions");
+                }
             }
             else if (ropeTypeStr == "llama3")
             {
@@ -821,6 +828,7 @@ template void compactVector<std::unordered_map<int32_t, float>>(
     std::vector<int32_t> const&, std::vector<std::unordered_map<int32_t, float>>&);
 template void compactVector<SlotStreamState>(std::vector<int32_t> const&, std::vector<SlotStreamState>&);
 template void compactVector<LogprobsSlot>(std::vector<int32_t> const&, std::vector<LogprobsSlot>&);
+template void compactVector<ResidentRef>(std::vector<int32_t> const&, std::vector<ResidentRef>&);
 
 // Build batch mapping from finished states
 // Returns a vector mapping old batch indices to new indices (-1 for evicted batches)
@@ -977,7 +985,7 @@ rt::Tensor generateMultimodalIndices(
             }
             else
             {
-                indicesPtr[pos] = 0;
+                indicesPtr[pos] = -1;
             }
         }
     }

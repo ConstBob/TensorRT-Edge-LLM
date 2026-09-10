@@ -363,7 +363,7 @@ def get_tree_attention_mask(seq_len: int):
 
 def pack_tree_mask(mask: torch.Tensor, seq_len: int,
                    batch_size: int) -> torch.Tensor:
-    """Bit-pack tree mask to [B, S, ceil(S/32)] int32 for the XQA kernel.
+    """Bit-pack tree mask to [B*S, ceil(S/32)] int32 for the XQA kernel.
 
     Column ``c`` of a row goes to word ``c // 32``, bit ``c % 32`` (so widths
     above 32 span multiple words). Word values are wrapped to signed int32 so
@@ -378,7 +378,9 @@ def pack_tree_mask(mask: torch.Tensor, seq_len: int,
                 words[col // 32] |= (1 << (col % 32))
         for w, val in enumerate(words):
             packed[row, w] = val - (1 << 32) if val >= (1 << 31) else val
-    return packed[None].expand(batch_size, *packed.shape).contiguous()
+    return packed[None].expand(batch_size,
+                               *packed.shape).reshape(batch_size * seq_len,
+                                                      num_packed).contiguous()
 
 
 def commit_kv_cache(k_cache: torch.Tensor, v_cache: torch.Tensor,
@@ -411,7 +413,8 @@ def _fp8_available() -> bool:
 class AttentionPluginRunner:
     """Builds + runs an attention plugin for a given AttentionParams config.
 
-    The plugin takes a single packed QKV input [B, S, C].  The
+    The runner accepts packed QKV as [B, S, C] and binds it to the plugin as
+    token-major [B*S, C]. The
     ``enable_kv_shared`` plugin field selects the layout: C = (Hq + 2*Hkv)*D
     for normal (own-KV) layers. Shared-KV layers use C = Hq*D (Q only) when
     reading the donor cache directly, or the packed width when bounded SWA also
@@ -500,55 +503,56 @@ class AttentionPluginRunner:
         p = self.p
         qh = p.q_hidden
         D, Hkv = p.head_size, p.num_kv_heads
-        mb, ms, mpe = p.max_batch_size, p.max_seq_len, p.max_position_embeddings
+        mb, ms = p.max_batch_size, p.max_seq_len
 
-        common_input_specs = [
+        input_specs = [
+            ("qkv", trt.float16, (-1, -1)),
             ("kv_cache", self.kv_dtype, (2, -1, PAGE_SIZE, Hkv, D)),
-            ("context_lengths", trt.int32, (-1, )),
-            ("rope_cos_sin", trt.float32, (1, mpe, D)),
+            ("query_lengths", trt.int32, (-1, )),
+            ("rope_cos_sin", trt.float32, (-1, D)),
             ("kv_cache_indices", trt.int32, (-1, )),
             (self.page_table_name, trt.int32, (-1, 2, self.mpps)),
         ]
         # The pool never resizes: numPages is fixed per engine (min=opt=max).
         pool_shape = (2, self.num_pages, PAGE_SIZE, Hkv, D)
+        # Shared-KV normally carries Q only. Bounded SWA consumers also carry
+        # transient current donor K/V in the packed-QKV input.
+        qkv_c = (qh if self.kv_shared and not self.shared_current_kv else
+                 p.qkv_hidden_size)
         profiles = {
+            "qkv":
+            ((1, qkv_c), (p.batch_size * p.seq_len, qkv_c), (mb * ms, qkv_c)),
             "kv_cache": (pool_shape, pool_shape, pool_shape),
-            "context_lengths": ((1, ), (p.batch_size, ), (mb, )),
-            "rope_cos_sin": ((1, mpe, D), (1, mpe, D), (1, mpe, D)),
+            "query_lengths": ((1, ), (p.batch_size, ), (mb, )),
+            "rope_cos_sin":
+            ((1, D), (p.batch_size * p.seq_len, D), (mb * ms, D)),
+            # min 0: an empty kv_cache_indices binding selects normal prefill.
+            "kv_cache_indices": ((0, ), (p.batch_size, ), (mb, )),
             self.page_table_name:
             ((1, 2, self.mpps), (p.batch_size, 2, self.mpps), (mb, 2,
                                                                self.mpps)),
         }
-        # Shared-KV normally carries Q only. Bounded SWA consumers also carry
-        # transient current donor K/V in the existing packed-QKV input.
-        qkv_c = (qh if self.kv_shared and not self.shared_current_kv else
-                 p.qkv_hidden_size)
-        input_specs = [("qkv", trt.float16, (-1, -1, -1))] + common_input_specs
-        profiles.update({
-            "qkv":
-            ((1, 1, qkv_c), (p.batch_size, p.seq_len, qkv_c), (mb, ms, qkv_c)),
-            # An empty binding selects normal prefill.
-            "kv_cache_indices": ((0, ), (p.batch_size, ), (mb, )),
-        })
         plugin_input_order = [
-            "qkv", "kv_cache", "context_lengths", "rope_cos_sin",
+            "qkv", "kv_cache", "query_lengths", "rope_cos_sin",
             "kv_cache_indices", self.page_table_name
         ]
         if self.tree:
             input_specs += [
-                ("tree_mask", trt.int32, (-1, -1, -1)),
-                ("position_ids", trt.int32, (-1, -1)),
+                ("tree_mask", trt.int32, (-1, -1)),
+                ("position_ids", trt.int32, (-1, )),
             ]
-            profiles["tree_mask"] = ((1, 1, 1), (p.batch_size, p.seq_len,
-                                                 p.seq_len), (mb, ms, ms))
-            profiles["position_ids"] = ((1, 1), (p.batch_size, p.seq_len),
-                                        (mb, ms))
+            profiles["tree_mask"] = ((1, 1), (p.batch_size * p.seq_len,
+                                              (p.seq_len + 31) // 32),
+                                     (mb * ms, (ms + 31) // 32))
+            profiles["position_ids"] = ((1, ), (p.batch_size * p.seq_len, ),
+                                        (mb * ms, ))
         if self.vision:
-            # vision_block_ids [B, S]: -1 for text/pad, non-negative per image
+            # vision_block_ids [B*S]: -1 for text/pad, non-negative per image
             # run. Occupies the optional attention-mask input slot.
-            input_specs.append(("vision_block_ids", trt.int32, (-1, -1)))
-            profiles["vision_block_ids"] = ((1, 1), (p.batch_size, p.seq_len),
-                                            (mb, ms))
+            input_specs.append(("vision_block_ids", trt.int32, (-1, )))
+            profiles["vision_block_ids"] = ((1, ),
+                                            (p.batch_size * p.seq_len, ),
+                                            (mb * ms, ))
 
         # qk_norm gammas are OPTIONAL engine-weight constant inputs, wired only
         # when enable_qk_norm=1.
@@ -573,6 +577,24 @@ class AttentionPluginRunner:
             input_specs.append(("swa_kv_cache_mode", trt.int8, (-1, )))
             profiles["swa_kv_cache_mode"] = ((0, ), (1, ), (1, ))
             plugin_input_order.append("swa_kv_cache_mode")
+        input_specs += [
+            ("query_start_offsets", trt.int32, (-1, )),
+            ("attention_sequence_lengths", trt.int32, (-1, )),
+            ("execution_phase_marker", trt.int32, (-1, )),
+            ("context_sequence_count_carrier", trt.int32, (-1, )),
+        ]
+        profiles.update({
+            "query_start_offsets": ((2, ), (p.batch_size + 1, ), (mb + 1, )),
+            "attention_sequence_lengths": ((1, ), (p.batch_size, ), (mb, )),
+            "execution_phase_marker":
+            ((1, ), (1 if p.is_prefill else 3, ), (8, )),
+            "context_sequence_count_carrier":
+            ((0, ), (p.batch_size if p.is_prefill else 0, ), (mb, )),
+        })
+        plugin_input_order += [
+            "query_start_offsets", "attention_sequence_lengths",
+            "execution_phase_marker", "context_sequence_count_carrier"
+        ]
 
         fields = [
             pf_int32("num_q_heads", p.num_q_heads),
@@ -723,7 +745,8 @@ class AttentionPluginRunner:
             vision_block_ids=None,
             input_shapes=None,
             context_mask_selector=None,
-            attention_output=None):
+            attention_output=None,
+            execution_phase=None):
         """Execute; returns (attn_output fp16, kv_cache after update).
 
         ``qkv`` is the packed [B, S, (Hq+2*Hkv)*D] input, or a Q-only
@@ -747,28 +770,84 @@ class AttentionPluginRunner:
         pool = self._get_pool(kv_cache.dtype)
         page_table = self._make_page_table(batch)
         self._scatter_cache(pool, kv_cache, page_table)
+        batch_size, seq_len = qkv.shape[:2]
+        physical_tokens = batch_size * seq_len
+        empty_cache_indices = (cache_indices.numel() == 0
+                               or input_shapes is not None and
+                               input_shapes.get("kv_cache_indices") == (0, ))
+        has_token_positions = (position_ids is not None
+                               and position_ids.numel() == physical_tokens)
+        if has_token_positions:
+            positions = position_ids.reshape(-1).to(torch.int32)
+        else:
+            starts = (cache_indices if not empty_cache_indices else
+                      torch.zeros(batch_size, dtype=torch.int32, device=DEV))
+            positions = (starts[:, None] + torch.arange(
+                seq_len, dtype=torch.int32, device=DEV)[None, :]).reshape(-1)
+        rope_rows = rope_cos_sin[0].index_select(0, positions.to(torch.int64))
+        query_start_offsets = torch.arange(0,
+                                           physical_tokens + 1,
+                                           seq_len,
+                                           dtype=torch.int32,
+                                           device=DEV)
+        query_lengths = context_lengths.clamp(min=0, max=seq_len)
+        tree_step = self.tree and has_token_positions
+        if execution_phase is None:
+            if tree_step:
+                phase = 5
+            elif empty_cache_indices:
+                phase = 1
+            elif seq_len == 1:
+                phase = 3
+            else:
+                phase = 2
+        else:
+            phase = execution_phase
+        execution_phase_marker = torch.zeros(phase,
+                                             dtype=torch.int32,
+                                             device=DEV)
+        context_sequences = batch_size if phase in (1, 2) else 0
+        context_sequence_count_carrier = torch.empty(max(1, context_sequences),
+                                                     dtype=torch.int32,
+                                                     device=DEV)
         attn_out = attention_output
         if attn_out is None:
-            attn_out = torch.empty((qkv.shape[0], qkv.shape[1], p.q_hidden),
+            attn_out = torch.empty((physical_tokens, p.q_hidden),
                                    dtype=torch.float16,
                                    device=DEV)
+        else:
+            attn_out = attn_out.reshape(physical_tokens, p.q_hidden)
         tensors = {
-            "qkv": qkv,
+            "qkv": qkv.reshape(physical_tokens, qkv.shape[-1]),
             "kv_cache": pool,
-            "context_lengths": context_lengths,
-            "rope_cos_sin": rope_cos_sin,
+            "query_lengths": query_lengths,
+            "rope_cos_sin": rope_rows,
             "kv_cache_indices": cache_indices,
             self.page_table_name: page_table,
+            "query_start_offsets": query_start_offsets,
+            "attention_sequence_lengths": context_lengths,
+            "execution_phase_marker": execution_phase_marker,
+            "context_sequence_count_carrier": context_sequence_count_carrier,
             "attention_output": attn_out,
             "kv_cache_output": pool,  # aliased in-place to the pool binding
         }
         if self.tree:
-            tensors["tree_mask"] = tree_mask
-            tensors["position_ids"] = position_ids
+            mask_words = tree_mask.shape[-1]
+            if tree_mask.numel() == batch_size * mask_words:
+                tree_mask = tree_mask.reshape(batch_size, 1,
+                                              mask_words).expand(
+                                                  batch_size, seq_len,
+                                                  mask_words)
+            tensors["tree_mask"] = tree_mask.reshape(physical_tokens,
+                                                     mask_words)
+            if position_ids.numel() == batch_size:
+                position_ids = position_ids.reshape(batch_size, 1).expand(
+                    batch_size, seq_len)
+            tensors["position_ids"] = position_ids.reshape(-1)
         if self.context_mask_selector:
             tensors["context_mask_selector"] = context_mask_selector
         if self.vision:
-            tensors["vision_block_ids"] = vision_block_ids
+            tensors["vision_block_ids"] = vision_block_ids.reshape(-1)
         if self.swa_capable:
             tensors["swa_kv_cache_mode"] = torch.zeros(1,
                                                        dtype=torch.int8,
@@ -776,9 +855,12 @@ class AttentionPluginRunner:
             input_shapes = dict(input_shapes or {})
             input_shapes["swa_kv_cache_mode"] = (
                 1, ) if self.bounded_swa_cache else (0, )
+        if context_sequences == 0:
+            input_shapes = dict(input_shapes or {})
+            input_shapes["context_sequence_count_carrier"] = (0, )
         self.runner.execute(tensors, input_shapes)
         self._gather_cache(pool, kv_cache, page_table)
-        return attn_out, kv_cache
+        return attn_out.reshape(batch_size, seq_len, p.q_hidden), kv_cache
 
 
 # --------------------------------------------------------------------------- #
@@ -1599,6 +1681,81 @@ def test_head512_shared_vision_prefill_reads_donor_cache():
                        plugin_kv.view(torch.int16))
 
 
+@pytest.mark.skipif(_device_sm() not in NATIVE_SMS,
+                    reason="D512 CuTe DSL FMHA is unavailable on this SM")
+def test_head512_shared_vision_prefill_uses_token_aligned_rope():
+    """A reused vision prefill must not offset already-gathered RoPE rows."""
+    history = 16
+    seq_len = 64
+    total_length = history + seq_len
+    p = AttentionParams(batch_size=1,
+                        seq_len=seq_len,
+                        num_q_heads=4,
+                        num_kv_heads=2,
+                        head_size=512,
+                        kv_cache_capacity=128,
+                        max_batch_size=1,
+                        max_seq_len=seq_len,
+                        max_position_embeddings=128,
+                        is_prefill=True)
+    gen = torch.Generator().manual_seed(628)
+    runner = AttentionPluginRunner(p,
+                                   enable_kv_shared=1,
+                                   enable_vision_block_attention=True)
+    cos, sin, combined = _make_rope(p, gen)
+    ref_k, ref_v, plugin_kv = _empty_caches(p)
+    plugin_kv[:, :, :, :total_length] = (0.1 * torch.randn(
+        (1, 2, p.num_kv_heads, total_length, p.head_size),
+        generator=gen,
+        dtype=torch.float32)).to(DEV).to(torch.float16)
+    ref_k[:, :, :total_length] = plugin_kv[:, 0, :, :total_length].float()
+    ref_v[:, :, :total_length] = plugin_kv[:, 1, :, :total_length].float()
+
+    shared_q = (0.1 * torch.randn(
+        (1, seq_len, p.q_hidden), generator=gen, dtype=torch.float32)).to(DEV)
+    positions = torch.arange(history,
+                             total_length,
+                             dtype=torch.int32,
+                             device=DEV)[None]
+    shared_q_roped = apply_rotary_embedding(
+        shared_q.reshape(1, seq_len, p.num_q_heads,
+                         p.head_size).transpose(1, 2), cos, sin, positions)
+    mask = sliding_window_mask(seq_len, total_length, -1, DEV)
+    shared_ref = scaled_dot_product_attention(shared_q_roped,
+                                              ref_k[:, :, :total_length],
+                                              ref_v[:, :, :total_length],
+                                              p.qk_scale, mask, p.num_q_heads,
+                                              p.num_kv_heads)
+    shared_ref = shared_ref.transpose(1, 2).reshape(1, seq_len, p.q_hidden)
+    past_lengths = torch.full((1, ), history, dtype=torch.int32, device=DEV)
+    attention_lengths = torch.full((1, ),
+                                   total_length,
+                                   dtype=torch.int32,
+                                   device=DEV)
+    vision_block_ids = torch.full((1, seq_len),
+                                  -1,
+                                  dtype=torch.int32,
+                                  device=DEV)
+    donor_before = plugin_kv.clone()
+
+    shared_actual, plugin_kv = runner.run(shared_q.to(torch.float16),
+                                          plugin_kv,
+                                          attention_lengths,
+                                          combined,
+                                          past_lengths,
+                                          position_ids=positions,
+                                          vision_block_ids=vision_block_ids,
+                                          execution_phase=1)
+
+    assert_close("shared-vision-token-aligned-rope",
+                 shared_ref,
+                 shared_actual,
+                 atol=2e-2,
+                 rtol=2e-2)
+    assert torch.equal(donor_before.view(torch.int16),
+                       plugin_kv.view(torch.int16))
+
+
 @pytest.mark.skipif(not _fp8_available(),
                     reason="FP8 KV cache not supported on this device")
 def test_head512_shared_fp8_prefill_rejected():
@@ -2059,14 +2216,17 @@ def test_batch_permutation_invariance_decode():
 # --------------------------------------------------------------------------- #
 # Tree (speculative) attention
 # --------------------------------------------------------------------------- #
-def _tree_attention_rounds(q_norm_gamma=None, k_norm_gamma=None):
+def _tree_attention_rounds(q_norm_gamma=None,
+                           k_norm_gamma=None,
+                           shuffle_pages=False):
     p = AttentionParams(batch_size=4, seq_len=4, **BASE)
     num_rounds = 5
     gen = torch.Generator().manual_seed(42)
     runner = AttentionPluginRunner(p,
                                    enable_tree_attention=True,
                                    q_norm_gamma=q_norm_gamma,
-                                   k_norm_gamma=k_norm_gamma)
+                                   k_norm_gamma=k_norm_gamma,
+                                   shuffle_pages=shuffle_pages)
     cos, sin, combined = _make_rope(p, gen)
     ref_k, ref_v, plugin_kv = _empty_caches(p)
 
@@ -2140,6 +2300,10 @@ def _tree_attention_rounds(q_norm_gamma=None, k_norm_gamma=None):
 
 def test_tree_attention():
     _tree_attention_rounds()
+
+
+def test_tree_attention_shuffled_page_table():
+    _tree_attention_rounds(shuffle_pages=True)
 
 
 def test_tree_attention_qknorm():

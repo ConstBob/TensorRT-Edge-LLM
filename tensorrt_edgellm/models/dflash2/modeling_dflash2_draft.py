@@ -120,6 +120,31 @@ class DFlash2DecoderLayer(DFlashCachedDecoderLayer):
         hidden_states = self.mlp_conv.finish(feed_forward, mlp_post, residual)
         return hidden_states, present_kv
 
+    def forward_ragged(self, hidden_states, h_delta, past_key_value,
+                       rope_cos_sin, **metadata):
+        batch = metadata["query_lengths"].shape[0]
+        block = hidden_states.shape[0] // batch
+        hidden_size = self.self_attn.hidden_size
+
+        residual = hidden_states.to(torch.float32).reshape(
+            batch, block, hidden_size)
+        attention_input = self.input_layernorm(residual).to(torch.float16)
+        attention_input, attention_post = self.attention_conv.prepare(
+            attention_input)
+        attention, present_kv = self.self_attn.forward_ragged(
+            attention_input.reshape(-1, hidden_size), h_delta, past_key_value,
+            rope_cos_sin, **metadata)
+        hidden_states = self.attention_conv.finish(
+            attention.reshape(batch, block, hidden_size), attention_post,
+            residual)
+
+        residual = hidden_states
+        mlp_input = self.post_attention_layernorm(residual).to(torch.float16)
+        mlp_input, mlp_post = self.mlp_conv.prepare(mlp_input)
+        feed_forward = self.mlp(mlp_input)
+        hidden_states = self.mlp_conv.finish(feed_forward, mlp_post, residual)
+        return hidden_states.reshape(-1, hidden_size), present_kv
+
 
 class DFlash2CandidateSelector(nn.Module):
     """Checkpoint-shaped selector parameters."""
@@ -142,19 +167,33 @@ class DFlash2CandidateSelector(nn.Module):
 
 
 def _make_flat_wrapper(model: nn.Module, num_layers: int) -> nn.Module:
-    parameters = [
-        "inputs_embeds", "dflash_target_hidden_concat", "rope_rotary_cos_sin",
-        "context_lengths", "kvcache_start_index", "kv_page_table",
-        "dflash_delta_lengths", "attention_mask", "attention_pos_id"
-    ] + [f"past_key_values_{index}" for index in range(num_layers)]
+    parameters = (
+        ["inputs_embeds", "dflash_target_hidden_concat"] +
+        [f"past_key_values_{index}" for index in range(num_layers)] + [
+            "rope_rotary_cos_sin", "positions", "query_start_offsets",
+            "query_lengths", "past_lengths", "attention_sequence_lengths",
+            "state_indices", "execution_phase_marker",
+            "context_sequence_count_carrier", "kv_page_table",
+            "dflash_delta_rope_cos_sin", "dflash_delta_positions",
+            "dflash_delta_token_to_sequence", "attention_position_ids",
+            "packed_attention_mask"
+        ])
     past = "({},)".format(", ".join(f"past_key_values_{index}"
                                     for index in range(num_layers)))
     body = (
-        "    outputs, present = self._model(\n"
-        "        inputs_embeds, dflash_target_hidden_concat,\n"
-        "        rope_rotary_cos_sin, context_lengths, kvcache_start_index,\n"
-        "        kv_page_table, dflash_delta_lengths, attention_mask,\n"
-        f"        attention_pos_id, list({past}))\n"
+        "    outputs, present = self._model.forward_ragged(\n"
+        f"        inputs_embeds, dflash_target_hidden_concat, {past},\n"
+        "        rope_rotary_cos_sin=rope_rotary_cos_sin, positions=positions,\n"
+        "        query_start_offsets=query_start_offsets, query_lengths=query_lengths,\n"
+        "        past_lengths=past_lengths,\n"
+        "        attention_sequence_lengths=attention_sequence_lengths,\n"
+        "        state_indices=state_indices, execution_phase_marker=execution_phase_marker,\n"
+        "        context_sequence_count_carrier=context_sequence_count_carrier,\n"
+        "        kv_page_table=kv_page_table, delta_rope_cos_sin=dflash_delta_rope_cos_sin,\n"
+        "        delta_positions=dflash_delta_positions,\n"
+        "        delta_token_to_sequence=dflash_delta_token_to_sequence,\n"
+        "        attention_position_ids=attention_position_ids,\n"
+        "        packed_attention_mask=packed_attention_mask)\n"
         "    return tuple(outputs) + tuple(present)\n")
     namespace = {}
     exec("def _forward(self, {}):\n{}".format(", ".join(parameters), body),
@@ -213,38 +252,56 @@ class DFlash2DraftModel(DFlashDraftModel):
         outputs = (candidate_ids.to(torch.int32), unary_values, projected)
         return outputs, present_key_values
 
+    def forward_ragged(self, inputs_embeds, target_hidden_concat,
+                       past_key_values, **metadata):
+        bias = (self.fc.bias.to(torch.float32)
+                if self.fc.bias is not None else None)
+        h_delta = torch.nn.functional.linear(
+            target_hidden_concat.to(torch.float32),
+            self.fc.weight.to(torch.float32), bias)
+        h_delta = self.hidden_norm(h_delta).to(torch.float16)
+
+        hidden_states = inputs_embeds.to(torch.float32)
+        present_key_values = []
+        for index, layer in enumerate(self.layers):
+            hidden_states, present = layer.forward_ragged(
+                hidden_states, h_delta, past_key_values[index],
+                metadata["rope_rotary_cos_sin"], **metadata)
+            present_key_values.append(present)
+
+        batch = metadata["query_lengths"].shape[0]
+        block = hidden_states.shape[0] // batch
+        prediction_hidden = self.norm(hidden_states).to(torch.float16).reshape(
+            batch, block, self.config.hidden_size)[:, 1:, :]
+        projected = self.candidate_selector.hidden_projection(
+            prediction_hidden).to(torch.float16)
+        unary_logits = self.lm_head(prediction_hidden).to(torch.float32)
+        unary_values, candidate_ids = torch.topk(
+            unary_logits, self.config.dflash2_selector_top_k, dim=2)
+        outputs = (candidate_ids.to(torch.int32), unary_values, projected)
+        return outputs, tuple(present_key_values)
+
     def onnx_export_spec(self) -> OnnxSpec:
         config = self.config
         device = next(itertools.chain(self.parameters(),
                                       self.buffers())).device
-        batch, block, delta_len = _BATCH_SIZE, config.dflash2_block_size, _CTX_LEN
+        batch = _BATCH_SIZE
+        block = config.dflash2_block_size
+        delta_len = _CTX_LEN
+        physical_tokens = batch * block
+        delta_tokens = batch * delta_len
+        num_layers = config.num_hidden_layers
         rotary_dim = int(config.head_dim * config.partial_rotary_factor)
         args = [
-            torch.zeros(batch,
-                        block,
+            torch.zeros(physical_tokens,
                         config.hidden_size,
                         dtype=torch.float16,
                         device=device),
-            torch.zeros(batch,
-                        delta_len,
+            torch.zeros(delta_tokens,
                         len(config.dflash2_target_layer_ids) *
                         config.hidden_size,
                         dtype=torch.float16,
                         device=device),
-            torch.zeros(1,
-                        _KV_CAPACITY,
-                        rotary_dim,
-                        dtype=torch.float32,
-                        device=device),
-            torch.zeros(batch, dtype=torch.int32, device=device),
-            torch.zeros(batch, dtype=torch.int32, device=device),
-            torch.zeros(batch, 2, 1, dtype=torch.int32, device=device),
-            torch.zeros(batch, dtype=torch.int32, device=device),
-            torch.zeros(batch,
-                        block, (block + 31) // 32,
-                        dtype=torch.int32,
-                        device=device),
-            torch.zeros(batch, block, dtype=torch.int32, device=device),
         ]
         args.extend(
             torch.zeros(2,
@@ -253,64 +310,99 @@ class DFlash2DraftModel(DFlashDraftModel):
                         config.num_key_value_heads,
                         config.head_dim,
                         dtype=torch.float16,
-                        device=device)
-            for _ in range(config.num_hidden_layers))
-        input_names = [
-            "inputs_embeds", "dflash_target_hidden_concat",
-            "rope_rotary_cos_sin", "context_lengths", "kvcache_start_index",
-            "kv_page_table", "dflash_delta_lengths", "attention_mask",
-            "attention_pos_id"
-        ] + [f"past_key_values_{i}" for i in range(config.num_hidden_layers)]
+                        device=device) for _ in range(num_layers))
+        positions = torch.arange(block, dtype=torch.int32,
+                                 device=device).repeat(batch)
+        lengths = torch.full((batch, ),
+                             block,
+                             dtype=torch.int32,
+                             device=device)
+        args.extend([
+            torch.zeros(physical_tokens,
+                        rotary_dim,
+                        dtype=torch.float32,
+                        device=device),
+            positions,
+            torch.arange(0,
+                         physical_tokens + 1,
+                         block,
+                         dtype=torch.int32,
+                         device=device),
+            lengths,
+            torch.zeros(batch, dtype=torch.int32, device=device),
+            lengths.clone(),
+            torch.arange(batch, dtype=torch.int32, device=device),
+            torch.zeros(4, dtype=torch.int32, device=device),
+            torch.empty(0, dtype=torch.int32, device=device),
+            torch.zeros(batch, 2, 1, dtype=torch.int32, device=device),
+            torch.zeros(delta_tokens,
+                        rotary_dim,
+                        dtype=torch.float32,
+                        device=device),
+            torch.arange(delta_len, dtype=torch.int32,
+                         device=device).repeat(batch),
+            torch.arange(batch, dtype=torch.int32,
+                         device=device).repeat_interleave(delta_len),
+            positions.clone(),
+            torch.zeros(physical_tokens, (block + 31) // 32,
+                        dtype=torch.int32,
+                        device=device),
+        ])
+        input_names = (
+            ["inputs_embeds", "dflash_target_hidden_concat"] +
+            [f"past_key_values_{i}" for i in range(num_layers)] + [
+                "rope_rotary_cos_sin", "positions", "query_start_offsets",
+                "query_lengths", "past_lengths", "attention_sequence_lengths",
+                "state_indices", "execution_phase_marker",
+                "context_sequence_count_carrier", "kv_page_table",
+                "dflash_delta_rope_cos_sin", "dflash_delta_positions",
+                "dflash_delta_token_to_sequence", "attention_position_ids",
+                "packed_attention_mask"
+            ])
         output_names = [
             "spec_proposal_support_ids", "spec_proposal_unary_values",
             "spec_proposal_projected_hidden"
-        ] + [
-            f"present_key_values_{i}" for i in range(config.num_hidden_layers)
-        ]
-        batch_dim = torch.export.Dim("batch", min=1, max=256)
-        block_dim = torch.export.Dim("dflash2_block",
-                                     min=2,
-                                     max=_MAX_BLOCK_SIZE)
-        delta_dim = torch.export.Dim("delta_seq", min=1, max=32768)
-        kv_dim = torch.export.Dim("kv_len", min=1, max=32768)
+        ] + [f"present_key_values_{i}" for i in range(num_layers)]
+        token_dim = torch.export.Dim("physical_tokens", min=2, max=8_388_608)
+        delta_dim = torch.export.Dim("delta_tokens", min=1, max=8_388_608)
+        seq_dim = torch.export.Dim("num_sequences", min=1, max=256)
         pages_dim = torch.export.Dim("num_pages", min=1, max=1048576)
         max_pages_dim = torch.export.Dim("max_pages_per_seq", min=1, max=32768)
-        dynamic_shapes = [
-            {
-                0: batch_dim,
-                1: block_dim
-            },
-            {
-                0: batch_dim,
-                1: delta_dim
-            },
-            {
-                1: kv_dim
-            },
-            {
-                0: batch_dim
-            },
-            {
-                0: batch_dim
-            },
-            {
-                0: batch_dim,
-                2: max_pages_dim
-            },
-            {
-                0: batch_dim
-            },
-            {
-                0: batch_dim,
-                1: block_dim
-            },
-            {
-                0: batch_dim,
-                1: block_dim
-            },
-        ] + [{
-            1: pages_dim
-        } for _ in range(config.num_hidden_layers)]
+        phase_dim = torch.export.Dim("execution_phase_extent", min=1, max=8)
+        packed_width = torch.export.Dim("packed_mask_width", min=1, max=64)
+        dynamic_shapes = [{0: token_dim}, {0: delta_dim}]
+        dynamic_shapes += [{1: pages_dim} for _ in range(num_layers)]
+        dynamic_shapes += [{
+            0: token_dim
+        }, {
+            0: token_dim
+        }, {
+            0: seq_dim + 1
+        }, {
+            0: seq_dim
+        }, {
+            0: seq_dim
+        }, {
+            0: seq_dim
+        }, {
+            0: seq_dim
+        }, {
+            0: phase_dim
+        }, {}, {
+            0: seq_dim,
+            2: max_pages_dim
+        }, {
+            0: delta_dim
+        }, {
+            0: delta_dim
+        }, {
+            0: delta_dim
+        }, {
+            0: token_dim
+        }, {
+            0: token_dim,
+            1: packed_width
+        }]
         wrapped = _make_flat_wrapper(self, config.num_hidden_layers)
         wrapped.eval()
         return OnnxSpec(wrapped=wrapped,

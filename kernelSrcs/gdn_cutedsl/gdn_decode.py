@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -78,6 +78,8 @@ def _define_kernels():
     def gdn_kernel_small_batch(
         tiled_copy_load: cute.TiledCopy,
         h0_source: cute.Tensor,
+        state_indices: cute.Tensor,
+        use_state_indices: Int32,
         smem_layout_staged: cute.Layout,
         num_v_tiles: Int32,
         q: cute.Tensor,
@@ -110,6 +112,9 @@ def _define_kernels():
         i_n = batch_idx // HV
         i_hv = batch_idx % HV
         i_h = i_hv // (HV // H)
+        state_slot = cutlass.Int32(i_n)
+        if use_state_indices != 0:
+            state_slot = cutlass.Int32(state_indices[i_n])
 
         k_local = in_warp_tid // V_PER_WARP_SMALL
         v_local = in_warp_tid % V_PER_WARP_SMALL
@@ -132,7 +137,7 @@ def _define_kernels():
                 sK[tidx] = cutlass.Float32(k[i_n, 0, i_h, tidx])
                 sQ[tidx] = cutlass.Float32(q[i_n, 0, i_h, tidx])
 
-            gSrc_batch = h0_source[(i_n, i_hv, None, None)]
+            gSrc_batch = h0_source[(state_slot, i_hv, None, None)]
             gSrc = cute.local_tile(gSrc_batch, (TILE_K, TILE_V_SMALL), (0, None))
             thr_copy_load = tiled_copy_load.get_slice(tidx)
 
@@ -302,7 +307,7 @@ def _define_kernels():
                     if k_write < TILE_K:
                         h_val = sData[(k_write, v_write, stage)]
                         v_global_write = v_tile * TILE_V_SMALL + v_write
-                        h0_source[(i_n, i_hv, k_write, v_global_write)] = h_val
+                        h0_source[(state_slot, i_hv, k_write, v_global_write)] = h_val
 
                 cute.arch.barrier()
         else:
@@ -316,6 +321,8 @@ def _define_kernels():
     def gdn_kernel_small_batch_varlen(
         tiled_copy_load: cute.TiledCopy,
         h0_source: cute.Tensor,
+        state_indices: cute.Tensor,
+        use_state_indices: Int32,
         smem_layout_staged: cute.Layout,
         num_v_tiles: Int32,
         q: cute.Tensor,
@@ -348,6 +355,9 @@ def _define_kernels():
         i_n = batch_idx // HV
         i_hv = batch_idx % HV
         i_h = i_hv // (HV // H)
+        state_slot = cutlass.Int32(i_n)
+        if use_state_indices != 0:
+            state_slot = cutlass.Int32(state_indices[i_n])
 
         k_local = in_warp_tid // V_PER_WARP_SMALL
         v_local = in_warp_tid % V_PER_WARP_SMALL
@@ -370,7 +380,7 @@ def _define_kernels():
                 sK[tidx] = cutlass.Float32(k[0, i_n, i_h, tidx])
                 sQ[tidx] = cutlass.Float32(q[0, i_n, i_h, tidx])
 
-            gSrc_batch = h0_source[(i_n, i_hv, None, None)]
+            gSrc_batch = h0_source[(state_slot, i_hv, None, None)]
             gSrc = cute.local_tile(gSrc_batch, (TILE_K, TILE_V_SMALL), (0, None))
             thr_copy_load = tiled_copy_load.get_slice(tidx)
 
@@ -540,7 +550,7 @@ def _define_kernels():
                     if k_write < TILE_K:
                         h_val = sData[(k_write, v_write, stage)]
                         v_global_write = v_tile * TILE_V_SMALL + v_write
-                        h0_source[(i_n, i_hv, k_write, v_global_write)] = h_val
+                        h0_source[(state_slot, i_hv, k_write, v_global_write)] = h_val
 
                 cute.arch.barrier()
         else:
@@ -554,6 +564,8 @@ def _define_kernels():
     def gdn_kernel_large_batch(
         tiled_copy_load: cute.TiledCopy,
         h0_source: cute.Tensor,
+        state_indices: cute.Tensor,
+        use_state_indices: Int32,
         smem_layout_staged: cute.Layout,
         num_v_tiles: Int32,
         q: cute.Tensor,
@@ -580,6 +592,9 @@ def _define_kernels():
         i_n = batch_idx // HV
         i_hv = batch_idx % HV
         i_h = i_hv // (HV // H)
+        state_slot = cutlass.Int32(i_n)
+        if use_state_indices != 0:
+            state_slot = cutlass.Int32(state_indices[i_n])
 
         k_local = in_warp_tid // V_PER_WARP
         v_local = in_warp_tid % V_PER_WARP
@@ -602,7 +617,7 @@ def _define_kernels():
                 sK[tidx] = cutlass.Float32(k[i_n, 0, i_h, tidx])
                 sQ[tidx] = cutlass.Float32(q[i_n, 0, i_h, tidx])
 
-            gSrc_batch = h0_source[(i_n, i_hv, None, None)]
+            gSrc_batch = h0_source[(state_slot, i_hv, None, None)]
             gSrc = cute.local_tile(gSrc_batch, (TILE_K, TILE_V), (0, None))
             thr_copy_load = tiled_copy_load.get_slice(tidx)
 
@@ -763,7 +778,7 @@ def _define_kernels():
                     if k_write < TILE_K:
                         h_val = sData[(k_write, v_write, stage)]
                         v_global_write = v_tile * TILE_V + v_write
-                        h0_source[(i_n, i_hv, k_write, v_global_write)] = h_val
+                        h0_source[(state_slot, i_hv, k_write, v_global_write)] = h_val
 
                 cute.arch.barrier()
         else:
@@ -776,6 +791,8 @@ def _define_kernels():
     def gdn_kernel_large_batch_varlen(
         tiled_copy_load: cute.TiledCopy,
         h0_source: cute.Tensor,
+        state_indices: cute.Tensor,
+        use_state_indices: Int32,
         smem_layout_staged: cute.Layout,
         num_v_tiles: Int32,
         q: cute.Tensor,
@@ -802,6 +819,9 @@ def _define_kernels():
         i_n = batch_idx // HV
         i_hv = batch_idx % HV
         i_h = i_hv // (HV // H)
+        state_slot = cutlass.Int32(i_n)
+        if use_state_indices != 0:
+            state_slot = cutlass.Int32(state_indices[i_n])
 
         k_local = in_warp_tid // V_PER_WARP
         v_local = in_warp_tid % V_PER_WARP
@@ -824,7 +844,7 @@ def _define_kernels():
                 sK[tidx] = cutlass.Float32(k[0, i_n, i_h, tidx])
                 sQ[tidx] = cutlass.Float32(q[0, i_n, i_h, tidx])
 
-            gSrc_batch = h0_source[(i_n, i_hv, None, None)]
+            gSrc_batch = h0_source[(state_slot, i_hv, None, None)]
             gSrc = cute.local_tile(gSrc_batch, (TILE_K, TILE_V), (0, None))
             thr_copy_load = tiled_copy_load.get_slice(tidx)
 
@@ -985,7 +1005,7 @@ def _define_kernels():
                     if k_write < TILE_K:
                         h_val = sData[(k_write, v_write, stage)]
                         v_global_write = v_tile * TILE_V + v_write
-                        h0_source[(i_n, i_hv, k_write, v_global_write)] = h_val
+                        h0_source[(state_slot, i_hv, k_write, v_global_write)] = h_val
 
                 cute.arch.barrier()
         else:
@@ -1017,6 +1037,8 @@ def _create_jit_functions():
         A_log: cute.Tensor,
         dt_bias: cute.Tensor,
         h0_source: cute.Tensor,
+        state_indices: cute.Tensor,
+        use_state_indices: Int32,
         context_lengths: cute.Tensor,
         o: cute.Tensor,
         softplus_beta: cutlass.Constexpr[float],
@@ -1026,7 +1048,7 @@ def _create_jit_functions():
         use_qk_l2norm: cutlass.Constexpr[bool],
         stream: cuda.CUstream,
     ):
-        n_batch = h0_source.layout.shape[0]
+        n_batch = q.layout.shape[0]
         hv_dim = v.layout.shape[2]
         v_dim = v.layout.shape[3]
         batch_size = n_batch * hv_dim
@@ -1056,6 +1078,8 @@ def _create_jit_functions():
         gdn_small(
             tiled_copy_load_small,
             h0_source,
+            state_indices,
+            use_state_indices,
             smem_layout_small,
             num_v_tiles_small,
             q,
@@ -1088,6 +1112,8 @@ def _create_jit_functions():
         A_log: cute.Tensor,
         dt_bias: cute.Tensor,
         h0_source: cute.Tensor,
+        state_indices: cute.Tensor,
+        use_state_indices: Int32,
         context_lengths: cute.Tensor,
         o: cute.Tensor,
         softplus_beta: cutlass.Constexpr[float],
@@ -1097,7 +1123,7 @@ def _create_jit_functions():
         use_qk_l2norm: cutlass.Constexpr[bool],
         stream: cuda.CUstream,
     ):
-        n_batch = h0_source.layout.shape[0]
+        n_batch = q.layout.shape[0]
         hv_dim = v.layout.shape[2]
         v_dim = v.layout.shape[3]
         batch_size = n_batch * hv_dim
@@ -1127,6 +1153,8 @@ def _create_jit_functions():
         gdn_small_varlen(
             tiled_copy_load_small,
             h0_source,
+            state_indices,
+            use_state_indices,
             smem_layout_small,
             num_v_tiles_small,
             q,
@@ -1159,6 +1187,8 @@ def _create_jit_functions():
         A_log: cute.Tensor,
         dt_bias: cute.Tensor,
         h0_source: cute.Tensor,
+        state_indices: cute.Tensor,
+        use_state_indices: Int32,
         context_lengths: cute.Tensor,
         o: cute.Tensor,
         softplus_beta: cutlass.Constexpr[float],
@@ -1168,7 +1198,7 @@ def _create_jit_functions():
         use_qk_l2norm: cutlass.Constexpr[bool],
         stream: cuda.CUstream,
     ):
-        n_batch = h0_source.layout.shape[0]
+        n_batch = q.layout.shape[0]
         hv_dim = v.layout.shape[2]
         v_dim = v.layout.shape[3]
         batch_size = n_batch * hv_dim
@@ -1193,6 +1223,8 @@ def _create_jit_functions():
         gdn_large(
             tiled_copy_load,
             h0_source,
+            state_indices,
+            use_state_indices,
             base_smem_layout,
             num_v_tiles,
             q,
@@ -1225,6 +1257,8 @@ def _create_jit_functions():
         A_log: cute.Tensor,
         dt_bias: cute.Tensor,
         h0_source: cute.Tensor,
+        state_indices: cute.Tensor,
+        use_state_indices: Int32,
         context_lengths: cute.Tensor,
         o: cute.Tensor,
         softplus_beta: cutlass.Constexpr[float],
@@ -1234,7 +1268,7 @@ def _create_jit_functions():
         use_qk_l2norm: cutlass.Constexpr[bool],
         stream: cuda.CUstream,
     ):
-        n_batch = h0_source.layout.shape[0]
+        n_batch = q.layout.shape[0]
         hv_dim = v.layout.shape[2]
         v_dim = v.layout.shape[3]
         batch_size = n_batch * hv_dim
@@ -1259,6 +1293,8 @@ def _create_jit_functions():
         gdn_large_varlen(
             tiled_copy_load,
             h0_source,
+            state_indices,
+            use_state_indices,
             base_smem_layout,
             num_v_tiles,
             q,
@@ -1334,6 +1370,7 @@ def _make_placeholder_tensors(n, h, hv, k, v, varlen):
         "A_log":      cp.zeros(hv, dtype=cp.float32),
         "dt_bias":    cp.zeros(hv, dtype=dt),
         "h0_source":  cp.zeros((n, hv, k, v), dtype=cp.float32),
+        "state_indices": cp.arange(n, dtype=cp.int32),
         "context_lengths": cp.ones(n, dtype=cp.int32),
         "o": o,
     }
@@ -1367,6 +1404,7 @@ def _to_cute_tensors(ph):
     q = wrap(ph["q"])
     v = wrap(ph["v"])
     h0_src = _mark_h0_source_dynamic(from_dlpack(ph["h0_source"], assumed_align=32))
+    state_indices = _mark_gdn_1d_dynamic(from_dlpack(ph["state_indices"], assumed_align=16))
     ctx = from_dlpack(ph["context_lengths"], assumed_align=16)
     ctx = ctx.mark_layout_dynamic(leading_dim=0).mark_compact_shape_dynamic(mode=0, stride_order=(0,))
     return {
@@ -1378,6 +1416,7 @@ def _to_cute_tensors(ph):
         "A_log":      wrap(ph["A_log"], leading_dim=0),
         "dt_bias":    wrap(ph["dt_bias"], leading_dim=0),
         "h0_source":  h0_src,
+        "state_indices": state_indices,
         "context_lengths": ctx,
         "o":          wrap(ph["o"]),
     }
@@ -1403,7 +1442,7 @@ def _compile_decode(n, h, hv, k, v, use_small_batch, varlen, stream, gpu_arch=""
     compiled = cute.compile(
         kernel_func,
         t["q"], t["k"], t["v"], t["a"], t["b"],
-        t["A_log"], t["dt_bias"], t["h0_source"], t["context_lengths"], t["o"],
+        t["A_log"], t["dt_bias"], t["h0_source"], t["state_indices"], 1, t["context_lengths"], t["o"],
         softplus_beta=1.0,
         softplus_threshold=20.0,
         scale=k ** -0.5,
@@ -1564,7 +1603,7 @@ def run_test_decode(n, h, hv, k, v, varlen=False,
     t = _to_cute_tensors(ph)
     args = (
         t["q"], t["k"], t["v"], t["a"], t["b"],
-        t["A_log"], t["dt_bias"], t["h0_source"], t["context_lengths"], t["o"],
+        t["A_log"], t["dt_bias"], t["h0_source"], t["state_indices"], 1, t["context_lengths"], t["o"],
         stream,
     )
 
@@ -1577,7 +1616,7 @@ def run_test_decode(n, h, hv, k, v, varlen=False,
         t = _to_cute_tensors(ph)
         args = (
             t["q"], t["k"], t["v"], t["a"], t["b"],
-            t["A_log"], t["dt_bias"], t["h0_source"], t["context_lengths"], t["o"],
+            t["A_log"], t["dt_bias"], t["h0_source"], t["state_indices"], 1, t["context_lengths"], t["o"],
             stream,
         )
         compiled(*args)
@@ -1605,7 +1644,7 @@ def run_test_decode(n, h, hv, k, v, varlen=False,
     t = _to_cute_tensors(ph)
     args = (
         t["q"], t["k"], t["v"], t["a"], t["b"],
-        t["A_log"], t["dt_bias"], t["h0_source"], t["context_lengths"], t["o"],
+        t["A_log"], t["dt_bias"], t["h0_source"], t["state_indices"], 1, t["context_lengths"], t["o"],
         stream,
     )
     t0 = time.perf_counter()

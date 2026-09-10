@@ -22,6 +22,7 @@
 #include "testUtils.h"
 #include <algorithm>
 #include <gtest/gtest.h>
+#include <numeric>
 
 using namespace trt_edgellm;
 using namespace nvinfer1;
@@ -350,4 +351,43 @@ TEST(UtilKernelTest, visionBlockRanges_runsSentinelsAndPadding)
         EXPECT_EQ(begin[i], expectedBegin[i]) << "blockBegin mismatch at flat index " << i;
         EXPECT_EQ(end[i], expectedEnd[i]) << "blockEnd mismatch at flat index " << i;
     }
+}
+
+TEST(UtilKernelTest, gatherTokenAlignedRope_usesResidentSlotsAndZerosPadding)
+{
+    int32_t constexpr sourceSlots = 3;
+    int32_t constexpr cacheCapacity = 4;
+    int32_t constexpr rotaryDim = 2;
+    int32_t constexpr numSequences = 2;
+    int32_t constexpr numTokens = 4;
+
+    std::vector<float> source(static_cast<size_t>(sourceSlots * cacheCapacity * rotaryDim));
+    std::iota(source.begin(), source.end(), 0.0F);
+    std::vector<int32_t> const positions{1, 3, -1, 0};
+    std::vector<int32_t> const queryStartOffsets{0, 1, 4};
+    std::vector<int32_t> const queryLengths{1, 1};
+    std::vector<int32_t> const stateIndices{2, 0};
+    std::vector<float> const expected{18.0F, 19.0F, 6.0F, 7.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+
+    rt::Tensor sourceTensor({sourceSlots, cacheCapacity, rotaryDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    rt::Tensor positionsTensor({numTokens}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor offsetsTensor({numSequences + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor lengthsTensor({numSequences}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor statesTensor({numSequences}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor outputTensor({numTokens, rotaryDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    copyHostToDevice(sourceTensor, source);
+    copyHostToDevice(positionsTensor, positions);
+    copyHostToDevice(offsetsTensor, queryStartOffsets);
+    copyHostToDevice(lengthsTensor, queryLengths);
+    copyHostToDevice(statesTensor, stateIndices);
+    copyHostToDevice(outputTensor, std::vector<float>(expected.size(), -1.0F));
+
+    cudaStream_t stream{nullptr};
+    kernel::launchGatherTokenAlignedRope(sourceTensor.dataPointer<float>(), outputTensor.dataPointer<float>(),
+        positionsTensor.dataPointer<int32_t>(), offsetsTensor.dataPointer<int32_t>(),
+        lengthsTensor.dataPointer<int32_t>(), statesTensor.dataPointer<int32_t>(), numTokens, numSequences, sourceSlots,
+        cacheCapacity, rotaryDim, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    EXPECT_EQ(copyDeviceToHost<float>(outputTensor), expected);
 }

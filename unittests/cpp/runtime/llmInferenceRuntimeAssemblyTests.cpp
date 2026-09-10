@@ -291,6 +291,44 @@ TEST_F(RuntimeAssemblyTest, LogicalEvictionRemapsTheSurvivorAndTheNextRequestRes
         << "a new unmanaged request must restore the base page table to identity";
 }
 
+TEST_F(RuntimeAssemblyTest, RejectsEngineWithoutContextSequenceCountCarrier)
+{
+    using ::testing::Return;
+    using ::testing::StrEq;
+
+    rt::LLMEngineConfig config;
+    auto engine = makeEngine();
+    ON_CALL(*engine, hasIOTensor(StrEq(binding_names::kContextSequenceCountCarrier))).WillByDefault(Return(false));
+
+    EXPECT_THROW(validateAgainstEngine(config, *engine, "base"), std::runtime_error);
+}
+
+TEST_F(RuntimeAssemblyTest, AcceptsInt32ContextSequenceCountCarrier)
+{
+    using ::testing::Return;
+    using ::testing::StrEq;
+
+    rt::LLMEngineConfig config;
+    auto engine = makeEngine();
+    ON_CALL(*engine, hasIOTensor(StrEq(binding_names::kContextSequenceCountCarrier))).WillByDefault(Return(true));
+    ON_CALL(*engine, getBindingDataType(StrEq(binding_names::kContextSequenceCountCarrier)))
+        .WillByDefault(Return(nvinfer1::DataType::kINT32));
+
+    EXPECT_NO_THROW(validateAgainstEngine(config, *engine, "base"));
+}
+
+TEST_F(RuntimeAssemblyTest, RejectsObsoleteGenericTokenOwnerBinding)
+{
+    using ::testing::Return;
+    using ::testing::StrEq;
+
+    rt::LLMEngineConfig config;
+    auto engine = makeEngine();
+    ON_CALL(*engine, hasIOTensor(StrEq("token_to_sequence"))).WillByDefault(Return(true));
+
+    EXPECT_THROW(validateAgainstEngine(config, *engine, "base"), std::runtime_error);
+}
+
 // --------------------------------------------------------------------------
 // Request validation.
 //
@@ -1053,12 +1091,13 @@ TEST_F(RuntimeAssemblyTest, SteppedAdmissionMatchesTheFusedPathTokenForToken)
         if (boundaryCalls == 2)
         {
             rt::AdmissionIntent intent;
+            intent.requestId = 102;
             intent.seed.promptTokenIds = {42};
             intent.seed.originalIndex = kAdmittedIndexBase;
             rt::AdmissionResult const admitted = stepper->admit(std::move(intent));
             ASSERT_EQ(admitted.status, rt::AdmissionResult::Status::kAdmitted);
             EXPECT_EQ(admitted.ref.slot, 1);
-            EXPECT_EQ(admitted.ref.epoch, 0U);
+            EXPECT_EQ(admitted.ref.epoch, 1U);
 
             rt::StepResult const seated = stepper->prefill({admitted.ref});
             ASSERT_TRUE(seated.ok);
@@ -1105,7 +1144,7 @@ TEST_F(RuntimeAssemblyTest, StepperKeepsRefsStableAcrossEviction)
 
     // A stepper-driven decode carries the batch across A's eviction: the StepResult must file A
     // under finished and credit B's token to its ref -- which stays identical across the eviction,
-    // because refs are stable handles and dense-row compaction is runtime-private.
+    // because refs are stable resident identities and execution-row compaction is runtime-private.
     constexpr int64_t kMaxGenerateLength{3};
     constexpr int32_t kA1 = 3, kA2 = 4, kA3 = 5;
     constexpr int32_t kB1 = 7, kB2 = 8, kB3 = 9;
@@ -1142,6 +1181,7 @@ TEST_F(RuntimeAssemblyTest, StepperKeepsRefsStableAcrossEviction)
         if (boundaryCalls == 2)
         {
             rt::AdmissionIntent intent;
+            intent.requestId = 102;
             intent.seed.promptTokenIds = {42};
             intent.seed.originalIndex = kAdmittedIndexBase;
             rt::AdmissionResult const admitted = stepper->admit(std::move(intent));
@@ -1161,7 +1201,7 @@ TEST_F(RuntimeAssemblyTest, StepperKeepsRefsStableAcrossEviction)
             EXPECT_EQ(step.deltas.front().second.tokenIds, (std::vector<int32_t>{kB2}));
 
             ASSERT_EQ(step.finished.size(), 1U);
-            EXPECT_EQ(step.finished.front().first, (rt::ResidentRef{0, 0}));
+            EXPECT_EQ(step.finished.front().first, (rt::ResidentRef{0, 1}));
             auto const& resultA = step.finished.front().second;
             ASSERT_GE(resultA.tokenIds.size(), 3U);
             EXPECT_EQ(std::vector<int32_t>(resultA.tokenIds.end() - 3, resultA.tokenIds.end()),
@@ -1169,7 +1209,7 @@ TEST_F(RuntimeAssemblyTest, StepperKeepsRefsStableAcrossEviction)
             EXPECT_EQ(resultA.terminalReason, rt::FinishReason::kLength);
 
             // Middle/head retirement: the survivor's execution row changed underneath, but its
-            // handle -- the only identity the scheduler ever saw -- did not.
+            // resident identity -- the only identity the scheduler ever saw -- did not.
             ASSERT_EQ(stepper->residents().size(), 1U);
             EXPECT_EQ(stepper->residents().front(), refB);
             stepped = true;
@@ -1227,7 +1267,9 @@ TEST_F(RuntimeAssemblyTest, ASteppedRequestRunsEndToEndWithoutTheHook)
         std::move(artifacts), mModelDir.string(), /*multimodalEngineDir=*/"", {}, std::nullopt, mStream};
     ASSERT_TRUE(runtime.supportsSteppedExecution());
 
-    auto stepped = runtime.beginStepped(makeGreedyRequest("a", kMaxGenerateLength), mStream);
+    EXPECT_THROW(
+        runtime.beginStepped(makeGreedyRequest("a", kMaxGenerateLength), /*requestId=*/0, mStream), std::runtime_error);
+    auto stepped = runtime.beginStepped(makeGreedyRequest("a", kMaxGenerateLength), /*requestId=*/101, mStream);
     ASSERT_NE(stepped, nullptr);
     rt::SteppedExecution& stepper = *stepped;
 
@@ -1253,27 +1295,28 @@ TEST_F(RuntimeAssemblyTest, ASteppedRequestRunsEndToEndWithoutTheHook)
     // Tick 3: admit B (logical only), then its seated prefill tick.
     rt::LLMGenerationRequest requestB = makeGreedyRequest("b", kMaxGenerateLength);
     requestB.preTokenizedInputIds = {{43}};
-    rt::AdmissionResult const admitted = stepper.admit(requestB, kIndexB);
+    EXPECT_THROW(stepper.admit(requestB, kIndexB, /*requestId=*/0), std::runtime_error);
+    rt::AdmissionResult const admitted = stepper.admit(requestB, kIndexB, /*requestId=*/102);
     ASSERT_EQ(admitted.status, rt::AdmissionResult::Status::kAdmitted);
     rt::StepResult const seated = stepper.prefill({admitted.ref});
     ASSERT_TRUE(seated.ok);
     ASSERT_EQ(seated.deltas.size(), 1U);
     EXPECT_EQ(seated.deltas.front().second.tokenIds, (std::vector<int32_t>{kB1}));
 
-    // Decode until A retires; its finished ref releases handle 0.
+    // Decode until A retires; its finished ref releases resident slot 0.
     while (outcomes.empty())
     {
         commit(stepper.decode({stepper.residents()}), {});
     }
 
     // Tail-retirement reuse, the aliasing case from review: C is admitted after A released its
-    // handle, so C reuses handle 0 -- with the epoch bumped, so A's stale ref can never name C.
+    // resident slot, so C reuses slot 0 with a bumped epoch and A's stale ref cannot name C.
     rt::LLMGenerationRequest requestC = makeGreedyRequest("c", kMaxGenerateLength);
     requestC.preTokenizedInputIds = {{44}};
-    rt::AdmissionResult const admittedC = stepper.admit(requestC, kIndexC);
+    rt::AdmissionResult const admittedC = stepper.admit(requestC, kIndexC, /*requestId=*/103);
     ASSERT_EQ(admittedC.status, rt::AdmissionResult::Status::kAdmitted);
-    EXPECT_EQ(admittedC.ref, (rt::ResidentRef{0, 1}));
-    EXPECT_FALSE(admittedC.ref == (rt::ResidentRef{0, 0}));
+    EXPECT_EQ(admittedC.ref, (rt::ResidentRef{0, 2}));
+    EXPECT_FALSE(admittedC.ref == (rt::ResidentRef{0, 1}));
     rt::StepResult const seatedC = stepper.prefill({admittedC.ref});
     ASSERT_TRUE(seatedC.ok);
     ASSERT_EQ(seatedC.deltas.size(), 1U);

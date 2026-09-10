@@ -123,6 +123,7 @@ void prepareEagleBaseTreeDecodingInputs(rt::Tensor const& baseTreeDecodingMask, 
 //!     activeBatchSize: Number of active sequences in the batch.
 //!     maxDepth: max-depth of acceptedIndices (acceptedIndices.shape[1]).
 //!     kvCacheType: Storage dtype of the per-layer buffers (kHALF or kFP8).
+//!     stateIndices: Execution-row to resident page-table-row mapping [batch].
 //!     stream: CUDA stream to execute the kernel.
 //!     pageTable: Required device page table [batch, 2, maxPagesPerSeq], with K rows followed by
 //!         V rows and V page id equal to K page id + numPages. An unmapped or out-of-plane source
@@ -132,9 +133,10 @@ void prepareEagleBaseTreeDecodingInputs(rt::Tensor const& baseTreeDecodingMask, 
 //!
 //! @throws std::runtime_error if tensors are not located on the GPU, or if datatypes are invalid
 void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const& acceptLengths,
-    rt::Tensor const& kvCacheLengths, KVLayerInfo const* deviceLayerInfos, int32_t numLayers, int32_t headDim,
-    int32_t maxKVHeads, int32_t activeBatchSize, int32_t maxDepth, nvinfer1::DataType kvCacheType,
-    cudaStream_t stream, int32_t const* pageTable, int32_t numPages, int32_t maxPagesPerSeq);
+    rt::Tensor const& kvCacheLengths, rt::Tensor const& stateIndices, KVLayerInfo const* deviceLayerInfos,
+    int32_t numLayers, int32_t headDim, int32_t maxKVHeads, int32_t activeBatchSize, int32_t residentPoolRows,
+    int32_t maxDepth, nvinfer1::DataType kvCacheType, cudaStream_t stream, int32_t const* pageTable,
+    int32_t numPages, int32_t maxPagesPerSeq);
 
 //! In-place compact the hidden-state buffer to keep only the accepted tokens.
 //!

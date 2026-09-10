@@ -161,8 +161,6 @@ private:
     half const* resolveNormGammaInput(
         nvinfer1::PluginTensorDesc const* inputDesc, void const* const* inputs, int32_t inputIdx) const;
 
-    //! Resolve the learned attention-sink engine-weight input to a device
-    //! pointer (nullptr when absent). Length must equal numQHeads.
     float const* resolveAttentionSinkInput(
         nvinfer1::PluginTensorDesc const* inputDesc, void const* const* inputs, int32_t inputIdx) const;
 
@@ -182,7 +180,7 @@ protected:
     float mAttentionScale{}; //!< Absolute QK^T multiplier.
     //! Whether to enable tree attention for EAGLE speculative decoding
     int32_t mEnableTreeAttention{};
-    //! Whether slot 7 carries [B,S] Gemma4 image block IDs.
+    //! Whether the optional token-aligned input carries [T_exec] Gemma4 image block IDs.
     int32_t mEnableVisionBlockAttention{};
     //! Whether the fused per-head q_norm / k_norm RMSNorm is enabled. When set, the q/k gamma
     //! engine-weight constants are wired as optional plugin inputs right after the required ones.
@@ -191,18 +189,12 @@ protected:
     //! 1 = rotate then norm (HunYuan V1). Meaningful only when mEnableQKNorm.
     int32_t mQKNormPostRope{};
     //! Whether this layer reads K/V from a donated (shared) cache: the packed input carries
-    //! Q only [B, S, Hq*D] and the plugin skips the KV-cache write.
+    //! Q only [T_exec, Hq*D] and the plugin skips the KV-cache write.
     int32_t mEnableKVShared{};
-    //! Whether this layer's speculative query block occupies CONSECUTIVE positions
-    //! (a linear proposal chain, e.g. DSpark). The contiguous-query XQA SWA variant
-    //! derives each row's position as firstQueryPosition + queryRow, so it is only
-    //! valid here; tree-shaped drafts (EAGLE) must leave this off.
+    //! Whether speculative query rows occupy consecutive positions, as required by the linear DSpark SWA path.
     int32_t mEnableContiguousQuerySwa{};
-    //! Whether a learned per-Q-head attention sink is merged into the softmax denominator.
-    //! When set, the FP32 sink engine-weight constant is wired as the last optional input.
-    //! Only the XQA decode path implements sinks; the FMHA prefill backends do not.
+    //! Whether a learned per-query-head attention sink is supplied as an engine-weight input.
     int32_t mEnableAttentionSink{};
-
     //! Datatype of QKV and KV cache. Only supports FP16 as of now.
     nvinfer1::DataType const mDataType{nvinfer1::DataType::kHALF};
     int32_t mSMVersion; //!< CUDA SM version

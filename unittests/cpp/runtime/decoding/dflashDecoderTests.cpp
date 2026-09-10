@@ -508,7 +508,7 @@ TEST_F(DFlash2AssemblyTest, CapturesOwnedShapeMatrixThenRunsNormally)
     std::set<std::pair<int64_t, int64_t>> draftShapes;
     for (auto const& dims : mDraftTrace.captures)
     {
-        EXPECT_EQ(dims.seqLen, kDFlash2BlockSize);
+        EXPECT_EQ(dims.seqLen, dims.batch * kDFlash2BlockSize);
         draftShapes.emplace(dims.batch, dims.selectLen);
     }
     std::set<std::pair<int64_t, int64_t>> expectedDraftShapes;
@@ -516,7 +516,7 @@ TEST_F(DFlash2AssemblyTest, CapturesOwnedShapeMatrixThenRunsNormally)
     {
         for (int64_t delta = 1; delta <= kDFlash2BlockSize; ++delta)
         {
-            expectedDraftShapes.emplace(batch, delta);
+            expectedDraftShapes.emplace(batch, batch * delta);
         }
     }
     EXPECT_EQ(draftShapes, expectedDraftShapes);
@@ -527,8 +527,8 @@ TEST_F(DFlash2AssemblyTest, CapturesOwnedShapeMatrixThenRunsNormally)
     {
         auto const& dims = mBaseTrace.captures[static_cast<size_t>(batch - 1)];
         EXPECT_EQ(dims.batch, batch);
-        EXPECT_EQ(dims.seqLen, kDFlash2BlockSize);
-        EXPECT_EQ(dims.selectLen, kDFlash2BlockSize);
+        EXPECT_EQ(dims.seqLen, batch * kDFlash2BlockSize);
+        EXPECT_EQ(dims.selectLen, batch * kDFlash2BlockSize);
     }
 
     // Capture mutates binding shapes and simulated cache lengths. A real request afterwards checks teardown restored

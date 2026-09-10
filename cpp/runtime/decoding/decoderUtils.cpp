@@ -19,12 +19,15 @@
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/logger.h"
+#include "kernels/speculative/dflashRuntimeKernels.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/debug/layerDebugger.h"
+#include "runtime/state/pipelineIO.h"
 #include "sampler/sampling.h"
 
 #include <algorithm>
 #include <filesystem>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -38,6 +41,118 @@ void zeroActiveRegion(Tensor& tensor, cudaStream_t stream)
 {
     auto const bytes = static_cast<size_t>(tensor.getShape().volume()) * utils::getTypeSize(tensor.getDataType());
     CUDA_CHECK(cudaMemsetAsync(tensor.rawPointer(), 0, bytes, stream));
+}
+
+void prepareSpecRaggedBindings(DecodingRuntimeContext& runtime, LLMEngineConfig const& cfg, int32_t kvCacheIndex,
+    Tensor const& attentionPositions, Tensor const& committedPastLengths, Tensor const* validCounts,
+    Tensor const& selectedTokenIndices, int32_t selectedRows, std::vector<ResidentRef> const* residentRefs,
+    int32_t batchSize, int32_t queryWidth, InferenceDims const& dims, cudaStream_t stream)
+{
+    ExecutionPhase const phase = executionPhase(dims);
+    PipelineIO& io = runtime.base.pipelineIO;
+    int32_t const physicalTokens = batchSize * queryWidth;
+    check::check(io.positions.reshape({physicalTokens}), "Tensor reshape failed");
+    check::check(io.queryStartOffsets.reshape({batchSize + 1}), "Tensor reshape failed");
+    check::check(io.queryLengths.reshape({batchSize}), "Tensor reshape failed");
+    check::check(io.pastLengths.reshape({batchSize}), "Tensor reshape failed");
+    check::check(io.attentionSequenceLengths.reshape({batchSize}), "Tensor reshape failed");
+    int32_t* treeParentIds = nullptr;
+    int32_t* treeDepths = nullptr;
+    if (!io.specTreeParentIds.isEmpty() && !io.specTreeDepths.isEmpty())
+    {
+        check::check(io.specTreeParentIds.reshape({physicalTokens}), "Tensor reshape failed");
+        check::check(io.specTreeDepths.reshape({physicalTokens}), "Tensor reshape failed");
+        treeParentIds = io.specTreeParentIds.dataPointer<int32_t>();
+        treeDepths = io.specTreeDepths.dataPointer<int32_t>();
+    }
+    io.uploadStateIndices(residentRefs, batchSize, stream);
+    kernel::launchPrepareSpecRaggedMetadata(attentionPositions.dataPointer<int32_t>(),
+        committedPastLengths.dataPointer<int32_t>(),
+        validCounts == nullptr ? nullptr : validCounts->dataPointer<int32_t>(), queryWidth,
+        io.positions.dataPointer<int32_t>(), io.queryStartOffsets.dataPointer<int32_t>(),
+        io.queryLengths.dataPointer<int32_t>(), io.pastLengths.dataPointer<int32_t>(),
+        io.attentionSequenceLengths.dataPointer<int32_t>(), treeParentIds, treeDepths,
+        phase == ExecutionPhase::kSpecDraftProposal, batchSize, stream);
+    check::check(io.logitsIndices.reshape({selectedRows}), "Tensor reshape failed");
+    CUDA_CHECK(cudaMemcpyAsync(io.logitsIndices.rawPointer(), selectedTokenIndices.rawPointer(),
+        static_cast<size_t>(selectedRows) * sizeof(int64_t), cudaMemcpyDeviceToDevice, stream));
+    check::check(io.contextSequenceCountCarrier.reshape({0}), "Tensor reshape failed");
+    prepareRaggedKVPageTable(io, *runtime.base.sharedResources.kvPageTables.at(kvCacheIndex), batchSize, stream);
+    prepareRaggedRope(io, runtime.base.sharedResources, cfg, physicalTokens, batchSize, stream);
+}
+
+RaggedExecutionBatch buildSpecPrefillRaggedBatch(DecodingInferenceContext const& context, int32_t queryWidth)
+{
+    check::check(queryWidth > 0, "Speculative prefill query width must be positive");
+    int32_t const batchSize = context.activeBatchSize;
+    check::check(batchSize >= 0, "Speculative prefill batch size must be non-negative");
+    check::check(batchSize <= std::numeric_limits<int32_t>::max() / queryWidth,
+        "Speculative prefill physical-token count exceeds int32");
+    check::check(context.effectivePrefillLengths.size() >= static_cast<size_t>(batchSize),
+        "Missing speculative prefill query lengths");
+    check::check(context.prefillStartLengths.size() >= static_cast<size_t>(batchSize),
+        "Missing speculative prefill start lengths");
+    check::check(
+        context.residentRefs.size() >= static_cast<size_t>(batchSize), "Missing speculative prefill resident slots");
+    int32_t const physicalTokens = batchSize * queryWidth;
+    RaggedExecutionBatch batch;
+    batch.shape = {batchSize, 0, physicalTokens, queryWidth, batchSize, 0, batchSize};
+    batch.positions.resize(physicalTokens, -1);
+    batch.queryStartOffsets.resize(batchSize + 1);
+    batch.queryLengths.resize(batchSize);
+    batch.pastLengths.assign(context.prefillStartLengths.begin(), context.prefillStartLengths.begin() + batchSize);
+    batch.attentionSequenceLengths.resize(batchSize);
+    batch.stateIndices.resize(batchSize);
+    batch.logitsIndices.resize(batchSize);
+    for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+    {
+        int32_t const queryLength = context.effectivePrefillLengths.at(static_cast<size_t>(batchIdx));
+        check::check(queryLength > 0 && queryLength <= queryWidth,
+            "Speculative prefill query length must be in [1, query width]");
+        int32_t const start = batch.pastLengths[batchIdx];
+        check::check(start >= 0, "Speculative prefill start length must be non-negative");
+        batch.shape.validTokens += queryLength;
+        batch.shape.numContextTokens += queryLength;
+        batch.queryStartOffsets[batchIdx] = batchIdx * queryWidth;
+        batch.queryLengths[batchIdx] = queryLength;
+        batch.attentionSequenceLengths[batchIdx] = start + queryLength;
+        batch.stateIndices[batchIdx] = context.residentRefs.at(static_cast<size_t>(batchIdx)).slot;
+        batch.logitsIndices[batchIdx] = static_cast<int64_t>(batchIdx) * queryWidth + queryLength - 1;
+        for (int32_t tokenIdx = 0; tokenIdx < queryLength; ++tokenIdx)
+        {
+            int32_t const row = batchIdx * queryWidth + tokenIdx;
+            batch.positions[row] = start + tokenIdx;
+        }
+    }
+    batch.queryStartOffsets[batchSize] = physicalTokens;
+    return batch;
+}
+
+ExecutionPhase contextPrefillPhase(std::vector<int32_t> const& pastLengths, int32_t activeBatchSize)
+{
+    check::check(activeBatchSize > 0 && pastLengths.size() >= static_cast<size_t>(activeBatchSize),
+        "Context phase selection requires one past length per active sequence");
+    auto const activeEnd = pastLengths.begin() + activeBatchSize;
+    check::check(std::all_of(pastLengths.begin(), activeEnd, [](int32_t pastLength) { return pastLength >= 0; }),
+        "Context past length must be non-negative");
+    bool const hasRestoredPrefix
+        = std::any_of(pastLengths.begin(), activeEnd, [](int32_t pastLength) { return pastLength > 0; });
+    return hasRestoredPrefix ? ExecutionPhase::kContextChunk : ExecutionPhase::kContextPrefill;
+}
+
+void prepareSpecPrefillRaggedBindings(DecodingRuntimeContext& runtime, LLMEngineConfig const& cfg, int32_t kvCacheIndex,
+    DecodingInferenceContext const& context, int32_t queryWidth, InferenceDims const& dims, cudaStream_t stream)
+{
+    ExecutionPhase const phase = executionPhase(dims);
+    check::check(phase == ExecutionPhase::kContextPrefill || phase == ExecutionPhase::kContextChunk,
+        "Speculative draft prefill requires a context phase");
+    RaggedExecutionBatch const batch = buildSpecPrefillRaggedBatch(context, queryWidth);
+    int32_t const batchSize = batch.shape.numSequences;
+    int32_t const physicalTokens = batch.shape.physicalTokens;
+    PipelineIO& io = runtime.base.pipelineIO;
+    io.uploadRaggedMetadata(batch, stream);
+    prepareRaggedKVPageTable(io, *runtime.base.sharedResources.kvPageTables.at(kvCacheIndex), batchSize, stream);
+    prepareRaggedRope(io, runtime.base.sharedResources, cfg, physicalTokens, batchSize, stream);
 }
 
 std::unique_ptr<EngineExecutor> loadDraftEngine(
@@ -112,6 +227,9 @@ void appendAcceptedTokens(DecodingInferenceContext& context, Tensor& hostAcceptL
             continue;
         }
         int32_t const acceptLength = hostAcceptLengthsData[batchIdx];
+        ELLM_CHECK(static_cast<size_t>(batchIdx) < context.committedLengths.size(),
+            "Speculative acceptance is missing the host committed-length frontier");
+        context.committedLengths[batchIdx] += acceptLength;
         int32_t const proposedDrafts = perSlotProposedDrafts ? perSlotProposedDrafts[batchIdx] : proposedDraftsPerRound;
         int32_t appended = 0;
         for (int32_t i = 0; i < acceptLength; i++)
@@ -206,8 +324,9 @@ void applyForcedAcceptance(DecodingInferenceContext& context, Tensor& hostAccept
 }
 
 void dumpSpecRound(DecodingInferenceContext& context, HybridCacheManager& cacheManager, KVPageTable const& pageTable,
-    Tensor const& verifyLogits, Tensor const& acceptedTokenIndices, Tensor const& hostAcceptLengths,
-    std::vector<int32_t> const& ownTokens, int32_t verifySize, int32_t maxAcceptDepth, cudaStream_t stream)
+    KVPageTable const* swaPageTable, Tensor const& verifyLogits, Tensor const& acceptedTokenIndices,
+    Tensor const& hostAcceptLengths, std::vector<int32_t> const& ownTokens, int32_t verifySize, int32_t maxAcceptDepth,
+    cudaStream_t stream)
 {
     if (context.layerDebugger == nullptr)
     {
@@ -249,8 +368,9 @@ void dumpSpecRound(DecodingInferenceContext& context, HybridCacheManager& cacheM
     {
         validLengths[i] = static_cast<int32_t>(context.tokenIds[i].size()) - 1;
     }
-    context.layerDebugger->dumpRound(cacheManager, pageTable, bonusLogits, validLengths, context.batchIndexMapping,
-        ownTokens.empty() ? nullptr : ownTokens.data(), activeBatchSize, stream);
+    context.layerDebugger->dumpRound(cacheManager, pageTable, swaPageTable, bonusLogits, validLengths,
+        context.batchIndexMapping, context.residentRefs, ownTokens.empty() ? nullptr : ownTokens.data(),
+        activeBatchSize, stream);
 }
 
 void enqueueLogprobsD2H(

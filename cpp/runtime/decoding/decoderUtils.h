@@ -20,6 +20,7 @@
 #include "common/tensor.h"
 #include "runtime/decoding/decodingStrategy.h"
 #include "runtime/exec/engineExecutor.h"
+#include "runtime/exec/raggedBatchBuilder.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
 
@@ -58,6 +59,7 @@ void appendSampledTokens(DecodingInferenceContext& context, int32_t const* sampl
 void zeroActiveRegion(Tensor& tensor, cudaStream_t stream);
 
 //! @brief Copy accepted tokens from device buffers into the host-side context token lists.
+//! The caller must commit the same accept lengths to persistent base state before calling this function.
 //! On return, hostAcceptLengths holds the number of tokens actually appended per slot.
 void appendAcceptedTokens(DecodingInferenceContext& context, Tensor& hostAcceptLengths, Tensor& hostAcceptedTokenIds,
     Tensor const& deviceAcceptLength, Tensor const& deviceAcceptedTokenIds, int32_t maxAcceptDepth,
@@ -92,8 +94,21 @@ void applyForcedAcceptance(DecodingInferenceContext& context, Tensor& hostAccept
 //! @param hostAcceptLengths    Host accept lengths, as written back by appendAcceptedTokens().
 //! @param ownTokens            From applyForcedAcceptance(); empty when forcing is off.
 void dumpSpecRound(DecodingInferenceContext& context, HybridCacheManager& cacheManager, KVPageTable const& pageTable,
-    Tensor const& verifyLogits, Tensor const& acceptedTokenIndices, Tensor const& hostAcceptLengths,
-    std::vector<int32_t> const& ownTokens, int32_t verifySize, int32_t maxAcceptDepth, cudaStream_t stream);
+    KVPageTable const* swaPageTable, Tensor const& verifyLogits, Tensor const& acceptedTokenIndices,
+    Tensor const& hostAcceptLengths, std::vector<int32_t> const& ownTokens, int32_t verifySize, int32_t maxAcceptDepth,
+    cudaStream_t stream);
+
+void prepareSpecRaggedBindings(DecodingRuntimeContext& runtime, LLMEngineConfig const& cfg, int32_t kvCacheIndex,
+    Tensor const& attentionPositions, Tensor const& committedPastLengths, Tensor const* validCounts,
+    Tensor const& selectedTokenIndices, int32_t selectedRows, std::vector<ResidentRef> const* residentRefs,
+    int32_t batchSize, int32_t queryWidth, InferenceDims const& dims, cudaStream_t stream);
+
+void prepareSpecPrefillRaggedBindings(DecodingRuntimeContext& runtime, LLMEngineConfig const& cfg, int32_t kvCacheIndex,
+    DecodingInferenceContext const& context, int32_t queryWidth, InferenceDims const& dims, cudaStream_t stream);
+
+RaggedExecutionBatch buildSpecPrefillRaggedBatch(DecodingInferenceContext const& context, int32_t queryWidth);
+
+ExecutionPhase contextPrefillPhase(std::vector<int32_t> const& pastLengths, int32_t activeBatchSize);
 
 // Logprobs collection is split into a device-side enqueue and a host-side collect so that
 // decoding keeps a single host<->device synchronization point per round: decoders call

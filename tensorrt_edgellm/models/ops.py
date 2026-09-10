@@ -108,13 +108,30 @@ def use_geforce_nvfp4_moe() -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _validate_attention_plugin_inputs(
+        qkv: torch.Tensor, enable_tree_attention: bool,
+        attention_mask: Optional[torch.Tensor],
+        attention_pos_id: Optional[torch.Tensor]) -> None:
+    if qkv.ndim != 2:
+        raise ValueError("AttentionPlugin qkv must use token-major rank-2 ABI")
+    if enable_tree_attention:
+        if attention_mask is None or attention_mask.ndim != 2:
+            raise ValueError(
+                "AttentionPlugin tree mask must use rank-2 [T_exec, words] ABI"
+            )
+        if attention_pos_id is None or attention_pos_id.ndim != 1:
+            raise ValueError(
+                "AttentionPlugin tree position IDs must use rank-1 [T_exec] ABI"
+            )
+
+
 @torch.library.custom_op("trt::attention_plugin", mutates_args=())
 def attention_plugin(
     qkv: torch.Tensor,
     past_key_value: torch.Tensor,
-    context_lengths: torch.Tensor,
+    query_lengths: torch.Tensor,
     rope_rotary_cos_sin: torch.Tensor,
-    kvcache_start_index: torch.Tensor,
+    past_lengths: torch.Tensor,
     kv_page_table: torch.Tensor,
     num_q_heads: int,
     num_kv_heads: int,
@@ -151,14 +168,13 @@ def attention_plugin(
     # Shape-only runtime policy selector for bounded-capable SWA layers. A
     # length of 1 selects bounded O(W) storage; length 0 selects full storage.
     swa_kv_cache_mode: Optional[torch.Tensor] = None,
-    # Per-Q-head learned attention sink logits, length == num_q_heads, ordered
-    # [num_kv_heads][q_heads_per_kv]. Default None so torch.export strips the
-    # kwarg for models without sinks.
     attention_sinks: Optional[List[float]] = None,
     enable_attention_sink: int = 0,
-    # Set only when the speculative query block occupies consecutive positions
-    # (linear proposal chain). Tree-shaped drafts must leave this at 0.
     enable_contiguous_query_swa: int = 0,
+    query_start_offsets: Optional[torch.Tensor] = None,
+    attention_sequence_lengths: Optional[torch.Tensor] = None,
+    execution_phase_marker: Optional[torch.Tensor] = None,
+    context_sequence_count_carrier: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Unified stub for AttentionPlugin covering all feature combinations.
 
@@ -203,30 +219,31 @@ def attention_plugin(
     ``attention_pos_id`` must be provided (non-None).
 
     When ``enable_vision_block_attention=True``, the ``attention_mask`` input
-    carries a ``[batch, seq_len]`` INT32 vision-block-ID tensor instead of a
+    carries a ``[T_exec]`` INT32 vision-block-ID tensor instead of a
     tree mask.  ``-1`` means causal text/audio; equal non-negative IDs identify
     one contiguous image run whose tokens may attend bidirectionally to
     each other.  This mode is mutually exclusive with tree attention.
 
-    ``qkv`` is the PACKED projection output ``[B, S, (Hq + 2*Hkv) * D]``
+    ``qkv`` is the token-major PACKED projection output
+    ``[T_exec, (Hq + 2*Hkv) * D]``
     (Q/K/V concatenated on the last dim — either a single fused QKV GEMM
     output or ``torch.cat`` of the three separate projections), or
-    ``[B, S, Hq * D]`` (Q only) for ordinary shared-KV layers, or
-    ``[B, S, (Hq + 2*Hkv) * D]`` when a bounded SWA consumer also carries the
+    ``[T_exec, Hq * D]`` (Q only) for ordinary shared-KV layers, or
+    ``[T_exec, (Hq + 2*Hkv) * D]`` when a bounded SWA consumer also carries the
     donor's current K/V transiently. Shared layers never write the donor cache.
 
     The presence of the shape-only ``swa_kv_cache_mode`` final optional input
     advertises bounded-storage capability. Its length selects bounded O(W) or
     full storage at runtime.
 
-    The TRT AttentionPlugin kernel returns a 4-D tensor
-    ``[batch, seq_len, num_q_heads, head_size]``.
+    The TRT AttentionPlugin kernel returns a 3-D tensor
+    ``[T_exec, num_q_heads, head_size]``.
     The caller (``Attention.forward``) is responsible for reshaping to
-    ``[batch, seq_len, num_q_heads * head_size]``.
+    ``[T_exec, num_q_heads * head_size]``.
     """
-    batch_size, seq_len, _ = qkv.shape
-    attn_output = torch.zeros(batch_size,
-                              seq_len,
+    _validate_attention_plugin_inputs(qkv, enable_tree_attention,
+                                      attention_mask, attention_pos_id)
+    attn_output = torch.zeros(qkv.shape[0],
                               num_q_heads,
                               head_size,
                               dtype=qkv.dtype,
@@ -239,9 +256,9 @@ def attention_plugin(
 def _(
     qkv,
     past_key_value,
-    context_lengths,
+    query_lengths,
     rope_rotary_cos_sin,
-    kvcache_start_index,
+    past_lengths,
     kv_page_table,
     num_q_heads,
     num_kv_heads,
@@ -268,13 +285,15 @@ def _(
     attention_sinks=None,
     enable_attention_sink=0,
     enable_contiguous_query_swa=0,
+    query_start_offsets=None,
+    attention_sequence_lengths=None,
+    execution_phase_marker=None,
+    context_sequence_count_carrier=None,
 ):
-    batch_size, seq_len, _ = qkv.shape
-    return (torch.empty(batch_size,
-                        seq_len,
-                        num_q_heads,
-                        head_size,
-                        dtype=qkv.dtype,
+    _validate_attention_plugin_inputs(qkv, enable_tree_attention,
+                                      attention_mask, attention_pos_id)
+    output_shape = (qkv.shape[0], num_q_heads, head_size)
+    return (torch.empty(*output_shape, dtype=qkv.dtype,
                         device=qkv.device), torch.empty_like(past_key_value))
 
 
@@ -482,21 +501,21 @@ def dflash_target_kv_cache_update(
     k_delta: torch.Tensor,
     v_delta: torch.Tensor,
     past_key_value: torch.Tensor,
-    rope_cos_sin: torch.Tensor,
-    delta_start_positions: torch.Tensor,
-    delta_lengths: torch.Tensor,
+    token_aligned_rope_cos_sin: torch.Tensor,
+    delta_positions: torch.Tensor,
+    delta_token_to_sequence: torch.Tensor,
     kv_page_table: torch.Tensor,
 ) -> torch.Tensor:
     """Update the draft combined KV cache with target-hidden-derived K/V delta.
 
-    k_delta: [B, L, numKVHeads, headDim] FP16, k_normed, not RoPE-applied.
-    v_delta: [B, L, numKVHeads, headDim] FP16.
+    k_delta: [T_delta, numKVHeads, headDim] FP16, k_normed, not RoPE-applied.
+    v_delta: [T_delta, numKVHeads, headDim] FP16.
     past_key_value: [2, num_pages, KV_PAGE_SIZE, numKVHeads, headDim] FP16 —
         the paged KV pool (same contract as the AttentionPlugin kv_cache
         binding).
-    rope_cos_sin: [ropeBatch, cosSinSeqLen, rotaryDim] FP32, cosSinSeqLen <= capPadded.
-    delta_start_positions: [B] INT32, old committed draft target cache length.
-    delta_lengths: [B] INT32, per-batch delta lengths.
+    token_aligned_rope_cos_sin: [T_delta, rotaryDim] FP32.
+    delta_positions: [T_delta] INT32; padding rows use -1.
+    delta_token_to_sequence: [T_delta] INT32; padding rows use -1.
     kv_page_table: [B, 2, maxPagesPerSeq] INT32 with canonical K page ids in
         [0, num_pages) and V page ids in [num_pages, 2 * num_pages).
 
@@ -509,8 +528,8 @@ def dflash_target_kv_cache_update(
 
 
 @dflash_target_kv_cache_update.register_fake
-def _(k_delta, v_delta, past_key_value, rope_cos_sin, delta_start_positions,
-      delta_lengths, kv_page_table):
+def _(k_delta, v_delta, past_key_value, token_aligned_rope_cos_sin,
+      delta_positions, delta_token_to_sequence, kv_page_table):
     return torch.empty_like(past_key_value)
 
 
@@ -1248,15 +1267,19 @@ def _(weight, scale):
 
 @torch.library.custom_op("trt_edgellm::causal_conv1d", mutates_args=())
 def causal_conv1d(
-    hidden_states: torch.Tensor,  # [batch, seq_len, conv_dim]
+    hidden_states: torch.Tensor,  # [T_exec, conv_dim]
     weight: torch.Tensor,  # [conv_dim, 1, kernel_size]
     bias: torch.Tensor,  # [conv_dim]
-    conv_state: torch.Tensor,  # [batch, conv_dim, conv_kernel]
-    context_lengths: torch.Tensor,  # [batch] int32
+    conv_state: torch.Tensor,  # [resident_rows, conv_dim, conv_kernel]
+    query_lengths: torch.Tensor,  # [N] int32
     stride: int,
     padding: int,
     dilation: int,
     groups: int,
+    query_start_offsets: torch.Tensor,
+    state_indices: torch.Tensor,
+    execution_phase_marker: torch.Tensor,
+    context_sequence_count_carrier: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Stub: causal conv1d."""
     return (torch.zeros_like(hidden_states), conv_state.clone(),
@@ -1264,8 +1287,9 @@ def causal_conv1d(
 
 
 @causal_conv1d.register_fake
-def _(hidden_states, weight, bias, conv_state, context_lengths, stride,
-      padding, dilation, groups):
+def _(hidden_states, weight, bias, conv_state, query_lengths, stride, padding,
+      dilation, groups, query_start_offsets, state_indices,
+      execution_phase_marker, context_sequence_count_carrier):
     return (torch.empty_like(hidden_states), conv_state.clone(),
             torch.empty_like(conv_state))
 
@@ -1273,25 +1297,25 @@ def _(hidden_states, weight, bias, conv_state, context_lengths, stride,
 @torch.library.custom_op("trt_edgellm::causal_conv1d_with_intermediate",
                          mutates_args=())
 def causal_conv1d_with_intermediate(
-    hidden_states: torch.Tensor,  # [batch, seq_len, conv_dim]
+    hidden_states: torch.Tensor,  # [T_exec, conv_dim]
     weight: torch.Tensor,  # [conv_dim, 1, kernel_size]
     bias: torch.Tensor,  # [conv_dim]
-    conv_state: torch.Tensor,  # [batch, conv_dim, conv_kernel]
-    context_lengths: torch.Tensor,  # [batch] int32
+    conv_state: torch.Tensor,  # [resident_rows, conv_dim, conv_kernel]
+    query_lengths: torch.Tensor,  # [N] int32
+    query_start_offsets: torch.Tensor,
+    state_indices: torch.Tensor,
     stride: int,
     padding: int,
     dilation: int,
     groups: int,
-    spec_verify_phase_marker: torch.Tensor,
-    tree_parent_ids: Optional[
-        torch.Tensor] = None,  # [batch, verify_seq] int32
-    tree_depths: Optional[torch.Tensor] = None,  # [batch, verify_seq] int32
+    execution_phase_marker: torch.Tensor,
+    context_sequence_count_carrier: torch.Tensor,
+    tree_parent_ids: Optional[torch.Tensor] = None,  # [T_exec] int32
+    tree_depths: Optional[torch.Tensor] = None,  # [T_exec] int32
     use_ddtree_state: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Stub: causal conv1d with per-token intermediate state output."""
-    batch_size, seq_len, _ = hidden_states.shape
-    intermediate_conv_state = torch.zeros(batch_size,
-                                          seq_len,
+    intermediate_conv_state = torch.zeros(hidden_states.shape[0],
                                           conv_state.shape[1],
                                           conv_state.shape[2],
                                           dtype=conv_state.dtype,
@@ -1305,18 +1329,19 @@ def _(hidden_states,
       weight,
       bias,
       conv_state,
-      context_lengths,
+      query_lengths,
+      query_start_offsets,
+      state_indices,
       stride,
       padding,
       dilation,
       groups,
-      spec_verify_phase_marker,
+      execution_phase_marker,
+      context_sequence_count_carrier,
       tree_parent_ids=None,
       tree_depths=None,
       use_ddtree_state=False):
-    batch_size, seq_len, _ = hidden_states.shape
-    intermediate_conv_state = torch.empty(batch_size,
-                                          seq_len,
+    intermediate_conv_state = torch.empty(hidden_states.shape[0],
                                           conv_state.shape[1],
                                           conv_state.shape[2],
                                           dtype=conv_state.dtype,
@@ -1332,17 +1357,20 @@ def _(hidden_states,
 
 @torch.library.custom_op("trt_edgellm::update_ssm_state", mutates_args=())
 def update_ssm_state(
-    hidden_states: torch.Tensor,  # [batch, seq_len, num_heads, head_dim]
+    hidden_states: torch.Tensor,  # [T_exec, num_heads, head_dim]
     ssm_a: torch.Tensor,  # [num_heads] float32
-    ssm_b: torch.Tensor,  # [batch, seq_len, n_groups, ssm_state_size]
-    ssm_c: torch.Tensor,  # [batch, seq_len, n_groups, ssm_state_size]
+    ssm_b: torch.Tensor,  # [T_exec, n_groups, ssm_state_size]
+    ssm_c: torch.Tensor,  # [T_exec, n_groups, ssm_state_size]
     ssm_d: torch.Tensor,  # [num_heads] float16
-    dt: torch.Tensor,  # [batch, seq_len, num_heads]
+    dt: torch.Tensor,  # [T_exec, num_heads]
     dt_bias: torch.Tensor,  # [num_heads] float16
-    state: torch.Tensor,  # [batch, num_heads, head_dim, ssm_state_size]
-    context_lengths: torch.Tensor,  # [batch] int32
-    # [0] for cold prefill, [batch] for restored state
-    state_start_index: torch.Tensor,
+    state: torch.
+    Tensor,  # [resident_rows, num_heads, head_dim, ssm_state_size]
+    query_lengths: torch.Tensor,  # [N] int32
+    query_start_offsets: torch.Tensor,  # [N + 1] int32
+    state_indices: torch.Tensor,  # [N] int32
+    execution_phase_marker: torch.Tensor,  # shape carrier with extent 1..8
+    context_sequence_count_carrier: torch.Tensor,
     dt_softplus: int,
     ngroups: int,
     chunk_size: int = 0,
@@ -1360,8 +1388,11 @@ def _(hidden_states,
       dt,
       dt_bias,
       state,
-      context_lengths,
-      state_start_index,
+      query_lengths,
+      query_start_offsets,
+      state_indices,
+      execution_phase_marker,
+      context_sequence_count_carrier,
       dt_softplus,
       ngroups,
       chunk_size=0):
@@ -1371,8 +1402,7 @@ def _(hidden_states,
 # ---------------------------------------------------------------------------
 # Custom op: trt_edgellm::update_ssm_state_with_intermediate
 #   Mamba2 SSM update that also emits the per-token replay stash for MTP
-#   spec-verify. Adds a shape-only spec_verify_phase_marker input (length 0 =
-#   ordinary, 1 = verify). During verify the committed state is left read-only
+#   spec-verify. During verify the committed state is left read-only
 #   and the recurrent state is reconstructed from the replay stash after accept.
 #   Emits four FP32 replay outputs (dA / x / B / dt) instead of a full-state snapshot.
 # ---------------------------------------------------------------------------
@@ -1381,44 +1411,39 @@ def _(hidden_states,
 @torch.library.custom_op("trt_edgellm::update_ssm_state_with_intermediate",
                          mutates_args=())
 def update_ssm_state_with_intermediate(
-    hidden_states: torch.Tensor,  # [batch, seq_len, num_heads, head_dim]
+    hidden_states: torch.Tensor,  # [T_exec, num_heads, head_dim]
     ssm_a: torch.Tensor,  # [num_heads] float32
-    ssm_b: torch.Tensor,  # [batch, seq_len, n_groups, ssm_state_size]
-    ssm_c: torch.Tensor,  # [batch, seq_len, n_groups, ssm_state_size]
+    ssm_b: torch.Tensor,  # [T_exec, n_groups, ssm_state_size]
+    ssm_c: torch.Tensor,  # [T_exec, n_groups, ssm_state_size]
     ssm_d: torch.Tensor,  # [num_heads] float16
-    dt: torch.Tensor,  # [batch, seq_len, num_heads]
+    dt: torch.Tensor,  # [T_exec, num_heads]
     dt_bias: torch.Tensor,  # [num_heads] float16
-    state: torch.Tensor,  # [batch, num_heads, head_dim, ssm_state_size]
-    context_lengths: torch.Tensor,  # [batch] int32
-    state_start_index: torch.
-    Tensor,  # [0] cold / [batch] restored (unused in verify)
-    spec_verify_phase_marker: torch.Tensor,  # [0 or 1] int32 (shape-only)
+    state: torch.
+    Tensor,  # [resident_rows, num_heads, head_dim, ssm_state_size]
+    query_lengths: torch.Tensor,  # [N] int32
+    query_start_offsets: torch.Tensor,  # [N + 1] int32
+    state_indices: torch.Tensor,  # [N] int32
+    execution_phase_marker: torch.Tensor,  # shape carrier with extent 1..8
+    context_sequence_count_carrier: torch.Tensor,
     dt_softplus: int,
     ngroups: int,
     chunk_size: int = 0,
-    tree_parent_ids: Optional[
-        torch.Tensor] = None,  # [batch, verify_seq] int32
-    tree_depths: Optional[torch.Tensor] = None,  # [batch, verify_seq] int32
+    tree_parent_ids: Optional[torch.Tensor] = None,  # [T_exec] int32
+    tree_depths: Optional[torch.Tensor] = None,  # [T_exec] int32
     use_ddtree_state: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor, torch.Tensor]:
     """Stub: SSM update with the per-token replay stash (dA / x / B / dt, FP32)."""
-    b, s, nh, hd = hidden_states.shape
+    t, nh, hd = hidden_states.shape
     ds = state.shape[3]
-    replay_da = torch.zeros(b, s, nh, dtype=torch.float32, device=state.device)
-    replay_u = torch.zeros(b,
-                           s,
-                           nh,
-                           hd,
-                           dtype=torch.float32,
-                           device=state.device)
-    replay_b = torch.zeros(b,
-                           s,
+    replay_da = torch.zeros(t, nh, dtype=torch.float32, device=state.device)
+    replay_u = torch.zeros(t, nh, hd, dtype=torch.float32, device=state.device)
+    replay_b = torch.zeros(t,
                            ngroups,
                            ds,
                            dtype=torch.float32,
                            device=state.device)
-    replay_dt = torch.zeros(b, s, nh, dtype=torch.float32, device=state.device)
+    replay_dt = torch.zeros(t, nh, dtype=torch.float32, device=state.device)
     return (torch.zeros_like(hidden_states), state.clone(), replay_da,
             replay_u, replay_b, replay_dt)
 
@@ -1432,31 +1457,27 @@ def _(hidden_states,
       dt,
       dt_bias,
       state,
-      context_lengths,
-      state_start_index,
-      spec_verify_phase_marker,
+      query_lengths,
+      query_start_offsets,
+      state_indices,
+      execution_phase_marker,
+      context_sequence_count_carrier,
       dt_softplus,
       ngroups,
       chunk_size=0,
       tree_parent_ids=None,
       tree_depths=None,
       use_ddtree_state=False):
-    b, s, nh, hd = hidden_states.shape
+    t, nh, hd = hidden_states.shape
     ds = state.shape[3]
-    replay_da = torch.empty(b, s, nh, dtype=torch.float32, device=state.device)
-    replay_u = torch.empty(b,
-                           s,
-                           nh,
-                           hd,
-                           dtype=torch.float32,
-                           device=state.device)
-    replay_b = torch.empty(b,
-                           s,
+    replay_da = torch.empty(t, nh, dtype=torch.float32, device=state.device)
+    replay_u = torch.empty(t, nh, hd, dtype=torch.float32, device=state.device)
+    replay_b = torch.empty(t,
                            ngroups,
                            ds,
                            dtype=torch.float32,
                            device=state.device)
-    replay_dt = torch.empty(b, s, nh, dtype=torch.float32, device=state.device)
+    replay_dt = torch.empty(t, nh, dtype=torch.float32, device=state.device)
     return (torch.empty_like(hidden_states), state.clone(), replay_da,
             replay_u, replay_b, replay_dt)
 
@@ -1615,51 +1636,74 @@ def _(query, key, value, attn_mask, is_causal, scale):
 
 @torch.library.custom_op("trt_edgellm::gated_delta_net", mutates_args=())
 def gated_delta_net(
-    q: torch.Tensor,  # [batch, seq, num_k_heads, k_dim]
-    k: torch.Tensor,  # [batch, seq, num_k_heads, k_dim]
-    v: torch.Tensor,  # [batch, seq, num_v_heads, v_dim]
-    a: torch.Tensor,  # [batch, seq, num_v_heads]
-    b: torch.Tensor,  # [batch, seq, num_v_heads]
+    q: torch.Tensor,  # [T_exec, num_k_heads, k_dim]
+    k: torch.Tensor,  # [T_exec, num_k_heads, k_dim]
+    v: torch.Tensor,  # [T_exec, num_v_heads, v_dim]
+    a: torch.Tensor,  # [T_exec, num_v_heads]
+    b: torch.Tensor,  # [T_exec, num_v_heads]
     A_log: torch.Tensor,  # [num_v_heads] float32
     dt_bias: torch.Tensor,  # [num_v_heads] float16
-    h0_source: torch.Tensor,  # [batch, num_v_heads, k_dim, v_dim] float32
-    context_lengths: torch.Tensor,  # [batch] int32
+    h0_source: torch.
+    Tensor,  # [resident_rows, num_v_heads, k_dim, v_dim] float32
+    query_lengths: torch.Tensor,  # [N] int32
     k_dim: int,
     v_dim: int,
+    query_start_offsets: torch.Tensor,
+    state_indices: torch.Tensor,
+    execution_phase_marker: torch.Tensor,
+    context_sequence_count_carrier: torch.Tensor,
+    use_diffusion_state: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Stub: GatedDeltaNet."""
     return torch.zeros_like(v), h0_source.clone(), h0_source.clone()
 
 
 @gated_delta_net.register_fake
-def _(q, k, v, a, b, A_log, dt_bias, h0_source, context_lengths, k_dim, v_dim):
+def _(q,
+      k,
+      v,
+      a,
+      b,
+      A_log,
+      dt_bias,
+      h0_source,
+      query_lengths,
+      k_dim,
+      v_dim,
+      query_start_offsets,
+      state_indices,
+      execution_phase_marker,
+      context_sequence_count_carrier,
+      use_diffusion_state=False):
     return torch.empty_like(v), h0_source.clone(), torch.empty_like(h0_source)
 
 
 @torch.library.custom_op("trt_edgellm::gated_delta_net_with_intermediate",
                          mutates_args=())
 def gated_delta_net_with_intermediate(
-    q: torch.Tensor,  # [batch, seq, num_k_heads, k_dim]
-    k: torch.Tensor,  # [batch, seq, num_k_heads, k_dim]
-    v: torch.Tensor,  # [batch, seq, num_v_heads, v_dim]
-    a: torch.Tensor,  # [batch, seq, num_v_heads]
-    b: torch.Tensor,  # [batch, seq, num_v_heads]
+    q: torch.Tensor,  # [T_exec, num_k_heads, k_dim]
+    k: torch.Tensor,  # [T_exec, num_k_heads, k_dim]
+    v: torch.Tensor,  # [T_exec, num_v_heads, v_dim]
+    a: torch.Tensor,  # [T_exec, num_v_heads]
+    b: torch.Tensor,  # [T_exec, num_v_heads]
     A_log: torch.Tensor,  # [num_v_heads] float32
     dt_bias: torch.Tensor,  # [num_v_heads] float16
-    h0_source: torch.Tensor,  # [batch, num_v_heads, k_dim, v_dim] float32
-    context_lengths: torch.Tensor,  # [batch] int32
+    h0_source: torch.
+    Tensor,  # [resident_rows, num_v_heads, k_dim, v_dim] float32
+    query_lengths: torch.Tensor,  # [N] int32
+    query_start_offsets: torch.Tensor,
+    state_indices: torch.Tensor,
     k_dim: int,
     v_dim: int,
-    spec_verify_phase_marker: torch.Tensor,
-    tree_parent_ids: Optional[
-        torch.Tensor] = None,  # [batch, verify_seq] int32
-    tree_depths: Optional[torch.Tensor] = None,  # [batch, verify_seq] int32
+    execution_phase_marker: torch.Tensor,
+    context_sequence_count_carrier: torch.Tensor,
+    tree_parent_ids: Optional[torch.Tensor] = None,  # [T_exec] int32
+    tree_depths: Optional[torch.Tensor] = None,  # [T_exec] int32
     use_ddtree_state: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Stub: GatedDeltaNet with per-token recurrent state output."""
-    batch_size, seq_len, num_v_heads, _ = v.shape
-    intermediate_recurrent_state = torch.zeros(batch_size,
-                                               seq_len,
+    num_v_heads = v.shape[1]
+    intermediate_recurrent_state = torch.zeros(v.shape[0],
                                                num_v_heads,
                                                k_dim,
                                                v_dim,
@@ -1677,16 +1721,18 @@ def _(q,
       A_log,
       dt_bias,
       h0_source,
-      context_lengths,
+      query_lengths,
+      query_start_offsets,
+      state_indices,
       k_dim,
       v_dim,
-      spec_verify_phase_marker,
+      execution_phase_marker,
+      context_sequence_count_carrier,
       tree_parent_ids=None,
       tree_depths=None,
       use_ddtree_state=False):
-    batch_size, seq_len, num_v_heads, _ = v.shape
-    intermediate_recurrent_state = torch.empty(batch_size,
-                                               seq_len,
+    num_v_heads = v.shape[1]
+    intermediate_recurrent_state = torch.empty(v.shape[0],
                                                num_v_heads,
                                                k_dim,
                                                v_dim,

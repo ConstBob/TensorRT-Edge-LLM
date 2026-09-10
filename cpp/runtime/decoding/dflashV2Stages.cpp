@@ -141,15 +141,14 @@ void DFlashDecoder::initializeDFlash2(
     mDraftTensorMap.set(binding_names::kSpecProposalProjectedHidden, mProposalProjectedHidden);
     mDraftTensorMap.set(binding_names::kAttentionMask, mDraftPackedAttentionMask);
     mDraftTensorMap.set(binding_names::kAttentionPosId, mDraftAttentionPosId);
-    mDraftTensorMap.set(binding_names::kContextLengths, mDraftContextLengths);
-    mDraftTensorMap.set(binding_names::kDFlashDeltaLengths, mDraftDeltaLens);
+    LLMEngineConfig const& draftCfg = *deployment.draft;
+    initializeDraftRaggedBindings(draftCfg);
 
     // KV cache bindings: bind to draft cache manager's combined KV cache (index 1). Unified on
     // the paged-pool view — the engine's past/present_key_values_i binding for DFlash's own draft
     // cache is the same [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim] contract as the main
     // model and EAGLE/MTP drafts.
     auto& kvMgr = mDraftCacheManager.getKVCacheManager();
-    LLMEngineConfig const& draftCfg = *deployment.draft;
     int32_t localAttnIdx = 0;
     for (int32_t absIdx = 0; absIdx < static_cast<int32_t>(draftCfg.layerTypes.size()); ++absIdx)
     {
@@ -161,21 +160,6 @@ void DFlashDecoder::initializeDFlash2(
         mDraftTensorMap.set(binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/true), combinedKV);
         mDraftTensorMap.set(binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/false), combinedKV);
         ++localAttnIdx;
-    }
-    mDraftTensorMap.set(binding_names::kKVCacheStartIndex, mDraftCacheManager.getKVCacheLengths());
-
-    // The draft target update and proposal attention share the managed draft page table.
-    mDraftTensorMap.set(binding_names::kKVPageTable, mRuntime.base.sharedResources.kvPageTables[1]->kernelView());
-
-    if (draftCfg.ropeConfig.type == RopeType::kMRope)
-    {
-        mDraftTensorMap.set(binding_names::kRopeCosSin, mRuntime.base.pipelineIO.mropeCosSin);
-    }
-    else
-    {
-        mDraftTensorMap.set(binding_names::kRopeCosSin,
-            mRuntime.base.sharedResources.ropePool.getOrCreate(
-                draftCfg.ropeConfig, draftCfg.rotaryDim, baseCfg.maxKVCacheCapacity, nullptr));
     }
     mDraftExternalWeightManager = std::move(draftWeights);
     mDraftExternalWeightManager.registerTensorMapEntries(mDraftTensorMap);
@@ -349,7 +333,8 @@ bool DFlashDecoder::runV2Acceptance(DecodingInferenceContext& context, int32_t v
     {
         check::check(kernel::gdnTreeChunkVerifyEnabled(verifySize),
             "DFlash2 GDN tree verification exceeds the supported node count");
-        mambaManager.replayCommitAcceptedTreeStates(mAcceptedTokenIndices, mAcceptLength, context.stream);
+        mambaManager.replayCommitAcceptedTreeStates(
+            mAcceptedTokenIndices, mAcceptLength, mRuntime.base.pipelineIO.stateIndices, context.stream);
     }
 
     return true;

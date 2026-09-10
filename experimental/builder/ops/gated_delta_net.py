@@ -20,6 +20,7 @@ import tensorrt as trt
 from . import functional as F
 from .linear import Linear
 from .module import Module
+from .ragged import RaggedDecoderInputs
 
 
 class GatedDeltaNet(Module):
@@ -62,9 +63,9 @@ class GatedDeltaNet(Module):
                 hidden_states,
                 conv_state,
                 recurrent_state,
-                context_lengths,
-                spec_metadata=(),
-                use_ddtree=False,
+                ragged: RaggedDecoderInputs,
+                tree_parent_ids=None,
+                tree_depths=None,
                 collect_intermediate=False):
         cfg = self.cfg
         gdn = cfg.gdn_cfg
@@ -93,35 +94,54 @@ class GatedDeltaNet(Module):
                              f"{(gdn.conv_dim,)}, got {conv_bias_data.shape}")
         conv_bias = F.constant(conv_bias_data, "conv_bias")
         mixed, conv_state_out, intermediate_conv = F.causal_conv1d(
-            mixed, conv_weight, conv_bias, conv_state, context_lengths,
-            gdn.conv_dim, gdn.conv_kernel - 1, spec_metadata, use_ddtree,
-            collect_intermediate)
+            mixed,
+            conv_weight,
+            conv_bias,
+            conv_state,
+            ragged,
+            gdn.conv_dim,
+            gdn.conv_kernel - 1,
+            tree_parent_ids=tree_parent_ids,
+            tree_depths=tree_depths,
+            use_intermediate=collect_intermediate)
         mixed = mixed.activation(cfg.hidden_act)
         query = mixed[..., :gdn.key_dim].reshape(
-            (0, 0, gdn.num_key_heads, gdn.key_head_dim))
+            (0, gdn.num_key_heads, gdn.key_head_dim))
         key = mixed[..., gdn.key_dim:gdn.key_dim * 2].reshape(
-            (0, 0, gdn.num_key_heads, gdn.key_head_dim))
+            (0, gdn.num_key_heads, gdn.key_head_dim))
         value = mixed[...,
                       gdn.key_dim * 2:gdn.key_dim * 2 + gdn.value_dim].reshape(
-                          (0, 0, gdn.num_value_heads, gdn.value_head_dim))
+                          (0, gdn.num_value_heads, gdn.value_head_dim))
         full_value_heads = (gdn.num_value_heads * cfg.tp_size, )
         a_log = self._constant_weight("A_log", (gdn.num_value_heads, ),
                                       np.float32, full_value_heads)
         dt_bias = self._constant_weight("dt_bias", (gdn.num_value_heads, ),
                                         np.float16, full_value_heads)
         output, recurrent_state_out, intermediate_recurrent = F.gated_delta_net(
-            query, key, value, alpha, beta, a_log, dt_bias, recurrent_state,
-            context_lengths, gdn.key_head_dim, gdn.value_head_dim,
-            spec_metadata, use_ddtree, collect_intermediate)
-        gate = gate.reshape((0, 0, gdn.num_value_heads, gdn.value_head_dim))
+            query,
+            key,
+            value,
+            alpha,
+            beta,
+            a_log,
+            dt_bias,
+            recurrent_state,
+            ragged,
+            gdn.key_head_dim,
+            gdn.value_head_dim,
+            tree_parent_ids=tree_parent_ids,
+            tree_depths=tree_depths,
+            use_intermediate=collect_intermediate,
+            use_diffusion_state=cfg.engine_role == "dllm")
+        gate = gate.reshape((0, gdn.num_value_heads, gdn.value_head_dim))
         norm_weight = self.weights.f16(self.key("norm.weight"))
         if norm_weight.shape != (gdn.value_head_dim, ):
             raise ValueError(
                 f"{self.key('norm.weight')} must have shape "
                 f"{(gdn.value_head_dim,)}, got {norm_weight.shape}")
-        output = F.rms_norm(output, norm_weight, cfg.rms_norm_eps, 4)
+        output = F.rms_norm(output, norm_weight, cfg.rms_norm_eps, 3)
         output = (output.cast(trt.float32) *
                   gate.cast(trt.float32).silu()).cast(trt.float16)
-        output = output.reshape((0, 0, gdn.value_dim))
+        output = output.reshape((0, gdn.value_dim))
         return (self.out_proj(output), conv_state_out, recurrent_state_out,
                 intermediate_conv, intermediate_recurrent)

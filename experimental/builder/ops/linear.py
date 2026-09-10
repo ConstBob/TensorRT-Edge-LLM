@@ -53,7 +53,7 @@ class Linear(Module):
         self,
         ctx: BuildContext,
         prefix: str,
-        rank: int = 3,
+        rank: Optional[int] = None,
         *,
         tensor_parallel: bool = True,
         tp_mode: Optional[str] = None,
@@ -67,7 +67,8 @@ class Linear(Module):
             int(size) for size in tp_output_segments)
 
     def forward(self, hidden_states, rank: Optional[int] = None):
-        rank = self.rank if rank is None else rank
+        rank = (self.rank if self.rank is not None else
+                hidden_states.ndim) if rank is None else rank
         if not self.tensor_parallel:
             output = F.linear_from_weights(hidden_states,
                                            self.weight_descriptor(),
@@ -133,7 +134,8 @@ class Linear(Module):
         if self.has_adapter():
             raise ValueError(
                 f"{self.prefix}: FP32 projection does not support adapters")
-        rank = self.rank if rank is None else rank
+        rank = (self.rank if self.rank is not None else
+                hidden_states.ndim) if rank is None else rank
         output = F.linear_f32_from_weights(hidden_states,
                                            self.weight_descriptor(),
                                            self.prefix, rank)

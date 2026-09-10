@@ -136,9 +136,10 @@ protected:
         ContextCacheBatchAdmission admission;
         admission.lookupPolicy = lookupPolicy;
         admission.commitPolicy = commitPolicy;
-        for (auto const& tokens : batch)
+        for (size_t slot = 0; slot < batch.size(); ++slot)
         {
-            admission.sequences.push_back(ContextCacheSequenceAdmission{tokens, {}});
+            admission.sequences.push_back(
+                ContextCacheSequenceAdmission{batch[slot], {}, {}, ResidentRef{static_cast<int32_t>(slot), 1}});
         }
         return mCoordinator->beginRequest(admission, DecodingKvHeadroom{1, 0}, mStream);
     }
@@ -190,6 +191,31 @@ TEST_F(ContextCacheCoordinatorTests, PublishesColdPrefixAndReusesLongestFullBloc
     finish(*second.admission);
 }
 
+TEST_F(ContextCacheCoordinatorTests, AdmissionUsesSchedulerOwnedResidentSlot)
+{
+    for (int32_t slot = 0; slot < kMAX_BATCH; ++slot)
+    {
+        mPageTable->setRow(slot, nullptr, 0);
+    }
+    mPageTable->upload(mStream);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+
+    ContextCacheSequenceAdmission sequence{makeTokens(129), {}};
+    sequence.resident = ResidentRef{2, 7};
+    ContextCacheBatchAdmission batch;
+    batch.sequences.push_back(std::move(sequence));
+    auto request = mCoordinator->beginRequest(batch, DecodingKvHeadroom{1, 0}, mStream);
+    ASSERT_EQ(request.status, ContextCacheCoordinatorStatus::kOk);
+    ASSERT_TRUE(request.admission.has_value());
+    ASSERT_EQ(mCoordinator->preparePrefill(request.admission->request), ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+
+    EXPECT_TRUE(std::all_of(mPageTable->hostRow(0), mPageTable->hostRow(0) + mPageTable->maxPagesPerSeq(),
+        [](int32_t page) { return page == -1; }));
+    EXPECT_GE(mPageTable->hostRow(2)[0], 0);
+    finish(*request.admission);
+}
+
 TEST_F(ContextCacheCoordinatorTests, ExactFullInputHitReportsMatchButRewindsExecution)
 {
     auto producer = begin({makeTokens(129)});
@@ -219,6 +245,30 @@ TEST_F(ContextCacheCoordinatorTests, BypassUsesManagedPagesWithoutPublishing)
     ASSERT_TRUE(lookup.admission.has_value());
     EXPECT_EQ(lookup.admission->prefillStarts[0], 0);
     finish(*lookup.admission);
+}
+
+TEST_F(ContextCacheCoordinatorTests, BatchAppliesLookupPolicyPerSequence)
+{
+    auto producer = begin({makeTokens(129)});
+    ASSERT_TRUE(producer.admission.has_value());
+    finalizePrefillWithLengths(*producer.admission, {129});
+    finish(*producer.admission);
+
+    ContextCacheBatchAdmission batch;
+    batch.lookupPolicy = ContextCacheLookupPolicy::kUseCache;
+    ContextCacheSequenceAdmission bypass{makeTokens(130), {}, {}, ResidentRef{0, 2}};
+    bypass.lookupPolicy = ContextCacheLookupPolicy::kBypass;
+    batch.sequences.push_back(std::move(bypass));
+    batch.sequences.push_back(ContextCacheSequenceAdmission{makeTokens(130), {}, {}, ResidentRef{1, 1}});
+
+    ContextCacheMetrics const before = mCoordinator->metrics();
+    auto request = mCoordinator->beginRequest(batch, DecodingKvHeadroom{1, 0}, mStream);
+    ASSERT_TRUE(request.admission.has_value());
+    EXPECT_EQ(request.admission->prefillStarts, (std::vector<int32_t>{0, kTOKENS_PER_PAGE}));
+    ContextCacheMetrics const after = mCoordinator->metrics();
+    EXPECT_EQ(after.lookupBypassSequences - before.lookupBypassSequences, 1U);
+    EXPECT_EQ(after.hitSequences - before.hitSequences, 1U);
+    finish(*request.admission);
 }
 
 TEST_F(ContextCacheCoordinatorTests, MetricsClassifyPlansPublicationsAndCurrentOccupancy)
@@ -292,6 +342,7 @@ TEST_F(ContextCacheCoordinatorTests, SequenceIdentityAppliesToGeneratedPageBound
     ContextCacheSequenceAdmission producerSequence;
     producerSequence.tokenIds = makeTokens(kINPUT_LENGTH);
     producerSequence.keyExtras.isolationDigest = kIDENTITY_A;
+    producerSequence.resident = ResidentRef{0, 1};
     ContextCacheBatchAdmission producerBatch;
     producerBatch.sequences.push_back(std::move(producerSequence));
     ContextCacheCoordinator::BeginRequestResult producer
@@ -315,6 +366,7 @@ TEST_F(ContextCacheCoordinatorTests, SequenceIdentityAppliesToGeneratedPageBound
     ContextCacheSequenceAdmission matchingSequence;
     matchingSequence.tokenIds = publishedTokens;
     matchingSequence.keyExtras.isolationDigest = kIDENTITY_A;
+    matchingSequence.resident = ResidentRef{0, 2};
     ContextCacheBatchAdmission matchingBatch;
     matchingBatch.sequences.push_back(std::move(matchingSequence));
     ContextCacheCoordinator::BeginRequestResult matching
@@ -327,6 +379,7 @@ TEST_F(ContextCacheCoordinatorTests, SequenceIdentityAppliesToGeneratedPageBound
     ContextCacheSequenceAdmission isolatedSequence;
     isolatedSequence.tokenIds = std::move(publishedTokens);
     isolatedSequence.keyExtras.isolationDigest = kIDENTITY_B;
+    isolatedSequence.resident = ResidentRef{0, 3};
     ContextCacheBatchAdmission isolatedBatch;
     isolatedBatch.sequences.push_back(std::move(isolatedSequence));
     ContextCacheCoordinator::BeginRequestResult isolated
@@ -357,26 +410,33 @@ TEST_F(ContextCacheCoordinatorTests, RejectsMalformedBatchProgressBeforeMutation
     finish(*request.admission);
 }
 
-TEST_F(ContextCacheCoordinatorTests, CompactionMovesRowsWithoutCopyingOrRenumberingPages)
+TEST_F(ContextCacheCoordinatorTests, ResidentCompactionPreservesPhysicalRowsAcrossMiddleEviction)
 {
     auto request = begin({makeTokens(129), makeTokens(130), makeTokens(131)});
     ASSERT_TRUE(request.admission.has_value());
     finalizePrefillWithLengths(*request.admission, {129, 130, 131});
 
-    std::vector<int32_t> oldRow0(mPageTable->hostRow(0), mPageTable->hostRow(0) + 2);
-    std::vector<int32_t> oldRow1(mPageTable->hostRow(1), mPageTable->hostRow(1) + 2);
-    std::vector<int32_t> oldRow2(mPageTable->hostRow(2), mPageTable->hostRow(2) + 2);
-    Tensor deviceMapping({kMAX_BATCH}, rt::DeviceType::kGPU, DataType::kINT32, "coordinatorTestMapping");
+    std::vector<int32_t> const survivorRow0(
+        mPageTable->hostRow(0), mPageTable->hostRow(0) + mPageTable->maxPagesPerSeq());
+    std::vector<int32_t> const survivorRow2(
+        mPageTable->hostRow(2), mPageTable->hostRow(2) + mPageTable->maxPagesPerSeq());
+    Tensor deviceMapping({kMAX_BATCH}, rt::DeviceType::kGPU, DataType::kINT32, "residentCompactionMapping");
 
     ASSERT_EQ(mCoordinator->beginBatchCompaction(request.admission->request, {0, -1, 1}, 2, deviceMapping),
         ContextCacheCoordinatorStatus::kOk);
     ASSERT_EQ(mCoordinator->compactBatch(request.admission->request), ContextCacheCoordinatorStatus::kOk);
-    EXPECT_TRUE(std::equal(oldRow0.begin(), oldRow0.end(), mPageTable->hostRow(0)));
-    EXPECT_TRUE(std::equal(oldRow2.begin(), oldRow2.end(), mPageTable->hostRow(1)));
-    for (PageId const page : oldRow1)
-    {
-        EXPECT_EQ(mCoordinator->manager().pools().activeRefCount({ResourceType::kBaseKvPage, page}), 0);
-    }
+    EXPECT_TRUE(std::equal(survivorRow0.begin(), survivorRow0.end(), mPageTable->hostRow(0)));
+    EXPECT_TRUE(std::equal(survivorRow2.begin(), survivorRow2.end(), mPageTable->hostRow(2)));
+    EXPECT_TRUE(std::all_of(mPageTable->hostRow(1), mPageTable->hostRow(1) + mPageTable->maxPagesPerSeq(),
+        [](int32_t page) { return page == -1; }));
+
+    ASSERT_EQ(mCoordinator->prepareDecodeStep(request.admission->request, DecodingKvHeadroom{128, 0}),
+        ContextCacheCoordinatorStatus::kOk);
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    EXPECT_GE(mPageTable->hostRow(0)[2], 0);
+    EXPECT_GE(mPageTable->hostRow(2)[2], 0);
+    EXPECT_TRUE(std::all_of(mPageTable->hostRow(1), mPageTable->hostRow(1) + mPageTable->maxPagesPerSeq(),
+        [](int32_t page) { return page == -1; }));
     finish(*request.admission);
 }
 
@@ -401,13 +461,23 @@ TEST_F(ContextCacheCoordinatorTests, AdmitsASequenceMidRequestAndReusesThePublis
     auto founder = begin({makeTokens(kPrefix)});
     ASSERT_TRUE(founder.admission.has_value());
     finalizePrefillWithLengths(*founder.admission, {kPrefix});
+    std::vector<PageId> const untouchedRow(
+        mPageTable->hostRow(1), mPageTable->hostRow(1) + mPageTable->maxPagesPerSeq());
+    std::vector<PageId> const rowBeforeAdmission(
+        mPageTable->hostRow(2), mPageTable->hostRow(2) + mPageTable->maxPagesPerSeq());
 
     std::vector<int32_t> joiningTokens = makeTokens(kPrefix);
     joiningTokens.push_back(7001); // diverges after the shared prefix
-    ContextCacheCoordinator::AdmitSequenceResult admitted = mCoordinator->admitSequence(
-        founder.admission->request, ContextCacheSequenceAdmission{joiningTokens, {}}, DecodingKvHeadroom{1, 0});
+    ContextCacheCoordinator::AdmitSequenceResult admitted = mCoordinator->admitSequence(founder.admission->request,
+        ContextCacheSequenceAdmission{joiningTokens, {}, {}, ResidentRef{2, 1}}, DecodingKvHeadroom{1, 0});
     ASSERT_EQ(admitted.status, ContextCacheCoordinatorStatus::kOk);
     EXPECT_EQ(admitted.prefillStart, kPrefix) << "the shared prefix must be reused, not recomputed";
+    EXPECT_FALSE(std::equal(rowBeforeAdmission.begin(), rowBeforeAdmission.end(), mPageTable->hostRow(2)))
+        << "the lease must bind the physical resident row";
+    EXPECT_EQ(mPageTable->hostRow(2)[0], mPageTable->hostRow(0)[0])
+        << "the admitted row must share the published founder prefix";
+    EXPECT_TRUE(std::equal(untouchedRow.begin(), untouchedRow.end(), mPageTable->hostRow(1)))
+        << "logical execution order must not choose a page-table row";
 
     // The seated prefill sampled one lookahead token; finalization aligns the ledger and publishes.
     int32_t const lookahead = 7002;
@@ -424,6 +494,7 @@ TEST_F(ContextCacheCoordinatorTests, AdmitsASequenceMidRequestAndReusesThePublis
         ContextCacheSequenceAdvance{&next[1], 1, static_cast<int32_t>(joiningTokens.size()) + 1}};
     ASSERT_EQ(
         mCoordinator->completeDecodeStep(founder.admission->request, progress, {}), ContextCacheCoordinatorStatus::kOk);
+    EXPECT_TRUE(std::equal(untouchedRow.begin(), untouchedRow.end(), mPageTable->hostRow(1)));
     finish(*founder.admission);
 
     // The admitted sequence's own full blocks are findable afterwards.
@@ -446,8 +517,8 @@ TEST_F(ContextCacheCoordinatorTests, RetractingAnAdmissionUnwindsTheLeaseAndTheR
 
     std::vector<int32_t> joiningTokens = makeTokens(kPrefix);
     joiningTokens.push_back(7101);
-    ContextCacheCoordinator::AdmitSequenceResult admitted = mCoordinator->admitSequence(
-        founder.admission->request, ContextCacheSequenceAdmission{joiningTokens, {}}, DecodingKvHeadroom{1, 0});
+    ContextCacheCoordinator::AdmitSequenceResult admitted = mCoordinator->admitSequence(founder.admission->request,
+        ContextCacheSequenceAdmission{joiningTokens, {}, {}, ResidentRef{1, 1}}, DecodingKvHeadroom{1, 0});
     ASSERT_EQ(admitted.status, ContextCacheCoordinatorStatus::kOk);
 
     mCoordinator->retractSequenceAdmission(founder.admission->request);
@@ -461,8 +532,8 @@ TEST_F(ContextCacheCoordinatorTests, RetractingAnAdmissionUnwindsTheLeaseAndTheR
     ASSERT_EQ(
         mCoordinator->completeDecodeStep(founder.admission->request, progress, {}), ContextCacheCoordinatorStatus::kOk);
 
-    ContextCacheCoordinator::AdmitSequenceResult readmitted = mCoordinator->admitSequence(
-        founder.admission->request, ContextCacheSequenceAdmission{joiningTokens, {}}, DecodingKvHeadroom{1, 0});
+    ContextCacheCoordinator::AdmitSequenceResult readmitted = mCoordinator->admitSequence(founder.admission->request,
+        ContextCacheSequenceAdmission{joiningTokens, {}, {}, ResidentRef{1, 2}}, DecodingKvHeadroom{1, 0});
     EXPECT_EQ(readmitted.status, ContextCacheCoordinatorStatus::kOk) << "the retracted seat must be admittable again";
     int32_t const lookahead = 7103;
     ASSERT_EQ(mCoordinator->finalizeSequenceAdmission(founder.admission->request, 1,
@@ -483,8 +554,8 @@ TEST_F(ContextCacheCoordinatorTests, AnUnfinalizedAdmissionHoldsAtZeroAdvanceIns
 
     std::vector<int32_t> joiningTokens = makeTokens(kPrefix);
     joiningTokens.push_back(7201);
-    ContextCacheCoordinator::AdmitSequenceResult admitted = mCoordinator->admitSequence(
-        founder.admission->request, ContextCacheSequenceAdmission{joiningTokens, {}}, DecodingKvHeadroom{1, 0});
+    ContextCacheCoordinator::AdmitSequenceResult admitted = mCoordinator->admitSequence(founder.admission->request,
+        ContextCacheSequenceAdmission{joiningTokens, {}, {}, ResidentRef{1, 1}}, DecodingKvHeadroom{1, 0});
     ASSERT_EQ(admitted.status, ContextCacheCoordinatorStatus::kOk);
     // No finalizeSequenceAdmission: the seated prefill failed and the slot is a kError ghost.
 
@@ -547,8 +618,8 @@ TEST_F(ContextCacheCoordinatorTests, FounderRetiresWhileTheAdmittedSequenceKeeps
 
     std::vector<int32_t> joiningTokens = makeTokens(kPrefix);
     joiningTokens.push_back(7001);
-    ContextCacheCoordinator::AdmitSequenceResult admitted = mCoordinator->admitSequence(
-        founder.admission->request, ContextCacheSequenceAdmission{joiningTokens, {}}, DecodingKvHeadroom{1, 0});
+    ContextCacheCoordinator::AdmitSequenceResult admitted = mCoordinator->admitSequence(founder.admission->request,
+        ContextCacheSequenceAdmission{joiningTokens, {}, {}, ResidentRef{1, 1}}, DecodingKvHeadroom{1, 0});
     ASSERT_EQ(admitted.status, ContextCacheCoordinatorStatus::kOk);
     ASSERT_EQ(admitted.prefillStart, kPrefix);
     int32_t const lookahead = 7002;
@@ -595,8 +666,8 @@ TEST_F(ContextCacheCoordinatorTests, AdmissionRefusalOnPoolPressureLeavesTheRequ
 
     std::vector<int32_t> disjoint(static_cast<size_t>(kMAX_SEQUENCE_LENGTH - 1));
     std::iota(disjoint.begin(), disjoint.end(), 100000);
-    ContextCacheCoordinator::AdmitSequenceResult refused = mCoordinator->admitSequence(
-        pressured.admission->request, ContextCacheSequenceAdmission{disjoint, {}}, DecodingKvHeadroom{1, 0});
+    ContextCacheCoordinator::AdmitSequenceResult refused = mCoordinator->admitSequence(pressured.admission->request,
+        ContextCacheSequenceAdmission{disjoint, {}, {}, ResidentRef{2, 1}}, DecodingKvHeadroom{1, 0});
     EXPECT_EQ(refused.status, ContextCacheCoordinatorStatus::kRequestFailed);
     EXPECT_TRUE(refused.insufficientCapacity) << "pool pressure must read as retry-later, not failure";
 

@@ -19,6 +19,7 @@
 
 #include "common/tensor.h"
 #include "runtime/config/llmEngineConfig.h"
+#include "runtime/exec/scheduledStep.h"
 #include "runtime/state/pipelineIO.h"
 
 #include <cstdint>
@@ -87,9 +88,8 @@ struct PruneRequest
 //!
 //! The non-virtual pruneForPrefill() / pruneBatchForPrefill() own everything algorithms must
 //! not diverge on: the enablement guards (minVisualTokens, target-is-a-reduction), modality
-//! partitioning, and the target computation. Subclasses implement prune() — with full freedom
-//! over what "pruning" means (subset selection, token merging, per-image quotas, ...) — and
-//! finish by calling compactToKeepList(), which owns the invariant-laden buffer compaction:
+//! partitioning, and the target computation. Every subclass that shortens a request must finish
+//! by calling compactToKeepList(), which records the ordered slot-local subset and owns the buffer compaction:
 //! all text tokens are always kept; kept tokens retain their original absolute RoPE positions;
 //! decode continues at the position after the unpruned sequence (matching the HF DART
 //! reference).
@@ -99,7 +99,8 @@ struct PruneRequest
 //! batch-agnostic. In the batched flow compactToKeepList() records the slot's keep list
 //! instead of compacting immediately; once every slot is selected, the base repacks all
 //! batch planes to the new (pruned) row pitch in one pass. Consequently batched pruning
-//! requires the algorithm to route its result through compactToKeepList().
+//! requires the algorithm to route its result through compactToKeepList(). Direct rewrites and
+//! token merging are unsupported by the MR1 protocol.
 //!
 //! Instances are created through createVisualTokenPruner() and reused across requests, so
 //! per-request device work buffers should be preallocated in the constructor. The caller is
@@ -182,6 +183,16 @@ public:
     //! feature plane is too large to always reserve for deployments that never need it.
     void preallocateAuxiliaryBuffers();
 
+    std::vector<int32_t> const& keepStartOffsets() const noexcept
+    {
+        return mKeepStartOffsets;
+    }
+
+    std::vector<int32_t> const& concatenatedKeepIndices() const noexcept
+    {
+        return mConcatenatedKeepIndices;
+    }
+
     VisualPrunerConfig const& config() const noexcept
     {
         return mConfig;
@@ -192,10 +203,8 @@ protected:
     //! \throws std::runtime_error on invalid config.
     VisualTokenPruner(VisualPrunerConfig const& config, LLMEngineConfig const& engineConfig);
 
-    //! The algorithm hook. Implementations own the buffer update: either delegate to
-    //! compactToKeepList() (subset-selection algorithms) or perform a custom rewrite of the
-    //! PipelineIO buffers (e.g. token merging), upholding the compaction invariants described
-    //! on the class. Return the pruned length, or req.origLen to skip pruning this request.
+    //! The algorithm hook. Implementations that shorten a request must delegate buffer updates
+    //! to compactToKeepList(). Return the pruned length, or req.origLen to skip pruning this request.
     virtual int32_t prune(PruneRequest const& req, PipelineIO& io, cudaStream_t stream) = 0;
 
     //! Shared compaction for subset-selection algorithms: keep all text tokens plus
@@ -217,6 +226,7 @@ private:
     //! mRoPE rows in place. Consumes mSlotKeepLists.
     void executeBatchCompaction(PipelineIO& io, std::vector<int32_t> const& oldLens,
         std::vector<int32_t> const& newLens, int32_t oldMaxLen, int32_t newMaxLen, cudaStream_t stream);
+    void publishKeepMap(std::vector<int32_t> const& lengths, int32_t batch);
 
     VisualPrunerConfig mConfig;
     int32_t mImageTokenId{-1};
@@ -234,6 +244,8 @@ private:
     bool mDeferCompaction{false};
     int32_t mCurrentSlot{0};
     std::vector<std::vector<int32_t>> mSlotKeepLists;
+    std::vector<int32_t> mKeepStartOffsets;
+    std::vector<int32_t> mConcatenatedKeepIndices;
     std::vector<int32_t> mOldLens; //!< per-request scratch (reused)
     std::vector<int32_t> mNewLens; //!< per-request scratch (reused)
 

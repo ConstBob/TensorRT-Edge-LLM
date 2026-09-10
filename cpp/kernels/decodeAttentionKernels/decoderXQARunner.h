@@ -53,8 +53,9 @@ struct XQALaunchParams
     void* scratch = nullptr;         //!< Scratch memory
 
     //! Unique device memory pointer for spec-decode tree attention
-    void* treeAttnMask = nullptr; //!< Tree attention mask
-    int32_t* qCuSeqLen = nullptr; //!< Cumulative query sequence lengths
+    void* treeAttnMask = nullptr;      //!< Tree attention mask
+    int32_t* qCuSeqLen = nullptr;      //!< Cumulative query sequence lengths for compact input
+    int32_t const* qSeqLens = nullptr; //!< Logical query lengths for fixed-width input
 
     float const* attentionSinks = nullptr; //!< Attention sinks parameter
 

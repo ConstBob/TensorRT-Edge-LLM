@@ -65,6 +65,12 @@ enum class SwaKVCacheMode : int32_t
 char const* specDecodeModeName(SpecDecodeMode mode) noexcept;
 bool isCachedBlockDraftMode(SpecDecodeMode mode) noexcept;
 
+enum class RaggedBackendKind : int32_t
+{
+    kNone,
+    kEntryPaddedCompatibility,
+};
+
 //! Gemma4 MTP assistant-layer to target-layer shared-KV mapping.
 struct Gemma4MTPKVSharingEntry
 {
@@ -81,14 +87,19 @@ struct Gemma4MTPKVSharingEntry
 struct LLMEngineConfig
 {
     // --- Core model dimensions ---
-    int32_t hiddenSize{};                //!< Model hidden dimension
-    int32_t outputVocabSize{};           //!< Actual output vocab (reduced if vocab reduction active)
-    int32_t numAttentionLayers{};        //!< Number of attention layers needing KV cache
-    int32_t numKVHeads{};                //!< Number of key-value heads
-    int32_t headDim{};                   //!< Dimension of each attention head
-    int32_t maxSupportedBatchSize{};     //!< Maximum supported batch size
-    int32_t maxSupportedInputLength{};   //!< Maximum supported input length
-    int32_t maxKVCacheCapacity{};        //!< Maximum KV cache capacity (sequence length)
+    int32_t hiddenSize{};              //!< Model hidden dimension
+    int32_t outputVocabSize{};         //!< Actual output vocab (reduced if vocab reduction active)
+    int32_t numAttentionLayers{};      //!< Number of attention layers needing KV cache
+    int32_t numKVHeads{};              //!< Number of key-value heads
+    int32_t headDim{};                 //!< Dimension of each attention head
+    int32_t maxSupportedBatchSize{};   //!< Maximum supported batch size
+    int32_t maxSupportedInputLength{}; //!< Maximum supported input length
+    int32_t maxKVCacheCapacity{};      //!< Maximum KV cache capacity (sequence length)
+    RaggedBackendKind raggedBackend{RaggedBackendKind::kNone};
+    int32_t maxNumSequences{};
+    int32_t maxQueryLength{};
+    int32_t maxPhysicalTokens{};
+    int32_t recurrentPoolRows{};
     int64_t skipSoftmaxScaleOverride{0}; //!< skip-softmax scale-factor override (0 = disabled)
     int32_t kvPoolPages{};               //!< Exact physical K-page count serialized in KV binding shapes
     //! Total physical K-page budget for the independent SWA pool. Zero means
@@ -305,7 +316,7 @@ struct LLMEngineConfig
     //! shape to `[0]` (engine's "initial prefill" sentinel) instead of `[batch]`.
     //! DiffusionGemma keeps `kvcache_start_index` at `[batch]` and uses
     //! `context_mask_selector` as its attention-mask sentinel.
-    InferenceDims prefillDims(int64_t batch, int64_t seqLen, bool kvCacheAllEmpty) const;
+    InferenceDims prefillDims(int64_t batch, int64_t seqLen, ExecutionPhase phase) const;
 
     //! Vanilla single-token decode dims.
     //! seqLen is always 1 here; packedMaskLen is 1 (no proposal mask in vanilla).

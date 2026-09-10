@@ -204,7 +204,7 @@ public:
     // these system-prompt-specific interfaces. The runtime should call a generic
     // prefill method; system prompt caching becomes an internal optimisation.
     virtual bool hasSystemPromptKVCache(SystemPromptCacheKey const&) const = 0;
-    virtual void restoreSystemPromptKVCache(SystemPromptCacheKey const&, int32_t, cudaStream_t) = 0;
+    virtual void restoreSystemPromptKVCache(SystemPromptCacheKey const&, int32_t residentSlot, cudaStream_t) = 0;
     virtual bool runSystemPromptPrefill(DecodingInferenceContext&) = 0;
     virtual void saveSystemPromptKVCache(SystemPromptCacheKey const&, std::string const&,
         std::vector<tokenizer::Rank> const&, int32_t, cudaStream_t) = 0;

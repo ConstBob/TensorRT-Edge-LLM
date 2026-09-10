@@ -69,7 +69,8 @@ public:
     void setContextMemory(Tensor& memory) override;
 
     bool hasSystemPromptKVCache(SystemPromptCacheKey const& key) const override;
-    void restoreSystemPromptKVCache(SystemPromptCacheKey const& key, int32_t batchIdx, cudaStream_t stream) override;
+    void restoreSystemPromptKVCache(
+        SystemPromptCacheKey const& key, int32_t residentSlot, cudaStream_t stream) override;
     bool runSystemPromptPrefill(DecodingInferenceContext& context) override;
     void saveSystemPromptKVCache(SystemPromptCacheKey const& key, std::string const& prompt,
         std::vector<tokenizer::Rank> const& tokenizedPrompt, int32_t promptIdsLength, cudaStream_t stream) override;
@@ -82,6 +83,8 @@ private:
     bool runDraftForward(DecodingInferenceContext& context);
     bool runBaseVerification(DecodingInferenceContext& context);
     bool buildTreeVerifyInputs(int32_t activeBatchSize, cudaStream_t stream, bool useConfidence);
+    void prepareDraftRaggedBindings(int32_t activeBatchSize, int32_t executionWidth, int32_t deltaWidth,
+        cudaStream_t stream, std::vector<ResidentRef> const* residentRefs = nullptr);
     void commitAcceptedTreePath(DecodingInferenceContext& context, int32_t verifySize, int32_t maxAcceptLength);
     void dsparkBiasMarkovGreedy(DecodingInferenceContext& context, int32_t activeBatchSize, int32_t proposalLen);
     void dsparkBiasMarkovSample(DecodingInferenceContext& context, int32_t activeBatchSize, int32_t proposalLen);
@@ -103,11 +106,14 @@ private:
     Tensor mDraftHiddenStates; //!< [B, proposalLen, draftHiddenSize] FP16
 
     //! Proposal attention inputs
-    Tensor mDraftPackedAttentionMask; //!< [B, proposalLen, divUp(proposalLen,32)] INT32
-    Tensor mDraftAttentionPosId;      //!< [B, proposalLen] INT32
-    Tensor mDraftContextLengths;      //!< [B] INT32
-    Tensor mDraftDeltaLenCommit;      //!< [B] INT32
-    Tensor mDraftDeltaLens;           //!< [B] INT32
+    Tensor mDraftPackedAttentionMask;  //!< [B, proposalLen, divUp(proposalLen,32)] INT32
+    Tensor mDraftAttentionPosId;       //!< [B, proposalLen] INT32
+    Tensor mDraftContextLengths;       //!< [B] INT32
+    Tensor mDraftDeltaLenCommit;       //!< [B] INT32
+    Tensor mDraftDeltaLens;            //!< [B] INT32
+    Tensor mDraftDeltaRopeCosSin;      //!< [T_delta, rotaryDim] FLOAT
+    Tensor mDraftDeltaPositions;       //!< [T_delta] INT32
+    Tensor mDraftDeltaTokenToSequence; //!< [T_delta] INT32
 
     //! Draft/verify/accepted tokens
     Tensor mDraftTokenIds;        //!< [B, proposalLen] INT32

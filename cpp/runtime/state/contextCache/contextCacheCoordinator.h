@@ -59,6 +59,10 @@ struct ContextCacheSequenceAdmission
     //! Per-position media content hash. Empty means text-only. When non-empty, must have tokenIds.size() entries.
     //! A non-zero Hash128 at position i causes the block hash to consume that 128-bit digest instead of the token ID.
     std::vector<Hash128> perPositionMediaHash;
+    //! Scheduler-owned physical state identity; the coordinator may not derive this from logical sequence order.
+    ResidentRef resident;
+    //! Optional sequence-level override of ContextCacheBatchAdmission::lookupPolicy.
+    std::optional<ContextCacheLookupPolicy> lookupPolicy;
 };
 
 //! One serialized runtime request. Bypass still uses managed private pages but neither looks up nor publishes state.
@@ -76,9 +80,8 @@ struct ContextCacheBatchAdmission
 //! Host-visible sequence advance observed after an existing stream synchronization.
 struct ContextCacheSequenceAdvance
 {
-    //! committedStateLength value for a zero advance: hold the ledger's current committed length
-    //! in place. The producer cannot reconstruct that length for a slot that failed before its
-    //! admission was finalized, and must not have to -- the ledger already knows it.
+    //! committedStateLength value for a zero advance that holds the ledger's current committed
+    //! length in place. A concrete length with no accepted tokens represents a state-only advance.
     static constexpr int32_t kHoldCommittedStateLength = -1;
 
     int32_t const* acceptedTokenIds{};
@@ -100,9 +103,8 @@ enum class ContextCacheCoordinatorStatus : uint8_t
 //! calls serialized. Request handles may overlap in lifetime: several may be admitted and hold a page lease at once,
 //! which is the ownership shape in-flight batching needs.
 //!
-//! Overlapping leases are not overlapping execution, and the distinction is load-bearing. Page-table rows and the
-//! reuse-length staging buffer are addressed per request starting at row zero, so preparing request B rewrites the
-//! shared rows describing request A. Resuming A afterwards would run it against B's page mapping, and a prepare
+//! Overlapping leases are not overlapping execution, and the distinction is load-bearing. Page-table rows bind to
+//! stable physical resident slots, while request-local reuse-length staging is reused across preparations. A prepare
 //! issued before the previous request's async copy has landed would corrupt that staging buffer. A caller must
 //! therefore still finish one request's steps before preparing the next; what a count rather than a flag permits is
 //! that the leases, not the execution, may interleave.
@@ -191,7 +193,7 @@ public:
     //! slot for it -- the recovery path for a seating that threw between lease and slot append. A
     //!        seated slot that failed later stays, terminal from birth, and leaves through the
     //!        ordinary eviction instead.
-    void retractSequenceAdmission(RequestHandle& request);
+    bool retractSequenceAdmission(RequestHandle& request) noexcept;
 
     //! Bind every admitted row and reset logical cache lengths to the selected reuse boundaries.
     ContextCacheCoordinatorStatus preparePrefill(RequestHandle& request);
@@ -219,10 +221,10 @@ public:
     ContextCacheCoordinatorStatus completeDecodeStep(RequestHandle& request,
         std::vector<ContextCacheSequenceAdvance> const& advances, std::vector<int32_t> const& publishableCompletedSlots,
         std::vector<int32_t> const* commonStateLengths = nullptr);
-    //! Validate and upload the one authoritative old-to-new mapping before any old-slot compaction work.
+    //! Validate and upload the one authoritative old-to-new mapping before any old-slot retirement work.
     ContextCacheCoordinatorStatus beginBatchCompaction(
         RequestHandle& request, std::vector<int32_t> const& oldToNew, int32_t newBatchSize, Tensor& deviceBatchMapping);
-    //! Compact slot-addressed state/page-table rows, retire leases, and consume the existing eviction sync.
+    //! Retire logical sequences while preserving survivor physical rows, then consume the eviction sync.
     ContextCacheCoordinatorStatus compactBatch(RequestHandle& request);
     //! Consume a normally completed request. This is idempotent for an already-empty handle.
     ContextCacheCoordinatorStatus finish(RequestHandle& request);
@@ -231,6 +233,9 @@ public:
 
     ContextCacheMetrics metrics() const noexcept;
     ContextCacheManager const& manager() const noexcept;
+
+    //! Whether this deployment can lease and bind a new sequence into an executing request.
+    bool supportsLiveSequenceAdmission() const noexcept;
 
 private:
     enum class PublicationPoint : uint8_t

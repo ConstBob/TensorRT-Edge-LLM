@@ -103,8 +103,8 @@ class DeviceConfig:
     full_rope_config: Optional[dict] = None
     attention_layer_types: List[str] = field(default_factory=list)
     attention_bias: bool = False
-    attention_sink_bias: bool = False
     attention_k_eq_v: bool = False
+    attention_sink_bias: bool = False
     tie_word_embeddings: bool = False
     sliding_window_size: int = -1
     final_logit_softcapping: Optional[float] = None
@@ -414,8 +414,8 @@ class DeviceConfig:
             full_rope_config=dual_rope.get("full_rope_config"),
             attention_layer_types=attention_layer_types,
             attention_bias=bool(llm.get("attention_bias", False)),
-            attention_sink_bias=bool(dspark["attention_sink_bias"]),
             attention_k_eq_v=bool(llm.get("attention_k_eq_v", False)),
+            attention_sink_bias=bool(dspark["attention_sink_bias"]),
             tie_word_embeddings=bool(llm.get("tie_word_embeddings", False)),
             sliding_window_size=dspark_sliding_window,
             skip_softmax_scale_factor=_get_skip_softmax_scale_factor(

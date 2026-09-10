@@ -74,7 +74,8 @@ public:
     void setContextMemory(Tensor& memory) override;
 
     bool hasSystemPromptKVCache(SystemPromptCacheKey const& key) const override;
-    void restoreSystemPromptKVCache(SystemPromptCacheKey const& key, int32_t batchIdx, cudaStream_t stream) override;
+    void restoreSystemPromptKVCache(
+        SystemPromptCacheKey const& key, int32_t residentSlot, cudaStream_t stream) override;
     bool runSystemPromptPrefill(DecodingInferenceContext& context) override;
     void saveSystemPromptKVCache(SystemPromptCacheKey const& key, std::string const& prompt,
         std::vector<tokenizer::Rank> const& tokenizedPrompt, int32_t promptIdsLength, cudaStream_t stream) override;
@@ -110,6 +111,9 @@ private:
     void commitAcceptedTreePath(DecodingInferenceContext& context, int32_t verifySize, int32_t maxAcceptLength);
     void bindTargetHiddenDelta(
         int32_t activeBatchSize, int64_t maxDeltaLen, int64_t sourceSeqLen, bool allowLargeDelta, cudaStream_t stream);
+    void initializeDraftRaggedBindings(LLMEngineConfig const& draftCfg);
+    void prepareDraftRaggedBindings(int32_t activeBatchSize, int32_t proposalLen, int32_t deltaWidth,
+        cudaStream_t stream, std::vector<ResidentRef> const* residentRefs = nullptr);
     bool checkCudaLastError(char const* stage) const;
     bool useTreeVerification() const noexcept
     {
@@ -142,11 +146,14 @@ private:
     Tensor mDraftPrefillTargetHidden; //!< Lazy scratch for non-compact round-0 target hidden FP16, max batch reserve
     Tensor mDraftOutputLogits;        //!< [B, blockSize, vocabSize] FP32
 
-    Tensor mDraftPackedAttentionMask; //!< [B, blockSize, divUp(blockSize,32)] INT32
-    Tensor mDraftAttentionPosId;      //!< [B, blockSize] INT32
-    Tensor mDraftContextLengths;      //!< [B] INT32
-    Tensor mDraftDeltaLenCommit;      //!< [B] INT32
-    Tensor mDraftDeltaLens;           //!< [B] INT32
+    Tensor mDraftPackedAttentionMask;  //!< [B, blockSize, divUp(blockSize,32)] INT32
+    Tensor mDraftAttentionPosId;       //!< [B, blockSize] INT32
+    Tensor mDraftContextLengths;       //!< [B] INT32
+    Tensor mDraftDeltaLenCommit;       //!< [B] INT32
+    Tensor mDraftDeltaLens;            //!< [B] INT32
+    Tensor mDraftDeltaRopeCosSin;      //!< [T_delta, rotaryDim] FLOAT
+    Tensor mDraftDeltaPositions;       //!< [T_delta] INT32
+    Tensor mDraftDeltaTokenToSequence; //!< [T_delta] INT32
 
     Tensor mDraftTokenIds;          //!< [B, blockSize] INT32
     Tensor mHostDraftInputIds;      //!< [B, blockSize] INT32 CPU

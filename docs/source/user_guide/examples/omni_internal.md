@@ -570,24 +570,23 @@ build base with `--specBase --maxVerifyTreeSize 7` and draft with
 `--specDraft` into the same engine dir; run with `--specDecode
 --specDraftTopK 1 --specDraftStep 3 --specVerifySize 4`.
 
-**Base export requires the `spec_verify_phase_marker` input.** On a
-GDN-hybrid backbone the speculative *verify* step re-runs the whole
-drafted window through the GDN mixers, but a GDN layer carries a
-recurrent state that mutates per token, so a verify that ends up
-rejecting tokens must be able to roll that state back. The marker is a
-**shape-only** input (`[0]` = ordinary prefill/decode, `[1]` = spec
-verify; the payload is ignored) that flips `gated_delta_net` /
-`causal_conv1d` into their spec-verify kernels, which additionally emit
-`intermediate_states` — a per-step checkpoint of the recurrent state the
-runtime commits by accepted token id. This is **not** new to this MR or
-to any rebase: the marker and its `--specBase` validation shipped with
-the Qwen3.5 hybrid DFlash/DDTree work (`0b5091a21`, work item #421) and
-the `qwen3_5` MTP base has always wired it. The Next MoE Thinker
-(`modeling_qwen3_omni_next_moe_text.py`) is a new subclass that inherits
-that MTP infrastructure but initially omitted the pass-through, so it
-must thread the marker through its backbone / `forward` / flat-wrapper /
-OnnxSpec the same way `qwen3_5_text.py` does, or `llm_build --specBase`
-fails with *"missing input `spec_verify_phase_marker`"*.
+**Base and draft exports use the unified `execution_phase_marker`.** Its
+INT32 payload is ignored; its shape extent selects context prefill (1), context
+chunk (2), autoregressive decode (3), draft proposal (4), target verify (5),
+diffusion denoise (6), or diffusion commit (7). On a GDN-hybrid backbone,
+target verify re-runs the drafted window through stateful mixers. Phase 5 makes
+GDN and causal Conv emit token-aligned intermediate state so the runtime can
+commit only the accepted prefix or tree path. Rejected and entry-padding rows
+never advance resident state.
+
+The decoder is token-major: physical offsets cover the fixed entry-padded
+`T_exec` rows, while query, past, sequence, and attention lengths remain
+logical. `state_indices` maps the current execution order to persistent
+KV/GDN/Conv/Mamba slots, so entry reorder does not move resident state. Old
+exports using `spec_verify_phase_marker` or batch-major decoder tensors are not
+supported. Re-export and rebuild both base and draft engines with compatible
+export/build/plugin/runtime artifacts. The plugin creator version is unchanged;
+there is no dual-ABI fallback.
 
 Pitfall worth keeping: the MTP base export must feed the draft the
 **final post-norm** hidden states (the backbone's first return value).

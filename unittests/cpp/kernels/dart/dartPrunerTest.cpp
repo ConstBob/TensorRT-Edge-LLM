@@ -235,10 +235,10 @@ struct PrunerHarness
         {
             std::fill_n(rope.begin() + static_cast<int64_t>(r) * kRotaryDim, kRotaryDim, float(r));
         }
-        io.mropeCosSin
+        io.mropeActiveCosSin
             = rt::Tensor({1, kCapacity, kRotaryDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "rope");
-        CUDA_CHECK(
-            cudaMemcpy(io.mropeCosSin.rawPointer(), rope.data(), rope.size() * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(
+            io.mropeActiveCosSin.rawPointer(), rope.data(), rope.size() * sizeof(float), cudaMemcpyHostToDevice));
     }
 
     //! Recover the gather indices from the first deepstack marker plane (or rope rows).
@@ -258,8 +258,8 @@ struct PrunerHarness
     std::vector<int32_t> readRopeRows(int32_t count)
     {
         std::vector<float> out(static_cast<size_t>(count) * kRotaryDim);
-        CUDA_CHECK(
-            cudaMemcpy(out.data(), io.mropeCosSin.rawPointer(), out.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(
+            out.data(), io.mropeActiveCosSin.rawPointer(), out.size() * sizeof(float), cudaMemcpyDeviceToHost));
         std::vector<int32_t> rows(count);
         for (int32_t r = 0; r < count; ++r)
         {
@@ -359,10 +359,10 @@ struct BatchPrunerHarness
                     rope.begin() + (static_cast<int64_t>(b) * kCapacity + r) * kRotaryDim, kRotaryDim, float(r));
             }
         }
-        io.mropeCosSin
+        io.mropeActiveCosSin
             = rt::Tensor({batch, kCapacity, kRotaryDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "rope");
-        CUDA_CHECK(
-            cudaMemcpy(io.mropeCosSin.rawPointer(), rope.data(), rope.size() * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(
+            io.mropeActiveCosSin.rawPointer(), rope.data(), rope.size() * sizeof(float), cudaMemcpyHostToDevice));
     }
 
     //! Recover slot `b`'s (row, slot) marker pairs from the first deepstack plane at pitch `pitch`.
@@ -384,7 +384,7 @@ struct BatchPrunerHarness
     std::vector<int32_t> readRopeRows(int32_t b, int32_t count)
     {
         std::vector<float> out(static_cast<size_t>(count) * kRotaryDim);
-        auto const* base = static_cast<float const*>(io.mropeCosSin.rawPointer());
+        auto const* base = static_cast<float const*>(io.mropeActiveCosSin.rawPointer());
         CUDA_CHECK(cudaMemcpy(out.data(), base + static_cast<int64_t>(b) * kCapacity * kRotaryDim,
             out.size() * sizeof(float), cudaMemcpyDeviceToHost));
         std::vector<int32_t> rows(count);
@@ -611,6 +611,43 @@ TEST(VisualTokenPruner, CustomSelectorRegistration)
     {
         ASSERT_EQ(rows[i], i); // leading text + first 32 visual tokens are contiguous
     }
+}
+
+TEST(VisualTokenPruner, RejectsCustomPrunerWithoutSubsetProvenance)
+{
+    class RewritePruner final : public rt::VisualTokenPruner
+    {
+    public:
+        RewritePruner(rt::VisualPrunerConfig const& cfg, rt::LLMEngineConfig const& engineCfg)
+            : rt::VisualTokenPruner(cfg, engineCfg)
+        {
+        }
+
+        char const* name() const noexcept override
+        {
+            return "rewrite";
+        }
+
+    protected:
+        int32_t prune(rt::PruneRequest const& req, rt::PipelineIO&, cudaStream_t) override
+        {
+            return req.origLen - 1;
+        }
+    };
+
+    rt::registerVisualPruner("rewrite", [](rt::VisualPrunerConfig const& cfg, rt::LLMEngineConfig const& engineCfg) {
+        return std::unique_ptr<rt::VisualTokenPruner>(std::make_unique<RewritePruner>(cfg, engineCfg));
+    });
+
+    rt::VisualPrunerConfig cfg;
+    cfg.enabled = true;
+    cfg.algorithm = "rewrite";
+    cfg.reductionRatio = 0.5F;
+    auto tokens = makeTokens(8, 64, 8);
+    PrunerHarness h(tokens, /*numDeepstack=*/0, /*seed=*/101);
+    auto pruner = rt::createVisualTokenPruner(cfg, h.engineConfig);
+
+    EXPECT_THROW(pruner->pruneForPrefill(h.tokenIds, h.io, h.seqLen, nullptr), std::runtime_error);
 }
 
 TEST(VisualTokenPruner, RejectsInvalidRetainedIndices)

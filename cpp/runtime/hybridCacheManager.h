@@ -120,6 +120,9 @@ public:
     //! @return {kView, vView}, each shaped [maxBatch, capPadded, numKVHeads, headDim].
     std::pair<rt::Tensor, rt::Tensor> getSeparateKVCache(int32_t absLayerIdx);
 
+    //! Describe the physical pool and logical sequence geometry used by an attention layer.
+    KVLayerStorageMetadata getKVLayerStorageMetadata(int32_t absLayerIdx) const;
+
     //! Get the recurrent state for a given absolute layer index (must be a Mamba layer).
     //! @param absLayerIdx Absolute decoder-layer index.
     //! @return Reference to the per-layer recurrent state tensor.
@@ -203,6 +206,15 @@ public:
     //! @throws std::runtime_error if out of range [0, maxBatchSize].
     void setActiveBatchSize(int32_t newActiveBatchSize);
 
+    //! Restore a previously validated batch-size view from an exception guard.
+    void restoreActiveBatchSize(int32_t activeBatchSize) noexcept;
+
+    //! Materialize the logical lengths for the next contiguous execution batch.
+    //!
+    //! The source is indexed by execution row. This updates only the transient length input read
+    //! by the engines; KV pages and recurrent state remain indexed by their resident slots.
+    void materializeExecutionLengths(rt::Tensor const& executionLengths, cudaStream_t stream);
+
     //! @brief Check if KV cache for all sequences is empty.
     //! @return True if no prefill has been committed yet.
     bool getKVCacheAllEmpty() const noexcept;
@@ -211,51 +223,11 @@ public:
     // Compaction
     // ------------------------------------------------------------------
 
-    //! Compact both KV caches and Mamba states after batch eviction.
-    //! @param batchMapping GPU tensor [oldBatch], mapping[i] = newBatchIdx or -1 (evicted).
-    //! @param oldBatch Batch size before eviction.
-    //! @param newBatch Batch size after eviction.
-    //! @param stream CUDA stream.
-    void compactBatch(rt::Tensor const& batchMapping, int32_t oldBatch, int32_t newBatch, cudaStream_t stream);
+    //! Compact execution-row-aligned KV lengths without moving resident slot state.
+    void compactKVCacheLengths(rt::Tensor const& batchMapping, int32_t oldBatch, int32_t newBatch, cudaStream_t stream);
 
-    //! Compact only slot-addressed sequence lengths and recurrent/conv state. Global paged KV remains in place;
-    //! callers using non-identity page tables compact those table rows separately.
-    void compactBatchSlotState(rt::Tensor const& batchMapping, int32_t oldBatch, int32_t newBatch, cudaStream_t stream);
-
-    //! @brief Exchange the device-side per-slot state of two slots. Self-inverse.
-    //!
-    //! The device half of temporarily seating a resident slot at index zero (see
-    //! DecodingInferenceContext::swapSlots for why that is ever done): the KV-length entries the
-    //! kernels read per slot must travel with the slot, or a pass at the borrowed position reads
-    //! another sequence's length. Only the two int32 lengths move; the KV pages are reached through
-    //! the page table, which is swapped separately by its owner.
-    //!
-    //! @throws std::runtime_error if a slot is out of range, or if this deployment carries Mamba
-    //!         state. Mamba recurrent and convolution rows hold the sequence's state by value, per
-    //!         slot -- relocating them is a different, far heavier operation than exchanging two
-    //!         lengths, and no caller needs it yet, so a hybrid deployment refuses rather than
-    //!         silently corrupting recurrent state.
-    void swapSlotState(int32_t slotA, int32_t slotB, cudaStream_t stream);
-
-    //! @brief Whether per-slot cache state can be relocated between batch rows.
-    //!
-    //! False when the deployment carries Mamba layers: their recurrent/conv rows hold state by
-    //! value and swapSlotState/setSlotLength refuse to touch them. Callers that need to reseat
-    //! slots (boundary scheduling's seated prefill) must probe this before committing to it.
-    bool supportsSlotStateRelocation() const noexcept
-    {
-        return mMambaCache.numLayers() == 0;
-    }
-
-    //! @brief Overwrite one slot's device-side KV length.
-    //!
-    //! A slot that joins an already-running batch occupies a row whose length entry still holds
-    //! whatever its previous occupant left there; resetForNewSequences cannot be used to clear it
-    //! because that resets every resident slot too. Same Mamba refusal as swapSlotState, for the
-    //! same reason.
-    //!
-    //! @throws std::runtime_error if the slot is outside the active batch or Mamba state exists
-    void setSlotLength(int32_t slot, int32_t length, cudaStream_t stream);
+    //! Clear one retired resident row's recurrent/convolution state without moving survivors.
+    void clearResidentSlot(int32_t slot, cudaStream_t stream);
 
     // ------------------------------------------------------------------
     // System prompt cache
@@ -299,18 +271,12 @@ private:
         std::vector<kernel::KVLayerInfo> hostInfos; //!< Host copy for building save/restore info arrays
     };
 
-    Config mConfig{};                      //!< Full configuration
-    KVCacheManager mKVCache;               //!< Sub-manager for attention KV caches
-    MambaCacheManager mMambaCache;         //!< Sub-manager for Mamba recurrent / conv states
-    std::vector<int32_t> mAbsToKVIndex;    //!< Absolute layer -> local KV index (-1 if not attention)
-    std::vector<int32_t> mAbsToMambaIndex; //!< Absolute layer -> local Mamba index (-1 if not Mamba)
-    rt::Tensor mDeviceKVCacheLengths{};    //!< Shared KV cache lengths on device [activeBatchSize]
-    //! Device scratch for swapSlotState's three-copy exchange: the lengths never bounce through
-    //! the host, so the seating swap enqueues without a single synchronization.
-    rt::Tensor mLengthSwapScratch{};
-    //! Pinned (Tensor's CPU allocation is cudaMallocHost) staging for setSlotLength, so the
-    //! upload is a true async copy; one synchronization guards the buffer's reuse.
-    rt::Tensor mLengthStaging{};
+    Config mConfig{};                         //!< Full configuration
+    KVCacheManager mKVCache;                  //!< Sub-manager for attention KV caches
+    MambaCacheManager mMambaCache;            //!< Sub-manager for Mamba recurrent / conv states
+    std::vector<int32_t> mAbsToKVIndex;       //!< Absolute layer -> local KV index (-1 if not attention)
+    std::vector<int32_t> mAbsToMambaIndex;    //!< Absolute layer -> local Mamba index (-1 if not Mamba)
+    rt::Tensor mDeviceKVCacheLengths{};       //!< Shared KV cache lengths on device [activeBatchSize]
     int32_t mActiveBatchSize{};               //!< Number of active sequences
     bool mKVCacheAllEmpty{true};              //!< True until the first commitSequenceLength call
     std::vector<HeadDimGroup> mHeadDimGroups; //!< Pre-computed per-headDim groups for batched kernels

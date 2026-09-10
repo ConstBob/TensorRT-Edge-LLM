@@ -70,7 +70,7 @@ std::optional<ManagedKVCacheRequest> ManagedKVCacheRequest::begin(ContextCacheCo
             && context.rawBatchedInputIds.size() == static_cast<size_t>(context.activeBatchSize),
         "Bounded SWA admission requires one raw input per active sequence");
     BoundedSwaKVPageManager::BeginRequestResult admitted
-        = swaPageManager->beginRequest(context.activeBatchSize, context.stream);
+        = swaPageManager->beginRequest(context.residentRefs, context.stream);
     if (!swaOperationSucceeded(admitted.status, "admission") || !admitted.request.has_value())
     {
         return std::nullopt;
@@ -198,16 +198,16 @@ bool ManagedKVCacheRequest::completeBatchCompaction(std::vector<int32_t> const& 
 }
 
 ContextCacheRequest::AdmitSequenceStatus ManagedKVCacheRequest::admitSequence(std::vector<int32_t> const& tokenIds,
-    std::string const& loraWeightsName, DecodingKvHeadroom const& headroom, int32_t& prefillStart, cudaStream_t stream,
-    std::vector<int32_t> const& mediaTokenIds, std::vector<imageUtils::ImageData> const& imageBuffers,
-    std::vector<audioUtils::AudioData> const& audioBuffers)
+    std::string const& loraWeightsName, DecodingKvHeadroom const& headroom, int32_t& prefillStart, ResidentRef resident,
+    cudaStream_t stream, std::vector<int32_t> const& mediaTokenIds,
+    std::vector<imageUtils::ImageData> const& imageBuffers, std::vector<audioUtils::AudioData> const& audioBuffers)
 {
     if (!hasContextReuse())
     {
         return ContextCacheRequest::AdmitSequenceStatus::kFailed;
     }
     return contextRequest().admitSequence(
-        tokenIds, loraWeightsName, headroom, prefillStart, stream, mediaTokenIds, imageBuffers, audioBuffers);
+        tokenIds, loraWeightsName, headroom, prefillStart, resident, stream, mediaTokenIds, imageBuffers, audioBuffers);
 }
 
 bool ManagedKVCacheRequest::finalizeSequenceAdmission(
@@ -220,12 +220,13 @@ bool ManagedKVCacheRequest::finalizeSequenceAdmission(
     return contextRequest().finalizeSequenceAdmission(slot, lookaheadToken, fullInputLength);
 }
 
-void ManagedKVCacheRequest::retractSequenceAdmission()
+bool ManagedKVCacheRequest::retractSequenceAdmission() noexcept
 {
     if (hasContextReuse())
     {
-        contextRequest().retractSequenceAdmission();
+        return contextRequest().retractSequenceAdmission();
     }
+    return true;
 }
 
 bool ManagedKVCacheRequest::finish()

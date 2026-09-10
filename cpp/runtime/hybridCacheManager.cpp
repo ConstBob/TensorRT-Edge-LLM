@@ -22,6 +22,8 @@
 #include "common/pagedKvTypes.h"
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "kernels/speculative/batchEvictKernels.h"
+
+#include <exception>
 #include <unordered_map>
 
 using namespace nvinfer1;
@@ -211,6 +213,15 @@ std::pair<rt::Tensor, rt::Tensor> HybridCacheManager::getSeparateKVCache(int32_t
     return mKVCache.getSeparateKVCache(localIdx);
 }
 
+KVLayerStorageMetadata HybridCacheManager::getKVLayerStorageMetadata(int32_t absLayerIdx) const
+{
+    check::check(absLayerIdx >= 0 && absLayerIdx < static_cast<int32_t>(mAbsToKVIndex.size()),
+        "getKVLayerStorageMetadata: absolute layer index is out of range.");
+    int32_t const localIdx = mAbsToKVIndex[absLayerIdx];
+    check::check(localIdx >= 0, "getKVLayerStorageMetadata: layer is not an attention layer.");
+    return mKVCache.getLayerStorageMetadata(localIdx);
+}
+
 rt::Tensor& HybridCacheManager::getRecurrentState(int32_t absLayerIdx)
 {
     check::check(absLayerIdx >= 0 && absLayerIdx < static_cast<int32_t>(mAbsToMambaIndex.size()),
@@ -342,6 +353,32 @@ void HybridCacheManager::setActiveBatchSize(int32_t newActiveBatchSize)
     check::check(mDeviceKVCacheLengths.reshape({mActiveBatchSize}), "Tensor reshape failed");
 }
 
+void HybridCacheManager::restoreActiveBatchSize(int32_t activeBatchSize) noexcept
+{
+    mActiveBatchSize = activeBatchSize;
+    bool const reshaped = mDeviceKVCacheLengths.reshape({activeBatchSize});
+    if (!reshaped)
+    {
+        std::terminate();
+    }
+}
+
+void HybridCacheManager::materializeExecutionLengths(rt::Tensor const& executionLengths, cudaStream_t stream)
+{
+    check::check(executionLengths.getDeviceType() == DeviceType::kGPU, "Execution lengths tensor shall reside on GPU.");
+    check::check(
+        executionLengths.getDataType() == DataType::kINT32, "Execution lengths tensor shall have data type int32_t.");
+    check::check(executionLengths.getShape().getNumDims() == 1, "Execution lengths tensor shall be one-dimensional.");
+    int32_t const batchSize = static_cast<int32_t>(executionLengths.getShape()[0]);
+    check::check(batchSize > 0 && batchSize <= mConfig.maxBatchSize,
+        "Execution lengths batch size must be in range [1, maxBatchSize].");
+
+    mActiveBatchSize = batchSize;
+    check::check(mDeviceKVCacheLengths.reshape({batchSize}), "Tensor reshape failed");
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceKVCacheLengths.rawPointer(), executionLengths.rawPointer(),
+        static_cast<size_t>(batchSize) * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+}
+
 bool HybridCacheManager::getKVCacheAllEmpty() const noexcept
 {
     return mKVCacheAllEmpty;
@@ -351,109 +388,20 @@ bool HybridCacheManager::getKVCacheAllEmpty() const noexcept
 // Compaction
 // ------------------------------------------------------------------
 
-void HybridCacheManager::compactBatch(
+void HybridCacheManager::compactKVCacheLengths(
     rt::Tensor const& batchMapping, int32_t oldBatch, int32_t newBatch, cudaStream_t stream)
 {
-    check::check(!mKVCache.hasReducedKVCache(),
-        "HybridCacheManager::compactBatch cannot compact a reduced SWA pool; use the page-table-backed runtime "
-        "adapter path.");
-
-    // Compaction moves only each full-capacity layer's live prefix. Reduced pools are maintained by
-    // their page table and never participate in this dense active-slot operation.
-    for (auto const& group : mHeadDimGroups)
-    {
-        auto const* layerInfos = static_cast<kernel::KVLayerInfo const*>(group.deviceLayerInfos.rawPointer());
-        kernel::compactKVCacheBatched(layerInfos, batchMapping, mDeviceKVCacheLengths, group.numLayers, group.headDim,
-            mKVCache.numPages(), mConfig.kvConfig.kvCacheType, oldBatch, newBatch, stream);
-    }
-
-    compactBatchSlotState(batchMapping, oldBatch, newBatch, stream);
-}
-
-void HybridCacheManager::swapSlotState(int32_t slotA, int32_t slotB, cudaStream_t stream)
-{
-    // The lengths tensor is kept reshaped to the active batch, so this bound is "resident slots",
-    // which is the only range a swap makes sense over anyway.
-    auto const activeBatch = static_cast<int32_t>(mDeviceKVCacheLengths.getShape()[0]);
-    ELLM_CHECK(slotA >= 0 && slotA < activeBatch && slotB >= 0 && slotB < activeBatch,
-        "HybridCacheManager::swapSlotState: slot is out of range.");
-    ELLM_CHECK(mMambaCache.numLayers() == 0,
-        "HybridCacheManager::swapSlotState: Mamba state is per-slot by value and is not relocatable this way.");
-    if (slotA == slotB)
-    {
-        return;
-    }
-
-    // Two int32s exchanged entirely on the device: scratch <- a, a <- b, b <- scratch. Nothing
-    // bounces through the host, so the swap enqueues onto the stream without one synchronization
-    // and stays ordered against the caller's surrounding work by the stream itself.
-    if (mLengthSwapScratch.isEmpty())
-    {
-        mLengthSwapScratch
-            = rt::Tensor({1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "hybridCache::lengthSwapScratch");
-    }
-    int32_t* const device = mDeviceKVCacheLengths.dataPointer<int32_t>();
-    int32_t* const scratch = mLengthSwapScratch.dataPointer<int32_t>();
-    CUDA_CHECK(cudaMemcpyAsync(scratch, device + slotA, sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(device + slotA, device + slotB, sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(device + slotB, scratch, sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
-}
-
-void HybridCacheManager::setSlotLength(int32_t slot, int32_t length, cudaStream_t stream)
-{
-    auto const activeBatch = static_cast<int32_t>(mDeviceKVCacheLengths.getShape()[0]);
-    ELLM_CHECK(slot >= 0 && slot < activeBatch, "HybridCacheManager::setSlotLength: slot is out of range.");
-    ELLM_CHECK(mMambaCache.numLayers() == 0,
-        "HybridCacheManager::setSlotLength: Mamba state is per-slot by value; its rows cannot be reseeded this way.");
-    ELLM_CHECK(length >= 0, "HybridCacheManager::setSlotLength: length must be non-negative.");
-
-    // Pinned staging (Tensor's CPU allocation is cudaMallocHost), so the upload is a genuinely
-    // asynchronous copy. The synchronize guards the staging buffer's reuse by the next call, not
-    // the copy's visibility -- stream order already provides that.
-    if (mLengthStaging.isEmpty())
-    {
-        mLengthStaging
-            = rt::Tensor({1}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "hybridCache::lengthStaging");
-    }
-    *mLengthStaging.dataPointer<int32_t>() = length;
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceKVCacheLengths.dataPointer<int32_t>() + slot,
-        mLengthStaging.dataPointer<int32_t>(), sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    if (length > 0)
-    {
-        mKVCacheAllEmpty = false;
-    }
-}
-
-void HybridCacheManager::compactBatchSlotState(
-    rt::Tensor const& batchMapping, int32_t oldBatch, int32_t newBatch, cudaStream_t stream)
-{
-
-    // Compact the shared KV cache lengths tensor separately after all layers are done.
+    check::check(mActiveBatchSize == oldBatch, "KV length compaction old batch does not match the active batch size");
+    check::check(mDeviceKVCacheLengths.reshape({oldBatch}), "Tensor reshape failed");
     kernel::compactTensorBatch(mDeviceKVCacheLengths, batchMapping, mDeviceKVCacheLengths, oldBatch, newBatch, stream);
+    check::check(mDeviceKVCacheLengths.reshape({newBatch}), "Tensor reshape failed");
+    mActiveBatchSize = newBatch;
+}
 
-    // Compact Mamba recurrent and conv states.
-    // compactTensorBatch asserts shape[0] == oldBatch, but Mamba tensors are allocated with
-    // shape[0] == maxBatchSize. Reshape to [oldBatch, ...] before compaction and [newBatch, ...] after.
-    auto const& mambaConfig = mMambaCache.getConfig();
-    for (int32_t i = 0; i < mMambaCache.numLayers(); ++i)
-    {
-        rt::Tensor& recState = mMambaCache.getRecurrentState(i);
-        check::check(recState.reshape({oldBatch, mambaConfig.recurrentStateNumHeads, mambaConfig.recurrentStateHeadDim,
-                         mambaConfig.recurrentStateSize}),
-            "Tensor reshape failed");
-        kernel::compactTensorBatch(recState, batchMapping, recState, oldBatch, newBatch, stream);
-        check::check(recState.reshape({mambaConfig.maxBatchSize, mambaConfig.recurrentStateNumHeads,
-                         mambaConfig.recurrentStateHeadDim, mambaConfig.recurrentStateSize}),
-            "Tensor reshape failed");
-
-        rt::Tensor& convState = mMambaCache.getConvState(i);
-        check::check(
-            convState.reshape({oldBatch, mambaConfig.convDim, mambaConfig.convKernel}), "Tensor reshape failed");
-        kernel::compactTensorBatch(convState, batchMapping, convState, oldBatch, newBatch, stream);
-        check::check(convState.reshape({mambaConfig.maxBatchSize, mambaConfig.convDim, mambaConfig.convKernel}),
-            "Tensor reshape failed");
-    }
+void HybridCacheManager::clearResidentSlot(int32_t slot, cudaStream_t stream)
+{
+    check::check(slot >= 0 && slot < mConfig.maxBatchSize, "Resident cache slot is out of range.");
+    mMambaCache.clearSlot(slot, stream);
 }
 
 // ------------------------------------------------------------------

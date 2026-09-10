@@ -56,7 +56,7 @@ _attention_plugin_schema = OpSchema(
         OpSchema.FormalParameter(
             name="qkv",
             description=
-            "Packed QKV tensor [B, S, (H_q + 2*H_kv) * D] (concat on last "
+            "Packed QKV tensor [T_exec, (H_q + 2*H_kv) * D] (concat on last "
             "dim of separate Q/K/V projections)",
             type_str="T",
         ),
@@ -66,8 +66,8 @@ _attention_plugin_schema = OpSchema(
             type_str="T_KV",
         ),
         OpSchema.FormalParameter(
-            name="context_lengths",
-            description="Context length tensor",
+            name="query_lengths",
+            description="Valid query tokens per sequence",
             type_str="tensor(int32)",
         ),
         OpSchema.FormalParameter(
@@ -76,9 +76,8 @@ _attention_plugin_schema = OpSchema(
             type_str="tensor(float)",
         ),
         OpSchema.FormalParameter(
-            name="kvcache_start_index",
-            description=
-            "KV cache start index tensor of shape [kv_cache_start_batch_size]",
+            name="past_lengths",
+            description="Committed prefix visible before this invocation",
             type_str="tensor(int32)",
         ),
         OpSchema.FormalParameter(
@@ -143,11 +142,24 @@ _attention_plugin_schema = OpSchema(
         OpSchema.FormalParameter(
             name="attention_sinks",
             description=
-            "Per-Q-head learned attention sink logits (FP32, 1-D, length == "
-            "num_q_heads, ordered [num_kv_heads][q_heads_per_kv]). Fed as a "
-            "Constant initializer so TRT bakes it into the engine as weights at "
-            "build time. Optional: only wired when enable_attention_sink=1.",
+            "Per-Q-head learned attention sink logits supplied as an FP32 engine-weight constant",
             type_str="tensor(float)",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
+        *[
+            OpSchema.FormalParameter(
+                name=name,
+                description="Unified token-major execution metadata",
+                type_str="tensor(int32)",
+                param_option=OpSchema.FormalParameterOption.Optional,
+            ) for name in ("query_start_offsets", "attention_sequence_lengths",
+                           "execution_phase_marker")
+        ],
+        OpSchema.FormalParameter(
+            name="context_sequence_count_carrier",
+            description=
+            "Shape-only context sequence count carrier; payload is ignored",
+            type_str="tensor(int32)",
             param_option=OpSchema.FormalParameterOption.Optional,
         ),
     ],
@@ -176,6 +188,10 @@ _attention_plugin_schema = OpSchema(
         ),
     ],
     attributes=[
+        OpSchema.Attribute(name="plugin_version",
+                           type=OpSchema.AttrType.STRING,
+                           description="TensorRT Attention plugin version",
+                           required=True),
         OpSchema.Attribute(
             name="num_q_heads",
             type=OpSchema.AttrType.INT,
@@ -289,26 +305,21 @@ _attention_plugin_schema = OpSchema(
             type=OpSchema.AttrType.INT,
             description=
             "Whether this layer reads K/V from a donated (shared) cache; the packed qkv "
-            "input then carries Q only [B, S, Hq*D] (0(false), 1(true)).",
+            "input then carries Q only [T_exec, Hq*D] (0(false), 1(true)).",
             required=False,
         ),
         OpSchema.Attribute(
             name="enable_contiguous_query_swa",
             type=OpSchema.AttrType.INT,
             description=
-            "Whether this layer's speculative query block occupies CONSECUTIVE positions "
-            "(a linear proposal chain, e.g. DSpark) (0(false), 1(true)). The contiguous-query "
-            "XQA sliding-window variant reconstructs each row's position as "
-            "firstQueryPosition + queryRow, so tree-shaped drafts (EAGLE) must leave this off.",
+            "Whether speculative query rows form a consecutive linear chain for SWA",
             required=False,
         ),
         OpSchema.Attribute(
             name="enable_attention_sink",
             type=OpSchema.AttrType.INT,
             description=
-            "Whether a learned per-Q-head attention sink is merged into the softmax "
-            "denominator (0(false), 1(true)). When 1, the attention_sinks optional "
-            "input must be wired. Only the XQA decode path implements sinks.",
+            "Whether the learned per-query-head attention sink input is enabled",
             required=False,
         ),
     ],
@@ -967,15 +978,30 @@ _causal_conv1d_schema = OpSchema(
         OpSchema.FormalParameter(name="conv_state",
                                  description="Conv state",
                                  type_str="T"),
-        OpSchema.FormalParameter(name="context_lengths",
-                                 description="Context lengths per batch",
-                                 type_str="T_CL"),
         OpSchema.FormalParameter(
-            name="spec_decode_metadata",
-            description=
-            "Optional speculative metadata: spec_verify_phase_marker, tree_parent_ids, tree_depths",
-            type_str="T_CL",
-            param_option=OpSchema.FormalParameterOption.Variadic),
+            name="query_lengths",
+            description="Valid query lengths per sequence",
+            type_str="T_CL"),
+        *[
+            OpSchema.FormalParameter(
+                name=name,
+                description="Token-major execution metadata",
+                type_str="T_CL")
+            for name in ("query_start_offsets", "state_indices",
+                         "execution_phase_marker")
+        ],
+        OpSchema.FormalParameter(
+            name="context_sequence_count_carrier",
+            description="Shape-only context sequence count carrier",
+            type_str="tensor(int32)"),
+        *[
+            OpSchema.FormalParameter(
+                name=name,
+                description="Optional DDTree metadata",
+                type_str="T_CL",
+                param_option=OpSchema.FormalParameterOption.Optional)
+            for name in ("tree_parent_ids", "tree_depths")
+        ],
     ],
     outputs=[
         OpSchema.FormalParameter(name="output",
@@ -986,7 +1012,7 @@ _causal_conv1d_schema = OpSchema(
                                  type_str="T"),
         OpSchema.FormalParameter(
             name="intermediate_conv_state_out",
-            description="Per-token conv states [batch, seq, dim, width]",
+            description="Per-token conv states [T_exec, dim, width]",
             type_str="T",
             param_option=OpSchema.FormalParameterOption.Optional),
     ],
@@ -995,6 +1021,10 @@ _causal_conv1d_schema = OpSchema(
         ("T_CL", ["tensor(int32)"], ""),
     ],
     attributes=[
+        OpSchema.Attribute(name="plugin_version",
+                           type=OpSchema.AttrType.STRING,
+                           description="TensorRT CausalConv plugin version",
+                           required=True),
         OpSchema.Attribute(name="stride",
                            type=OpSchema.AttrType.INT,
                            description="Stride",
@@ -1055,20 +1085,35 @@ _update_ssm_state_schema = OpSchema(
         OpSchema.FormalParameter(name="state",
                                  description="SSM state",
                                  type_str="T"),
-        OpSchema.FormalParameter(name="context_lengths",
-                                 description="Context lengths per batch",
-                                 type_str="T_CL"),
         OpSchema.FormalParameter(
-            name="state_start_index",
-            description=
-            "[0] initial-prefill sentinel or [batch] restored-state marker",
+            name="query_lengths",
+            description="Logical token count per sequence",
             type_str="T_CL"),
         OpSchema.FormalParameter(
-            name="spec_decode_metadata",
+            name="query_start_offsets",
+            description="Exclusive token-major offsets with shape [N + 1]",
+            type_str="T_CL"),
+        OpSchema.FormalParameter(
+            name="state_indices",
+            description="Resident state-pool row per active sequence",
+            type_str="T_CL"),
+        OpSchema.FormalParameter(
+            name="execution_phase_marker",
             description=
-            "Optional speculative metadata: spec_verify_phase_marker, tree_parent_ids, tree_depths",
-            type_str="T_CL",
-            param_option=OpSchema.FormalParameterOption.Variadic),
+            "Shape-only INT32 execution-phase carrier with extent 1..8",
+            type_str="T_CL"),
+        OpSchema.FormalParameter(
+            name="context_sequence_count_carrier",
+            description="Shape-only context sequence count carrier",
+            type_str="tensor(int32)"),
+        *[
+            OpSchema.FormalParameter(
+                name=name,
+                description="Optional DDTree metadata",
+                type_str="T_CL",
+                param_option=OpSchema.FormalParameterOption.Optional)
+            for name in ("tree_parent_ids", "tree_depths")
+        ],
     ],
     outputs=[
         OpSchema.FormalParameter(name="output",
@@ -1080,25 +1125,25 @@ _update_ssm_state_schema = OpSchema(
         OpSchema.FormalParameter(
             name="replay_da",
             description="Optional spec-verify replay stash: per-token decay "
-            "dA [batch, seq, nheads] FP32",
+            "dA [T_exec, nheads] FP32",
             type_str="T_F32",
             param_option=OpSchema.FormalParameterOption.Optional),
         OpSchema.FormalParameter(
             name="replay_u",
-            description="Optional spec-verify replay stash: per-token input "
-            "factor u=dt*x [batch, seq, nheads, dim] FP32",
+            description="Optional spec-verify replay stash: per-token "
+            "unscaled input x [T_exec, nheads, dim] FP32",
             type_str="T_F32",
             param_option=OpSchema.FormalParameterOption.Optional),
         OpSchema.FormalParameter(
             name="replay_b",
             description="Optional spec-verify replay stash: per-token key "
-            "B [batch, seq, ngroups, dstate] FP32",
+            "B [T_exec, ngroups, dstate] FP32",
             type_str="T_F32",
             param_option=OpSchema.FormalParameterOption.Optional),
         OpSchema.FormalParameter(
             name="replay_dt",
             description="Optional spec-verify replay stash: per-token dt "
-            "[batch, seq, nheads] FP32",
+            "[T_exec, nheads] FP32",
             type_str="T_F32",
             param_option=OpSchema.FormalParameterOption.Optional),
     ],
@@ -1109,6 +1154,10 @@ _update_ssm_state_schema = OpSchema(
         ("T_F32", ["tensor(float)"], ""),
     ],
     attributes=[
+        OpSchema.Attribute(name="plugin_version",
+                           type=OpSchema.AttrType.STRING,
+                           description="TensorRT Mamba plugin version",
+                           required=True),
         OpSchema.Attribute(name="dt_softplus",
                            type=OpSchema.AttrType.INT,
                            description="Apply softplus to dt",
@@ -1378,19 +1427,19 @@ _gated_delta_net_schema = OpSchema(
     doc="Qwen3.5 GatedDeltaNet linear attention plugin.",
     inputs=[
         OpSchema.FormalParameter(name="q",
-                                 description="Query [n, seq, h, k]",
+                                 description="Query [T_exec, h, k]",
                                  type_str="T"),
         OpSchema.FormalParameter(name="k",
-                                 description="Key [n, seq, h, k]",
+                                 description="Key [T_exec, h, k]",
                                  type_str="T"),
         OpSchema.FormalParameter(name="v",
-                                 description="Value [n, seq, hv, v]",
+                                 description="Value [T_exec, hv, v]",
                                  type_str="T"),
         OpSchema.FormalParameter(name="a",
-                                 description="A gating tensor [n, seq, hv]",
+                                 description="A gating tensor [T_exec, hv]",
                                  type_str="T"),
         OpSchema.FormalParameter(name="b",
-                                 description="B gating tensor [n, seq, hv]",
+                                 description="B gating tensor [T_exec, hv]",
                                  type_str="T"),
         OpSchema.FormalParameter(name="A_log",
                                  description="A_log [hv]",
@@ -1400,30 +1449,44 @@ _gated_delta_net_schema = OpSchema(
                                  type_str="T"),
         OpSchema.FormalParameter(
             name="h0_source",
-            description="Recurrent state in [n, hv, k, v]",
+            description="Resident recurrent-state pool [R_pool, hv, k, v]",
             type_str="T_A"),
         OpSchema.FormalParameter(
-            name="context_lengths",
-            description="Valid token count per batch row [n]",
+            name="query_lengths",
+            description="Valid query count per execution sequence [N]",
             type_str="T_CL"),
+        *[
+            OpSchema.FormalParameter(
+                name=name,
+                description="Token-major execution metadata",
+                type_str="T_CL")
+            for name in ("query_start_offsets", "state_indices",
+                         "execution_phase_marker")
+        ],
         OpSchema.FormalParameter(
-            name="spec_decode_metadata",
-            description=
-            "Optional speculative metadata: spec_verify_phase_marker, tree_parent_ids, tree_depths",
-            type_str="T_CL",
-            param_option=OpSchema.FormalParameterOption.Variadic),
+            name="context_sequence_count_carrier",
+            description="Shape-only context sequence count carrier",
+            type_str="tensor(int32)"),
+        *[
+            OpSchema.FormalParameter(
+                name=name,
+                description="Optional DDTree metadata",
+                type_str="T_CL",
+                param_option=OpSchema.FormalParameterOption.Optional)
+            for name in ("tree_parent_ids", "tree_depths")
+        ],
     ],
     outputs=[
         OpSchema.FormalParameter(name="o",
-                                 description="Output [n, seq, hv, v]",
+                                 description="Output [T_exec, hv, v]",
                                  type_str="T"),
         OpSchema.FormalParameter(
             name="h0_out",
-            description="Recurrent state out [n, hv, k, v]",
+            description="Aliased resident-state pool [R_pool, hv, k, v]",
             type_str="T_A"),
         OpSchema.FormalParameter(
             name="intermediate_h0_out",
-            description="Per-token recurrent states [n, seq, hv, k, v]",
+            description="Per-token recurrent states [T_exec, hv, k, v]",
             type_str="T_A",
             param_option=OpSchema.FormalParameterOption.Optional),
     ],
@@ -1433,6 +1496,10 @@ _gated_delta_net_schema = OpSchema(
         ("T_CL", ["tensor(int32)"], ""),
     ],
     attributes=[
+        OpSchema.Attribute(name="plugin_version",
+                           type=OpSchema.AttrType.STRING,
+                           description="TensorRT GDN plugin version",
+                           required=True),
         OpSchema.Attribute(name="k_dim",
                            type=OpSchema.AttrType.INT,
                            description="K head dimension",
@@ -1452,6 +1519,11 @@ _gated_delta_net_schema = OpSchema(
             type=OpSchema.AttrType.INT,
             description=
             "Whether tree_parent_ids/tree_depths drive tree-state execution; also enables intermediate state output",
+            required=False),
+        OpSchema.Attribute(
+            name="use_diffusion_state",
+            type=OpSchema.AttrType.INT,
+            description="Enable transactional diffusion denoise/commit phases",
             required=False),
     ],
 )
@@ -1906,12 +1978,12 @@ _dflash_target_kv_cache_update_schema = OpSchema(
     inputs=[
         OpSchema.FormalParameter(
             name="k_delta",
-            description="K delta [B, L, Hkv, D] after k_norm, no RoPE",
+            description="K delta [T_delta, Hkv, D] after k_norm, no RoPE",
             type_str="T",
         ),
         OpSchema.FormalParameter(
             name="v_delta",
-            description="V delta [B, L, Hkv, D]",
+            description="V delta [T_delta, Hkv, D]",
             type_str="T",
         ),
         OpSchema.FormalParameter(
@@ -1921,19 +1993,19 @@ _dflash_target_kv_cache_update_schema = OpSchema(
             type_str="T",
         ),
         OpSchema.FormalParameter(
-            name="rope_cos_sin",
-            description="RoPE cos/sin [ropeBatch, capacity, rotaryDim] FP32",
+            name="token_aligned_rope_cos_sin",
+            description="RoPE cos/sin [T_delta, rotaryDim] FP32",
             type_str="tensor(float)",
         ),
         OpSchema.FormalParameter(
-            name="delta_start_positions",
-            description="Start positions for delta write [B] INT32",
+            name="delta_positions",
+            description="Absolute positions [T_delta] INT32; padding is -1",
             type_str="tensor(int32)",
         ),
         OpSchema.FormalParameter(
-            name="delta_lengths",
+            name="delta_token_to_sequence",
             description=
-            "Per-batch delta lengths [B] INT32 for multi-batch guard",
+            "Execution sequence owner [T_delta] INT32; padding is -1",
             type_str="tensor(int32)",
         ),
         OpSchema.FormalParameter(
