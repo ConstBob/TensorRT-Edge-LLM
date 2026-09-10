@@ -978,8 +978,8 @@ bool RuntimeCoordinator::dispatchRequest(LLMGenerationRequest const& request, bo
 
 bool RuntimeCoordinator::supportsSteppedExecution() const noexcept
 {
-    // Inline single-rank in this change; the thread-parallel command stream arrives with the
-    // integration part of this series.
+    // Single rank only in this release: the stepped step decisions are not yet carried to the
+    // other ranks of a tensor-parallel deployment.
     return mInlineSingleRank;
 }
 

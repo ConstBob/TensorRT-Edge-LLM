@@ -131,7 +131,7 @@ public:
     //! threads. MPI-launched ranks are other processes and are not covered.
     bool supportsBoundaryScheduling() const noexcept;
 
-    //! True when this runtime can hand out stepped requests (inline single-rank in this stage).
+    //! True when this runtime can hand out stepped requests (inline single-rank only in this release).
     bool supportsSteppedExecution() const noexcept;
 
     //! Open one request under the stepped control plane; see RuntimeCoordinator::beginStepped.

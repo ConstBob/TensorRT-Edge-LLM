@@ -24,8 +24,10 @@
 
 #include "substituteEngine.h"
 
+#include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRankRuntime.h"
 #include "runtime/runtimeStepper.h"
+#include "scheduler/requestEngine.h"
 
 using namespace trt_edgellm;
 using namespace substitute_engine;
@@ -924,6 +926,91 @@ TEST_F(RuntimeAssemblyTest, AdmitsASecondSequenceMidFlightAndKeepsBothTokenStrea
     EXPECT_EQ(resultB.terminalReason, rt::FinishReason::kLength);
 }
 
+// ---------------------------------------------------------------------------
+// Shutdown ordering under leases: the one path whose failure mode is
+// std::terminate. An engine owning a context-cache runtime shuts down with a
+// founder decoding, a mid-flight admission holding a lease, and a request
+// still queued. Every caller must get a terminal outcome, and the coordinator
+// must reach its destructor quiescent -- it terminates the process otherwise,
+// so this test passing IS the proof that every lease came back.
+// ---------------------------------------------------------------------------
+TEST_F(RuntimeAssemblyTest, ShutdownWithResidentLeasesReturnsEveryOutcomeAndEveryLease)
+{
+    using ::testing::_;
+
+    auto engine = makeEngine();
+    // Every forward pass emits token 3 for row 0 and lets other rows tie-break to 0; the pace
+    // gives shutdown a wide mid-generation window to land in.
+    ON_CALL(*engine, execute(_)).WillByDefault([this](cudaStream_t stream) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        writeLogits(*mLogits, kVocabSize, {3}, stream);
+        return true;
+    });
+
+    auto artifacts = makeVanillaArtifacts(mModelDir, std::move(engine), mStream);
+    auto runtime = std::make_unique<rt::LLMInferenceRuntime>(std::move(artifacts), mModelDir.string(),
+        /*multimodalEngineDir=*/"", std::unordered_map<std::string, std::string>{}, std::nullopt, mStream,
+        rt::ContextCacheConfig{/*enabled=*/true, /*maxRecords=*/16});
+
+    rt::scheduler::EngineConfig config;
+    config.maxBatchSize = 2;
+    rt::scheduler::RequestEngine requestEngine(std::move(runtime), mStream, config);
+
+    // Generation lengths are sized to the page pool: 4 pages of 16 tokens serve two sequences of
+    // (prompt + 12 + headroom) each, so the joiner's lease is grantable while the founder runs.
+    // A larger ask never fails loudly -- the joiner waits on kNoCapacity forever, by design.
+    // The assembly tokenizer is an empty shell, so every request carries pre-tokenized input --
+    // the path admitRequest prefers anyway.
+    auto const makeTokenizedRequest = [](std::vector<int32_t> tokenIds, int64_t maxGenerateLength) {
+        rt::LLMGenerationRequest request = makeGreedyRequest("x", maxGenerateLength);
+        request.preTokenizedInputIds = {std::move(tokenIds)};
+        return request;
+    };
+
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    rt::scheduler::RequestHandle founder = requestEngine.submit(makeTokenizedRequest({41}, 12));
+    while (requestEngine.resident() == 0)
+    {
+        ASSERT_LT(std::chrono::steady_clock::now(), deadline) << "the founder never became resident";
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    rt::scheduler::RequestHandle joiner = requestEngine.submit(makeTokenizedRequest({42}, 12));
+    while (requestEngine.metrics().admittedMidFlight == 0)
+    {
+        if (joiner.ready())
+        {
+            try
+            {
+                joiner.get();
+                FAIL() << "the joiner completed without ever being admitted mid-flight";
+            }
+            catch (std::exception const& error)
+            {
+                FAIL() << "the joiner was rejected: " << error.what();
+            }
+        }
+        ASSERT_LT(std::chrono::steady_clock::now(), deadline)
+            << "the joiner was never admitted (stallsNoCapacity=" << requestEngine.metrics().stallsNoCapacity
+            << ", stallsIncompatible=" << requestEngine.metrics().stallsIncompatible
+            << ", resident=" << requestEngine.resident() << ", queued=" << requestEngine.queued() << ")";
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    // The batch is full (maxBatchSize 2), so this one stays queued until shutdown abandons it --
+    // unless the batch drains first, in which case it founds and is cancelled mid-run. Both are
+    // legitimate shutdown paths; what matters below is that every caller gets an outcome.
+    rt::scheduler::RequestHandle queued = requestEngine.submit(makeTokenizedRequest({43}, 12));
+
+    requestEngine.shutdown(rt::scheduler::ShutdownMode::kCancel);
+
+    // Nobody is left parked: every handle has a terminal outcome the moment shutdown returns.
+    EXPECT_TRUE(founder.ready());
+    EXPECT_TRUE(joiner.ready());
+    EXPECT_TRUE(queued.ready());
+
+    // Scope exit destroys the engine, then the runtime, then the coordinator, whose destructor
+    // proves quiescence or terminates. Reaching the end of this test is the assertion.
+}
+
 TEST_F(RuntimeAssemblyTest, SteppedAdmissionMatchesTheFusedPathTokenForToken)
 {
     using ::testing::_;
@@ -1207,4 +1294,126 @@ TEST_F(RuntimeAssemblyTest, ASteppedRequestRunsEndToEndWithoutTheHook)
 
     rt::LLMGenerationResponse response;
     EXPECT_TRUE(stepped->finish(response));
+}
+
+TEST_F(RuntimeAssemblyTest, TheEngineDrivesTheSteppedPlaneEndToEnd)
+{
+    using ::testing::_;
+
+    // The full stack, no hook anywhere: RequestEngine's actor owns the loop, the runtime executes
+    // typed steps, and both callers get their serial token streams back through handles.
+    constexpr int64_t kMaxGenerateLength{4};
+    constexpr int32_t kA1 = 3, kA2 = 4, kA3 = 5, kA4 = 6;
+    constexpr int32_t kB1 = 7, kB2 = 8, kB3 = 9, kB4 = 10;
+
+    auto engine = makeEngine();
+    auto& mock = *engine;
+    std::atomic<bool> aSecondDecodeStarted{false};
+    std::atomic<bool> bQueued{false};
+    EXPECT_CALL(mock, prepare(kPrefillProfile, _, _, _)).Times(2);
+    EXPECT_CALL(mock, prepare(kDecodeProfile, _, _, _)).Times(4);
+    {
+        ::testing::InSequence forwardOrder;
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kA1})); // founding prefill
+        // Two-way handshake for a deterministic interleave: B is submitted only once A's first
+        // decode is already executing (so no earlier tick can admit it), and that decode holds
+        // until B is queued (so the very next tick does).
+        EXPECT_CALL(mock, execute(_))
+            .WillOnce([this, &aSecondDecodeStarted, &bQueued, action = emit({kA2})](cudaStream_t stream) {
+                aSecondDecodeStarted.store(true, std::memory_order_release);
+                while (!bQueued.load(std::memory_order_acquire))
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                return action(stream);
+            });
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kB1})); // B's seated prefill tick
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kA3, kB2}));
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kA4, kB3})); // A finishes, evicted
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kB4}));      // B finishes
+    }
+
+    auto artifacts = makeVanillaArtifacts(mModelDir, std::move(engine), mStream);
+    auto runtime = std::make_unique<rt::LLMInferenceRuntime>(std::move(artifacts), mModelDir.string(),
+        /*multimodalEngineDir=*/"", std::unordered_map<std::string, std::string>{}, std::nullopt, mStream);
+    ASSERT_TRUE(runtime->supportsSteppedExecution());
+
+    rt::scheduler::EngineConfig config;
+    config.maxBatchSize = 2;
+    rt::scheduler::RequestEngine requestEngine(std::move(runtime), mStream, config);
+
+    rt::scheduler::RequestHandle handleA = requestEngine.submit(makeGreedyRequest("a", kMaxGenerateLength));
+    while (!aSecondDecodeStarted.load(std::memory_order_acquire))
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    rt::LLMGenerationRequest requestB = makeGreedyRequest("b", kMaxGenerateLength);
+    requestB.preTokenizedInputIds = {{43}};
+    rt::scheduler::RequestHandle handleB = requestEngine.submit(std::move(requestB));
+    bQueued.store(true, std::memory_order_release);
+
+    rt::LLMGenerationResponse const responseA = handleA.get();
+    rt::LLMGenerationResponse const responseB = handleB.get();
+    ASSERT_EQ(responseA.outputIds.size(), 1U);
+    EXPECT_EQ(responseA.outputIds.front(), (std::vector<int32_t>{kA1, kA2, kA3, kA4}));
+    EXPECT_EQ(responseA.finishReasons.front(), rt::FinishReason::kLength);
+    ASSERT_EQ(responseB.outputIds.size(), 1U);
+    EXPECT_EQ(responseB.outputIds.front(), (std::vector<int32_t>{kB1, kB2, kB3, kB4}));
+    EXPECT_EQ(responseB.finishReasons.front(), rt::FinishReason::kLength);
+
+    requestEngine.shutdown(rt::scheduler::ShutdownMode::kDrain);
+    auto const metrics = requestEngine.metrics();
+    EXPECT_EQ(metrics.completed, 2U);
+    EXPECT_EQ(metrics.admittedMidFlight, 1U) << "B must have joined mid-flight through the stepped plane";
+    EXPECT_EQ(metrics.failed, 0U);
+}
+
+TEST_F(RuntimeAssemblyTest, ASteppedDecodeThrowFailsTheBatchAndTheActorSurvives)
+{
+    using ::testing::_;
+
+    // A CUDA failure inside a stepped decode leaves the runtime as an exception. The engine must
+    // turn it into a terminal outcome for every resident and stay alive for the next request; an
+    // unwind out of the actor thread would be std::terminate.
+    constexpr int64_t kMaxGenerateLength{3};
+    constexpr int32_t kA1 = 3, kC1 = 11, kC2 = 12, kC3 = 13;
+
+    auto engine = makeEngine();
+    auto& mock = *engine;
+    EXPECT_CALL(mock, prepare(_, _, _, _)).Times(::testing::AnyNumber());
+    {
+        ::testing::InSequence forwardOrder;
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kA1})); // A's founding prefill
+        EXPECT_CALL(mock, execute(_)).WillOnce([action = emit({kA1})](cudaStream_t stream) {
+            throw std::runtime_error("device lost mid-decode");
+            return action(stream);
+        });
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kC1})); // C founds the next batch
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kC2}));
+        EXPECT_CALL(mock, execute(_)).WillOnce(emit({kC3}));
+    }
+
+    auto artifacts = makeVanillaArtifacts(mModelDir, std::move(engine), mStream);
+    auto runtime = std::make_unique<rt::LLMInferenceRuntime>(std::move(artifacts), mModelDir.string(),
+        /*multimodalEngineDir=*/"", std::unordered_map<std::string, std::string>{}, std::nullopt, mStream);
+    ASSERT_TRUE(runtime->supportsSteppedExecution());
+
+    rt::scheduler::EngineConfig config;
+    config.maxBatchSize = 2;
+    rt::scheduler::RequestEngine requestEngine(std::move(runtime), mStream, config);
+
+    rt::scheduler::RequestHandle handleA = requestEngine.submit(makeGreedyRequest("a", kMaxGenerateLength));
+    EXPECT_THROW(handleA.get(), std::runtime_error);
+
+    rt::LLMGenerationRequest requestC = makeGreedyRequest("b", kMaxGenerateLength);
+    requestC.preTokenizedInputIds = {{43}};
+    rt::scheduler::RequestHandle handleC = requestEngine.submit(std::move(requestC));
+    rt::LLMGenerationResponse const responseC = handleC.get();
+    ASSERT_EQ(responseC.outputIds.size(), 1U);
+    EXPECT_EQ(responseC.outputIds.front(), (std::vector<int32_t>{kC1, kC2, kC3}));
+
+    requestEngine.shutdown(rt::scheduler::ShutdownMode::kDrain);
+    auto const metrics = requestEngine.metrics();
+    EXPECT_EQ(metrics.failed, 1U);
+    EXPECT_EQ(metrics.completed, 1U);
 }

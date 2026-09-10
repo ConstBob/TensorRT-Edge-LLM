@@ -97,8 +97,8 @@ public:
     //! shared memory. MPI-launched ranks live in other processes and are not covered.
     bool supportsBoundaryScheduling() const noexcept;
 
-    //! True when this coordinator can hand out stepped requests: inline single-rank execution in
-    //! this stage (the stepped multi-rank command stream arrives with a later change).
+    //! True when this coordinator can hand out stepped requests: inline single-rank execution
+    //! only in this release; a tensor-parallel deployment answers false.
     bool supportsSteppedExecution() const noexcept;
 
     //! Open one request under the stepped control plane. Prepares request state, runs the

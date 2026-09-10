@@ -194,6 +194,7 @@ file(GLOB_RECURSE SAMPLER_CU_SRCS "sampler/*.cu")
 file(GLOB_RECURSE MULTIMODAL_CPP_SRCS "multimodal/*.cpp")
 file(GLOB_RECURSE ACTION_CPP_SRCS "action/*.cpp")
 file(GLOB_RECURSE RUNTIME_CPP_SRCS "runtime/*.cpp")
+file(GLOB_RECURSE SCHEDULER_CPP_SRCS "scheduler/*.cpp")
 file(GLOB_RECURSE PROFILER_CPP_SRCS "profiling/*.cpp")
 
 # Enable relocatable device code for MoE Marlin kernels
@@ -254,6 +255,7 @@ add_library(
   ${MULTIMODAL_CPP_SRCS}
   ${ACTION_CPP_SRCS}
   ${RUNTIME_CPP_SRCS}
+  ${SCHEDULER_CPP_SRCS}
   ${PROFILER_CPP_SRCS}
   ${TOKENIZER_CPP_SRCS})
 target_include_directories(edgellmCore PRIVATE ${COMMON_INCLUDE_DIRS})

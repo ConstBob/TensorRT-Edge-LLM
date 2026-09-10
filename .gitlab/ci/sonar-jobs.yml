@@ -61,7 +61,7 @@ build-sonar:
   # Scanner acquisition and SonarQube outages use EX_TEMPFAIL.
   allow_failure:
     exit_codes: 75
-  timeout: 20 minutes
+  timeout: 30 minutes
   needs:
     - job: pre_commit_checks
       artifacts: false
