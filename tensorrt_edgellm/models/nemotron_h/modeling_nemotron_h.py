@@ -64,10 +64,11 @@ from ..default.modeling_default import (OnnxSpec,
                                         _concat_hidden_in_provider_order)
 from ..linear import FP16Linear, make_linear
 from ..ops import (KV_PAGE_SIZE, attention_plugin, causal_conv1d,
-                   causal_conv1d_with_intermediate, nvfp4_a16_moe_plugin,
+                   causal_conv1d_with_intermediate,
+                   nvfp4_a16_blackwell_moe_plugin, nvfp4_a16_moe_plugin,
                    nvfp4_moe_plugin, nvfp4_moe_plugin_geforce,
                    update_ssm_state, update_ssm_state_with_intermediate,
-                   use_geforce_nvfp4_moe)
+                   use_blackwell_nvfp4_a16_moe, use_geforce_nvfp4_moe)
 
 _NVFP4_ACTIVATION_RELU2 = 4
 _NVFP4_ROUTING_MODE_SIGMOID_GROUP_TOPK = 1
@@ -621,10 +622,13 @@ class NemotronHMoEMLP(nn.Module):
         self._padded_hidden_size = self.routed_hidden_size
         self.gate = NemotronHTopkRouter(config)
 
-        # Weight-only NVFP4 (W4A16) routes the experts through the Marlin
-        # Nvfp4A16MoePlugin instead of the W4A4 CuTeDSL Nvfp4MoePlugin.
+        # W4A16 experts go through an A16 MoE plugin: Marlin by default,
+        # Nvfp4A16BlackwellMoePlugin for an explicit SM110 export target.
         self._is_a16 = config.quant.quant_type == QUANT_NVFP4_A16
-        # ReLU2 (non-gated) FC1 padded to a Marlin 128 multiple (1856 -> 1920).
+        # Latched in ``_prepare_for_export_a16``, re-checked in ``forward``.
+        self._use_blackwell_a16_moe: Optional[bool] = None
+        # ReLU2 (non-gated) FC1 padded to a 128 multiple (1856 -> 1920);
+        # Marlin takes the padded size, Blackwell the logical one.
         self._a16_moe_inter_padded = (
             ((self.moe_intermediate_size + 127) // 128) *
             128 if self._is_a16 else self.moe_intermediate_size)
@@ -692,8 +696,18 @@ class NemotronHMoEMLP(nn.Module):
         self._prepare_for_export_impl()
 
     def _prepare_for_export_a16(self) -> None:
-        """Stack routed-expert NVFP4 (W4A16) weights for ``Nvfp4A16MoePlugin``."""
-        from ...checkpoint.repacking import repack_nvfp4_a16_marlin_moe_experts
+        """Stack routed-expert NVFP4 (W4A16) weights for the A16 MoE plugin.
+
+        An explicit SM110 export target stacks into ``BLACKWELL_MOE_N128_K64_V1``
+        for ``Nvfp4A16BlackwellMoePlugin`` (FC1 N padding lives inside the
+        layout; per-expert global scales stay FP32). Every other target keeps
+        the Marlin ``Nvfp4A16MoePlugin`` stack (FC1 N and FC2 K padded to
+        ``_a16_moe_inter_padded``; FP16 pre-scaled global scales). The buffer
+        names are shared; ``forward`` re-checks the latched route.
+        """
+        from ...checkpoint.repacking import (
+            repack_nvfp4_a16_blackwell_moe_experts,
+            repack_nvfp4_a16_marlin_moe_experts)
 
         def gather(attr):
             return [getattr(e, attr)._buffers["weight"]
@@ -707,10 +721,18 @@ class NemotronHMoEMLP(nn.Module):
 
         fc1_p, fc1_s, fc1_g = gather("up_proj")
         fc2_p, fc2_s, fc2_g = gather("down_proj")
-        (fc1_qweights, fc1_block_scales, fc1_global, fc2_qweights,
-         fc2_block_scales, fc2_global) = repack_nvfp4_a16_marlin_moe_experts(
-             fc1_p, fc1_s, fc1_g, fc2_p, fc2_s, fc2_g,
-             self._a16_moe_inter_padded)
+        self._use_blackwell_a16_moe = use_blackwell_nvfp4_a16_moe()
+        if self._use_blackwell_a16_moe:
+            (fc1_qweights, fc1_block_scales, fc1_global, fc2_qweights,
+             fc2_block_scales,
+             fc2_global) = repack_nvfp4_a16_blackwell_moe_experts(
+                 fc1_p, fc1_s, fc1_g, fc2_p, fc2_s, fc2_g)
+        else:
+            (fc1_qweights, fc1_block_scales, fc1_global, fc2_qweights,
+             fc2_block_scales,
+             fc2_global) = repack_nvfp4_a16_marlin_moe_experts(
+                 fc1_p, fc1_s, fc1_g, fc2_p, fc2_s, fc2_g,
+                 self._a16_moe_inter_padded)
         self._padded_moe_intermediate_size = self._a16_moe_inter_padded
         self._padded_hidden_size = self.routed_hidden_size
 
@@ -799,30 +821,69 @@ class NemotronHMoEMLP(nn.Module):
         routed_hidden_states = self.fc1_latent_proj(hidden_states)
 
         if self._is_a16:
-            # FP16 activations end-to-end: the Marlin MoE kernel has an FP16
-            # E2M1 path, so hidden states / global scales / output stay FP16.
-            moe_out = nvfp4_a16_moe_plugin(
-                router_logits,
-                routed_hidden_states,
-                self.fc1_qweights,
-                self.fc1_block_scales,
-                self.fc1_global_scales,
-                self.fc2_qweights,
-                self.fc2_block_scales,
-                self.fc2_global_scales,
-                self._e_score_correction_bias_fp32,
-                self.n_routed_experts,
-                self.num_experts_per_tok,
-                self.routed_hidden_size,
-                self._a16_moe_inter_padded,
-                self.activation_type,
-                self.gate.n_group,
-                self.gate.topk_group,
-                int(bool(self.gate.norm_topk_prob)),
-                float(self.gate.routed_scaling_factor),
-                _NVFP4_ROUTING_MODE_SIGMOID_GROUP_TOPK,
-                self.max_routed_rows,
-            )
+            use_blackwell = use_blackwell_nvfp4_a16_moe()
+            if self._use_blackwell_a16_moe is None:
+                raise RuntimeError(
+                    "NemotronHMoEMLP NVFP4-A16 forward requires "
+                    "prepare_for_export first (no stacked expert buffers)")
+            if self._use_blackwell_a16_moe != use_blackwell:
+                raise ValueError(
+                    "NemotronHMoEMLP NVFP4-A16 plugin route changed between "
+                    f"export preparation ({self._use_blackwell_a16_moe}) and "
+                    f"forward ({use_blackwell})")
+            if use_blackwell:
+                # SM110: BLACKWELL_MOE_N128_K64_V1 buffers, FP32 global
+                # scales, and the logical intermediate size (the layout pads
+                # FC1 N internally). FP16 hidden states and output.
+                moe_out = nvfp4_a16_blackwell_moe_plugin(
+                    router_logits,
+                    routed_hidden_states,
+                    self.fc1_qweights,
+                    self.fc1_block_scales,
+                    self.fc1_global_scales,
+                    self.fc2_qweights,
+                    self.fc2_block_scales,
+                    self.fc2_global_scales,
+                    self._e_score_correction_bias_fp32,
+                    self.n_routed_experts,
+                    self.num_experts_per_tok,
+                    self.routed_hidden_size,
+                    self.moe_intermediate_size,
+                    self.activation_type,
+                    self.gate.n_group,
+                    self.gate.topk_group,
+                    int(bool(self.gate.norm_topk_prob)),
+                    float(self.gate.routed_scaling_factor),
+                    _NVFP4_ROUTING_MODE_SIGMOID_GROUP_TOPK,
+                    self.max_routed_rows,
+                    self.backend,
+                )
+            else:
+                # FP16 activations end-to-end: the Marlin MoE kernel has an
+                # FP16 E2M1 path, so hidden states / global scales / output
+                # stay FP16.
+                moe_out = nvfp4_a16_moe_plugin(
+                    router_logits,
+                    routed_hidden_states,
+                    self.fc1_qweights,
+                    self.fc1_block_scales,
+                    self.fc1_global_scales,
+                    self.fc2_qweights,
+                    self.fc2_block_scales,
+                    self.fc2_global_scales,
+                    self._e_score_correction_bias_fp32,
+                    self.n_routed_experts,
+                    self.num_experts_per_tok,
+                    self.routed_hidden_size,
+                    self._a16_moe_inter_padded,
+                    self.activation_type,
+                    self.gate.n_group,
+                    self.gate.topk_group,
+                    int(bool(self.gate.norm_topk_prob)),
+                    float(self.gate.routed_scaling_factor),
+                    _NVFP4_ROUTING_MODE_SIGMOID_GROUP_TOPK,
+                    self.max_routed_rows,
+                )
             moe_out = self.fc2_latent_proj(moe_out)
             return moe_out + self._expert_forward(self.shared_experts,
                                                   hidden_states)

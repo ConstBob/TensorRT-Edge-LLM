@@ -1059,7 +1059,7 @@ def _(q, k, v):
 
 
 # ---------------------------------------------------------------------------
-# Dense NVFP4-A16 export target selector
+# NVFP4-A16 export target selector (dense GEMM and Nemotron-H routed MoE)
 # ---------------------------------------------------------------------------
 
 _NVFP4_A16_BLACKWELL_TARGET_SM = 110
@@ -1068,11 +1068,13 @@ _NVFP4_A16_TARGET_LOGGED = False
 
 
 def set_nvfp4_a16_export_target_sm(target_sm: Optional[int]) -> None:
-    """Select the dense NVFP4-A16 plugin from an explicit export target.
+    """Select the NVFP4-A16 plugins from an explicit export target.
 
-    ``SM110`` selects ``Nvfp4A16BlackwellGemmPlugin`` and its
-    ``BLACKWELL_N128_K64_V1`` layout. Every other target, including an omitted
-    target, preserves the ``Nvfp4A16GemmPlugin`` Marlin contract. The selector
+    ``SM110`` selects ``Nvfp4A16BlackwellGemmPlugin`` (``BLACKWELL_N128_K64_V1``)
+    for dense linears and ``Nvfp4A16BlackwellMoePlugin``
+    (``BLACKWELL_MOE_N128_K64_V1``) for Nemotron-H routed experts. Every other
+    target, including an omitted target, preserves the Marlin
+    ``Nvfp4A16GemmPlugin`` / ``Nvfp4A16MoePlugin`` contracts. The selector
     intentionally never probes the export host GPU so an x86 cross-export is
     deterministic.
     """
@@ -1102,6 +1104,18 @@ def use_blackwell_nvfp4_a16_gemm() -> bool:
                    if use_blackwell else "Nvfp4A16GemmPlugin (Marlin)")
         logger.info("Dense NVFP4-A16 export target %s: %s", target, backend)
     return use_blackwell
+
+
+def use_blackwell_nvfp4_a16_moe() -> bool:
+    """Whether Nemotron-H routed NVFP4-A16 experts should use the SM110 plugin.
+
+    Reads the same explicit export target as
+    :func:`use_blackwell_nvfp4_a16_gemm` so the dense and routed W4A16 paths of
+    one export always agree. ``SM110`` selects ``Nvfp4A16BlackwellMoePlugin``
+    over ``BLACKWELL_MOE_N128_K64_V1``; every other target, including an
+    omitted one, keeps the Marlin ``Nvfp4A16MoePlugin``.
+    """
+    return _NVFP4_A16_EXPORT_TARGET_SM == _NVFP4_A16_BLACKWELL_TARGET_SM
 
 
 # ---------------------------------------------------------------------------
@@ -1824,6 +1838,53 @@ def _(router_logits, hidden_states, fc1_qweights, fc1_block_scales,
       e_score_correction_bias, num_experts, top_k, hidden_size, moe_inter_size,
       activation_type, n_group, topk_group, norm_topk_prob,
       routed_scaling_factor, routing_mode, max_routed_rows):
+    return torch.empty_like(hidden_states)
+
+
+# ---------------------------------------------------------------------------
+# Custom op: trt_edgellm::Nvfp4A16BlackwellMoePlugin
+#   SM110-only FP16-A / NVFP4-W4 routed MoE (weight-only) over the
+#   BLACKWELL_MOE_N128_K64_V1 layout produced by
+#   ``repacking.repack_nvfp4_a16_blackwell_moe_experts``. Unlike the Marlin
+#   op, ``moe_inter_size`` is the logical intermediate size (FC1 N padding
+#   lives inside the layout) and the per-expert global scales stay FP32.
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt_edgellm::Nvfp4A16BlackwellMoePlugin",
+                         mutates_args=())
+def nvfp4_a16_blackwell_moe_plugin(
+    router_logits: torch.Tensor,  # [numTokens, num_experts] float32
+    hidden_states: torch.Tensor,  # [B, S, hidden_size] float16
+    fc1_qweights: torch.Tensor,  # [E, I_pad/128, H/64, 128, 32] int8
+    fc1_block_scales: torch.Tensor,  # [E, I_pad/128, H/64, 128, 4] int8
+    fc1_global_scales: torch.Tensor,  # [E] float32
+    fc2_qweights: torch.Tensor,  # [E, H/128, I/64, 128, 32] int8
+    fc2_block_scales: torch.Tensor,  # [E, H/128, I/64, 128, 4] int8
+    fc2_global_scales: torch.Tensor,  # [E] float32
+    e_score_correction_bias: torch.Tensor,  # [E] float32
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,  # logical I (e.g. 1856), not the 128-padded value
+    activation_type: int,
+    n_group: int,
+    topk_group: int,
+    norm_topk_prob: int,
+    routed_scaling_factor: float,
+    routing_mode: int,
+    max_routed_rows: int,
+    backend: int,
+) -> torch.Tensor:
+    return torch.zeros_like(hidden_states)
+
+
+@nvfp4_a16_blackwell_moe_plugin.register_fake
+def _(router_logits, hidden_states, fc1_qweights, fc1_block_scales,
+      fc1_global_scales, fc2_qweights, fc2_block_scales, fc2_global_scales,
+      e_score_correction_bias, num_experts, top_k, hidden_size, moe_inter_size,
+      activation_type, n_group, topk_group, norm_topk_prob,
+      routed_scaling_factor, routing_mode, max_routed_rows, backend):
     return torch.empty_like(hidden_states)
 
 

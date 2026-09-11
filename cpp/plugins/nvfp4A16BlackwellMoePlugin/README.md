@@ -21,6 +21,24 @@ weight layouts and distinct ONNX identities: an engine never carries both.
 | `backend` | 0 auto, 1 force decode kernels, 2 force grouped tcgen05 GEMM |
 | `max_routed_rows` | padded permuted-row capacity, 0 = resolve from the profile (`T*top_k + E*127`, rounded to 128) |
 
+## Export
+
+`python -m tensorrt_edgellm.scripts.export --target-sm 110` exports of
+Nemotron 3.5 Lightning (ModelOpt `W4A16_NVFP4` routed experts) emit this
+plugin: `NemotronHMoEMLP._prepare_for_export_a16` stacks the experts with
+`repack_nvfp4_a16_blackwell_moe_experts` and `forward` calls
+`torch.ops.trt_edgellm.Nvfp4A16BlackwellMoePlugin` with the logical
+`moe_inter_size` (1856, not the Marlin-padded 1920), `backend=0` and
+`max_routed_rows=0`; the dynamo translation pins `layout=1`, as the dense
+`Nvfp4A16BlackwellGemmPlugin` translation does. Every other `--target-sm` value, and an omitted
+target, keeps the Marlin `Nvfp4A16MoePlugin` export unchanged. The route is
+`tensorrt_edgellm.models.ops.use_blackwell_nvfp4_a16_moe()`, which reads the
+same explicit target as the dense `Nvfp4A16BlackwellGemmPlugin` selector and
+never probes the export host GPU; it is latched at export preparation and
+re-checked in `forward`. `tensorrt_edgellm/onnx/export.py` keeps inputs 4, 7
+and 8 (`fc1_global_scales`, `fc2_global_scales`, `e_score_correction_bias`)
+FP32 through the initializer downgrade.
+
 ## Execution
 
 * `T = 1` (decode): warp-per-token sigmoid top-k routing (contracts with
@@ -103,6 +121,10 @@ weight layouts and distinct ONNX identities: an engine never carries both.
 * `kernelSrcs/nvfp4_a16_blackwell_moe/` — CuTe DSL grouped GEMM (AOT group
   `nvfp4_a16_blackwell_moe`) and the on-board oracle
 * `tensorrt_edgellm/checkpoint/repacking.py` — `repack_nvfp4_a16_blackwell_moe_experts`
+* `tensorrt_edgellm/models/nemotron_h/modeling_nemotron_h.py` — export routing
+  (`NemotronHMoEMLP`); `tensorrt_edgellm/models/ops.py`,
+  `tensorrt_edgellm/onnx/{onnx_custom_schemas,dynamo_translations,export}.py` —
+  custom op, ONNX schema, translation and FP32 initializer pins
 
 ## Validation
 

@@ -1807,6 +1807,69 @@ _nvfp4_a16_moe_plugin_schema = OpSchema(
 )
 
 # ---------------------------------------------------------------------------
+# trt_edgellm::Nvfp4A16BlackwellMoePlugin (SM110 FP16-A / NVFP4-W4 routed MoE)
+# ---------------------------------------------------------------------------
+
+_nvfp4_a16_blackwell_moe_plugin_schema = OpSchema(
+    name="Nvfp4A16BlackwellMoePlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc=("SM110 NVFP4 (W4A16) routed-MoE plugin: FP16 hidden states, "
+         "BLACKWELL_MOE_N128_K64_V1 expert weights (INT8 view of the E2M1 "
+         "codes and raw E4M3 block scales) and unmodified FP32 per-expert "
+         "global scales. moe_inter_size is the logical intermediate size; "
+         "FC1 N padding lives inside the layout."),
+    inputs=[
+        OpSchema.FormalParameter("router_logits", "T_ROUTER",
+                                 "Router logits [B*S, E] FP32"),
+        OpSchema.FormalParameter("hidden_states", "T_HIDDEN",
+                                 "Hidden states [B, S, H] FP16"),
+        OpSchema.FormalParameter(
+            "fc1_qweights", "T_INT8",
+            "FC1 E2M1 codes [E, I_pad/128, H/64, 128, 32] INT8"),
+        OpSchema.FormalParameter(
+            "fc1_block_scales", "T_INT8",
+            "FC1 E4M3 block scales [E, I_pad/128, H/64, 128, 4] INT8"),
+        OpSchema.FormalParameter("fc1_global_scales", "T_ROUTER",
+                                 "FC1 per-expert global scales [E] FP32"),
+        OpSchema.FormalParameter(
+            "fc2_qweights", "T_INT8",
+            "FC2 E2M1 codes [E, H/128, I/64, 128, 32] INT8"),
+        OpSchema.FormalParameter(
+            "fc2_block_scales", "T_INT8",
+            "FC2 E4M3 block scales [E, H/128, I/64, 128, 4] INT8"),
+        OpSchema.FormalParameter("fc2_global_scales", "T_ROUTER",
+                                 "FC2 per-expert global scales [E] FP32"),
+        OpSchema.FormalParameter("e_score_correction_bias", "T_ROUTER",
+                                 "Router correction bias [E] FP32"),
+    ],
+    outputs=[
+        OpSchema.FormalParameter("output", "T_HIDDEN",
+                                 "Output [B, S, H] FP16"),
+    ],
+    type_constraints=[
+        ("T_ROUTER", ["tensor(float)"], "FP32 tensors"),
+        ("T_HIDDEN", ["tensor(float16)"], "FP16 tensors"),
+        ("T_INT8", ["tensor(int8)"], "INT8 byte tensors"),
+    ],
+    attributes=[
+        OpSchema.Attribute("num_experts", OpSchema.AttrType.INT),
+        OpSchema.Attribute("top_k", OpSchema.AttrType.INT),
+        OpSchema.Attribute("hidden_size", OpSchema.AttrType.INT),
+        OpSchema.Attribute("moe_inter_size", OpSchema.AttrType.INT),
+        OpSchema.Attribute("activation_type", OpSchema.AttrType.INT),
+        OpSchema.Attribute("n_group", OpSchema.AttrType.INT),
+        OpSchema.Attribute("topk_group", OpSchema.AttrType.INT),
+        OpSchema.Attribute("norm_topk_prob", OpSchema.AttrType.INT),
+        OpSchema.Attribute("routed_scaling_factor", OpSchema.AttrType.FLOAT),
+        OpSchema.Attribute("routing_mode", OpSchema.AttrType.INT),
+        OpSchema.Attribute("max_routed_rows", OpSchema.AttrType.INT),
+        OpSchema.Attribute("layout", OpSchema.AttrType.INT),
+        OpSchema.Attribute("backend", OpSchema.AttrType.INT),
+    ],
+)
+
+# ---------------------------------------------------------------------------
 # trt_edgellm::NvFP4MoEPluginGeforce (SM12x fused, plain [up, gate] concat)
 # ---------------------------------------------------------------------------
 
@@ -2386,6 +2449,7 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _int4_moe_plugin_schema,
     _nvfp4_moe_plugin_schema,
     _nvfp4_a16_moe_plugin_schema,
+    _nvfp4_a16_blackwell_moe_plugin_schema,
     _nvfp4_moe_plugin_geforce_schema,
     _fp16_moe_plugin_schema,
     _all_reduce_plugin_schema,
