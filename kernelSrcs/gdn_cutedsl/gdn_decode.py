@@ -1462,6 +1462,9 @@ def _make_aot_cute_tensors(n, h, hv, k, v, varlen):
     context_lengths = aot_placeholders.make_compact_tensor(
         cutlass.Int32, (n,), stride_order=(0,), assumed_align=16
     )
+    state_indices = aot_placeholders.make_compact_tensor(
+        cutlass.Int32, (n,), stride_order=(0,), assumed_align=16
+    )
     return {
         "q": _mark_gdn_qv_dynamic(q),
         "k": compact(cutlass.Float16, "k").mark_layout_dynamic(leading_dim=3),
@@ -1475,6 +1478,7 @@ def _make_aot_cute_tensors(n, h, hv, k, v, varlen):
             cutlass.Float16, (hv,), stride_order=(0,), assumed_align=16
         ).mark_layout_dynamic(leading_dim=0),
         "h0_source": _mark_h0_source_dynamic(h0_source),
+        "state_indices": _mark_gdn_1d_dynamic(state_indices),
         "context_lengths": _mark_gdn_1d_dynamic(context_lengths),
         "o": compact(cutlass.Float16, "o").mark_layout_dynamic(leading_dim=3),
     }
