@@ -1059,7 +1059,7 @@ class Gemma4NvFP4MoEBlock(nn.Module):
 
         Args:
             expert_input: [num_tokens, H] — pre-normed expert input (2D).
-            residual: [B, S, H] — pre-MLP residual used for routing.
+            residual: [num_tokens, H] — pre-MLP residual used for routing.
         """
         hidden_flat = residual.reshape(-1, self.hidden_size)
         # Router: RMSNorm + scale + proj → raw logits (softmax done by plugin)
@@ -1072,7 +1072,7 @@ class Gemma4NvFP4MoEBlock(nn.Module):
                   if use_geforce_nvfp4_moe() else nvfp4_moe_plugin)
         return moe_op(
             router_logits,
-            expert_input.unsqueeze(0),  # Plugin expects 3D [B, T, H]
+            expert_input,
             self.fc1_qweights,
             self.fc1_blocks_scale,
             self.fc1_alpha,
@@ -1309,7 +1309,7 @@ class Gemma4Int4MoEBlock(nn.Module):
 
         Args:
             expert_input: [num_tokens, H] — pre-normed expert input (2D).
-            residual: [B, S, H] — pre-MLP residual used for routing.
+            residual: [num_tokens, H] — pre-MLP residual used for routing.
         """
         hidden_flat = residual.reshape(-1, self.hidden_size)
         # Router: RMSNorm + scale + proj → raw logits (softmax done by plugin)
@@ -1320,7 +1320,7 @@ class Gemma4Int4MoEBlock(nn.Module):
 
         return int4_moe_plugin(
             router_logits,
-            expert_input.unsqueeze(0),  # Plugin expects 3D [B, T, H]
+            expert_input,
             self.fc_gate_up_qweights,
             self.fc_gate_up_scales,
             self.fc_down_qweights,

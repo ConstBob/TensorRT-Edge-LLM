@@ -132,7 +132,7 @@ def test_nvfp4_tp_gemm_allreduce_target_export(monkeypatch, tmp_path, target,
     assert op_types.count(expected_op) == 2
     assert unexpected_op not in op_types
     if target == "sm121":
-        assert "Gemm" in op_types
+        assert "MatMul" in op_types
 
 
 def test_nvfp4_fp8_kv_qkv_fusion_preserves_export_scales(tmp_path):

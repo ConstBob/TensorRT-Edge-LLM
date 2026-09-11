@@ -103,13 +103,21 @@ int32_t padTo(int32_t const value, int32_t const multiple) noexcept
 
 bool getTokenCount(Dims const& hidden, int64_t& numTokens) noexcept
 {
-    if (hidden.nbDims != 3 || hidden.d[0] <= 0 || hidden.d[1] <= 0
-        || hidden.d[0] > std::numeric_limits<int64_t>::max() / hidden.d[1])
+    if (hidden.nbDims == 2 && hidden.d[0] > 0)
+    {
+        numTokens = hidden.d[0];
+        return true;
+    }
+    return false;
+}
+
+bool shapesMatch(Dims const& lhs, Dims const& rhs) noexcept
+{
+    if (lhs.nbDims != rhs.nbDims)
     {
         return false;
     }
-    numTokens = static_cast<int64_t>(hidden.d[0]) * hidden.d[1];
-    return true;
+    return std::equal(lhs.d, lhs.d + lhs.nbDims, rhs.d);
 }
 
 } // namespace
@@ -430,10 +438,14 @@ int32_t Nvfp4A16BlackwellMoePlugin::getOutputShapes(DimsExprs const* inputs, int
     }
     (void) shapeInputs;
     (void) nbShapeInputs;
-    outputs[0].nbDims = 3;
+    if (inputs[kInHiddenStates].nbDims != 2)
+    {
+        LOG_ERROR("Nvfp4A16BlackwellMoePlugin: hidden_states must have rank 2");
+        return -1;
+    }
+    outputs[0].nbDims = 2;
     outputs[0].d[0] = inputs[kInHiddenStates].d[0];
-    outputs[0].d[1] = inputs[kInHiddenStates].d[1];
-    outputs[0].d[2] = exprBuilder.constant(mHiddenSize);
+    outputs[0].d[1] = exprBuilder.constant(mHiddenSize);
     return 0;
 }
 
@@ -455,7 +467,7 @@ bool Nvfp4A16BlackwellMoePlugin::validateTensorDesc(int32_t pos, PluginTensorDes
     {
     case kInRouterLogits:
         return desc.type == DataType::kFLOAT && desc.dims.nbDims == 2 && desc.dims.d[1] == mNumExperts;
-    case kInHiddenStates: return desc.type == DataType::kHALF && desc.dims.nbDims == 3 && desc.dims.d[2] == mHiddenSize;
+    case kInHiddenStates: return desc.type == DataType::kHALF && desc.dims.nbDims == 2 && desc.dims.d[1] == mHiddenSize;
     case kInFc1QWeights:
         return desc.dims.d[0] == mNumExperts && weightDims(fc1NTiles, fc1KTiles, kPackedBytesPerRowTile);
     case kInFc1BlockScales:
@@ -468,7 +480,7 @@ bool Nvfp4A16BlackwellMoePlugin::validateTensorDesc(int32_t pos, PluginTensorDes
         return desc.dims.d[0] == mNumExperts && weightDims(fc2NTiles, fc2KTiles, kPackedBytesPerRowTile);
     case kInFc2BlockScales:
         return desc.dims.d[0] == mNumExperts && weightDims(fc2NTiles, fc2KTiles, kScaleBytesPerRowTile);
-    case kOutOutput: return desc.type == DataType::kHALF && desc.dims.nbDims == 3 && desc.dims.d[2] == mHiddenSize;
+    case kOutOutput: return desc.type == DataType::kHALF && desc.dims.nbDims == 2 && desc.dims.d[1] == mHiddenSize;
     default: return false;
     }
 }
@@ -480,7 +492,11 @@ bool Nvfp4A16BlackwellMoePlugin::supportsFormatCombination(
     {
         return false;
     }
-    return validateTensorDesc(pos, inOut[pos].desc);
+    if (!validateTensorDesc(pos, inOut[pos].desc))
+    {
+        return false;
+    }
+    return pos != kOutOutput || shapesMatch(inOut[pos].desc.dims, inOut[kInHiddenStates].desc.dims);
 }
 
 namespace
@@ -553,8 +569,8 @@ int32_t Nvfp4A16BlackwellMoePlugin::configurePlugin(
 
         auto validateProfileEndpoint
             = [this](Dims const& hidden, Dims const& router, char const* endpoint, int64_t& numTokens) {
-                  if (!getTokenCount(hidden, numTokens) || hidden.d[2] != mHiddenSize || router.nbDims != 2
-                      || router.d[0] != numTokens || router.d[1] != mNumExperts)
+                  if (!getTokenCount(hidden, numTokens) || hidden.d[hidden.nbDims - 1] != mHiddenSize
+                      || router.nbDims != 2 || router.d[0] != numTokens || router.d[1] != mNumExperts)
                   {
                       LOG_ERROR("Nvfp4A16BlackwellMoePlugin: optimization profile %s dimensions are invalid", endpoint);
                       return false;
@@ -562,17 +578,18 @@ int32_t Nvfp4A16BlackwellMoePlugin::configurePlugin(
                   return true;
               };
         int64_t minTokens{0};
+        int64_t optTokens{0};
         int64_t maxTokens{0};
         if (!validateProfileEndpoint(in[kInHiddenStates].min, in[kInRouterLogits].min, "minimum", minTokens)
+            || !validateProfileEndpoint(in[kInHiddenStates].opt, in[kInRouterLogits].opt, "optimum", optTokens)
             || !validateProfileEndpoint(in[kInHiddenStates].max, in[kInRouterLogits].max, "maximum", maxTokens))
         {
             return -1;
         }
         Dims const& hiddenMin = in[kInHiddenStates].min;
         Dims const& hiddenMax = in[kInHiddenStates].max;
-        if (out[0].min.nbDims != 3 || out[0].max.nbDims != 3 || out[0].min.d[0] != hiddenMin.d[0]
-            || out[0].min.d[1] != hiddenMin.d[1] || out[0].min.d[2] != mHiddenSize || out[0].max.d[0] != hiddenMax.d[0]
-            || out[0].max.d[1] != hiddenMax.d[1] || out[0].max.d[2] != mHiddenSize)
+        if (!shapesMatch(out[0].min, hiddenMin) || !shapesMatch(out[0].opt, in[kInHiddenStates].opt)
+            || !shapesMatch(out[0].max, hiddenMax))
         {
             LOG_ERROR("Nvfp4A16BlackwellMoePlugin: output profile range must match hidden_states");
             return -1;
@@ -624,15 +641,17 @@ int32_t Nvfp4A16BlackwellMoePlugin::configurePlugin(
 size_t Nvfp4A16BlackwellMoePlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
     DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept
 {
-    (void) outputs;
-    if (inputs == nullptr || nbInputs != kNbPluginInputs || nbOutputs != 1)
+    if (inputs == nullptr || outputs == nullptr || nbInputs != kNbPluginInputs || nbOutputs != 1)
     {
         LOG_ERROR("Nvfp4A16BlackwellMoePlugin: getWorkspaceSize expected %d inputs and 1 output", kNbPluginInputs);
         return 0;
     }
     int64_t maxTokens{0};
-    if (!getTokenCount(inputs[kInHiddenStates].max, maxTokens)
-        || maxTokens > std::numeric_limits<int32_t>::max() / mTopK)
+    auto const& hiddenMax = inputs[kInHiddenStates].max;
+    auto const& routerMax = inputs[kInRouterLogits].max;
+    if (!getTokenCount(hiddenMax, maxTokens) || hiddenMax.d[hiddenMax.nbDims - 1] != mHiddenSize
+        || routerMax.nbDims != 2 || routerMax.d[0] != maxTokens || routerMax.d[1] != mNumExperts
+        || !shapesMatch(outputs[0].max, hiddenMax) || maxTokens > std::numeric_limits<int32_t>::max() / mTopK)
     {
         LOG_ERROR("Nvfp4A16BlackwellMoePlugin: invalid profile max shape while computing workspace");
         return 0;
@@ -648,14 +667,18 @@ int32_t Nvfp4A16BlackwellMoePlugin::enqueue(PluginTensorDesc const* inputDesc, P
 {
     try
     {
-        if (inputDesc == nullptr || outputDesc == nullptr || inputs == nullptr || outputs == nullptr)
+        if (inputDesc == nullptr || outputDesc == nullptr || inputs == nullptr || outputs == nullptr
+            || outputs[0] == nullptr)
         {
             LOG_ERROR("Nvfp4A16BlackwellMoePlugin: enqueue received null descriptors or buffers");
             return -1;
         }
         int64_t numTokens{0};
-        if (!getTokenCount(inputDesc[kInHiddenStates].dims, numTokens)
-            || numTokens > std::numeric_limits<int32_t>::max() / mTopK)
+        auto const& hiddenDims = inputDesc[kInHiddenStates].dims;
+        auto const& routerDims = inputDesc[kInRouterLogits].dims;
+        if (!getTokenCount(hiddenDims, numTokens) || hiddenDims.d[hiddenDims.nbDims - 1] != mHiddenSize
+            || routerDims.nbDims != 2 || routerDims.d[0] != numTokens || routerDims.d[1] != mNumExperts
+            || !shapesMatch(outputDesc[0].dims, hiddenDims) || numTokens > std::numeric_limits<int32_t>::max() / mTopK)
         {
             LOG_ERROR("Nvfp4A16BlackwellMoePlugin: invalid runtime hidden_states shape");
             return -1;
@@ -739,9 +762,11 @@ int32_t Nvfp4A16BlackwellMoePlugin::onShapeChange(
         return -1;
     }
     int64_t numTokens{0};
-    if (!getTokenCount(in[kInHiddenStates].dims, numTokens) || in[kInRouterLogits].dims.d[0] != numTokens
-        || out[0].dims.d[0] != in[kInHiddenStates].dims.d[0] || out[0].dims.d[1] != in[kInHiddenStates].dims.d[1]
-        || numTokens > std::numeric_limits<int32_t>::max() / mTopK)
+    auto const& hiddenDims = in[kInHiddenStates].dims;
+    auto const& routerDims = in[kInRouterLogits].dims;
+    if (!getTokenCount(hiddenDims, numTokens) || hiddenDims.d[hiddenDims.nbDims - 1] != mHiddenSize
+        || routerDims.nbDims != 2 || routerDims.d[0] != numTokens || routerDims.d[1] != mNumExperts
+        || !shapesMatch(out[0].dims, hiddenDims) || numTokens > std::numeric_limits<int32_t>::max() / mTopK)
     {
         LOG_ERROR("Nvfp4A16BlackwellMoePlugin: runtime router/output shapes do not match hidden_states");
         return -1;

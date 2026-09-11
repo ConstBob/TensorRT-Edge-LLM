@@ -1545,12 +1545,12 @@ _int4_moe_plugin_schema = OpSchema(
         OpSchema.FormalParameter(
             name="router_logits",
             description=
-            "Router logits (B*S, E) FP32, from gate GEMM + cast, before softmax",
+            "Router logits [T, E] FP32, from gate GEMM + cast, before softmax",
             type_str="tensor(float)",
         ),
         OpSchema.FormalParameter(
             name="hidden_states",
-            description="Input hidden states (B, S, D)",
+            description="Input hidden states [T, D]",
             type_str="T",
         ),
         OpSchema.FormalParameter(
@@ -1578,7 +1578,7 @@ _int4_moe_plugin_schema = OpSchema(
     outputs=[
         OpSchema.FormalParameter(
             name="output",
-            description="Output tensor (B, S, D)",
+            description="Output tensor [T, D]",
             type_str="T",
         ),
     ],
@@ -1638,9 +1638,9 @@ _nvfp4_moe_plugin_schema = OpSchema(
          "and FP8 block scales in 6D MMA layout."),
     inputs=[
         OpSchema.FormalParameter("router_logits", "T_ROUTER",
-                                 "Router logits [B*S, E] FP32"),
+                                 "Router logits [T, E] FP32"),
         OpSchema.FormalParameter("hidden_states", "T_HIDDEN",
-                                 "Hidden states [B, S, H] FP16"),
+                                 "Hidden states [T, H] FP16"),
         OpSchema.FormalParameter("fc1_qweights", "T_INT8",
                                  "FC1 weights [E, N1, H/2] INT8"),
         OpSchema.FormalParameter(
@@ -1663,8 +1663,7 @@ _nvfp4_moe_plugin_schema = OpSchema(
                                  "Router correction bias [E] FP32"),
     ],
     outputs=[
-        OpSchema.FormalParameter("output", "T_HIDDEN",
-                                 "Output [B, S, H] FP16"),
+        OpSchema.FormalParameter("output", "T_HIDDEN", "Output [T, H] FP16"),
     ],
     type_constraints=[
         ("T_ROUTER", ["tensor(float)"], "FP32 tensors"),
@@ -1706,9 +1705,9 @@ _fp16_moe_plugin_schema = OpSchema(
         "/ routed_scaling_factor attributes."),
     inputs=[
         OpSchema.FormalParameter("router_logits", "T_ROUTER",
-                                 "Router logits [B*S, E] FP32"),
+                                 "Router logits [T, E] FP32"),
         OpSchema.FormalParameter("hidden_states", "T_HIDDEN",
-                                 "Hidden states [B, S, H] FP16"),
+                                 "Hidden states [T, H] FP16"),
         OpSchema.FormalParameter("fc1_weights", "T_HIDDEN",
                                  "FC1 weights [E, N1, H] FP16"),
         OpSchema.FormalParameter("fc2_weights", "T_HIDDEN",
@@ -1720,8 +1719,7 @@ _fp16_moe_plugin_schema = OpSchema(
             param_option=OpSchema.FormalParameterOption.Optional),
     ],
     outputs=[
-        OpSchema.FormalParameter("output", "T_HIDDEN",
-                                 "Output [B, S, H] FP16"),
+        OpSchema.FormalParameter("output", "T_HIDDEN", "Output [T, H] FP16"),
     ],
     type_constraints=[
         ("T_ROUTER", ["tensor(float)"], "FP32 tensors"),
@@ -1762,9 +1760,9 @@ _nvfp4_a16_moe_plugin_schema = OpSchema(
          "per-expert global scales pre-scaled by 2**7."),
     inputs=[
         OpSchema.FormalParameter("router_logits", "T_ROUTER",
-                                 "Router logits [B*S, E] FP32"),
+                                 "Router logits [T, E] FP32"),
         OpSchema.FormalParameter("hidden_states", "T_HIDDEN",
-                                 "Hidden states [B, S, H] FP16"),
+                                 "Hidden states [T, H] FP16"),
         OpSchema.FormalParameter(
             "fc1_qweights", "T_INT8",
             "FC1 Marlin weights [E, H/16, 8*fc1_out] INT8"),
@@ -1783,8 +1781,7 @@ _nvfp4_a16_moe_plugin_schema = OpSchema(
                                  "Router correction bias [E] FP32"),
     ],
     outputs=[
-        OpSchema.FormalParameter("output", "T_HIDDEN",
-                                 "Output [B, S, H] FP16"),
+        OpSchema.FormalParameter("output", "T_HIDDEN", "Output [T, H] FP16"),
     ],
     type_constraints=[
         ("T_ROUTER", ["tensor(float)"], "FP32 tensors"),
@@ -1821,9 +1818,9 @@ _nvfp4_a16_blackwell_moe_plugin_schema = OpSchema(
          "FC1 N padding lives inside the layout."),
     inputs=[
         OpSchema.FormalParameter("router_logits", "T_ROUTER",
-                                 "Router logits [B*S, E] FP32"),
+                                 "Router logits [T, E] FP32"),
         OpSchema.FormalParameter("hidden_states", "T_HIDDEN",
-                                 "Hidden states [B, S, H] FP16"),
+                                 "Hidden states [T, H] FP16"),
         OpSchema.FormalParameter(
             "fc1_qweights", "T_INT8",
             "FC1 E2M1 codes [E, I_pad/128, H/64, 128, 32] INT8"),
@@ -1844,8 +1841,7 @@ _nvfp4_a16_blackwell_moe_plugin_schema = OpSchema(
                                  "Router correction bias [E] FP32"),
     ],
     outputs=[
-        OpSchema.FormalParameter("output", "T_HIDDEN",
-                                 "Output [B, S, H] FP16"),
+        OpSchema.FormalParameter("output", "T_HIDDEN", "Output [T, H] FP16"),
     ],
     type_constraints=[
         ("T_ROUTER", ["tensor(float)"], "FP32 tensors"),
@@ -1884,9 +1880,9 @@ _nvfp4_moe_plugin_geforce_schema = OpSchema(
          "and target arch differ."),
     inputs=[
         OpSchema.FormalParameter("router_logits", "T_ROUTER",
-                                 "Router logits [B*S, E] FP32"),
+                                 "Router logits [T, E] FP32"),
         OpSchema.FormalParameter("hidden_states", "T_HIDDEN",
-                                 "Hidden states [B, S, H] FP16"),
+                                 "Hidden states [T, H] FP16"),
         OpSchema.FormalParameter(
             "fc1_qweights", "T_INT8",
             "FC1 weights [E, N1, H/2] INT8 (plain [up, gate] concat)"),
@@ -1910,8 +1906,7 @@ _nvfp4_moe_plugin_geforce_schema = OpSchema(
                                  "Router correction bias [E] FP32"),
     ],
     outputs=[
-        OpSchema.FormalParameter("output", "T_HIDDEN",
-                                 "Output [B, S, H] FP16"),
+        OpSchema.FormalParameter("output", "T_HIDDEN", "Output [T, H] FP16"),
     ],
     type_constraints=[
         ("T_ROUTER", ["tensor(float)"], "FP32 tensors"),

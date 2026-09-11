@@ -119,12 +119,85 @@ def _build_grouped_conv(fuse_residual: bool) -> PluginRunner:
                                 profiles=profiles)
 
 
+def _build_grouped_conv_with_conservative_block_bound() -> PluginRunner:
+    profile_block, kernel, group, hidden = 16, 2, 16, 32
+    input_specs = [
+        ("hidden", trt.float16, (-1, -1, hidden)),
+        ("delta", trt.float16, (-1, -1, kernel, hidden // group)),
+    ]
+    profiles = {
+        "hidden": ((1, 1, hidden), (2, profile_block, hidden),
+                   (2, 2 * profile_block, hidden)),
+        "delta": ((1, 1, kernel, hidden // group), (2, profile_block, kernel,
+                                                    hidden // group),
+                  (2, 2 * profile_block, kernel, hidden // group)),
+    }
+    return PluginRunner().build(
+        input_specs=input_specs,
+        constant_specs=[
+            ("base_kernel", trt.float16, (kernel, hidden),
+             np.ones((kernel, hidden), dtype=np.float16)),
+        ],
+        plugin_input_order=["hidden", "delta", "base_kernel"],
+        output_names=["output"],
+        plugin_name="DFlash2GroupedDynamicConvPlugin",
+        plugin_version="1",
+        plugin_fields=[
+            pf_int32("block_size", profile_block),
+            pf_int32("kernel_size", kernel),
+            pf_int32("group_size", group),
+            pf_int32("fuse_residual", 0),
+        ],
+        profiles=profiles)
+
+
 def _grouped_conv_reference(hidden, residual=None):
     result = hidden.float().clone()
     result[:, 1:] += hidden[:, :-1].float()
     if residual is not None:
         result += residual
     return result
+
+
+def test_grouped_dynamic_conv_accepts_conservative_profile_block_bound():
+    batch, block, kernel, group, hidden_size = 2, 16, 2, 16, 32
+    runner = _build_grouped_conv_with_conservative_block_bound()
+    tensors = {
+        "hidden":
+        torch.ones((batch, block, hidden_size),
+                   device="cuda",
+                   dtype=torch.float16),
+        "delta":
+        torch.zeros((batch, block, kernel, hidden_size // group),
+                    device="cuda",
+                    dtype=torch.float16),
+        "output":
+        torch.empty((batch, block, hidden_size),
+                    device="cuda",
+                    dtype=torch.float16),
+    }
+
+    runner.execute(tensors)
+
+    assert_close("grouped-conv conservative profile bound",
+                 _grouped_conv_reference(tensors["hidden"]), tensors["output"])
+
+    oversized = {
+        "hidden":
+        torch.ones((batch, 2 * block, hidden_size),
+                   device="cuda",
+                   dtype=torch.float16),
+        "delta":
+        torch.zeros((batch, 2 * block, kernel, hidden_size // group),
+                    device="cuda",
+                    dtype=torch.float16),
+        "output":
+        torch.empty((batch, 2 * block, hidden_size),
+                    device="cuda",
+                    dtype=torch.float16),
+    }
+    with pytest.raises(RuntimeError, match="execute_async_v3 returned False"):
+        runner.execute(oversized)
 
 
 @pytest.mark.parametrize("fuse_residual", [False, True], ids=["pre", "post"])

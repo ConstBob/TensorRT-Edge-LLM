@@ -137,9 +137,12 @@ tests:
   - tests/python-unittests/test_gated_delta_net_plugin.py::test_prefill_decode_handoff
 
   # Marlin MoE plugin tests
-  - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_qwen_softmax_swiglu_decode_and_prefill_dynamic_engine
-  - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_nemotron_sigmoid_group_relu2_decode_and_prefill_dynamic_engine
+  - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_qwen_softmax_swiglu_token_count_boundary_dynamic_engine
+  - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_nemotron_sigmoid_group_relu2_token_count_boundary_dynamic_engine
+  - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_w4a16_rejects_rank3_hidden_states
+  - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_int4_rejects_rank3_hidden_states
   - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_int4_fp16_swiglu_preserves_legacy_rounding
+  - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_int4_build_rejects_profile_exceeding_routed_row_capacity
   - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_build_rejects_insufficient_max_routed_rows
   - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_build_rejects_unsupported_activation_or_routing
   - tests/python-unittests/test_nvfp4_a16_moe_plugin.py::test_build_rejects_wrong_hidden_state_dtype
@@ -158,6 +161,7 @@ tests:
   - tests/python-unittests/test_nvfp4_a16_blackwell_moe_plugin.py::test_small_relu2_sigmoid_decode_and_prefill_dynamic_engine
   - tests/python-unittests/test_nvfp4_a16_blackwell_moe_plugin.py::test_nemotron_shape_decode_and_prefill_dynamic_engine
   - tests/python-unittests/test_nvfp4_a16_blackwell_moe_plugin.py::test_grouped_routing_decode_and_prefill_dynamic_engine
+  - tests/python-unittests/test_nvfp4_a16_blackwell_moe_plugin.py::test_rank3_hidden_states_are_rejected
   - tests/python-unittests/test_nvfp4_a16_blackwell_moe_plugin.py::test_build_on_non_thor_gpu_is_rejected
   - tests/python-unittests/test_nvfp4_a16_blackwell_moe_plugin.py::test_build_rejects_marlin_layout_and_unknown_backend
   - tests/python-unittests/test_nvfp4_a16_blackwell_moe_plugin.py::test_build_rejects_unsupported_activation_or_routing
@@ -176,6 +180,22 @@ tests:
 
   # FP16 MoE plugin tests (softmax + sigmoid-group-topk routing)
   - tests/python-unittests/test_fp16_moe_plugin.py::test_fp16_moe_decode_and_prefill_dynamic_engine
+  - tests/python-unittests/test_fp16_moe_plugin.py::test_fp16_moe_rejects_rank3_hidden_states
+
+  # SM110 NVFP4 W4A4 MoE plugin tests
+  - tests/python-unittests/test_nvfp4_moe_plugin.py::test_rank2_is_stable_after_engine_round_trip
+  - tests/python-unittests/test_nvfp4_moe_plugin.py::test_rank3_hidden_states_are_rejected
+
+  # Token-major MoE frontend/export contracts
+  - tests/python-unittests/test_moe_frontend_rank_contract.py
+  - tests/python-unittests/test_experimental_decoder_rank_contract.py::test_nvfp4_moe_preserves_token_major_plugin_contract
+  - tests/python-unittests/test_experimental_decoder_rank_contract.py::test_other_moe_variants_preserve_token_major_plugin_contract
+  - tests/python-unittests/test_experimental_decoder_rank_contract.py::test_experimental_moe_rejects_rank3_hidden_states
+  - tests/python-unittests/test_nemotron_h_ragged_export.py::test_nemotron_h_moe_exports_token_major_hidden_states
+  - tests/python-unittests/test_qwen35_ragged_export.py::test_omni_next_moe_mtp_base_runs_token_major_wrapper
+
+  # Dense NVFP4 TP2 export contract shared by Qwen and other dense models
+  - tests/python-unittests/test_quantize_activations.py::test_tp2_dense_nvfp4_token_matrix_exports_rank2_gemm
 
   # LayerNorm plugin tests
   - tests/python-unittests/test_layernorm_plugin.py

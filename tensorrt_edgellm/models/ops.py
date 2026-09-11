@@ -1501,11 +1501,17 @@ def _(hidden_states,
 # ---------------------------------------------------------------------------
 
 
+def _validate_moe_token_layout(router_logits, hidden_states):
+    if router_logits.ndim != 2:
+        raise ValueError("router_logits must have shape [T, E]")
+    if hidden_states.ndim != 2:
+        raise ValueError("hidden_states must have shape [T, H]")
+
+
 @torch.library.custom_op("trt_edgellm::int4_moe_plugin", mutates_args=())
 def int4_moe_plugin(
-    router_logits: torch.
-    Tensor,  # [B*S, E] float32 — gate output before softmax
-    hidden_states: torch.Tensor,  # [B, S, H] float16
+    router_logits: torch.Tensor,  # [T, E] float32 — gate output before softmax
+    hidden_states: torch.Tensor,  # [T, H] float16
     fc_gate_up_qweights: torch.Tensor,  # [E, K//16, 2*I] Marlin int8
     fc_gate_up_scales: torch.Tensor,  # [E, num_groups, I] float16
     fc_down_qweights: torch.Tensor,  # [E, K//16, 2*D] Marlin int8
@@ -1526,24 +1532,16 @@ def int4_moe_plugin(
 
     Mirrors ``trt_edgellm::Int4MoePlugin`` in tensorrt_edgellm.
     """
-    batch_size, seq_len, _ = hidden_states.shape
-    return torch.zeros(batch_size,
-                       seq_len,
-                       hidden_size,
-                       dtype=hidden_states.dtype,
-                       device=hidden_states.device)
+    _validate_moe_token_layout(router_logits, hidden_states)
+    return torch.zeros_like(hidden_states)
 
 
 @int4_moe_plugin.register_fake
 def _(router_logits, hidden_states, fc_gate_up_qweights, fc_gate_up_scales,
       fc_down_qweights, fc_down_scales, num_experts, top_k, hidden_size,
       moe_inter_size, activation_type, quantization_group_size):
-    batch_size, seq_len, _ = hidden_states.shape
-    return torch.empty(batch_size,
-                       seq_len,
-                       hidden_size,
-                       dtype=hidden_states.dtype,
-                       device=hidden_states.device)
+    _validate_moe_token_layout(router_logits, hidden_states)
+    return torch.empty_like(hidden_states)
 
 
 # ---------------------------------------------------------------------------
@@ -1787,6 +1785,7 @@ def nvfp4_moe_plugin(
     io_dtype: int,
     max_routed_rows: int,
 ) -> torch.Tensor:
+    _validate_moe_token_layout(router_logits, hidden_states)
     return torch.zeros_like(hidden_states)
 
 
@@ -1797,6 +1796,7 @@ def _(router_logits, hidden_states, fc1_qweights, fc1_blocks_scale, fc1_alpha,
       hidden_size, moe_inter_size, activation_type, n_group, topk_group,
       norm_topk_prob, routed_scaling_factor, routing_mode, backend, io_dtype,
       max_routed_rows):
+    _validate_moe_token_layout(router_logits, hidden_states)
     return torch.empty_like(hidden_states)
 
 
@@ -1808,8 +1808,8 @@ def _(router_logits, hidden_states, fc1_qweights, fc1_blocks_scale, fc1_alpha,
 
 @torch.library.custom_op("trt_edgellm::Nvfp4A16MoePlugin", mutates_args=())
 def nvfp4_a16_moe_plugin(
-    router_logits: torch.Tensor,  # [numTokens, num_experts] float32
-    hidden_states: torch.Tensor,  # [B, S, hidden_size] float16
+    router_logits: torch.Tensor,  # [T, num_experts] float32
+    hidden_states: torch.Tensor,  # [T, hidden_size] float16
     fc1_qweights: torch.Tensor,  # [E, hidden/16, 8*fc1_out] int8
     fc1_block_scales: torch.Tensor,  # [E, hidden/16, fc1_out] int8
     fc1_global_scales: torch.Tensor,  # [E] float16
@@ -1829,6 +1829,7 @@ def nvfp4_a16_moe_plugin(
     routing_mode: int,
     max_routed_rows: int,
 ) -> torch.Tensor:
+    _validate_moe_token_layout(router_logits, hidden_states)
     return torch.zeros_like(hidden_states)
 
 
@@ -1838,6 +1839,7 @@ def _(router_logits, hidden_states, fc1_qweights, fc1_block_scales,
       e_score_correction_bias, num_experts, top_k, hidden_size, moe_inter_size,
       activation_type, n_group, topk_group, norm_topk_prob,
       routed_scaling_factor, routing_mode, max_routed_rows):
+    _validate_moe_token_layout(router_logits, hidden_states)
     return torch.empty_like(hidden_states)
 
 
@@ -1854,8 +1856,8 @@ def _(router_logits, hidden_states, fc1_qweights, fc1_block_scales,
 @torch.library.custom_op("trt_edgellm::Nvfp4A16BlackwellMoePlugin",
                          mutates_args=())
 def nvfp4_a16_blackwell_moe_plugin(
-    router_logits: torch.Tensor,  # [numTokens, num_experts] float32
-    hidden_states: torch.Tensor,  # [B, S, hidden_size] float16
+    router_logits: torch.Tensor,  # [T, num_experts] float32
+    hidden_states: torch.Tensor,  # [T, hidden_size] float16
     fc1_qweights: torch.Tensor,  # [E, I_pad/128, H/64, 128, 32] int8
     fc1_block_scales: torch.Tensor,  # [E, I_pad/128, H/64, 128, 4] int8
     fc1_global_scales: torch.Tensor,  # [E] float32
@@ -1876,6 +1878,7 @@ def nvfp4_a16_blackwell_moe_plugin(
     max_routed_rows: int,
     backend: int,
 ) -> torch.Tensor:
+    _validate_moe_token_layout(router_logits, hidden_states)
     return torch.zeros_like(hidden_states)
 
 
@@ -1885,6 +1888,7 @@ def _(router_logits, hidden_states, fc1_qweights, fc1_block_scales,
       e_score_correction_bias, num_experts, top_k, hidden_size, moe_inter_size,
       activation_type, n_group, topk_group, norm_topk_prob,
       routed_scaling_factor, routing_mode, max_routed_rows, backend):
+    _validate_moe_token_layout(router_logits, hidden_states)
     return torch.empty_like(hidden_states)
 
 
@@ -1923,6 +1927,7 @@ def nvfp4_moe_plugin_geforce(
     io_dtype: int,
     max_routed_rows: int,
 ) -> torch.Tensor:
+    _validate_moe_token_layout(router_logits, hidden_states)
     return torch.zeros_like(hidden_states)
 
 
@@ -1933,12 +1938,13 @@ def _(router_logits, hidden_states, fc1_qweights, fc1_blocks_scale, fc1_alpha,
       hidden_size, moe_inter_size, activation_type, n_group, topk_group,
       norm_topk_prob, routed_scaling_factor, routing_mode, backend, io_dtype,
       max_routed_rows):
+    _validate_moe_token_layout(router_logits, hidden_states)
     return torch.empty_like(hidden_states)
 
 
 # ---------------------------------------------------------------------------
 # Custom op: trt_edgellm::Fp16MoePlugin
-#   Unquantized (FP16/BF16) MoE experts via the CuTeDSL FP16 grouped-GEMM
+#   Unquantized FP16 MoE experts via the CuTeDSL FP16 grouped-GEMM
 #   plugin. Same softmax+topk routing and 64-row up/gate FC1 interleave as
 #   Nvfp4MoePlugin, but plain FP16 weights: no scales or alpha tensors.
 # ---------------------------------------------------------------------------
@@ -1958,6 +1964,7 @@ def fp16_moe_plugin(
     norm_topk_prob: int,
     max_routed_rows: int,
 ) -> torch.Tensor:
+    _validate_moe_token_layout(router_logits, hidden_states)
     return torch.zeros_like(hidden_states)
 
 
@@ -1965,6 +1972,7 @@ def fp16_moe_plugin(
 def _(router_logits, hidden_states, fc1_weights, fc2_weights, num_experts,
       top_k, hidden_size, moe_inter_size, activation_type, norm_topk_prob,
       max_routed_rows):
+    _validate_moe_token_layout(router_logits, hidden_states)
     return torch.empty_like(hidden_states)
 
 
@@ -1979,8 +1987,8 @@ def _(router_logits, hidden_states, fc1_weights, fc2_weights, num_experts,
 
 @torch.library.custom_op("trt_edgellm::Fp16MoePluginSigmoid", mutates_args=())
 def fp16_moe_plugin_sigmoid(
-    router_logits: torch.Tensor,  # [numTokens, num_experts] float32
-    hidden_states: torch.Tensor,  # [B, S, hidden_size] float16
+    router_logits: torch.Tensor,  # [T, num_experts] float32
+    hidden_states: torch.Tensor,  # [T, hidden_size] float16
     fc1_weights: torch.
     Tensor,  # [E, moe_inter, hidden] float16 (ReLU2, ungated)
     fc2_weights: torch.Tensor,  # [E, hidden, moe_inter] float16
@@ -1996,6 +2004,7 @@ def fp16_moe_plugin_sigmoid(
     routed_scaling_factor: float,
     max_routed_rows: int,
 ) -> torch.Tensor:
+    _validate_moe_token_layout(router_logits, hidden_states)
     return torch.zeros_like(hidden_states)
 
 
@@ -2004,6 +2013,7 @@ def _(router_logits, hidden_states, fc1_weights, fc2_weights,
       e_score_correction_bias, num_experts, top_k, hidden_size, moe_inter_size,
       activation_type, n_group, topk_group, norm_topk_prob,
       routed_scaling_factor, max_routed_rows):
+    _validate_moe_token_layout(router_logits, hidden_states)
     return torch.empty_like(hidden_states)
 
 

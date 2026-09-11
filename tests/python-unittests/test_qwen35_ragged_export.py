@@ -620,7 +620,21 @@ def test_omni_next_moe_mtp_base_runs_token_major_wrapper(tmp_path):
     graph = onnx.load(str(output), load_external_data=False).graph
     inputs = {tensor.name: tensor for tensor in graph.input}
     assert len(inputs["inputs_embeds"].type.tensor_type.shape.dim) == 2
-    assert sum(node.op_type == "Fp16MoePlugin" for node in graph.node) == 2
+    moe_nodes = [
+        node for node in graph.node if node.op_type == "Fp16MoePlugin"
+    ]
+    assert len(moe_nodes) == 2
+    value_info = {
+        value.name: value
+        for value in list(graph.input) + list(graph.value_info) +
+        list(graph.output)
+    }
+    assert all(
+        len(value_info[node.input[1]].type.tensor_type.shape.dim) == 2
+        for node in moe_nodes)
+    assert all(
+        len(value_info[node.output[0]].type.tensor_type.shape.dim) == 2
+        for node in moe_nodes)
 
 
 def test_omni_next_code_predictor_dynamic_head_uses_token_major_indices():

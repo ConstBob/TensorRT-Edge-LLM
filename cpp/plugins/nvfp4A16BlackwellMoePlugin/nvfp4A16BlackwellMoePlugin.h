@@ -41,6 +41,8 @@ namespace plugins
  * per-expert global scales are the checkpoint's verbatim fp32 `weight_scale_2` (no Marlin 2**7 factor).
  * `moe_inter_size` is the logical intermediate size; FC1 N padding to 128 happens inside the layout.
  *
+ * Activations use token-major [T, H] and router logits use [T, E].
+ *
  * max_routed_rows is the padded-row capacity of the permuted activation buffer: a runtime shape with T
  * tokens needs at most T * top_k + num_experts * 127 rows (0 == resolve from the optimization profile).
  */
