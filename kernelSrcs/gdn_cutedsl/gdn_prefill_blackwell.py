@@ -5277,6 +5277,9 @@ def _make_aot_cute_tensors_bw(n, h, hv, k, v, seq_len):
         "dt_bias": compact(cutlass.Float16, (hv,)),
         "h0_in": dynamic_h0(),
         "h0_out": dynamic_h0(),
+        "state_indices": compact(cutlass.Int32, (n,)).mark_compact_shape_dynamic(
+            mode=0, stride_order=(0,)
+        ),
         "o": dynamic_4d(cutlass.Float16, (n, seq_len, hv, v)),
         "cu_seqlens": compact(cutlass.Int32, (n + 1,)).mark_compact_shape_dynamic(
             mode=0, stride_order=(0,)

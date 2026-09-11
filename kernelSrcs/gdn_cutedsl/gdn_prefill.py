@@ -437,6 +437,7 @@ def _make_aot_cute_tensors(n, h, hv, k, v, seq_len):
     q = compact(cutlass.Float16, (n, seq_len, h, k))
     v_tensor = compact(cutlass.Float16, (n, seq_len, hv, v))
     h0_source = compact(cutlass.Float32, (n, hv, k, v), assumed_align=32)
+    state_indices = compact(cutlass.Int32, (n,))
     context_lengths = compact(cutlass.Int32, (n,))
     return {
         "q": _mark_gdn_prefill_qv_dynamic(q.mark_layout_dynamic(leading_dim=3)),
@@ -447,6 +448,7 @@ def _make_aot_cute_tensors(n, h, hv, k, v, seq_len):
         "A_log": compact(cutlass.Float32, (hv,)).mark_layout_dynamic(leading_dim=0),
         "dt_bias": compact(cutlass.Float16, (hv,)).mark_layout_dynamic(leading_dim=0),
         "h0_source": _mark_h0_source_dynamic(h0_source),
+        "state_indices": _mark_gdn_1d_dynamic(state_indices),
         "context_lengths": _mark_gdn_1d_dynamic(context_lengths),
         "o": compact(cutlass.Float16, (n, seq_len, hv, v)).mark_layout_dynamic(leading_dim=3),
     }

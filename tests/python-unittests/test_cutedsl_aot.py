@@ -35,6 +35,21 @@ def _load_build_module():
     return module
 
 
+def _load_kernel_module(relative_path):
+    pytest.importorskip("cutlass")
+    kernel_dir = _KERNEL_SRCS / "gdn_cutedsl"
+    for path in (_KERNEL_SRCS, kernel_dir):
+        if str(path) not in sys.path:
+            sys.path.insert(0, str(path))
+    module_path = kernel_dir / relative_path
+    module_name = f"test_cutedsl_aot_{module_path.stem}"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_all_registered_exporters_exist():
     build_cutedsl = _load_build_module()
     assert build_cutedsl.KERNEL_VARIANTS
@@ -150,3 +165,31 @@ def test_marker_emulation_rejects_inconsistent_stride_order():
                                                    assumed_align=16)
     with pytest.raises(ValueError, match="stride-1"):
         tensor2.mark_layout_dynamic(leading_dim=0)
+
+
+@pytest.mark.parametrize(
+    "module_name,factory_name,args",
+    [
+        ("gdn_decode.py", "_make_aot_cute_tensors",
+         (4, 8, 8, 128, 128, False)),
+        ("gdn_prefill.py", "_make_aot_cute_tensors", (4, 8, 8, 128, 128, 8)),
+        ("gdn_prefill_blackwell.py", "_make_aot_cute_tensors_bw",
+         (4, 8, 8, 128, 128, 128)),
+    ],
+)
+def test_gdn_aot_tensors_include_state_indices(module_name, factory_name,
+                                               args):
+    module = _load_kernel_module(module_name)
+    tensors = getattr(module, factory_name)(*args)
+
+    state_indices = tensors["state_indices"]
+    assert state_indices.element_type == module.cutlass.Int32
+    assert state_indices.dynamic_shapes_mask == (1, )
+    assert state_indices.dynamic_strides_mask == (0, )
+
+
+def test_gdn_mtp_aot_tensors_do_not_add_state_indices():
+    module = _load_kernel_module("gdn_decode_mtp.py")
+    tensors = module._make_aot_mtp_cute_tensors(4, 8, 8, 128, 128, 4)
+
+    assert "state_indices" not in tensors
