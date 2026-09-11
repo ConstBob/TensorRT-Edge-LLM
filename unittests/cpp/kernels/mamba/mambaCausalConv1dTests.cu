@@ -19,6 +19,7 @@
 #include <cuda_fp16.h>
 #include <gtest/gtest.h>
 #include <iostream>
+#include <tuple>
 #include <vector>
 
 #include "common/cudaUtils.h"
@@ -694,8 +695,9 @@ TEST(MambaCausalConv1dDecodeMTP, LargeDim)
 
 void runCausalConv1dDecodeDDTreeReference(int32_t batch, int32_t dim, int32_t width, int32_t verifySeq,
     std::vector<half> const& convState, std::vector<half> const& newCols, std::vector<half> const& weight,
-    std::vector<half> const& bias, std::vector<int32_t> const& parentIds, std::vector<int32_t> const& depths,
-    std::vector<half>& convStateOut, std::vector<half>& outRef, std::vector<half>& intermRef)
+    std::vector<half> const& bias, bool hasBias, std::vector<int32_t> const& parentIds,
+    std::vector<int32_t> const& depths, std::vector<half>& convStateOut, std::vector<half>& outRef,
+    std::vector<half>& intermRef)
 {
     convStateOut = convState;
     for (int32_t b = 0; b < batch; ++b)
@@ -747,7 +749,7 @@ void runCausalConv1dDecodeDDTreeReference(int32_t batch, int32_t dim, int32_t wi
                         state[width - 1 - pathOffset] = __half2float(newCols[newColIdx]);
                     }
 
-                    float acc = __half2float(bias[d]);
+                    float acc = hasBias ? __half2float(bias[d]) : 0.0F;
                     for (int32_t k = 0; k < width; ++k)
                     {
                         acc += state[k] * __half2float(weight[static_cast<int64_t>(d) * width + k]);
@@ -765,12 +767,16 @@ void runCausalConv1dDecodeDDTreeReference(int32_t batch, int32_t dim, int32_t wi
     }
 }
 
-TEST(MambaCausalConv1dDecodeDDTree, RootToNodeState)
+using DDTreeTestParams = std::tuple<int32_t, int32_t, bool, int32_t>;
+
+class MambaCausalConv1dDecodeDDTreeTest : public ::testing::TestWithParam<DDTreeTestParams>
+{
+};
+
+TEST_P(MambaCausalConv1dDecodeDDTreeTest, RootToNodeState)
 {
     constexpr int32_t batch = 2;
-    constexpr int32_t dim = 64;
-    constexpr int32_t width = 4;
-    constexpr int32_t verifySeq = 6;
+    auto const [verifySeq, width, hasBias, dim] = GetParam();
 
     std::vector<half> convStateHost(batch * dim * width);
     std::vector<half> weightHost(dim * width);
@@ -781,30 +787,24 @@ TEST(MambaCausalConv1dDecodeDDTree, RootToNodeState)
     uniformFloatInitialization<half>(biasHost, -0.5F, 0.5F);
     uniformFloatInitialization<half>(newColsHost, -0.5F, 0.5F);
 
-    std::vector<int32_t> parentIds{
-        -1, 0, 1, 1, 3, -1, // batch 0: root, chain 0->1->2, branch 1->3->4, padding node 5
-        -1, 0, 0, 2, 3, -1  // batch 1: root, two depth-1 children, chain 2->3->4, padding node 5
-    };
-    std::vector<int32_t> depths{
-        0,
-        1,
-        2,
-        2,
-        3,
-        0,
-        0,
-        1,
-        1,
-        2,
-        3,
-        0,
-    };
+    std::vector<int32_t> parentIds(static_cast<size_t>(batch) * verifySeq, -1);
+    std::vector<int32_t> depths(static_cast<size_t>(batch) * verifySeq, 0);
+    for (int32_t b = 0; b < batch; ++b)
+    {
+        for (int32_t node = 1; node < verifySeq - 1; ++node)
+        {
+            int32_t const parent = (b == 0) ? ((node == 3) ? 1 : node - 1) : ((node % 2 == 0) ? 0 : node - 1);
+            size_t const idx = static_cast<size_t>(b) * verifySeq + node;
+            parentIds[idx] = parent;
+            depths[idx] = depths[static_cast<size_t>(b) * verifySeq + parent] + 1;
+        }
+    }
 
     std::vector<half> convStateRef(convStateHost.size());
     std::vector<half> outRef(batch * verifySeq * dim);
     std::vector<half> intermRef(batch * verifySeq * dim * width);
     runCausalConv1dDecodeDDTreeReference(batch, dim, width, verifySeq, convStateHost, newColsHost, weightHost, biasHost,
-        parentIds, depths, convStateRef, outRef, intermRef);
+        hasBias, parentIds, depths, convStateRef, outRef, intermRef);
 
     auto convStateDevice = rt::Tensor({batch, dim, width}, rt::DeviceType::kGPU, DataType::kHALF);
     auto convStateOutDevice = rt::Tensor({batch, dim, width}, rt::DeviceType::kGPU, DataType::kHALF);
@@ -825,7 +825,11 @@ TEST(MambaCausalConv1dDecodeDDTree, RootToNodeState)
     CUDA_CHECK(
         cudaMemcpy(depthDevice.rawPointer(), depths.data(), depths.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
 
-    trt_edgellm::rt::OptionalInputTensor biasOpt = std::optional(std::cref(biasDevice));
+    trt_edgellm::rt::OptionalInputTensor biasOpt = std::nullopt;
+    if (hasBias)
+    {
+        biasOpt = std::optional(std::cref(biasDevice));
+    }
     mamba_ssm::invokeCausalConv1dDecodeDDTree(convStateDevice, newColsDevice, weightDevice, biasOpt, outDevice,
         convStateOutDevice, intermDevice, parentDevice, depthDevice, std::nullopt, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -853,3 +857,9 @@ TEST(MambaCausalConv1dDecodeDDTree, RootToNodeState)
             << ", expected " << __half2float(intermRef[i]);
     }
 }
+
+INSTANTIATE_TEST_SUITE_P(Configurations, MambaCausalConv1dDecodeDDTreeTest,
+    ::testing::Values(DDTreeTestParams{6, 4, true, 64}, DDTreeTestParams{7, 4, true, 64},
+        DDTreeTestParams{17, 4, true, 64}, DDTreeTestParams{7, 3, true, 64}, DDTreeTestParams{7, 4, false, 64},
+        DDTreeTestParams{7, 3, false, 64}, DDTreeTestParams{7, 8, true, 64}, DDTreeTestParams{7, 4, true, 257},
+        DDTreeTestParams{7, 3, true, 257}, DDTreeTestParams{1, 4, true, 64}));
