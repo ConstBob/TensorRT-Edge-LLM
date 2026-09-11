@@ -97,7 +97,8 @@ enum OptionId : int
     VIDEO_SUBSAMPLE = 919,
     ALTERNATE_VSF = 920,
     ACTION_CHUNK = 921,
-    VIDEO = 922
+    VIDEO = 922,
+    STATE = 923
 };
 
 struct Args
@@ -106,6 +107,7 @@ struct Args
     std::string imagePath;               //!< PNG/JPG conditioning observation (shared across the batch)
     std::string videoPath;               //!< comma-separated observation frames; i2v conditions on the most recent one
     std::vector<std::string> prompts;    //!< text instructions; batch = prompt count
+    std::vector<float> currentState;     //!< one clean current-state row for state-conditioned policy
     std::string domain{"droid_lerobot"}; //!< action domain
     std::string viewPoint{"ego_view"};   //!< camera viewpoint for the policy prompt framing
     bool rawPrompt{false};               //!< use --prompt / --promptFile verbatim (skip JSON build)
@@ -156,6 +158,7 @@ void printUsage(char const* programName)
     std::cerr << "               third_person_view, wrist_view, or concat_view." << std::endl;
     std::cerr << "  --steps      Diffusion denoise steps. Default = 4" << std::endl;
     std::cerr << "  --seed       Initial-noise seed. Default = 0" << std::endl;
+    std::cerr << "  --state      Comma-separated current model-space state (Policy-DROID: 8 values)." << std::endl;
     std::cerr << "  --iters      Benchmark iterations. Default = 1" << std::endl;
     std::cerr << "  --warmup     Benchmark warmup rounds. Default = 2" << std::endl;
     std::cerr << "  --cudagraph  Capture/replay the per-step GEN forward as a CUDA graph." << std::endl;
@@ -196,7 +199,8 @@ bool parseArgs(Args& args, int argc, char** argv)
             {"cudagraph", no_argument, nullptr, CUDAGRAPH}, {"guidance", required_argument, nullptr, GUIDANCE},
             {"video-subsample-factor", required_argument, nullptr, VIDEO_SUBSAMPLE},
             {"alternate-vsf", no_argument, nullptr, ALTERNATE_VSF},
-            {"action-chunk-size", required_argument, nullptr, ACTION_CHUNK}, {nullptr, 0, nullptr, 0}};
+            {"action-chunk-size", required_argument, nullptr, ACTION_CHUNK},
+            {"state", required_argument, nullptr, STATE}, {nullptr, 0, nullptr, 0}};
     int opt;
     while ((opt = getopt_long(argc, argv, "", options, nullptr)) != -1)
     {
@@ -226,6 +230,24 @@ bool parseArgs(Args& args, int argc, char** argv)
         case VIDEO_SUBSAMPLE: args.videoSubsampleFactor = optarg ? std::stoi(optarg) : args.videoSubsampleFactor; break;
         case ALTERNATE_VSF: args.alternateVsf = true; break;
         case ACTION_CHUNK: args.actionChunk = optarg ? std::stoi(optarg) : args.actionChunk; break;
+        case STATE:
+            if (optarg != nullptr)
+            {
+                std::string values(optarg);
+                for (size_t start = 0; start <= values.size();)
+                {
+                    size_t const comma = values.find(',', start);
+                    size_t const end = comma == std::string::npos ? values.size() : comma;
+                    ELLM_CHECK(end > start, "--state contains an empty value");
+                    args.currentState.push_back(std::stof(values.substr(start, end - start)));
+                    if (comma == std::string::npos)
+                    {
+                        break;
+                    }
+                    start = comma + 1;
+                }
+            }
+            break;
         default: return false;
         }
     }
@@ -275,7 +297,9 @@ std::string viewpointFraming(std::string const& viewPoint)
     }
     if (viewPoint == "concat_view")
     {
-        return "This video contains concatenated views from multiple camera perspectives.";
+        return "This video contains concatenated views from multiple camera perspectives. The top row is from the "
+               "wrist-mounted camera. The bottom row contains two horizontally concatenated third-person perspective "
+               "views of the scene from opposite sides, with the robot visible.";
     }
     ELLM_CHECK(false,
         "Unsupported --viewPoint '" + viewPoint
@@ -673,6 +697,13 @@ int main(int argc, char** argv)
         // (d) VAE encode -> UND prefill -> GEN diffusion loop -> action chunk //
         // ------------------------------------------------------------------ //
         cosmos3::Cosmos3Runtime runtime(args.engineDir, stream);
+        auto const& policyConfig = runtime.policyConfig();
+        if (policyConfig.stateRows > 0)
+        {
+            ELLM_CHECK(batch == 1, "State-conditioned CLI currently supports batch size 1");
+            ELLM_CHECK(args.currentState.size() == static_cast<size_t>(policyConfig.rawActionDim),
+                "--state must contain exactly raw_action_dim values for this engine");
+        }
         runtime.setNoiseSeed(args.seed);
         runtime.setNumInferenceSteps(args.steps);
         runtime.setUseCudaGraph(args.cudagraph);
@@ -708,7 +739,7 @@ int main(int argc, char** argv)
             {
                 runtime.setVideoSubsampleFactor(vsfForRound(round++));
             }
-            action = runtime.generatePolicy(pixelTensor, inputsEmbeds, uncondPtr, stream);
+            action = runtime.generatePolicy(pixelTensor, inputsEmbeds, uncondPtr, args.currentState, stream);
         }
         std::vector<double> walls;
         std::vector<double> wallsVsfLow;  //!< --alternate-vsf rounds at vsf == 1.
@@ -722,7 +753,7 @@ int main(int argc, char** argv)
                 runtime.setVideoSubsampleFactor(vsf);
             }
             auto const t0 = std::chrono::high_resolution_clock::now();
-            action = runtime.generatePolicy(pixelTensor, inputsEmbeds, uncondPtr, stream);
+            action = runtime.generatePolicy(pixelTensor, inputsEmbeds, uncondPtr, args.currentState, stream);
             cudaStreamSynchronize(stream);
             auto const t1 = std::chrono::high_resolution_clock::now();
             double const ms = std::chrono::duration<double, std::milli>(t1 - t0).count();

@@ -33,8 +33,8 @@ from ..._version import __version__
 from ...onnx.export_encoder import _run_dynamo_export
 from .modeling_gen import (ACTION_CHUNK_SIZE, DEFAULT_FPS,
                            DEFAULT_MAX_VIDEO_SUBSAMPLE_FACTOR,
-                           DEFAULT_NUM_FRAMES, build_cosmos3_gen,
-                           gen_config_from_transformer, make_gen_config)
+                           build_cosmos3_gen, gen_config_from_transformer,
+                           make_gen_config)
 from .modeling_und_prefill import (build_cosmos3_und_prefill,
                                    make_und_prefill_config)
 from .modeling_vae_encoder import (VAE_HEIGHT, VAE_WIDTH,
@@ -50,6 +50,22 @@ CONTRACT_VERSION = 1
 
 # Policy-path export default (droid context length).
 DEFAULT_MAX_UND_LEN = 512
+
+
+def _policy_defaults(checkpoint: str) -> dict:
+    """Read released policy metadata and domain-owned representation facts."""
+    path = os.path.join(checkpoint, "checkpoint.json")
+    if not os.path.isfile(path):
+        return {}
+    with open(path) as fh:
+        policy = json.load(fh).get("policy") or {}
+    if not isinstance(policy, dict):
+        raise ValueError("checkpoint.json 'policy' must be an object")
+    defaults = dict(policy)
+    if defaults.get("domain_name") == "droid_lerobot":
+        defaults.setdefault("raw_action_dim", 8)
+        defaults.setdefault("use_state", True)
+    return defaults
 
 
 def _write_component_config(out_dir: str, config: dict) -> None:
@@ -111,14 +127,19 @@ def export_gen(
         action_chunk_size: "int | None" = None,
         num_frames: "int | None" = None,
         fps: float = DEFAULT_FPS,
+        raw_action_dim: int = 10,
+        use_state: bool = False,
         max_video_subsample_factor: int = DEFAULT_MAX_VIDEO_SUBSAMPLE_FACTOR,
         min_action_chunk: "int | None" = None,
         max_action_chunk: "int | None" = None) -> None:
     """Export the GEN diffusion expert."""
     tcfg = load_config_json(checkpoint, "transformer")
     _, gen_weights = split_transformer_weights(_transformer_dir(checkpoint))
+    future_action_chunk_size = (action_chunk_size if action_chunk_size
+                                is not None else ACTION_CHUNK_SIZE)
+    action_token_count = future_action_chunk_size + (1 if use_state else 0)
     cfg = gen_config_from_transformer(tcfg,
-                                      action_chunk_size=action_chunk_size,
+                                      action_chunk_size=action_token_count,
                                       num_frames=num_frames)
     model = build_cosmos3_gen(cfg, gen_weights, dtype).to("cpu")
     args, input_names, output_names, dynamic_shapes = model.get_onnx_export_args(
@@ -132,6 +153,9 @@ def export_gen(
                         tcfg,
                         max_und_len,
                         fps=fps,
+                        future_action_chunk_size=future_action_chunk_size,
+                        raw_action_dim=raw_action_dim,
+                        use_state=use_state,
                         max_video_subsample_factor=max_video_subsample_factor,
                         min_action_chunk=min_action_chunk,
                         max_action_chunk=max_action_chunk))
@@ -178,9 +202,11 @@ def export_cosmos3_components(checkpoint: str,
                               height: int = VAE_HEIGHT,
                               width: int = VAE_WIDTH,
                               dtype: torch.dtype = torch.float16,
-                              num_frames: int = DEFAULT_NUM_FRAMES,
-                              action_chunk_size: int = ACTION_CHUNK_SIZE,
-                              fps: float = DEFAULT_FPS,
+                              num_frames: "int | None" = None,
+                              action_chunk_size: "int | None" = None,
+                              fps: "float | None" = None,
+                              raw_action_dim: "int | None" = None,
+                              use_state: "bool | None" = None,
                               max_video_subsample_factor: int = (
                                   DEFAULT_MAX_VIDEO_SUBSAMPLE_FACTOR),
                               min_action_chunk: "int | None" = None,
@@ -192,6 +218,19 @@ def export_cosmos3_components(checkpoint: str,
     [16, 8]). The generated frames are the rollout associated with the
     action chunk, not an input video.
     """
+    policy = _policy_defaults(checkpoint)
+    action_chunk_size = int(action_chunk_size if action_chunk_size is not None
+                            else policy.get("action_chunk_size",
+                                            ACTION_CHUNK_SIZE))
+    fps = float(fps if fps is not None else policy.get("conditioning_fps",
+                                                       DEFAULT_FPS))
+    raw_action_dim = int(raw_action_dim if raw_action_dim is not None else
+                         policy.get("raw_action_dim", 10))
+    use_state = bool(use_state if use_state is not None else
+                     policy.get("use_state", False))
+    num_frames = int(num_frames if num_frames is not None else
+                     action_chunk_size + 1)
+
     components = list(components or COSMOS3_COMPONENTS)
     unknown = [c for c in components if c not in COSMOS3_COMPONENTS]
     if unknown:
@@ -209,6 +248,8 @@ def export_cosmos3_components(checkpoint: str,
                        action_chunk_size=action_chunk_size,
                        num_frames=num_frames,
                        fps=fps,
+                       raw_action_dim=raw_action_dim,
+                       use_state=use_state,
                        max_video_subsample_factor=max_video_subsample_factor,
                        min_action_chunk=min_action_chunk,
                        max_action_chunk=max_action_chunk)

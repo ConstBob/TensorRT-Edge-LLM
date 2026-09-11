@@ -683,6 +683,9 @@ def make_gen_config(
         tcfg: dict,
         max_und_len: int,
         fps: float = DEFAULT_FPS,
+        future_action_chunk_size: "int | None" = None,
+        raw_action_dim: int = DEFAULT_RAW_ACTION_DIM,
+        use_state: bool = False,
         max_video_subsample_factor: int = DEFAULT_MAX_VIDEO_SUBSAMPLE_FACTOR,
         min_action_chunk: "int | None" = None,
         max_action_chunk: "int | None" = None) -> dict:
@@ -698,12 +701,22 @@ def make_gen_config(
     # the optimization target. Defaults keep min == opt == max = the canonical
     # chunk (action axis fixed, behavior identical) unless the caller widens it.
     action_len = cfg.action_chunk_size
+    state_rows = 1 if use_state else 0
+    future_action_chunk_size = (action_len - state_rows
+                                if future_action_chunk_size is None else
+                                future_action_chunk_size)
+    if action_len != future_action_chunk_size + state_rows:
+        raise ValueError(
+            "GEN action token count must equal future action chunk plus state rows: "
+            f"{action_len} != {future_action_chunk_size} + {state_rows}")
     max_action = max(
         action_len,
-        max_action_chunk if max_action_chunk is not None else action_len)
+        (max_action_chunk + state_rows
+         if max_action_chunk is not None else action_len))
     min_action = min(
         action_len,
-        min_action_chunk if min_action_chunk is not None else action_len)
+        (min_action_chunk + state_rows
+         if min_action_chunk is not None else action_len))
     opt_und = min(32, max_und_len)
 
     # The video-token sequence axis is DYNAMIC: the regular request (vsf=1,
@@ -712,8 +725,8 @@ def make_gen_config(
     # engine then serves any request whose video-token count lies in [min, max];
     # the runtime binds the per-request temporal extent (Cosmos3PolicyRunner).
     min_latent_t = min(
-        _latent_t_for_subsample(action_len, max_video_subsample_factor),
-        cfg.latent_t)
+        _latent_t_for_subsample(future_action_chunk_size,
+                                max_video_subsample_factor), cfg.latent_t)
     min_v_tok = min_latent_t * cfg.hp * cfg.wp
     # GEN sequence = video tokens + action tokens; both axes vary, so the gen-len
     # profile spans (min video + min action) .. (max video + max action) with the
@@ -803,8 +816,14 @@ def make_gen_config(
         "latent_channel": cfg.latent_channel,
         "latent_patch_size": cfg.latent_patch_size,
         "num_video_tokens": cfg.num_video_tokens,
-        "action_chunk_size": cfg.action_chunk_size,
-        "raw_action_dim": DEFAULT_RAW_ACTION_DIM,
+        # Public policy metadata describes FUTURE commands. The GEN action
+        # tensor has one additional clean leading row when use_state=true.
+        "action_chunk_size": future_action_chunk_size,
+        "action_token_count": action_len,
+        "state_rows": state_rows,
+        "history_length": state_rows,
+        "use_state": use_state,
+        "raw_action_dim": raw_action_dim,
         "max_action_dim": cfg.max_action_dim,
         "num_embodiment_domains": cfg.num_embodiment_domains,
         "domain": DEFAULT_DOMAIN,
@@ -821,5 +840,5 @@ def make_gen_config(
         "base_fps": 24.0,
         "temporal_compression_factor": 4,
         "temporal_modality_margin": 15000,
-        "action_start_frame_offset": 1,
+        "action_start_frame_offset": 0 if use_state else 1,
     }

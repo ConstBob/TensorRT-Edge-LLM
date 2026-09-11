@@ -16,7 +16,8 @@
 
 Exposes the observation -> action-chunk contract over HTTP + JSON so a RoboLab
 ``InferenceClient`` (Isaac Lab / Isaac Sim, x86-only) can drive the Edge-LLM
-Cosmos3 policy running on a remote target. See ``policy_server.py`` for
-the server, ``cosmos3_client.py`` for the RoboLab client subclass, and
-``selftest.py`` for a local mock self-test that runs without Isaac Sim.
+Cosmos3 policy running on a remote target. See ``policy_server.py`` for the
+HTTP+JSON server, ``openpi_server.py`` for the OpenPI websocket front-end
+used by RoboLab-120 Isaac workers, ``cosmos3_client.py`` for the HTTP client,
+and ``selftest.py`` for a local mock self-test that runs without Isaac Sim.
 """

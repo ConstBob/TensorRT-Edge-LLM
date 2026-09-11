@@ -44,8 +44,10 @@ import io
 import json
 import logging
 import os
+import random
 import subprocess
 import tempfile
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -64,18 +66,55 @@ class Cosmos3PolicyBackend:
         engine_dir: str,
         domain: str = "droid_lerobot",
         steps: int = 4,
+        guidance: float = 3.0,
+        viewpoint: str = "concat_view",
+        action_chunk_size: int = ACTION_CHUNK_SIZE,
+        seed: int = 0,
         extra_env: dict | None = None,
     ) -> None:
         self.binary = binary
         self.engine_dir = engine_dir
         self.domain = domain
         self.steps = steps
+        self.guidance = guidance
+        self.viewpoint = viewpoint
+        self.action_chunk_size = action_chunk_size
         self.extra_env = extra_env or {}
+        self._rng = random.Random(seed)
+        self._rng_lock = threading.Lock()
         if not os.path.isfile(binary):
             raise FileNotFoundError(
                 f"cosmos3_policy_inference binary not found: {binary}")
         if not os.path.isdir(engine_dir):
             raise FileNotFoundError(f"engine dir not found: {engine_dir}")
+        self._validate_engine_contract()
+
+    def _validate_engine_contract(self) -> None:
+        """Fail before serving if the engine was exported for another recipe."""
+        config_path = os.path.join(self.engine_dir, "gen", "config.json")
+        with open(config_path) as fh:
+            config = json.load(fh)
+        chunk = int(config["action_chunk_size"])
+        fps = float(config["fps"])
+        raw_action_dim = int(config["raw_action_dim"])
+        state_rows = int(config.get("state_rows", 0))
+        use_state = bool(config.get("use_state", False))
+        action_offset = int(config["action_start_frame_offset"])
+        if chunk != self.action_chunk_size:
+            raise ValueError(
+                f"engine action_chunk_size={chunk}, expected {self.action_chunk_size}; "
+                "re-export with --action-chunk-size 32")
+        if abs(fps - 15.0) > 1e-6:
+            raise ValueError(
+                f"engine fps={fps}, expected 15; re-export with --fps 15")
+        if (raw_action_dim != RAW_ACTION_DIM or state_rows != 1
+                or not use_state or action_offset != 0):
+            raise ValueError(
+                "Policy-DROID engine must have raw_action_dim=8, use_state=true, "
+                "one clean state row, and action_start_frame_offset=0; got "
+                f"raw_action_dim={raw_action_dim}, use_state={use_state}, "
+                f"state_rows={state_rows}, action_start_frame_offset={action_offset}"
+            )
 
     def _decode_image_to_png(self, image_field, tmpdir: str) -> str:
         """Materialize the request image to a PNG path.
@@ -122,6 +161,11 @@ class Cosmos3PolicyBackend:
             raise ValueError("request missing 'instruction'")
         domain = request.get("domain", self.domain)
         steps = int(request.get("steps", self.steps))
+        state = request.get("state")
+        if not isinstance(state, list) or len(state) != RAW_ACTION_DIM:
+            raise ValueError("request 'state' must contain 8 values")
+        with self._rng_lock:
+            seed = int(request.get("seed", self._rng.randrange(2**31)))
         with tempfile.TemporaryDirectory() as tmpdir:
             image_path = self._decode_image_to_png(request["image"], tmpdir)
             out_path = os.path.join(tmpdir, "action.json")
@@ -135,6 +179,16 @@ class Cosmos3PolicyBackend:
                 domain,
                 "--steps",
                 str(steps),
+                "--seed",
+                str(seed),
+                "--guidance",
+                str(self.guidance),
+                "--viewPoint",
+                self.viewpoint,
+                "--action-chunk-size",
+                str(self.action_chunk_size),
+                "--state",
+                ",".join(str(float(value)) for value in state),
                 "--engineDir",
                 self.engine_dir,
                 "--output",
@@ -152,6 +206,7 @@ class Cosmos3PolicyBackend:
             with open(out_path) as fh:
                 result = json.load(fh)
         result.setdefault("meta", {})["server_latency_s"] = latency
+        result["meta"]["seed"] = seed
         return result
 
 
@@ -187,6 +242,8 @@ class _Handler(BaseHTTPRequestHandler):
                     "action_shape": [ACTION_CHUNK_SIZE, RAW_ACTION_DIM],
                     "domain": self.server.backend.domain,
                     "num_inference_steps": self.server.backend.steps,
+                    "guidance": self.server.backend.guidance,
+                    "viewpoint": self.server.backend.viewpoint,
                 },
             )
         else:
@@ -251,10 +308,15 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--domain", default="droid_lerobot")
     ap.add_argument("--steps", type=int, default=4)
+    ap.add_argument("--guidance", type=float, default=3.0)
+    ap.add_argument("--viewpoint", default="concat_view")
+    ap.add_argument("--action-chunk-size", type=int, default=ACTION_CHUNK_SIZE)
+    ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
     backend = Cosmos3PolicyBackend(args.binary, args.engine_dir, args.domain,
-                                   args.steps)
+                                   args.steps, args.guidance, args.viewpoint,
+                                   args.action_chunk_size, args.seed)
     httpd = serve(backend, args.host, args.port)
     try:
         httpd.serve_forever()
