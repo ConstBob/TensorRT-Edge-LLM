@@ -33,6 +33,7 @@
 #include "common/checkMacros.h"
 #include "conversion.cuh"
 
+#include <cstdint>
 #include <cuda_fp16.h>
 #include <stdexcept>
 
@@ -592,6 +593,120 @@ void invokeCausalConv1dDecodeMTP(trt_edgellm::rt::Tensor const& convState, trt_e
 // DDTree decode kernel: each node independently reconstructs its conv window by walking
 // parent_ids back to root and appending the full root-to-node token path. This avoids
 // cross-node synchronization and still executes all tree nodes in one launch.
+// Width four is kept separate so that every state row can be transferred as one aligned
+// 64-bit value; other widths retain the generic scalar implementation below.
+__device__ __forceinline__ void unpackHalf4(uint64_t packed, float* values)
+{
+    constexpr uint64_t kHalfMask{0xFFFFU}; // bit mask for one packed FP16 value
+    constexpr int32_t kHalfBits{16};       // bit width of one packed FP16 value
+#pragma unroll
+    for (int32_t k = 0; k < 4; ++k)
+    {
+        uint16_t const raw = static_cast<uint16_t>((packed >> (k * kHalfBits)) & kHalfMask);
+        values[k] = __half2float(__ushort_as_half(raw));
+    }
+}
+
+__device__ __forceinline__ uint64_t packHalf4(float const* values)
+{
+    constexpr int32_t kHalfBits{16}; // bit width of one packed FP16 value
+    uint64_t packed{0};
+#pragma unroll
+    for (int32_t k = 0; k < 4; ++k)
+    {
+        uint64_t const raw = static_cast<uint64_t>(__half_as_ushort(__float2half(values[k])));
+        packed |= raw << (k * kHalfBits);
+    }
+    return packed;
+}
+
+__global__ void causalConv1dDecodeDDTreeWidth4Kernel(half const* __restrict__ convState,
+    half const* __restrict__ newCols, half const* __restrict__ weight, half const* __restrict__ bias,
+    half* __restrict__ output, half* __restrict__ intermediateConvStates, int32_t const* __restrict__ treeParentIds,
+    int32_t const* __restrict__ treeDepths, int32_t const* __restrict__ stateIndices, int32_t stateRows, int32_t dim,
+    int32_t verifySeq)
+{
+    constexpr int32_t kWidth{4}; // convolution width handled by this specialization
+    int32_t const batchIdx = blockIdx.x;
+    int32_t const nodeIdx = blockIdx.y;
+    int32_t const dimIdx = static_cast<int32_t>(blockIdx.z * blockDim.x + threadIdx.x);
+    if (dimIdx >= dim)
+    {
+        return;
+    }
+
+    int64_t const treeOffset = static_cast<int64_t>(batchIdx) * verifySeq;
+    int32_t const stateRow = stateIndices == nullptr ? batchIdx : stateIndices[batchIdx];
+    if (stateRow < 0 || stateRow >= stateRows)
+    {
+        return;
+    }
+    int64_t const stateRowOffset = (static_cast<int64_t>(stateRow) * dim + dimIdx) * kWidth;
+    int32_t const parentIdx = treeParentIds[treeOffset + nodeIdx];
+    int32_t const depth = treeDepths[treeOffset + nodeIdx];
+    bool const isRoot = nodeIdx == 0 && parentIdx < 0 && depth == 0;
+    bool const isValidChild = nodeIdx > 0 && parentIdx >= 0 && parentIdx < nodeIdx && depth > 0;
+    bool const isValidNode = isRoot || isValidChild;
+    // width==4 makes each [dim, width] row naturally 64-bit aligned.
+    uint64_t const packedState = *reinterpret_cast<uint64_t const*>(convState + stateRowOffset);
+    int64_t const intermediateOffset = ((treeOffset + nodeIdx) * dim + dimIdx) * kWidth;
+
+    if (!isValidNode)
+    {
+        // Padding nodes must preserve the base window for a later accepted-path scatter.
+        int64_t const outIdx = (treeOffset + nodeIdx) * dim + dimIdx;
+        conversion::convertAndStore(&output[outIdx], 0.0F);
+        *reinterpret_cast<uint64_t*>(intermediateConvStates + intermediateOffset) = packedState;
+        return;
+    }
+
+    float state[kWidth];
+    unpackHalf4(packedState, state);
+    // Store the path leaf-to-root. The convolution window only needs its latest four tokens.
+    int32_t pathNodes[kWidth];
+    int32_t pathLen{0};
+    int32_t const maxPathLen = (depth + 1 < kWidth) ? depth + 1 : kWidth;
+    int32_t currentNode = nodeIdx;
+    while (pathLen < maxPathLen && currentNode >= 0 && currentNode < verifySeq)
+    {
+        pathNodes[pathLen] = currentNode;
+        ++pathLen;
+        if (currentNode == 0)
+        {
+            break;
+        }
+        currentNode = treeParentIds[treeOffset + currentNode];
+    }
+
+#pragma unroll
+    for (int32_t k = 0; k < kWidth; ++k)
+    {
+        if (k + pathLen < kWidth)
+        {
+            state[k] = state[k + pathLen];
+        }
+        else
+        {
+            // Reversing the leaf-to-root walk appends tokens in chronological order.
+            int32_t const pathNode = pathNodes[kWidth - 1 - k];
+            int64_t const newColIdx = (treeOffset + pathNode) * dim + dimIdx;
+            state[k] = conversion::toFloat(newCols[newColIdx]);
+        }
+    }
+
+    float weightValues[kWidth];
+    unpackHalf4(*reinterpret_cast<uint64_t const*>(weight + static_cast<int64_t>(dimIdx) * kWidth), weightValues);
+    float acc = (bias != nullptr) ? conversion::toFloat(bias[dimIdx]) : 0.0F;
+#pragma unroll
+    for (int32_t k = 0; k < kWidth; ++k)
+    {
+        acc += state[k] * weightValues[k];
+    }
+    int64_t const outIdx = (treeOffset + nodeIdx) * dim + dimIdx;
+    conversion::convertAndStore(&output[outIdx], acc);
+    *reinterpret_cast<uint64_t*>(intermediateConvStates + intermediateOffset) = packHalf4(state);
+}
+
 template <typename T>
 __global__ void causalConv1dDecodeDDTreeKernel(T const* __restrict__ convState, T const* __restrict__ newCols,
     T const* __restrict__ weight, T const* __restrict__ bias, T* __restrict__ output,
@@ -727,15 +842,26 @@ void invokeCausalConv1dDecodeDDTree(trt_edgellm::rt::Tensor const& convState, tr
         treeDepths.getShape()[0] == batch && treeDepths.getShape()[1] == verifySeq, "treeDepths must be [B, S].");
 
     int32_t constexpr kThreads = 256;
+    constexpr int32_t kWidth4{4}; // width that selects the packed specialization
     dim3 const block(kThreads);
     dim3 const grid(batch, verifySeq, static_cast<uint32_t>((dim + kThreads - 1) / kThreads));
     half const* biasPtr = bias.has_value() ? bias->get().dataPointer<half>() : nullptr;
     int32_t const* stateIndicesPtr = stateIndices.has_value() ? stateIndices->get().dataPointer<int32_t>() : nullptr;
 
-    causalConv1dDecodeDDTreeKernel<half><<<grid, block, 0, stream>>>(convState.dataPointer<half>(),
-        newCols.dataPointer<half>(), weight.dataPointer<half>(), biasPtr, out.dataPointer<half>(),
-        intermediateConvStates.dataPointer<half>(), treeParentIds.dataPointer<int32_t>(),
-        treeDepths.dataPointer<int32_t>(), stateIndicesPtr, stateRows, dim, width, verifySeq);
+    if (width == kWidth4)
+    {
+        causalConv1dDecodeDDTreeWidth4Kernel<<<grid, block, 0, stream>>>(convState.dataPointer<half>(),
+            newCols.dataPointer<half>(), weight.dataPointer<half>(), biasPtr, out.dataPointer<half>(),
+            intermediateConvStates.dataPointer<half>(), treeParentIds.dataPointer<int32_t>(),
+            treeDepths.dataPointer<int32_t>(), stateIndicesPtr, stateRows, dim, verifySeq);
+    }
+    else
+    {
+        causalConv1dDecodeDDTreeKernel<half><<<grid, block, 0, stream>>>(convState.dataPointer<half>(),
+            newCols.dataPointer<half>(), weight.dataPointer<half>(), biasPtr, out.dataPointer<half>(),
+            intermediateConvStates.dataPointer<half>(), treeParentIds.dataPointer<int32_t>(),
+            treeDepths.dataPointer<int32_t>(), stateIndicesPtr, stateRows, dim, width, verifySeq);
+    }
     CUDA_CHECK(cudaPeekAtLastError());
 }
 
