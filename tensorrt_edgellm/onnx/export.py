@@ -617,6 +617,10 @@ def _initializer_dtype_fixup_required(
             for input_idx in (4, 7, 8, 9, 10):
                 if len(node.input) > input_idx:
                     plugin_fp32_init_names.add(node.input[input_idx])
+        if node.op_type == "Nvfp4A16BlackwellMoePlugin":
+            for input_idx in (4, 7, 8):
+                if len(node.input) > input_idx:
+                    plugin_fp32_init_names.add(node.input[input_idx])
         if node.op_type == "Fp16MoePlugin" and len(node.input) > 4:
             plugin_fp32_init_names.add(node.input[4])
         if node.op_type == "AttentionPlugin":
@@ -919,6 +923,8 @@ def _fix_initializer_dtypes(
     # - Nvfp4MoePlugin / NvFP4MoEPluginGeforce: inputs[4,7,8,9] are FP32 scale
     #   vectors; input[10] is the FP32 router correction bias. Both plugins
     #   share the same 11-input ONNX surface.
+    # - Nvfp4A16BlackwellMoePlugin: inputs[4,7] are the FP32 per-expert global
+    #   scales; input[8] is the FP32 router correction bias.
     plugin_fp32_init_names: set = set()
     for node in model.graph.node:
         if node.op_type == "update_ssm_state" and len(node.input) > 1:
@@ -931,6 +937,10 @@ def _fix_initializer_dtypes(
                     plugin_fp32_init_names.add(node.input[input_idx])
         if node.op_type == "Nvfp4A16MoePlugin" and len(node.input) > 8:
             plugin_fp32_init_names.add(node.input[8])
+        if node.op_type == "Nvfp4A16BlackwellMoePlugin":
+            for input_idx in (4, 7, 8):
+                if len(node.input) > input_idx:
+                    plugin_fp32_init_names.add(node.input[input_idx])
         if node.op_type == "Fp16MoePlugin" and len(node.input) > 4:
             plugin_fp32_init_names.add(node.input[4])
         if node.op_type == "AttentionPlugin":

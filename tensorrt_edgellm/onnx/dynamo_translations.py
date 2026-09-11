@@ -1391,6 +1391,57 @@ def _nvfp4_a16_moe_plugin_translation(
 
 
 @script()
+def _nvfp4_a16_blackwell_moe_plugin_translation(
+    router_logits: onnxscript.FLOAT,
+    hidden_states: onnxscript.FLOAT16,
+    fc1_qweights: onnxscript.INT8,
+    fc1_block_scales: onnxscript.INT8,
+    fc1_global_scales: onnxscript.FLOAT,
+    fc2_qweights: onnxscript.INT8,
+    fc2_block_scales: onnxscript.INT8,
+    fc2_global_scales: onnxscript.FLOAT,
+    e_score_correction_bias: onnxscript.FLOAT,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+    n_group: int,
+    topk_group: int,
+    norm_topk_prob: int,
+    routed_scaling_factor: float,
+    routing_mode: int,
+    max_routed_rows: int,
+    backend: int,
+) -> onnxscript.FLOAT16:
+    """Emit the dedicated SM110 routed NVFP4-A16 MoE plugin contract."""
+    return _trt_edgellm.Nvfp4A16BlackwellMoePlugin(
+        router_logits,
+        hidden_states,
+        fc1_qweights,
+        fc1_block_scales,
+        fc1_global_scales,
+        fc2_qweights,
+        fc2_block_scales,
+        fc2_global_scales,
+        e_score_correction_bias,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden_size,
+        moe_inter_size=moe_inter_size,
+        activation_type=activation_type,
+        n_group=n_group,
+        topk_group=topk_group,
+        norm_topk_prob=norm_topk_prob,
+        routed_scaling_factor=routed_scaling_factor,
+        routing_mode=routing_mode,
+        max_routed_rows=max_routed_rows,
+        layout=1,
+        backend=backend,
+    )
+
+
+@script()
 def _nvfp4_moe_plugin_translation(
     router_logits: onnxscript.FLOAT,
     hidden_states: onnxscript.FLOAT16,
@@ -1779,6 +1830,8 @@ def build_custom_translation_table() -> dict:
         _nvfp4_moe_plugin_translation,
         torch.ops.trt_edgellm.Nvfp4A16MoePlugin.default:
         _nvfp4_a16_moe_plugin_translation,
+        torch.ops.trt_edgellm.Nvfp4A16BlackwellMoePlugin.default:
+        _nvfp4_a16_blackwell_moe_plugin_translation,
         torch.ops.trt_edgellm.NvFP4MoEPluginGeforce.default:
         _nvfp4_moe_plugin_geforce_translation,
         torch.ops.trt_edgellm.Fp16MoePlugin.default:

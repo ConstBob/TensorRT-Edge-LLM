@@ -4360,11 +4360,13 @@ def main() -> None:
         default=None,
         metavar="SM",
         help=("Explicit GPU compute capability for target-specific ONNX ABI "
-              "selection (for example 110 for Thor). Dense NVFP4-A16 selects "
-              "Nvfp4A16BlackwellGemmPlugin / BLACKWELL_N128_K64_V1 only for "
-              "SM110; an omitted or non-SM110 target preserves the Marlin "
-              "Nvfp4A16GemmPlugin. Selection never depends on the GPU "
-              "installed on the export host."),
+              "selection (for example 110 for Thor). Only for SM110, dense "
+              "NVFP4-A16 selects Nvfp4A16BlackwellGemmPlugin / "
+              "BLACKWELL_N128_K64_V1 and Nemotron-H routed NVFP4-A16 experts "
+              "select Nvfp4A16BlackwellMoePlugin / BLACKWELL_MOE_N128_K64_V1; "
+              "an omitted or non-SM110 target preserves the Marlin "
+              "Nvfp4A16GemmPlugin and Nvfp4A16MoePlugin. Selection never "
+              "depends on the GPU installed on the export host."),
     )
     p.add_argument(
         "--quantization",
@@ -4392,7 +4394,8 @@ def main() -> None:
 
     # Select the INT4 GEMM plugin backend before any weight repack / op emission.
     set_int4_gemm_plugin_version(args.int4_gemm_plugin_version)
-    # Dense NVFP4-A16 repacking and ONNX emission read the same explicit target.
+    # Dense and routed-MoE NVFP4-A16 repacking and ONNX emission read the same
+    # explicit target.
     set_nvfp4_a16_export_target_sm(args.target_sm)
     # Applies to every QuantConfig parsed from here on (backbone and drafts).
     set_default_quantize_activations(args.quantize_activations)
