@@ -122,6 +122,31 @@ def make_thread_cooperative_group(size: int):
     return pipeline.CooperativeGroup(pipeline.Agent.Thread, size)
 
 
+def _exp2_emulation_count(head_dim: int) -> int:
+    """Split count for the compile-time ex2 variants, per (head_dim, target SM).
+
+    Measured optima (counts {2..32} x S {1k..32k} x B {1,2,4}, A/B against the
+    dense variant on the same idle pinned-clock GPU):
+
+                       sm_100 (B200)          sm_101/110 (Thor)
+        head_dim 64    28 (1.067~1.091x,      2  (all counts lose; 2 is the
+                           S>=12k)                least-harm value)
+        head_dim 128   8  (~1.00x; variant    2  (1.031~1.045x in its one
+                           not recommended)       winning window: B=1, S>=28k)
+
+    AOT builds are device-native, so the local device's compute capability IS
+    the target SM; CUTE_DSL_ARCH overrides it (e.g. cross builds).
+    """
+    arch = os.environ.get("CUTE_DSL_ARCH", "")
+    if arch:
+        sm = int("".join(ch for ch in arch if ch.isdigit()))
+    else:
+        sm = int(cp.cuda.Device().compute_capability)  # e.g. "100", "110"
+    if sm in (101, 110):
+        return 2
+    return 28 if head_dim <= 64 else 8
+
+
 class BlackwellFusedMultiHeadAttentionForward:
     WINDOW_NO_LIMIT = 1 << 30
 
@@ -139,6 +164,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         skip_softmax_threshold: Optional[float] = None,
         kv_stage: Optional[int] = None,
         q_stage: Optional[int] = None,
+        enable_ex2_emulation: bool = False,
     ):
         """Initializes the configuration for a Blackwell Fused Multi-Head Attention (FMHA) kernel.
 
@@ -186,6 +212,11 @@ class BlackwellFusedMultiHeadAttentionForward:
         # TMA ZFILL bridges the gap on loads; OOB drop on stores.
         self.head_dim = actual_head_dim if actual_head_dim is not None else mma_tiler[2]
         self.log2_e = math.log2(math.e)
+        # Compile-time flag: a runtime switch would add the emulation's live
+        # registers to the dense path too (measured 2.3-2.7x dense slowdown).
+        self.enable_ex2_emulation = enable_ex2_emulation
+        self.exp2_emulation_count = (
+            _exp2_emulation_count(self.head_dim) if enable_ex2_emulation else 0)
         self.cta_tiler = (
             2 * mma_tiler[0],  # 2 Q tile per CTA
             mma_tiler[1],
@@ -2654,6 +2685,17 @@ class BlackwellFusedMultiHeadAttentionForward:
         if old_row_max != row_max_safe:
             acc_scale = cute.math.exp2(acc_scale_, fastmath=True)
 
+        # ex2 emulation applies to unmasked tiles only (as in FA4 / TRT-LLM);
+        # masked tiles keep the pure-SFU exp2.
+        EXP2_EMULATION_COUNT = (
+            self.exp2_emulation_count
+            if self.enable_ex2_emulation
+            and not need_apply_mask
+            and frg_tile >= self.exp2_emulation_count
+            and frg_tile % 2 == 0
+            else 0
+        )
+
         # Compute P unless this warp's 32 rows are skipped. Skip-specific code is
         # const_expr-guarded so the disabled path is byte-identical to base.
         if cutlass.const_expr(enable_skip_softmax):
@@ -2679,35 +2721,81 @@ class BlackwellFusedMultiHeadAttentionForward:
                     tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.q_dtype))
         else:
             row_sum *= acc_scale
-            for j in range(frg_cnt):
-                for k in cutlass.range(
-                    cute.size(tTMEM_LOADrS_frg, mode=[0]), vectorize=True
-                ):
-                    tTMEM_LOADrS_frg[k, j] = (
-                        tTMEM_LOADrS_frg[k, j] * scale + minus_row_max_scale
-                    )
-                    tTMEM_LOADrS_frg[k, j] = cute.math.exp2(
-                        tTMEM_LOADrS_frg[k, j], fastmath=True
-                    )
-
-                s_vec = tTMEM_LOADrS_frg[None, j].load()
-                row_sum = s_vec.reduce(cute.ReductionOp.ADD, row_sum, 0)
-                if cutlass.const_expr(self.q_dtype == cutlass.Float8E4M3FN):
-                    # PRMT-free packed f32x4 -> e4m3x4 conversion
-                    # (F2FP.PACK_AB_MERGE_C chains; SASS-verified on sm_100/110).
-                    src_cvt = cute.logical_divide(
-                        tTMEM_LOADrS_frg[None, j], cute.make_layout(4)
-                    )
-                    dst_cvt = cute.logical_divide(
-                        tTMEM_STORErS_x4_e_frg[None, j], cute.make_layout(4)
-                    )
-                    for cvt_idx in cutlass.range_constexpr(
-                        cute.size(src_cvt, mode=[1])
+            if cutlass.const_expr(EXP2_EMULATION_COUNT == 0):
+                for j in range(frg_cnt):
+                    for k in cutlass.range(
+                        cute.size(tTMEM_LOADrS_frg, mode=[0]), vectorize=True
                     ):
-                        fmha_utils.cvt_f32x4_to_f8x4(
-                            src_cvt[None, cvt_idx], dst_cvt[None, cvt_idx]
+                        tTMEM_LOADrS_frg[k, j] = (
+                            tTMEM_LOADrS_frg[k, j] * scale + minus_row_max_scale
                         )
-                else:
+                        tTMEM_LOADrS_frg[k, j] = cute.math.exp2(
+                            tTMEM_LOADrS_frg[k, j], fastmath=True
+                        )
+
+                    s_vec = tTMEM_LOADrS_frg[None, j].load()
+                    row_sum = s_vec.reduce(cute.ReductionOp.ADD, row_sum, 0)
+                    if cutlass.const_expr(self.q_dtype == cutlass.Float8E4M3FN):
+                        # PRMT-free packed f32x4 -> e4m3x4 conversion
+                        # (F2FP.PACK_AB_MERGE_C chains; SASS-verified on sm_100/110).
+                        src_cvt = cute.logical_divide(
+                            tTMEM_LOADrS_frg[None, j], cute.make_layout(4)
+                        )
+                        dst_cvt = cute.logical_divide(
+                            tTMEM_STORErS_x4_e_frg[None, j], cute.make_layout(4)
+                        )
+                        for cvt_idx in cutlass.range_constexpr(
+                            cute.size(src_cvt, mode=[1])
+                        ):
+                            fmha_utils.cvt_f32x4_to_f8x4(
+                                src_cvt[None, cvt_idx], dst_cvt[None, cvt_idx]
+                            )
+                    else:
+                        tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.q_dtype))
+            else:
+                # Unmasked tile of an _ex2 variant: the last EXP2_EMULATION_COUNT
+                # elements of the final fragment take the FFMA polynomial path.
+                for j in cutlass.range_constexpr(frg_cnt):
+                    if cutlass.const_expr(j < frg_cnt - 1):
+                        for k in cutlass.range(
+                            cute.size(tTMEM_LOADrS_frg, mode=[0]), vectorize=True
+                        ):
+                            tTMEM_LOADrS_frg[k, j] = (
+                                tTMEM_LOADrS_frg[k, j] * scale + minus_row_max_scale
+                            )
+                            tTMEM_LOADrS_frg[k, j] = cute.math.exp2(
+                                tTMEM_LOADrS_frg[k, j], fastmath=True
+                            )
+                    else:
+                        for k in cutlass.range_constexpr(0, frg_tile, 2):
+                            (
+                                tTMEM_LOADrS_frg[k, j],
+                                tTMEM_LOADrS_frg[k + 1, j],
+                            ) = cute.arch.fma_packed_f32x2(
+                                (tTMEM_LOADrS_frg[k, j], tTMEM_LOADrS_frg[k + 1, j]),
+                                (scale, scale),
+                                (minus_row_max_scale, minus_row_max_scale),
+                            )
+                            if cutlass.const_expr(
+                                k < frg_tile - EXP2_EMULATION_COUNT
+                            ):
+                                tTMEM_LOADrS_frg[k, j] = cute.math.exp2(
+                                    tTMEM_LOADrS_frg[k, j], fastmath=True
+                                )
+                                tTMEM_LOADrS_frg[k + 1, j] = cute.math.exp2(
+                                    tTMEM_LOADrS_frg[k + 1, j], fastmath=True
+                                )
+                            else:
+                                (
+                                    tTMEM_LOADrS_frg[k, j],
+                                    tTMEM_LOADrS_frg[k + 1, j],
+                                ) = fmha_utils.ex2_emulation_packed_f32x2(
+                                    tTMEM_LOADrS_frg[k, j],
+                                    tTMEM_LOADrS_frg[k + 1, j],
+                                )
+
+                    s_vec = tTMEM_LOADrS_frg[None, j].load()
+                    row_sum = s_vec.reduce(cute.ReductionOp.ADD, row_sum, 0)
                     tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.q_dtype))
         # Sequence barrier arrive
         if cutlass.const_expr(stage == 0):
@@ -7033,6 +7121,7 @@ def run(
     function_prefix: str = "fmha",
     vit_mode: bool = False,
     enable_skip_correction: bool = True,
+    enable_ex2_emulation: bool = False,
     paged_kv: bool = False,
     bidirectional: bool = False,
     skip_softmax_threshold: Optional[float] = None,
@@ -7429,6 +7518,12 @@ def run(
     # skip-correction OFF (mutually exclusive with the skip predicate:
     # correction carries a lagged row max). threshold=None
     # compiles all of it out -- bit-identical to the dense kernel.
+    if skip_softmax_threshold is not None and enable_ex2_emulation:
+        raise ValueError(
+            "skip-softmax and ex2-emulation are separate kernel variants; "
+            "build one at a time")
+    if enable_ex2_emulation and (d in (256, 512) or in_dtype.width <= 8):
+        raise ValueError("ex2-emulation variants exist for FP16 d64/d128 only")
     # d64/d128 use the base class; d256/d512 route to the d256-per-CTA class,
     # which carries the same gated skip path.
     if skip_softmax_threshold is not None and d not in (256, 512):
@@ -7491,6 +7586,7 @@ def run(
             enable_skip_correction=enable_skip_correction,
             kv_stage=kv_stage,
             q_stage=q_stage,
+            enable_ex2_emulation=enable_ex2_emulation,
         )
 
     # Initialize Stream
@@ -7978,6 +8074,7 @@ def run(
                 tolerance=llm_prefill_tolerance,
                 skip_softmax_threshold=skip_softmax_threshold,
                 qkv_npz=load_qkv,
+                enable_ex2_emulation=enable_ex2_emulation,
             )
             print(f"{_tag} LLM multi-round prefill test passed.")
 
@@ -8059,6 +8156,98 @@ def run(
     return exec_time  # Return execution time in microseconds
 
 
+@cute.kernel
+def _ex2_emulation_test_kernel(x: cute.Tensor, y: cute.Tensor):
+    """Apply ex2_emulation_packed_f32x2 elementwise over consecutive pairs."""
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    pair = bidx * 128 + tidx
+    if pair * 2 + 1 < cute.size(x):
+        (
+            y[pair * 2],
+            y[pair * 2 + 1],
+        ) = fmha_utils.ex2_emulation_packed_f32x2(x[pair * 2], x[pair * 2 + 1])
+
+
+@cute.jit
+def _ex2_emulation_test_launch(x: cute.Tensor, y: cute.Tensor,
+                               stream: cuda.CUstream):
+    n_pairs = (cute.size(x) + 1) // 2
+    n_blocks = (n_pairs + 127) // 128
+    _ex2_emulation_test_kernel(x, y).launch(
+        grid=[n_blocks, 1, 1],
+        block=[128, 1, 1],
+        stream=stream,
+    )
+
+
+def run_ex2_emulation_unit_test():
+    """Unit test for fmha_utils.ex2_emulation_packed_f32x2.
+
+    Validates the FFMA exp2 emulation directly, outside the FMHA kernel:
+
+    1. Sweep of [-127, 0]: relative error vs np.exp2 within the cubic
+       polynomial's budget.
+    2. Boundary values 0.0, -1.0: same relative-error gate.
+    3. x <= -127 (including the clamp for arbitrarily negative inputs, i.e.
+       masked -inf scores): the exponent-add trick underflows to EXACTLY 0.0
+       (not 2^-127) — pinned here as documented behavior the kernel relies on
+       for masked tiles.
+    4. -127 < x < -126.5 region lands in FP32 subnormal territory: only an
+       absolute-error gate (<= 2^-126) applies there.
+    """
+    _tag = "[ex2_emulation_test]"
+    n = 4096
+    rng = np.random.default_rng(2026)
+
+    boundary = np.array([0.0, -1.0, -126.5, -127.0], dtype=np.float32)
+    below_clamp = np.array([-127.0001, -127.5, -128.0, -1024.0, -3.0e38],
+                           dtype=np.float32)
+    sweep = np.linspace(-126.0, 0.0, 2048, dtype=np.float32)
+    rand = rng.uniform(-126.0, 0.0,
+                       n - boundary.size - below_clamp.size -
+                       sweep.size).astype(np.float32)
+    x_np = np.concatenate([boundary, below_clamp, sweep, rand])
+    assert x_np.size == n and n % 2 == 0
+
+    x_cp = cp.asarray(x_np)
+    y_cp = cp.full((n, ), np.nan, dtype=cp.float32)
+    x_t = from_dlpack(x_cp, assumed_align=16)
+    y_t = from_dlpack(y_cp, assumed_align=16)
+    stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
+
+    compiled = cute.compile(_ex2_emulation_test_launch, x_t, y_t, stream)
+    compiled(x_t, y_t, stream)
+    cp.cuda.get_current_stream().synchronize()
+    y_np = y_cp.get()
+
+    ref = np.exp2(x_np.astype(np.float64))
+
+    # Region 3: everything at or below the -127 clamp is exactly +0.0.
+    at_or_below = x_np <= -127.0
+    np.testing.assert_array_equal(
+        y_np[at_or_below], np.zeros(int(at_or_below.sum()), dtype=np.float32),
+        err_msg=f"{_tag} x <= -127 must underflow to exactly 0.0")
+
+    # Region 4: subnormal territory — absolute gate only.
+    subnormal = (~at_or_below) & (x_np < -126.0)
+    assert np.all(y_np[subnormal] >= 0.0) and np.all(
+        np.abs(y_np[subnormal] - ref[subnormal]) <= 2.0**-126), (
+            f"{_tag} subnormal-region absolute error out of budget")
+
+    # Regions 1+2: normalized range — relative gate. The cubic polynomial's
+    # max relative error on [0, 1) is ~2e-4; gate at 5e-4 for headroom.
+    normal = x_np >= -126.0
+    rel = np.abs(y_np[normal] - ref[normal]) / ref[normal]
+    max_rel = float(rel.max())
+    assert max_rel < 5e-4, (
+        f"{_tag} max relative error {max_rel:.3e} exceeds 5e-4 budget")
+
+    print(f"{_tag} PASSED: n={n}, max_rel_err={max_rel:.3e} (gate 5e-4), "
+          f"x<=-127 -> exact 0.0 ({int(at_or_below.sum())} values), "
+          f"subnormal region within 2^-126 ({int(subnormal.sum())} values)")
+
+
 def run_llm_multi_round_prefill_test(
     batch_size: int = 4,
     seq_len: int = 8,
@@ -8077,6 +8266,7 @@ def run_llm_multi_round_prefill_test(
     tolerance: float = 0.1,
     skip_softmax_threshold: Optional[float] = None,
     qkv_npz: Optional[str] = None,
+    enable_ex2_emulation: bool = False,
 ):
     """LLM FMHA multi-round prefill accuracy test aligned with plugin unit test.
 
@@ -8103,6 +8293,7 @@ def run_llm_multi_round_prefill_test(
     :param window_size_left_val: Left window size (-1 = disabled).
     :param attention_scale: Absolute QK^T multiplier; None selects the default 1/sqrt(d) value.
     :param tolerance: Max absolute error tolerance.
+    :param enable_ex2_emulation: Build the compile-time FFMA exp2 emulation variant.
     """
     _tag = "[llm_prefill_test]"
     b = batch_size
@@ -8204,6 +8395,7 @@ def run_llm_multi_round_prefill_test(
             is_persistent, mask_type, use_sliding_window=use_sliding_window,
             is_causal=is_causal,
             actual_head_dim=actual_head_dim,
+            enable_ex2_emulation=enable_ex2_emulation,
         )
     current_stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
     # Runtime persistent-grid size (sm_count kernel argument): AOT callers pass
@@ -8632,6 +8824,23 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--enable_ex2_emulation",
+        action="store_true",
+        help="Build the ex2-emulation kernel flavor: on unmasked tiles part of the "
+        "softmax exp2 runs as a polynomial FFMA emulation instead of the SFU "
+        "(2^x ~= ((0.077x + 0.228)x + 0.695)x + 1). FP16 d64/d128 only. Not "
+        "built by default; add a build_cutedsl.py KernelVariant to ship it.",
+    )
+
+    parser.add_argument(
+        "--test_ex2_emulation",
+        action="store_true",
+        help="Run the ex2_emulation_packed_f32x2 unit test (sweep of "
+        "[-127, 0] vs np.exp2 plus the -127 underflow-to-zero boundary) "
+        "and exit.",
+    )
+
+    parser.add_argument(
         "--paged_kv",
         action="store_true",
         help="Compile LLM FMHA variant that reads paged KV cache directly. "
@@ -8708,6 +8917,10 @@ if __name__ == "__main__":
     if not args.export_only and cp.cuda.runtime.getDeviceCount() == 0:
         raise RuntimeError("GPU is required to run this example!")
 
+    if args.test_ex2_emulation:
+        run_ex2_emulation_unit_test()
+        sys.exit(0)
+
     if len(args.q_shape) != 4:
         parser.error("--q_shape must contain exactly 4 values")
 
@@ -8755,6 +8968,7 @@ if __name__ == "__main__":
         function_prefix=args.function_prefix,
         vit_mode=args.vit_mode,
         enable_skip_correction=args.enable_skip_correction,
+        enable_ex2_emulation=args.enable_ex2_emulation,
         paged_kv=args.paged_kv,
         bidirectional=args.bidirectional,
         skip_softmax_threshold=args.skip_softmax_threshold,
