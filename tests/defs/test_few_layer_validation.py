@@ -122,6 +122,19 @@ _FEW_LAYER_MODELS = {
         "cos_threshold": 0.99,
         "needs_cutedsl": True,
     },
+    # Gemma4 26B-A4B MoE, NVFP4 (the only supported precision for this model --
+    # see docs/source/user_guide/getting_started/supported-models.md). The
+    # golden swaps HF's stacked-parameter Gemma4TextExperts for per-expert
+    # placeholders so each expert's separately-quantized NVFP4 projection can
+    # be patched (see _GoldenGemma4MoEExperts in golden_layer_dump.py). Worst
+    # cosine drifts to ~0.954 by the last decode round, an NVFP4 floor like
+    # Nemotron NVFP4 above (validated worst 0.95376).
+    "gemma-4-26B-A4B-NVFP4": {
+        "dir_name": "gemma/nvidia-Gemma-4-26B-A4B-NVFP4",
+        "num_layers": 4,
+        "cos_threshold": 0.95,
+        "needs_cutedsl": True,
+    },
 }
 
 
