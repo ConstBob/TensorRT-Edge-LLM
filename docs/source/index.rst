@@ -49,6 +49,7 @@ and action models on NVIDIA edge platforms.
    user_guide/features/guided-decoding.md
    user_guide/features/visual-token-pruning.md
    user_guide/features/kv-cache-reuse.md
+   user_guide/features/in-flight-batching.md
    user_guide/features/codepredictor-speculative-decoding.md
 
 .. toctree::

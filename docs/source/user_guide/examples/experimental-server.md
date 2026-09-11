@@ -46,6 +46,11 @@ result = llm.chat(
 print(result.text)
 ```
 
+Pass `enable_in_flight_batching=True` together with `max_batch_size` to let
+concurrent `chat()`, `generate()`, and `generate_stream()` calls from several
+threads share the running batch instead of taking turns; see
+[In-Flight Batching](../features/in-flight-batching.md).
+
 Streaming uses the same runtime:
 
 ```python
@@ -67,6 +72,9 @@ tensorrt-edgellm-serve Qwen/Qwen3.5-0.8B \
   --max-kv-cache-capacity 8192 \
   --port 8000
 ```
+
+Add `--enable-in-flight-batching --max-batch-size 4` to serve up to four
+requests at once; see [Runtime Concurrency](#runtime-concurrency).
 
 The cache contains downloaded checkpoints and complete, profile-specific
 runtime bundles. A launch reuses a bundle only when the base checkpoint,
@@ -378,7 +386,7 @@ When `--api-key` is set, both OpenAI bearer authentication and Anthropic
 
 | Method | Path | Contract |
 |---|---|---|
-| `GET` | `/health`, `/health/ready` | Runtime, queue, and capability state |
+| `GET` | `/health`, `/health/ready` | Runtime, queue, and capability state; under in-flight batching also the scheduler counters (`scheduling`) |
 | `GET` | `/v1/models` | The loaded model |
 | `POST` | `/v1/chat/completions` | OpenAI chat and SSE |
 | `POST` | `/v1/messages` | Anthropic Messages and SSE |
@@ -393,13 +401,27 @@ API.
 
 ## Runtime Concurrency
 
-The current high-level runtime has one mutable generation state. The server
-therefore admits one request at a time and uses a bounded async queue configured
-by `--max-queued-requests` and `--queue-timeout`. Queue overflow and timeout
-return HTTP 429 (Anthropic 529). Streaming disconnects cancel the native channel
-immediately, wait for the native worker to exit, and then release the runtime
-lease. Engines stay resident across HTTP connections; graceful server shutdown
-drains active work and releases the runtime and its device resources.
+By default the server admits one request at a time: the runtime has one mutable
+generation state, and a bounded async queue configured by
+`--max-queued-requests` and `--queue-timeout` holds the rest. Queue overflow and
+timeout return HTTP 429 (Anthropic 529). Streaming disconnects cancel the native
+channel immediately, wait for the native worker to exit, and then release the
+runtime lease. Engines stay resident across HTTP connections; graceful server
+shutdown drains active work and releases the runtime and its device resources.
 
-Continuous batching, chunked prefill scheduling, and tensor parallelism require
-additional native scheduler support and are rejected at launch.
+`--enable-in-flight-batching` replaces the one-at-a-time path with the request
+engine: up to `--max-batch-size` requests decode together, and a new request
+joins the running batch at the next generation boundary instead of waiting for
+it to finish. Admission is then a limit rather than a queue: at most
+`--max-batch-size` plus `--max-queued-requests` requests are in flight, and a
+request past that limit gets an immediate 429. A disconnect cancels the request
+inside the engine, so an abandoned stream stops decoding and frees its seat.
+`/health` reports `in_flight_batching: true`, `max_num_seqs` equal to the batch
+size, and a `scheduling` block with the engine's counters (submitted, completed,
+cancelled, admissions that joined mid-flight, and the reasons a queued request
+had to wait).
+
+Not every deployment can take the flag, and not every request can join a
+running batch; see [In-Flight Batching](../features/in-flight-batching.md) for
+the support matrix. Chunked prefill scheduling and tensor parallelism remain on
+the one-at-a-time path.

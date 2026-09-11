@@ -127,6 +127,9 @@ struct FakeScript
 {
     //! Tokens each resident produces before it finishes, one per decode tick.
     int32_t tokensPerRequest{1};
+    //! Extra tokens a joiner produces on top of tokensPerRequest, so a test can make a joiner
+    //! outlive its founder whatever tick it was seated on.
+    int32_t joinerExtraTokens{0};
     //! Runs at the top of every decode tick on the actor thread: a test parks the actor here.
     std::function<void()> beforeDecode;
     //! Refuse this many admissions with kNoCapacity before seating any.
@@ -232,7 +235,7 @@ public:
                 continue;
             }
             it->tokens.push_back(++it->generated);
-            if (it->generated >= mScript.tokensPerRequest)
+            if (it->generated >= mScript.tokensPerRequest + (it->joiner ? mScript.joinerExtraTokens : 0))
             {
                 if (mScript.abandonJoiners && it->joiner)
                 {
@@ -1131,6 +1134,9 @@ TEST(RequestEngineTests, AnEvictedFounderIsPublishedBeforeTheBatchDrains)
     // then, not when the batch finally drains.
     FakeScript script;
     script.tokensPerRequest = 3;
+    // The joiner outlives the founder whatever tick it is seated on; the test must not depend on
+    // where the admission lands relative to the founder's decodes.
+    script.joinerExtraTokens = 2;
     Gate gate;
     holdFirstDecode(script, gate);
     EngineConfig config;
@@ -1139,13 +1145,22 @@ TEST(RequestEngineTests, AnEvictedFounderIsPublishedBeforeTheBatchDrains)
 
     RequestHandle founder = engine.submit(makeRequest("founder"));
     ASSERT_TRUE(waitUntil([&] { return engine.resident() > 0; }));
-    RequestHandle joiner = engine.submit(makeRequest("joiner"));
-    // From here the founder needs two more decodes, the joiner (seated one tick later) three.
-    script.beforeDecode = [] { std::this_thread::sleep_for(20ms); };
+    RequestHandle joiner = engine.submit(makeRequest("joiner")); // queued while the actor is parked
+    // Once the founder has retired, hold the batch at its next decode: the joiner then provably
+    // still has work left at the moment the founder's caller is released. A timed sleep here made
+    // the check below a race that a slow, busy machine lost.
+    Gate afterFounder;
+    script.beforeDecode = [&] {
+        if (script.completed.load() >= 1)
+        {
+            afterFounder.wait();
+        }
+    };
     gate.open();
 
     EXPECT_NO_THROW(founder.get());
     EXPECT_FALSE(joiner.ready()) << "the founder's outcome must not wait for the batch to drain";
+    afterFounder.open();
     EXPECT_NO_THROW(joiner.get());
     EXPECT_EQ(script.batches.load(), 1);
     EXPECT_EQ(engine.metrics().completed, 2U) << "one outcome each, published exactly once";

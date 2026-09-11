@@ -97,6 +97,11 @@ class SpeculativeConfig:
                    draft_model=draft_model or "")
 
 
+#: Requests that may wait behind the running batch before the server refuses
+#: (HTTP 429) and the direct Python API blocks. One number for both entry points.
+DEFAULT_MAX_QUEUED_REQUESTS = 16
+
+
 @dataclass(frozen=True)
 class ContextCacheConfig:
     """Deployment-scoped KV-cache reuse configuration."""
@@ -177,6 +182,7 @@ class ModelConfig:
     speculative_config: Optional[SpeculativeConfig] = None
     context_cache_config: ContextCacheConfig = field(
         default_factory=ContextCacheConfig)
+    enable_in_flight_batching: bool = False
 
     def __post_init__(self) -> None:
         if (isinstance(self.engine_cache_max_size_gb, bool)
@@ -199,6 +205,7 @@ class ModelConfig:
             "verify_tree_size": self.verify_tree_size,
             "speculative_config": self.speculative_config,
             "context_cache_config": self.context_cache_config,
+            "enable_in_flight_batching": self.enable_in_flight_batching,
         }
 
 
@@ -213,7 +220,7 @@ class ApiConfig:
     reasoning_parser: str = "auto"
     tool_call_parser: str = "auto"
     enable_auto_tool_choice: bool = False
-    max_queued_requests: int = 16
+    max_queued_requests: int = DEFAULT_MAX_QUEUED_REQUESTS
     queue_timeout: float = 600.0
     allowed_local_media_path: str = ""
     log_level: str = "info"
@@ -332,6 +339,15 @@ def create_argument_parser() -> argparse.ArgumentParser:
         help="Reuse matching text prefixes across requests in this trusted "
         "server instance.",
     )
+    model.add_argument(
+        "--enable-in-flight-batching",
+        action="store_true",
+        help="Admit queued requests into the running batch at generation "
+        "boundaries instead of serving one request at a time. Text and "
+        "multimodal-input deployments only: a speculative-decoding or "
+        "standalone TTS deployment refuses the flag at startup, and a "
+        "Qwen3-Omni bundle serves text only (its speech endpoints refuse).",
+    )
     model.add_argument("--context-cache-max-records",
                        type=_non_negative_int,
                        default=1024)
@@ -379,6 +395,7 @@ def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
         verify_tree_size=args.verify_tree_size,
         speculative_config=speculative,
         context_cache_config=context_cache,
+        enable_in_flight_batching=args.enable_in_flight_batching,
     )
     api = ApiConfig(
         host=args.host,

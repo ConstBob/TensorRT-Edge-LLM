@@ -29,6 +29,7 @@ from experimental.server.runtime.engine import (
     _native_context_cache_config, _resolve_spec_decode_runtime_options,
     _set_context_cache_request_policies)
 from experimental.server.runtime.engine_client import (_AdmissionController,
+                                                       _IFBAdmissionGate,
                                                        _iterate_sync)
 from experimental.server.runtime.engine_layout import EngineType
 
@@ -764,3 +765,574 @@ def test_runtime_load_forwards_context_cache_config(monkeypatch, engine_type):
     assert native.max_records == 23
     if engine_type == EngineType.SPEC_DECODE:
         assert captured["args"][-1] == 0
+
+
+# ---------------------------------------------------------------------------
+# In-flight batching: the engine-backed request paths
+# ---------------------------------------------------------------------------
+
+
+class _FakeHandle:
+
+    def __init__(self):
+        self.cancelled = False
+        self.got = False
+        self.error = None
+        self.is_ready = False
+
+    def ready(self):
+        return self.is_ready
+
+    def cancel(self):
+        self.cancelled = True
+
+    def get(self):
+        self.got = True
+        if self.error is not None:
+            raise self.error
+        return SimpleNamespace(output_texts=["done"])
+
+
+class _FakeEngine:
+
+    def __init__(self):
+        self.submitted = []
+        self.handle = _FakeHandle()
+        self.shutdown_modes = []
+
+    def submit(self, request):
+        self.submitted.append(request)
+        return self.handle
+
+    def shutdown(self, mode):
+        self.shutdown_modes.append(mode)
+
+
+class _IFBChunk:
+    text = "partial"
+    token_ids = [1]
+    prompt_token_count = 1
+    finished = False
+    reason = None
+    logprobs = []
+
+
+class _IFBChannel:
+    """One unfinished chunk, then a finished channel: the loop exits on the
+    finished flag rather than a terminal chunk, so the fake runtime module
+    needs no FinishReason enum."""
+
+    def __init__(self):
+        self.chunks = [_IFBChunk()]
+        self.cancelled = False
+        self.skip_special = None
+        self.silent = False  # neither finished nor cancelled once drained
+
+    def set_skip_special_tokens(self, enabled):
+        self.skip_special = enabled
+
+    def wait_pop(self, timeout_ms=0):
+        return self.chunks.pop(0) if self.chunks else None
+
+    def is_finished(self):
+        return not self.silent and not self.chunks
+
+    def is_cancelled(self):
+        return self.cancelled
+
+    def cancel(self):
+        self.cancelled = True
+
+
+def _ifb_llm(engine, channel=None):
+    llm = _bare_llm(None)
+    llm._engine = engine
+    if channel is not None:
+
+        class RuntimeModule:
+
+            class StreamChannel:
+
+                @staticmethod
+                def create():
+                    return channel
+
+        llm._rt = RuntimeModule()
+    return llm
+
+
+def test_ifb_handle_request_does_not_take_the_infer_lock():
+    # On the blocking path a held _infer_lock would deadlock this call; under
+    # in-flight batching concurrency control lives in the engine, so it must
+    # go through even while the lock is held.
+    engine = _FakeEngine()
+    llm = _ifb_llm(engine)
+    with llm._infer_lock:
+        response = LLM._handle_request(llm, "req")
+    assert engine.submitted == ["req"]
+    assert response.output_texts == ["done"]
+
+
+def test_ifb_stream_attaches_its_channel_and_needs_no_worker():
+    engine = _FakeEngine()
+    channel = _IFBChannel()
+    llm = _ifb_llm(engine, channel)
+
+    request = type("Request", (), {"stream_channels": None})()
+    deltas = list(llm.generate_stream([], prebuilt_request=request))
+
+    assert [d.text for d in deltas] == ["partial"]
+    assert request.stream_channels == [channel]
+    assert engine.submitted == [request]
+    # Every stream the caller did not cancel collects its outcome: a terminal
+    # chunk says the tokens ended, get() says whether the request succeeded.
+    assert engine.handle.got
+
+
+def test_ifb_stream_close_cancels_the_engine_request():
+    engine = _FakeEngine()
+    channel = _IFBChannel()
+    channel.chunks = [_IFBChunk(), _IFBChunk()]
+    llm = _ifb_llm(engine, channel)
+
+    request = type("Request", (), {"stream_channels": None})()
+    stream = llm.generate_stream([], prebuilt_request=request)
+    assert next(stream).text == "partial"
+    stream.close()
+
+    assert engine.handle.cancelled
+    assert channel.cancelled
+    assert not engine.handle.got
+
+
+def test_ifb_stream_raises_an_outcome_error_after_a_clean_finish():
+    # The channel finished normally, but the outcome carries an execution
+    # error (a sequence that ended in FinishReason.ERROR, or a response that
+    # failed to materialize). It must reach the caller, not be dropped behind
+    # a normal-looking end of stream.
+    engine = _FakeEngine()
+    engine.handle.error = RuntimeError("materialize failed")
+    channel = _IFBChannel()
+    llm = _ifb_llm(engine, channel)
+    request = type("Request", (), {"stream_channels": None})()
+    with pytest.raises(RuntimeError, match="materialize failed"):
+        list(llm.generate_stream([], prebuilt_request=request))
+    assert engine.handle.got
+    assert not engine.handle.cancelled
+
+
+def test_ifb_handle_request_hands_the_handle_to_the_caller():
+    engine = _FakeEngine()
+    llm = _ifb_llm(engine)
+    seen = []
+    LLM._handle_request(llm, "req", on_handle=seen.append)
+    assert seen == [engine.handle]
+    assert engine.handle.got
+
+
+def test_run_sync_cancels_in_the_engine_before_waiting_for_the_worker():
+    from experimental.server.runtime.engine_client import _run_sync
+
+    cancelled = []
+    release = threading.Event()
+
+    def blocking():
+        release.wait(5)
+        return "done"
+
+    def on_cancel():
+        cancelled.append(True)
+        release.set()  # the engine's cancel is what lets the worker return
+
+    async def exercise():
+        task = asyncio.create_task(_run_sync(blocking, on_cancel=on_cancel))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+    assert cancelled == [True]
+
+
+def test_disconnect_before_submit_returns_still_cancels_the_request():
+    # The client goes away while the worker is still inside engine.submit():
+    # on_cancel runs before on_handle has anything to cancel. The handle that
+    # appears afterwards must be cancelled on publication, not left to decode.
+    from experimental.server.runtime.engine_client import (_HandleLatch,
+                                                           _run_sync)
+
+    class Handle:
+
+        def __init__(self):
+            self.cancelled = threading.Event()
+
+        def cancel(self):
+            self.cancelled.set()
+
+        def get(self):
+            assert self.cancelled.wait(5), "get() would run to max_tokens"
+            raise RuntimeError("Request 1 was cancelled.")
+
+    handle = Handle()
+    task_cancelled = threading.Event()
+    latch = _HandleLatch()
+
+    def operation():
+        task_cancelled.wait(5)  # still "inside submit()" when the cancel lands
+        latch.publish(handle)
+        return handle.get()
+
+    def on_cancel():
+        latch.cancel()
+        task_cancelled.set()
+
+    async def exercise():
+        task = asyncio.create_task(_run_sync(operation, on_cancel=on_cancel))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+    assert handle.cancelled.is_set()
+
+
+def test_load_model_keeps_the_ifb_flag_away_from_standalone_tts(
+        monkeypatch, tmp_path):
+    from experimental.server.runtime import engine as engine_module
+    from experimental.server.runtime import engine_build
+
+    model_dir = tmp_path / "tts"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"model_type": "qwen3_tts"}')
+    monkeypatch.setattr(engine_build, "resolve_model_dir",
+                        lambda model, cache_dir: str(model_dir))
+    received = {}
+
+    class FakeTTS:
+
+        def __init__(self, **kwargs):
+            received.update(kwargs)
+
+    monkeypatch.setattr(engine_module, "TTS", FakeTTS)
+    monkeypatch.setattr(engine_module, "_derive_model_id", lambda model: "tts")
+
+    # The server's llm_kwargs() always carries the flag; at its default the
+    # TTS constructor must simply not see it ...
+    engine_module.load_model(model=str(model_dir),
+                             enable_in_flight_batching=False)
+    assert "enable_in_flight_batching" not in received
+    # ... and an explicit opt-in is a configuration error, like speculative
+    # decoding on a TTS model.
+    with pytest.raises(ValueError, match="not supported for this deployment"):
+        engine_module.load_model(model=str(model_dir),
+                                 enable_in_flight_batching=True)
+
+
+def test_ifb_unsupported_reason_names_the_deployment():
+    from experimental.server.runtime.engine import ifb_unsupported_reason
+
+    text = SimpleNamespace(engine_type=EngineType.LLM, has_speech=False)
+    speech = SimpleNamespace(engine_type=EngineType.LLM, has_speech=True)
+    spec = SimpleNamespace(engine_type=EngineType.SPEC_DECODE,
+                           has_speech=False)
+    assert ifb_unsupported_reason(text) is None
+    assert ifb_unsupported_reason(speech) is None  # text-only, not refused
+    assert "speculative" in ifb_unsupported_reason(spec)
+    assert "TTS" in ifb_unsupported_reason(None, model_type="qwen3_tts")
+
+
+@pytest.mark.parametrize("layout, needle", [
+    (SimpleNamespace(engine_type=EngineType.SPEC_DECODE,
+                     has_speech=False), "speculative"),
+])
+def test_runtime_load_refuses_ifb_for_an_unsupported_deployment(
+        monkeypatch, layout, needle):
+    # The operator asked for in-flight batching on a deployment that cannot
+    # honour it: fail at startup with the reason, never fall back silently.
+    from experimental.server.runtime import engine as engine_module
+
+    class Runtime:
+
+        def __init__(self, *args):
+            raise AssertionError("no runtime may be built before the check")
+
+    monkeypatch.setattr(
+        engine_module, "_import_runtime",
+        lambda: SimpleNamespace(ContextCacheConfig=lambda: SimpleNamespace(),
+                                LLMRuntime=Runtime))
+    llm = LLM.__new__(LLM)
+    llm._layout = layout
+    llm._bundle_dir = "/bundle"
+    llm._media_dir = ""
+    llm._model_dir = "/model"
+    llm._context_cache_config = ContextCacheConfig()
+    llm._enable_in_flight_batching = True
+    with pytest.raises(ValueError, match=needle):
+        llm._load_runtime()
+
+
+def test_omni_bundle_under_ifb_serves_text_only():
+    # The Thinker is a text runtime the engine serves; the speech stack is
+    # not loaded and every speech entry point refuses, naming the flag.
+    engine = _FakeEngine()
+    llm = _ifb_llm(engine)
+    llm._layout = SimpleNamespace(engine_type=EngineType.LLM,
+                                  has_speech=True,
+                                  talker_dir="/talker")
+    assert not llm.speech_available
+    llm._load_omni_runtime()  # no runtime to load into; must not touch one
+    assert llm.list_voices() == []
+    with pytest.raises(ValueError, match="in-flight batching"):
+        llm.generate_speech_stream("hello")
+    with pytest.raises(ValueError, match="in-flight batching"):
+        llm.generate_stream_with_audio([])
+
+
+def test_capabilities_do_not_advertise_speech_under_ifb():
+    from experimental.server.runtime.engine_client import _capabilities_for
+
+    class FakeLLM:
+        bundle_dir = "/nonexistent"
+        model_dir = "/nonexistent"
+        model_id = "m"
+        runtime_kind = "chat"
+        video_capable = False
+        has_draft_model = False
+        context_cache_enabled = False
+        bundle_layout = SimpleNamespace(visual_dir=None,
+                                        audio_dir=None,
+                                        has_speech=True,
+                                        has_transcription=False)
+        _engine = object()
+
+    caps = _capabilities_for(FakeLLM())
+    assert caps.in_flight_batching
+    assert not caps.speech
+    assert "audio" not in caps.output_modalities
+
+    FakeLLM._engine = None
+    caps = _capabilities_for(FakeLLM())
+    assert caps.speech
+    assert "audio" in caps.output_modalities
+
+
+def test_direct_generate_overlaps_under_ifb_up_to_batch_plus_queue():
+    # The direct Python API must not serialise engine-backed requests: the
+    # gate is batch + queue depth, so with max_batch_size=1 exactly 17 callers
+    # are inside the engine at once and the 18th waits at the gate.
+    from experimental.server.config import DEFAULT_MAX_QUEUED_REQUESTS
+
+    release = threading.Event()
+    inside = threading.Semaphore(0)
+
+    class Handle:
+
+        def get(self):
+            inside.release()
+            release.wait(10)
+            return SimpleNamespace(output_texts=["x"],
+                                   output_ids=[[1]],
+                                   prompt_token_counts=[1],
+                                   finish_reasons=["stop"])
+
+    class Engine:
+
+        def __init__(self):
+            self.submitted = 0
+            self.lock = threading.Lock()
+
+        def submit(self, request):
+            with self.lock:
+                self.submitted += 1
+            return Handle()
+
+    engine = Engine()
+    llm = _ifb_llm(engine)
+    llm._max_batch_size = 1
+    limit = llm._max_batch_size + DEFAULT_MAX_QUEUED_REQUESTS
+    llm._admission_sem = threading.Semaphore(limit)
+    llm._make_generation_request = lambda *a, **k: object()
+    llm._context_cache_config = SimpleNamespace(enabled=False)
+
+    def one_call():
+        with llm._admission():
+            llm._handle_request(llm._make_generation_request())
+
+    threads = [threading.Thread(target=one_call) for _ in range(limit + 3)]
+    for t in threads:
+        t.start()
+    for _ in range(limit):
+        assert inside.acquire(timeout=5), "callers were serialised"
+    time.sleep(0.2)
+    assert engine.submitted == limit, "the gate let more than batch+queue in"
+    release.set()
+    for t in threads:
+        t.join(10)
+    assert engine.submitted == limit + 3
+
+
+def test_ifb_stream_takes_and_releases_the_gate():
+    # Streaming under IFB goes through the same gate as generate(): taken
+    # before the request is built, released when the stream ends.
+    engine = _FakeEngine()
+    channel = _IFBChannel()
+    llm = _ifb_llm(engine, channel)
+    llm._admission_sem = threading.Semaphore(1)
+    llm._make_generation_request = lambda *a, **k: object()
+    stream = llm.generate_stream([{"role": "user", "content": "hi"}])
+    first = next(stream)
+    assert first.text == "partial"
+    assert not llm._admission_sem.acquire(blocking=False), "gate not held"
+    for _ in stream:
+        pass
+    assert llm._admission_sem.acquire(blocking=False), "gate not released"
+
+
+def test_use_ifb_is_the_flag_alone():
+    llm = LLM.__new__(LLM)
+    llm._layout = SimpleNamespace(engine_type=EngineType.LLM, has_speech=True)
+    llm._enable_in_flight_batching = False
+    assert llm._use_ifb() is False
+    llm._enable_in_flight_batching = True
+    assert llm._use_ifb() is True  # the deployment check happened at load time
+
+
+def test_ifb_stream_ends_when_the_outcome_beats_the_channel():
+    # A request can retire without its channel ever being touched (rejected, or a
+    # founder failing before decoding). The consumer polls the channel, so it must
+    # also watch the outcome flag — or it waits out its transport timeout.
+    engine = _FakeEngine()
+    engine.handle.is_ready = True
+    engine.handle.error = RuntimeError("input too long")
+    channel = _IFBChannel()
+    channel.chunks = []
+    channel.silent = True  # silent forever, neither finished nor cancelled
+    llm = _ifb_llm(engine, channel)
+
+    request = type("Request", (), {"stream_channels": None})()
+    with pytest.raises(RuntimeError, match="input too long"):
+        list(llm.generate_stream([], prebuilt_request=request))
+    assert engine.handle.got
+
+
+def test_ifb_stream_surfaces_an_actor_failure():
+    engine = _FakeEngine()
+    engine.handle.error = RuntimeError("execution failed")
+    channel = _IFBChannel()
+    channel.chunks = []
+    channel.cancelled = True  # the actor, not the caller, cancelled it
+    llm = _ifb_llm(engine, channel)
+
+    request = type("Request", (), {"stream_channels": None})()
+    with pytest.raises(RuntimeError, match="execution failed"):
+        list(llm.generate_stream([], prebuilt_request=request))
+    assert engine.handle.got
+
+
+def test_ifb_close_drains_the_engine_once():
+    engine = _FakeEngine()
+    llm = _ifb_llm(engine)
+    llm._rt = SimpleNamespace(ShutdownMode=SimpleNamespace(DRAIN="drain"))
+
+    llm.close()
+    llm.close()
+
+    assert engine.shutdown_modes == ["drain"]
+    with pytest.raises(RuntimeError):
+        LLM._handle_request(llm, "req")
+
+
+def test_ifb_gate_limits_without_queueing():
+
+    async def exercise():
+        gate = _IFBAdmissionGate(max_queued_requests=1)
+        first = await gate.reserve()
+        second = await gate.reserve()  # limit is 1 + max_queued
+        assert gate.active == 2
+        assert gate.waiting == 0
+
+        # No waiting slot exists: the third caller is refused on the spot.
+        with pytest.raises(ServerOverloadedError):
+            await gate.reserve()
+
+        first.release()
+        third = await gate.reserve()
+        second.release()
+        third.release()
+        assert gate.active == 0
+
+    asyncio.run(exercise())
+
+
+def test_ifb_gate_capacity_scales_with_batch_size():
+    # A zero-depth queue must not serialize the engine: the gate's bound is
+    # batch capacity plus queue depth, so an mxbs-4 engine with no queue still
+    # admits four concurrent requests before refusing the fifth.
+
+    async def exercise():
+        gate = _IFBAdmissionGate(max_queued_requests=0, max_concurrency=4)
+        leases = [await gate.reserve() for _ in range(4)]
+        with pytest.raises(ServerOverloadedError):
+            await gate.reserve()
+        for lease in leases:
+            lease.release()
+        assert gate.active == 0
+
+    asyncio.run(exercise())
+
+
+def test_ifb_gate_close_rejects_new_work_and_waits_for_leases():
+
+    async def exercise():
+        gate = _IFBAdmissionGate(max_queued_requests=0)
+        lease = await gate.reserve()
+        closing = asyncio.create_task(gate.close())
+        while not gate._closing:
+            await asyncio.sleep(0)
+
+        with pytest.raises(ServerUnavailableError):
+            await gate.reserve()
+        assert not closing.done(), "close returned while a lease was live"
+
+        lease.release()
+        await closing
+
+    asyncio.run(exercise())
+
+
+def test_engine_refusal_maps_to_overload():
+    from experimental.server.runtime.engine_client import EngineClient
+
+    class SubmitError(Exception):
+        pass
+
+    class FakeLLM:
+        bundle_dir = "/nonexistent"
+        model_dir = "/nonexistent"
+        model_id = "m"
+        runtime_kind = "chat"
+        video_capable = False
+        has_draft_model = False
+        context_cache_enabled = False
+        bundle_layout = SimpleNamespace(visual_dir=None,
+                                        audio_dir=None,
+                                        has_speech=False,
+                                        has_transcription=False)
+        _rt = SimpleNamespace(SubmitError=SubmitError)
+        _engine = object()
+
+        def _make_generation_request(self, *args, **kwargs):
+            return object()
+
+        def _complete_prepared_request(self, *args, **kwargs):
+            raise SubmitError("too many requests in flight")
+
+    client = EngineClient(FakeLLM())
+
+    async def exercise():
+        with pytest.raises(ServerOverloadedError):
+            await client.generate([], SamplingParams())
+
+    asyncio.run(exercise())
