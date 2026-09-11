@@ -50,6 +50,21 @@ def _load_kernel_module(relative_path):
     return module
 
 
+def _load_qsa_module():
+    pytest.importorskip("cutlass")
+    qsa_dir = _KERNEL_SRCS / "qsa_cutedsl"
+    for path in (_KERNEL_SRCS, qsa_dir):
+        if str(path) not in sys.path:
+            sys.path.insert(0, str(path))
+    module_path = qsa_dir / "qsa_sparse_gqa.py"
+    spec = importlib.util.spec_from_file_location("test_cutedsl_aot_qsa",
+                                                  module_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_all_registered_exporters_exist():
     build_cutedsl = _load_build_module()
     assert build_cutedsl.KERNEL_VARIANTS
@@ -175,6 +190,7 @@ def test_marker_emulation_rejects_inconsistent_stride_order():
         ("gdn_prefill.py", "_make_aot_cute_tensors", (4, 8, 8, 128, 128, 8)),
         ("gdn_prefill_blackwell.py", "_make_aot_cute_tensors_bw",
          (4, 8, 8, 128, 128, 128)),
+        ("gdn_prefill_sm12x.py", "_make_aot_cute_tensors", (4, 8, 8, 8)),
     ],
 )
 def test_gdn_aot_tensors_include_state_indices(module_name, factory_name,
@@ -193,3 +209,29 @@ def test_gdn_mtp_aot_tensors_do_not_add_state_indices():
     tensors = module._make_aot_mtp_cute_tensors(4, 8, 8, 128, 128, 4)
 
     assert "state_indices" not in tensors
+
+
+def test_qsa_decode_aot_tensors_are_storage_free():
+    module = _load_qsa_module()
+    tensors = module._make_decode_aot_tensors(
+        module.cutlass.Float16,
+        batch_size=2,
+        num_head=24,
+        num_kv_head=2,
+        head_dim=256,
+        pool_head_dim=384,
+        num_flat_pages=6,
+        max_pages=1,
+        topk=2051,
+        max_splits=8,
+        m_block_size=16,
+    )
+
+    assert tensors["q"].element_type == module.cutlass.Float16
+    assert tensors["pool"].element_type == module.cutlass.Float16
+    assert tensors["page_table"].element_type == module.cutlass.Int32
+    assert tensors["indices"].element_type == module.cutlass.Int32
+    assert tensors["context_lengths"].element_type == module.cutlass.Int32
+    assert tensors["partial_output"].element_type == module.cutlass.Float32
+    assert tensors["partial_stats"].element_type == module.cutlass.Float32
+    assert tensors["counters"].element_type == module.cutlass.Int32
