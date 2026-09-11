@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -70,6 +70,9 @@ from gdn_prefill_blackwell_helpers import (
     make_smem_layout_b_kind,
     make_smem_layout_epi_kind,
 )
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from cutedsl_utils import aot_placeholders  # isort: skip
 
 # CuTe DSL 4.7 O3 spills heavily for this kernel on SM110.
 _GDN_COMPILE_OPTIONS = "--opt-level 2"
@@ -5198,12 +5201,66 @@ def _to_cute_tensors_bw(ph):
     }
 
 
-def _compile_prefill_bw(n, h, hv, k, v, seq_len, stream, gpu_arch=""):
+def _make_aot_cute_tensors_bw(n, h, hv, k, v, seq_len):
+    def compact(dtype, shape):
+        return aot_placeholders.make_compact_tensor(
+            dtype,
+            shape,
+            stride_order=tuple(reversed(range(len(shape)))),
+            assumed_align=16,
+        )
+
+    def dynamic_4d(dtype, shape):
+        return (
+            compact(dtype, shape)
+            .mark_layout_dynamic(leading_dim=3)
+            .mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2, 3))
+            .mark_compact_shape_dynamic(mode=1, stride_order=(0, 1, 2, 3))
+            .mark_compact_shape_dynamic(mode=2, stride_order=(0, 1, 2, 3))
+        )
+
+    def dynamic_3d(dtype, shape):
+        return (
+            compact(dtype, shape)
+            .mark_layout_dynamic(leading_dim=2)
+            .mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2))
+            .mark_compact_shape_dynamic(mode=1, stride_order=(0, 1, 2))
+            .mark_compact_shape_dynamic(mode=2, stride_order=(0, 1, 2))
+        )
+
+    def dynamic_h0():
+        return (
+            compact(cutlass.Float32, (n, hv, k, v))
+            .mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2, 3))
+            .mark_compact_shape_dynamic(mode=1, stride_order=(0, 1, 2, 3))
+        )
+
+    return {
+        "q": dynamic_4d(cutlass.Float16, (n, seq_len, h, k)),
+        "k": dynamic_4d(cutlass.Float16, (n, seq_len, h, k)),
+        "v": dynamic_4d(cutlass.Float16, (n, seq_len, hv, v)),
+        "a": dynamic_3d(cutlass.Float16, (n, seq_len, hv)),
+        "b": dynamic_3d(cutlass.Float16, (n, seq_len, hv)),
+        "A_log": compact(cutlass.Float32, (hv,)),
+        "dt_bias": compact(cutlass.Float16, (hv,)),
+        "h0_in": dynamic_h0(),
+        "h0_out": dynamic_h0(),
+        "o": dynamic_4d(cutlass.Float16, (n, seq_len, hv, v)),
+        "cu_seqlens": compact(cutlass.Int32, (n + 1,)).mark_compact_shape_dynamic(
+            mode=0, stride_order=(0,)
+        ),
+    }
+
+
+def _compile_prefill_bw(n, h, hv, k, v, seq_len, stream, gpu_arch="", export_only=False):
     if "_" in _compiled_blackwell:
         return _compiled_blackwell["_"]
 
-    ph = _make_placeholder_tensors_bw(n, h, hv, k, v, seq_len)
-    t = _to_cute_tensors_bw(ph)
+    if export_only:
+        t = _make_aot_cute_tensors_bw(n, h, hv, k, v, seq_len)
+    else:
+        ph = _make_placeholder_tensors_bw(n, h, hv, k, v, seq_len)
+        t = _to_cute_tensors_bw(ph)
     run_fn = _get_jit_blackwell()
 
     compile_opts = _GDN_COMPILE_OPTIONS
@@ -5219,7 +5276,7 @@ def _compile_prefill_bw(n, h, hv, k, v, seq_len, stream, gpu_arch=""):
         t["cu_seqlens"],   # cu_seqlens for padding masking (non-varlen padded layout)
         # Runtime persistent-grid size: AOT callers pass the launch GPU's SM
         # count; the trace value is a placeholder.
-        cutlass.Int32(cutlass.utils.HardwareInfo().get_device_multiprocessor_count()),
+        aot_placeholders.runtime_int32(),
         stream,
         options=compile_opts,
     )
@@ -5235,10 +5292,12 @@ def export_gdn_prefill_blackwell(n, h, hv, k, v, seq_len,
     if k != 128 or v != 128:
         raise ValueError("Blackwell kernel requires k == v == 128.")
 
-    stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
+    stream = aot_placeholders.make_stream()
     print("[gdn_prefill_blackwell] AOT compile gpu_arch=%r" % (gpu_arch or "auto"))
     t0 = time.time()
-    compiled = _compile_prefill_bw(n, h, hv, k, v, seq_len, stream, gpu_arch=gpu_arch)
+    compiled = _compile_prefill_bw(
+        n, h, hv, k, v, seq_len, stream, gpu_arch=gpu_arch, export_only=True
+    )
     print("[gdn_prefill_blackwell] Compilation time: %.4fs" % (time.time() - t0))
 
     os.makedirs(output_dir, exist_ok=True)
@@ -5285,9 +5344,6 @@ def _parse_args(argv=None):
 
 def main():
     args = _parse_args(_saved_argv)
-    if cp.cuda.runtime.getDeviceCount() == 0:
-        raise RuntimeError("No GPU found.")
-    cp.random.seed(42)
     np.random.seed(42)
 
     if args.export_only:
@@ -5304,6 +5360,10 @@ def main():
             gpu_arch=args.gpu_arch,
         )
         return
+
+    if cp.cuda.runtime.getDeviceCount() == 0:
+        raise RuntimeError("No GPU found.")
+    cp.random.seed(42)
 
     run_test_prefill_blackwell(
         n=args.n, h=args.h, hv=args.hv, k=args.k, v=args.v,

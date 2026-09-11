@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -41,6 +41,9 @@ import numpy as np
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from cutedsl_utils import aot_placeholders  # isort: skip
 
 TILE_K = 128        # state head dim K
 TILE_V = 32         # V columns per smem tile
@@ -409,14 +412,49 @@ def _to_cute_tensors(ph):
     }
 
 
-def _compile_prefill(n, h, hv, k, v, seq_len, stream, gpu_arch=""):
+def _make_aot_cute_tensors(n, h, hv, k, v, seq_len):
+    def compact(dtype, shape, assumed_align=16):
+        return aot_placeholders.make_compact_tensor(
+            dtype,
+            shape,
+            stride_order=tuple(reversed(range(len(shape)))),
+            assumed_align=assumed_align,
+        )
+
+    q = compact(cutlass.Float16, (n, seq_len, h, k))
+    v_tensor = compact(cutlass.Float16, (n, seq_len, hv, v))
+    h0_source = compact(cutlass.Float32, (n, hv, k, v), assumed_align=32)
+    context_lengths = compact(cutlass.Int32, (n,))
+    return {
+        "q": _mark_gdn_prefill_qv_dynamic(q.mark_layout_dynamic(leading_dim=3)),
+        "k": compact(cutlass.Float16, (n, seq_len, h, k)).mark_layout_dynamic(leading_dim=3),
+        "v": _mark_gdn_prefill_qv_dynamic(v_tensor.mark_layout_dynamic(leading_dim=3)),
+        "a": compact(cutlass.Float16, (n, seq_len, hv)).mark_layout_dynamic(leading_dim=2),
+        "b": compact(cutlass.Float16, (n, seq_len, hv)).mark_layout_dynamic(leading_dim=2),
+        "A_log": compact(cutlass.Float32, (hv,)).mark_layout_dynamic(leading_dim=0),
+        "dt_bias": compact(cutlass.Float16, (hv,)).mark_layout_dynamic(leading_dim=0),
+        "h0_source": _mark_h0_source_dynamic(h0_source),
+        "context_lengths": _mark_gdn_1d_dynamic(context_lengths),
+        "o": compact(cutlass.Float16, (n, seq_len, hv, v)).mark_layout_dynamic(leading_dim=3),
+    }
+
+
+def _compile_prefill(n, h, hv, k, v, seq_len, stream, gpu_arch="", export_only=False):
     if "_" in _compiled_kernels_prefill:
         return _compiled_kernels_prefill["_"]
 
-    ph = _make_placeholder_tensors(n, h, hv, k, v, seq_len)
-    t = _to_cute_tensors(ph)
+    if export_only:
+        t = _make_aot_cute_tensors(n, h, hv, k, v, seq_len)
+    else:
+        ph = _make_placeholder_tensors(n, h, hv, k, v, seq_len)
+        t = _to_cute_tensors(ph)
     run_prefill = _get_jit_function_prefill()
-    compile_opts = ("--gpu-arch " + gpu_arch) if gpu_arch else None
+    # Only the export path may pin a foreign target arch in the compile
+    # options; a native JIT run must compile for the local GPU (see the
+    # native-vs-cross note in cutedsl_utils/cutedsl_compile_wrapper.py).
+    compile_opts = aot_placeholders.compile_options(
+        f"--gpu-arch={gpu_arch}" if gpu_arch else ""
+    ) if export_only else None
     compiled = cute.compile(
         run_prefill,
         t["q"], t["k"], t["v"], t["a"], t["b"],
@@ -438,10 +476,12 @@ def export_gdn_prefill(n, h, hv, k, v, seq_len,
                        output_dir, file_name, function_prefix, gpu_arch=""):
     if seq_len < 2:
         raise ValueError("Prefill requires seq_len >= 2.")
-    stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
+    stream = aot_placeholders.make_stream()
     print("[gdn_prefill] AOT compile gpu_arch=%r" % (gpu_arch or "default"))
     t0 = time.time()
-    compiled = _compile_prefill(n, h, hv, k, v, seq_len, stream, gpu_arch=gpu_arch)
+    compiled = _compile_prefill(
+        n, h, hv, k, v, seq_len, stream, gpu_arch=gpu_arch, export_only=True
+    )
     print("[gdn_prefill] Compilation time: %.4fs" % (time.time() - t0))
 
     os.makedirs(output_dir, exist_ok=True)
@@ -634,9 +674,6 @@ def run_test_prefill(n, h, hv, k, v, seq_len,
 
 def main():
     args = _parsed_args
-    if cp.cuda.runtime.getDeviceCount() == 0:
-        raise RuntimeError("GPU required.")
-    cp.random.seed(42)
     np.random.seed(42)
 
     if args.export_only:
@@ -653,6 +690,10 @@ def main():
             gpu_arch=args.gpu_arch,
         )
         return
+
+    if cp.cuda.runtime.getDeviceCount() == 0:
+        raise RuntimeError("GPU required.")
+    cp.random.seed(42)
 
     run_test_prefill(
         n=args.n, h=args.h, hv=args.hv, k=args.k, v=args.v,

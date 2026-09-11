@@ -94,6 +94,7 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import numpy as np
+from cutedsl_utils import aot_placeholders
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from common import (
@@ -1794,15 +1795,29 @@ def run(
         print(f"{_tag}   A/B: Float4E2M1FN    SFA/SFB: Float8E4M3FN    C: {c_dtype_name}    acc: Float32")
         print(f"{_tag}   mma_tiler=(128,{mma_tiler_n}), cluster=(1,1), TMA store, 6 warps (4 epilog + MMA + TMA)")
 
-    if cp.cuda.runtime.getDeviceCount() == 0:
+    if not export_only and cp.cuda.runtime.getDeviceCount() == 0:
         raise RuntimeError("GPU is required!")
 
     if not export_only:
         cp.random.seed(1111)
     np.random.seed(1111)
 
-    ptrs, _backing = _create_nvfp4_pointers(m, n, k, sf_vec_size, c_dtype=c_dtype)
-    current_stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
+    if export_only:
+        ptrs = {
+            "a": aot_placeholders.make_ptr(cutlass.Float4E2M1FN, assumed_align=32),
+            "b": aot_placeholders.make_ptr(cutlass.Float4E2M1FN, assumed_align=32),
+            "sfa": aot_placeholders.make_ptr(cutlass.Float8E4M3FN, assumed_align=16),
+            "sfb": aot_placeholders.make_ptr(cutlass.Float8E4M3FN, assumed_align=16),
+            "c": aot_placeholders.make_ptr(c_dtype, assumed_align=16),
+            "alpha": aot_placeholders.make_ptr(cutlass.Float32, assumed_align=4),
+        }
+        _backing = None
+        current_stream = aot_placeholders.make_stream()
+    else:
+        ptrs, _backing = _create_nvfp4_pointers(
+            m, n, k, sf_vec_size, c_dtype=c_dtype
+        )
+        current_stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
 
     gemm = GemmBlackwellNvFp4WS(
         acc_dtype=cutlass.Float32,
@@ -1815,7 +1830,7 @@ def run(
     # deployed caller supplies the target GPU's value); run/verify probes the
     # local GPU as before.
     if export_only:
-        max_active_clusters = cutlass.Int32(1)
+        max_active_clusters = aot_placeholders.runtime_int32()
     else:
         max_active_clusters = cutlass.Int32(
             utils.HardwareInfo().get_max_active_clusters(1)
@@ -1830,6 +1845,11 @@ def run(
         sf_vec_size,
         max_active_clusters,
         current_stream,
+        **(
+            dict(options=aot_placeholders.compile_options())
+            if export_only
+            else {}
+        ),
     )
     compilation_time = time.time() - start_time
     print(f"{_tag} Compilation time: {compilation_time:.4f}s")

@@ -8,6 +8,9 @@
 # ------------------------------------------------------------------------------
 l0_local_spark_build_and_test:
   stage: l0_test
+  needs:
+    - job: build_cutedsl_docker_matrix
+      artifacts: true
   tags:
     - local-spark
   variables:
@@ -27,13 +30,6 @@ l0_local_spark_build_and_test:
     - echo "TRT version:$(dpkg -l | grep tensorrt-libs | awk '{print $3}')"
     - export PATH=/usr/local/cuda/bin:$PATH
     - export LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH
-    - echo "Generating CuteDSL kernel artifacts (venv)"
-    - python3 -m venv venv/cutedsl
-    - bash .gitlab/ci/scripts/ci_run.sh "$CI_PIP_INSTALL_TIMEOUT_SECONDS" "Install CuTeDSL dependencies" -- venv/cutedsl/bin/pip install 'nvidia-cutlass-dsl[cu13]==4.7.0' cupy-cuda13x==13.6.0
-    - >-
-      sh .gitlab/ci/scripts/ci_run.sh "$CI_JOB_PHASE_TIMEOUT_SECONDS"
-      "Build local Spark CuTeDSL kernels" --
-      venv/cutedsl/bin/python kernelSrcs/build_cutedsl.py --kernels ALL
     - echo "Building project with unit tests"
     - rm -rf build && mkdir build && cd build
     - >-

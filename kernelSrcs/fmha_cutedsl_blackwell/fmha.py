@@ -66,6 +66,8 @@ if __name__ == "__main__":
     sys.path.insert(0, os.path.join(current_dir, ".."))
 
 import fmha_helpers as fmha_utils  # isort: skip
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from cutedsl_utils import aot_placeholders  # isort: skip
 
 """
 A fused multi-head attention (FMHA) example for the NVIDIA Blackwell SM100 architecture using CUTE DSL
@@ -7229,7 +7231,7 @@ def run(
     h_r = h_q // h_k
 
     # Prepare GPU tensors: Q, KV cache, O
-    if cp.cuda.runtime.getDeviceCount() == 0:
+    if not export_only and cp.cuda.runtime.getDeviceCount() == 0:
         raise RuntimeError("GPU is required to run this example!")
 
     if not export_only:
@@ -7245,10 +7247,14 @@ def run(
         shape_ = tuple(map(lambda x, y: x + y, shape, padding))
 
         if export_only:
-            f32_gpu_full = cp.zeros(shape_, dtype=cp.float32)
-        else:
-            min_val = -2 if dtype.is_float or dtype.signed else 0
-            f32_gpu_full = cp.random.randint(min_val, 2, shape_).astype(cp.float32)
+            # Default stride order: C-contiguous, matching the cupy buffers.
+            cute_tensor = aot_placeholders.make_compact_tensor(
+                dtype, shape, assumed_align=16,
+            )
+            return (None, cute_tensor, None, None, None)
+
+        min_val = -2 if dtype.is_float or dtype.signed else 0
+        f32_gpu_full = cp.random.randint(min_val, 2, shape_).astype(cp.float32)
 
         # Create dtype GPU buffer and initialize
         cp_dtype = _cutlass_to_cupy_dtype(dtype)
@@ -7257,13 +7263,7 @@ def run(
                                                and dtype.width == 4)
         dtype_gpu_full = cp.empty(shape_, dtype=cp_dtype)
 
-        if export_only:
-            # AOT export only traces tensor metadata, so buffer contents are
-            # irrelevant. Skipping the fill also avoids cute.testing.convert,
-            # whose target-arch JIT helper fails when the build GPU's SM
-            # differs from the artifact target.
-            pass
-        elif is_narrow:
+        if is_narrow:
             # FP8/Int4: use cute.testing.convert
             f32_cute = from_dlpack(f32_gpu_full)
             if is_dynamic_layout:
@@ -7333,7 +7333,7 @@ def run(
     # k/v (B,Hkv,S,D), fp16. Random data never triggers threshold-driven
     # skip-softmax (tile max ~ running max everywhere), so perf/sparsity
     # measurements require real Q/K distributions.
-    if load_qkv is not None:
+    if load_qkv is not None and not export_only:
         assert in_dtype == cutlass.Float16, "--load_qkv supports fp16 only"
         _cap = np.load(load_qkv)
         _q = _cap["q"].astype(np.float32)[:, :, :s_q]  # (B, Hq, S, D)
@@ -7494,13 +7494,20 @@ def run(
         )
 
     # Initialize Stream
-    current_stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
+    current_stream = (
+        aot_placeholders.make_stream()
+        if export_only
+        else cuda.CUstream(cp.cuda.get_current_stream().ptr)
+    )
     # Runtime persistent-grid size (sm_count kernel argument): AOT callers pass
     # the deployment GPU's multiprocessor count at launch; here we seed the
     # trace/run with the local device's count (pure driver attribute — no
     # helper-kernel probe, so it is safe under cross/foreign-arch compiles).
-    _sm_count = Int32(utils.HardwareInfo().get_device_multiprocessor_count())
-
+    _sm_count = (
+        aot_placeholders.runtime_int32()
+        if export_only
+        else Int32(utils.HardwareInfo().get_device_multiprocessor_count())
+    )
     # Trailing optional args of the LLM __call__ ABI.
     _trailing = ()
 
@@ -7580,8 +7587,13 @@ def run(
         _, o_vit_tensor, o_vit_cp, *_ov = create_and_pad_tensor(
             q_vit_shape, (0, 0, 0, 0), out_dtype, is_dynamic_layout=True)
 
-        cu_seqlens_cp = cp.asarray(cu_seqlens_np)
-        cu_seqlens = from_dlpack(cu_seqlens_cp, assumed_align=16)
+        if export_only:
+            cu_seqlens = aot_placeholders.make_compact_tensor(
+                cutlass.Int32, (b + 1,), stride_order=(0,), assumed_align=16
+            )
+        else:
+            cu_seqlens_cp = cp.asarray(cu_seqlens_np)
+            cu_seqlens = from_dlpack(cu_seqlens_cp, assumed_align=16)
 
         q_dyn = mark_shd_dynamic(q_vit_tensor)
         k_dyn = mark_shd_dynamic(k_vit_tensor)
@@ -7607,8 +7619,13 @@ def run(
 
         _s_k = s_k if not isinstance(s_k, tuple) else max(s_k)
         cu_kv_seqlens_np = np.arange(b + 1, dtype=np.int32) * _s_k
-        cu_kv_seqlens_cp = cp.asarray(cu_kv_seqlens_np)
-        cu_kv_seqlens = from_dlpack(cu_kv_seqlens_cp, assumed_align=16)
+        if export_only:
+            cu_kv_seqlens = aot_placeholders.make_compact_tensor(
+                cutlass.Int32, (b + 1,), stride_order=(0,), assumed_align=16
+            )
+        else:
+            cu_kv_seqlens_cp = cp.asarray(cu_kv_seqlens_np)
+            cu_kv_seqlens = from_dlpack(cu_kv_seqlens_cp, assumed_align=16)
         cu_kv_seqlens = mark_1d_dynamic(cu_kv_seqlens)
 
         start_time = time.time()
@@ -7625,9 +7642,17 @@ def run(
             kv_pool_shape = (num_pages, h_k, tokens_per_page, d)
             _, kv_pool_tensor, *_kvp_keep = create_and_pad_tensor(
                 kv_pool_shape, (0, 0, 0, 0), in_dtype, is_dynamic_layout=True)
-            page_list_np = np.zeros((b, 2, max_pages_per_seq), dtype=np.int32)
-            page_list_cp = cp.asarray(page_list_np)
-            page_list_tensor = from_dlpack(page_list_cp, assumed_align=16)
+            if export_only:
+                page_list_tensor = aot_placeholders.make_compact_tensor(
+                    cutlass.Int32,
+                    (b, 2, max_pages_per_seq),
+                    stride_order=(2, 1, 0),
+                    assumed_align=16,
+                )
+            else:
+                page_list_np = np.zeros((b, 2, max_pages_per_seq), dtype=np.int32)
+                page_list_cp = cp.asarray(page_list_np)
+                page_list_tensor = from_dlpack(page_list_cp, assumed_align=16)
             page_list_tensor = (page_list_tensor.mark_layout_dynamic(
                 leading_dim=2).mark_compact_shape_dynamic(
                     mode=0, stride_order=(0, 1, 2)).mark_compact_shape_dynamic(
@@ -7638,14 +7663,28 @@ def run(
             if bidirectional:
                 # LLM D512 AOT trace inputs; their values are placeholders,
                 # while the tensors become runtime ABI arguments.
-                block_begin_cp = cp.full((b, s_q), -1, dtype=cp.int32)
-                block_end_cp = cp.full((b, s_q), -1, dtype=cp.int32)
-                block_begin_dyn = mark_bs_dynamic(
-                    from_dlpack(block_begin_cp, assumed_align=16)
-                )
-                block_end_dyn = mark_bs_dynamic(
-                    from_dlpack(block_end_cp, assumed_align=16)
-                )
+                if export_only:
+                    block_begin_dyn = mark_bs_dynamic(
+                        aot_placeholders.make_compact_tensor(
+                            cutlass.Int32, (b, s_q),
+                            stride_order=(1, 0), assumed_align=16,
+                        )
+                    )
+                    block_end_dyn = mark_bs_dynamic(
+                        aot_placeholders.make_compact_tensor(
+                            cutlass.Int32, (b, s_q),
+                            stride_order=(1, 0), assumed_align=16,
+                        )
+                    )
+                else:
+                    block_begin_cp = cp.full((b, s_q), -1, dtype=cp.int32)
+                    block_end_cp = cp.full((b, s_q), -1, dtype=cp.int32)
+                    block_begin_dyn = mark_bs_dynamic(
+                        from_dlpack(block_begin_cp, assumed_align=16)
+                    )
+                    block_end_dyn = mark_bs_dynamic(
+                        from_dlpack(block_end_cp, assumed_align=16)
+                    )
             if isinstance(
                 fmha, BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256
             ):
@@ -7670,7 +7709,7 @@ def run(
                 fmha,
                 q_dyn, kv_dyn, o_dyn, cu_kv_seqlens, _wsl,
                 scale_softmax, scale_q, scale_k, scale_v, inv_scale_o,
-                _sm_count, current_stream, 
+                _sm_count, current_stream,
                 *_trailing,
             )
 
@@ -8666,7 +8705,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    if cp.cuda.runtime.getDeviceCount() == 0:
+    if not args.export_only and cp.cuda.runtime.getDeviceCount() == 0:
         raise RuntimeError("GPU is required to run this example!")
 
     if len(args.q_shape) != 4:
