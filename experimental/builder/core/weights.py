@@ -156,7 +156,10 @@ class Weights:
     def has(self, name: str) -> bool:
         return self._resolve(name, required=False) is not None
 
-    def _resolve(self, name: str, required: bool = True) -> Optional[str]:
+    def _resolve(self,
+                 name: str,
+                 required: bool = True,
+                 pin: bool = True) -> Optional[str]:
         candidates = [name]
         resolve_candidates = getattr(self.conversion, "resolve_candidates",
                                      None)
@@ -189,11 +192,56 @@ class Weights:
                     if not candidate.endswith("embed_tokens.weight")
                 ]
         candidates = list(dict.fromkeys(candidates))
+        if pin:
+            owned = self._module_tensor_key(name)
+            if owned is not None:
+                candidates = [owned]
         for candidate in candidates:
             if self.store.has(candidate):
                 return candidate
         if required:
             raise KeyError(f"checkpoint tensor not found: {name!r}")
+        return None
+
+    # Every tensor one module can own, and the subset that can be its primary
+    # weight. A draft resolves its modules in its own namespace (Qwen3.5 MTP
+    # stores them under ``mtp.``) and then falls back to the base model's
+    # names, so resolving a module's tensors one name at a time lets the base
+    # model's identically named module answer for whatever the draft lacks.
+    _MODULE_TENSORS = (".weight", ".qweight", ".weight_packed", ".bias",
+                       ".weight_scale", ".weight_scale_2",
+                       ".weight_global_scale", ".input_scale",
+                       ".input_global_scale", ".pre_quant_scale", ".scales",
+                       ".qzeros", ".g_idx")
+    _PRIMARY_WEIGHTS = (".weight", ".qweight", ".weight_packed")
+    # Carrying anything besides a plain weight and a bias means a module's
+    # weights are stored quantized.
+    _QUANT_MARKERS = tuple(suffix for suffix in _MODULE_TENSORS
+                           if suffix not in (".weight", ".bias"))
+
+    def _module_namespace(self, prefix: str) -> Optional[str]:
+        """Concrete checkpoint prefix owning one module's tensors.
+
+        The first primary weight that resolves decides the namespace, so a
+        module is read as a whole rather than one tensor name at a time.
+        Returns None when no primary weight resolves.
+        """
+        for suffix in self._PRIMARY_WEIGHTS:
+            key = self._resolve(prefix + suffix, required=False, pin=False)
+            if key is not None:
+                return key[:-len(suffix)]
+        return None
+
+    def _module_tensor_key(self, name: str) -> Optional[str]:
+        """Key for a module tensor, pinned to the namespace owning its module.
+
+        Returns None when *name* is not a module tensor or its module has no
+        primary weight, leaving ordinary candidate resolution to run.
+        """
+        for suffix in self._MODULE_TENSORS:
+            if name.endswith(suffix) and len(name) > len(suffix):
+                namespace = self._module_namespace(name[:-len(suffix)])
+                return None if namespace is None else namespace + suffix
         return None
 
     def checkpoint_key(self, name: str) -> str:
@@ -247,10 +295,24 @@ class Weights:
                           *,
                           tie_word_embeddings: bool = False) -> str:
         """Return the checkpoint precision owned by one model projection."""
+        lookup = name
         normalize = getattr(self.conversion, "normalize_checkpoint_name", None)
         if normalize is not None:
-            name = normalize(name)
-        return self.quant.module_type(name, tie_word_embeddings)
+            lookup = normalize(lookup)
+        quant_type = self.quant.module_type(lookup, tie_word_embeddings)
+        # Overrides are keyed by module name, which a draft shares with the
+        # base layer it falls back to, so a quantized base layer would claim
+        # an unquantized draft layer. The weights stored for this module
+        # decide. ``lm_head`` is exempt because resolving it consults this
+        # method for embedding tying.
+        if quant_type == quantization.QUANT_FP16 or name == "lm_head":
+            return quant_type
+        namespace = self._module_namespace(name)
+        if namespace is None or any(
+                self.store.has(namespace + marker)
+                for marker in self._QUANT_MARKERS):
+            return quant_type
+        return quantization.QUANT_FP16
 
     def module_quant_group_size(self, name: str) -> int:
         """Return the checkpoint group size owned by one model projection."""
