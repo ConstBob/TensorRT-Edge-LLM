@@ -20,6 +20,7 @@
 #include "common/cudaUtils.h"
 #include "common/logger.h"
 #include "kernels/speculative/dflashRuntimeKernels.h"
+#include "kernels/speculative/eagleUtilKernels.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/debug/layerDebugger.h"
 #include "runtime/state/pipelineIO.h"
@@ -264,29 +265,22 @@ void appendAcceptedTokens(DecodingInferenceContext& context, Tensor& hostAcceptL
 }
 
 void clampAcceptLengthsToRemainingGeneration(
-    DecodingInferenceContext& context, Tensor& hostAcceptLengths, Tensor& deviceAcceptLength, cudaStream_t stream)
+    DecodingInferenceContext const& context, Tensor& deviceAcceptLength, cudaStream_t stream)
 {
     int32_t const activeBatchSize = context.activeBatchSize;
-    check::check(hostAcceptLengths.reshape({activeBatchSize}), "Tensor reshape failed");
-    int32_t* hostAcceptLengthsData = hostAcceptLengths.dataPointer<int32_t>();
+    check::check(static_cast<int32_t>(context.currentGenerateLengths.size()) >= activeBatchSize,
+        "currentGenerateLengths must cover the active batch.");
 
-    CUDA_CHECK(cudaMemcpyAsync(hostAcceptLengthsData, deviceAcceptLength.rawPointer(),
-        activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    bool changed = false;
-    for (int32_t batchIdx = 0; batchIdx < activeBatchSize; ++batchIdx)
+    for (int32_t slotOffset = 0; slotOffset < activeBatchSize; slotOffset += kernel::kMaxAcceptLengthBudgetsPerLaunch)
     {
-        int32_t const remaining = std::max(0, context.maxGenerateLength - context.currentGenerateLengths[batchIdx]);
-        int32_t const clamped = std::max(0, std::min(hostAcceptLengthsData[batchIdx], remaining));
-        changed |= clamped != hostAcceptLengthsData[batchIdx];
-        hostAcceptLengthsData[batchIdx] = clamped;
-    }
-
-    if (changed)
-    {
-        CUDA_CHECK(cudaMemcpyAsync(deviceAcceptLength.rawPointer(), hostAcceptLengthsData,
-            activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        int32_t const numSlots = std::min(kernel::kMaxAcceptLengthBudgetsPerLaunch, activeBatchSize - slotOffset);
+        kernel::AcceptLengthBudgets budgets{};
+        for (int32_t i = 0; i < numSlots; ++i)
+        {
+            budgets.remaining[i]
+                = std::max(0, context.maxGenerateLength - context.currentGenerateLengths[slotOffset + i]);
+        }
+        kernel::clampAcceptLengths(deviceAcceptLength, budgets, slotOffset, numSlots, stream);
     }
 }
 

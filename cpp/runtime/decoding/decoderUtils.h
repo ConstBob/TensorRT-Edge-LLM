@@ -67,8 +67,12 @@ void appendAcceptedTokens(DecodingInferenceContext& context, Tensor& hostAcceptL
     int32_t const* perSlotProposedDrafts = nullptr);
 
 //! @brief Clamp device accept lengths so multi-token speculative commits never exceed max_generate_length.
+//!
+//! Runs entirely on @p stream: the per-slot budgets travel as kernel arguments, so the verify round has no D2H
+//! copy and no host synchronization before appendAcceptedTokens(). A mid-round host sync drains the stream, and
+//! under GPU time-slicing that forfeits a full foreign quantum every round.
 void clampAcceptLengthsToRemainingGeneration(
-    DecodingInferenceContext& context, Tensor& hostAcceptLengths, Tensor& deviceAcceptLength, cudaStream_t stream);
+    DecodingInferenceContext const& context, Tensor& deviceAcceptLength, cudaStream_t stream);
 
 // Few-layer numeric validation hooks for a speculative round. Both are no-ops unless the debug
 // environment variables are set (see runtime/debug/layerDebugger.h). A speculative round commits a

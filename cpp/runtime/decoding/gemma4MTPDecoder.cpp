@@ -820,7 +820,7 @@ bool Gemma4MTPDecoder::acceptAndCommit(DecodingInferenceContext& context)
             mAcceptLength, mArgmaxScratch, activeBatchSize, verifySize, vocabSize, context.stream);
     }
 
-    decoder_utils::clampAcceptLengthsToRemainingGeneration(context, mHostAcceptLengths, mAcceptLength, context.stream);
+    decoder_utils::clampAcceptLengthsToRemainingGeneration(context, mAcceptLength, context.stream);
 
     if (mUseTree)
     {

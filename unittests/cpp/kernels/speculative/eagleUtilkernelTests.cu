@@ -20,9 +20,11 @@
 #include "kernels/speculative/eagleUtilKernels.h"
 #include "runtime/state/kvPageTable.h"
 #include "testUtils.h"
+#include <algorithm>
 #include <cmath>
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
+#include <stdexcept>
 #include <vector>
 
 using namespace trt_edgellm;
@@ -1962,4 +1964,61 @@ TEST(EagleKernels, PrepareEagleBaseTreeDecodingInputs)
             EXPECT_EQ(actualSelectIndices[i], i);
         }
     }
+}
+
+// ============================================================================
+// Test: clampAcceptLengths
+// Description: Clamp device accept lengths into [0, remaining budget] per slot; budgets are kernel arguments.
+// ============================================================================
+TEST(EagleKernels, ClampAcceptLengthsAppliesPerSlotBudgets)
+{
+    cudaStream_t stream = nullptr;
+    std::vector<int32_t> const acceptLengths{5, 3, 4, 0, -1, 7};
+    std::vector<int32_t> const budgets{2, 3, 9, 4, 5, 0};
+    std::vector<int32_t> const expected{2, 3, 4, 0, 0, 0};
+    int32_t const batchSize = static_cast<int32_t>(acceptLengths.size());
+
+    auto acceptLengthsDevice = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    copyHostToDevice<int32_t>(acceptLengthsDevice, acceptLengths);
+
+    AcceptLengthBudgets acceptLengthBudgets{};
+    std::copy(budgets.begin(), budgets.end(), acceptLengthBudgets.remaining);
+    clampAcceptLengths(acceptLengthsDevice, acceptLengthBudgets, /*slotOffset=*/0, batchSize, stream);
+
+    EXPECT_EQ(copyDeviceToHost<int32_t>(acceptLengthsDevice), expected);
+}
+
+TEST(EagleKernels, ClampAcceptLengthsHonorsSlotOffsetAndRange)
+{
+    cudaStream_t stream = nullptr;
+    constexpr int32_t tailSlots = 8;
+    int32_t const batchSize = kMaxAcceptLengthBudgetsPerLaunch + tailSlots;
+    std::vector<int32_t> const acceptLengths(batchSize, 10);
+    auto acceptLengthsDevice = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    copyHostToDevice<int32_t>(acceptLengthsDevice, acceptLengths);
+
+    AcceptLengthBudgets acceptLengthBudgets{};
+    for (int32_t i = 0; i < tailSlots; ++i)
+    {
+        acceptLengthBudgets.remaining[i] = i;
+    }
+    clampAcceptLengths(acceptLengthsDevice, acceptLengthBudgets, kMaxAcceptLengthBudgetsPerLaunch, tailSlots, stream);
+
+    auto const actual = copyDeviceToHost<int32_t>(acceptLengthsDevice);
+    for (int32_t i = 0; i < kMaxAcceptLengthBudgetsPerLaunch; ++i)
+    {
+        EXPECT_EQ(actual[i], 10) << "slot " << i << " outside the clamped range was modified";
+    }
+    for (int32_t i = 0; i < tailSlots; ++i)
+    {
+        EXPECT_EQ(actual[kMaxAcceptLengthBudgetsPerLaunch + i], i);
+    }
+
+    EXPECT_THROW(
+        clampAcceptLengths(acceptLengthsDevice, acceptLengthBudgets, batchSize - tailSlots + 1, tailSlots, stream),
+        std::runtime_error);
+    EXPECT_THROW(
+        clampAcceptLengths(acceptLengthsDevice, acceptLengthBudgets, 0, kMaxAcceptLengthBudgetsPerLaunch + 1, stream),
+        std::runtime_error);
+    EXPECT_THROW(clampAcceptLengths(acceptLengthsDevice, acceptLengthBudgets, 0, 0, stream), std::runtime_error);
 }

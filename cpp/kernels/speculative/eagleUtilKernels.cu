@@ -1008,6 +1008,33 @@ void eagleBaseAssembleHiddenState(
     CUDA_CHECK(cudaGetLastError());
 }
 
+__global__ void clampAcceptLengthsKernel(
+    int32_t* acceptLengths, AcceptLengthBudgets const budgets, int32_t slotOffset, int32_t numSlots)
+{
+    int32_t const slot = static_cast<int32_t>(threadIdx.x);
+    if (slot < numSlots)
+    {
+        int32_t const acceptLength = acceptLengths[slotOffset + slot];
+        acceptLengths[slotOffset + slot] = max(0, min(acceptLength, budgets.remaining[slot]));
+    }
+}
+
+void clampAcceptLengths(rt::Tensor& acceptLengths, AcceptLengthBudgets const& budgets, int32_t slotOffset,
+    int32_t numSlots, cudaStream_t stream)
+{
+    check::check(acceptLengths.getDeviceType() == rt::DeviceType::kGPU, "acceptLengths shall reside on the GPU.");
+    check::check(acceptLengths.getDataType() == DataType::kINT32, "acceptLengths should be INT32.");
+    check::check(acceptLengths.getShape().getNumDims() == 1, "acceptLengths should be 1D tensor [batch].");
+    check::check(numSlots > 0 && numSlots <= kMaxAcceptLengthBudgetsPerLaunch,
+        "numSlots must be in [1, kMaxAcceptLengthBudgetsPerLaunch].");
+    check::check(slotOffset >= 0 && static_cast<int64_t>(slotOffset) + numSlots <= acceptLengths.getShape()[0],
+        "Clamped slot range exceeds acceptLengths.");
+
+    clampAcceptLengthsKernel<<<1, kMaxAcceptLengthBudgetsPerLaunch, 0, stream>>>(
+        acceptLengths.dataPointer<int32_t>(), budgets, slotOffset, numSlots);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void initializeDraftTreeTables(rt::Tensor const& selectedIndices, rt::Tensor const& logProb,
     rt::Tensor const& rootTokens, rt::Tensor const& vocabMappingTable, rt::Tensor& draftIdFullTable,
     rt::Tensor& draftScoreFullTable, rt::Tensor& draftParentFullTable, int32_t const draftTopK, cudaStream_t stream)

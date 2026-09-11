@@ -705,7 +705,7 @@ bool EagleDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     int32_t const baseNumPages = kvMgrBase.numPages();
     int32_t const baseMaxPagesPerSeq = basePageTable.maxPagesPerSeq();
 
-    decoder_utils::clampAcceptLengthsToRemainingGeneration(context, mHostAcceptLengths, mAcceptLength, context.stream);
+    decoder_utils::clampAcceptLengthsToRemainingGeneration(context, mAcceptLength, context.stream);
 
     for (auto const& group : kvHeadDimGroups)
     {
