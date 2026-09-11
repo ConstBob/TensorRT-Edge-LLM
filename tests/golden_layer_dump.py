@@ -602,6 +602,84 @@ def _set_submodule(root: torch.nn.Module, dotted: str,
         setattr(parent, last, new)
 
 
+class _GoldenGemma4MoEExperts(torch.nn.ModuleList):
+    """Per-expert placeholder replacing HF's stacked-parameter ``Gemma4TextExperts``.
+
+    HF's native module holds ``gate_up_proj`` / ``down_proj`` as single 3D
+    ``[num_experts, ...]`` parameters, batched over experts in ``forward``.
+    NVFP4 checkpoints (e.g. ``nvidia/Gemma-4-26B-A4B-NVFP4``), however, quantize
+    and store each expert's gate/up/down projection *separately*
+    (``experts.{i}.{gate,up,down}_proj.weight`` + NVFP4 scales), with no
+    stacked tensor at all. This container exposes one ``nn.Linear`` per expert
+    per projection at exactly those paths, so ``_load_quantized_state``'s
+    generic per-prefix loader (below) discovers and patches each one into a
+    ``_GoldenNVFP4Linear``, then loads the checkpoint's per-expert weights
+    directly -- matching the engine's fake-quant numerics like every other
+    recipe, instead of a stacked FP16 dequant.
+    """
+
+    def __init__(self, num_experts: int, hidden_dim: int,
+                 intermediate_dim: int, act_fn) -> None:
+        experts = []
+        for _ in range(num_experts):
+            expert = torch.nn.Module()
+            expert.gate_proj = torch.nn.Linear(hidden_dim,
+                                               intermediate_dim,
+                                               bias=False)
+            expert.up_proj = torch.nn.Linear(hidden_dim,
+                                             intermediate_dim,
+                                             bias=False)
+            expert.down_proj = torch.nn.Linear(intermediate_dim,
+                                               hidden_dim,
+                                               bias=False)
+            experts.append(expert)
+        super().__init__(experts)
+        self.act_fn = act_fn
+
+    def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor,
+                top_k_weights: torch.Tensor) -> torch.Tensor:
+        """Mirrors ``Gemma4TextExperts.forward`` (transformers.models.gemma4),
+        substituting per-expert Linear calls for the stacked-parameter matmul."""
+        final_hidden_states = torch.zeros_like(hidden_states)
+        with torch.no_grad():
+            expert_mask = torch.nn.functional.one_hot(top_k_index,
+                                                      num_classes=len(self))
+            expert_mask = expert_mask.permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)),
+                                       0).nonzero()
+        for expert_idx in expert_hit:
+            expert_idx = int(expert_idx[0])
+            expert = self[expert_idx]
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states[token_idx]
+            gate = expert.gate_proj(current_state)
+            up = expert.up_proj(current_state)
+            current_hidden_states = self.act_fn(gate) * up
+            current_hidden_states = expert.down_proj(current_hidden_states)
+            current_hidden_states = current_hidden_states * top_k_weights[
+                token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(
+                0, token_idx,
+                current_hidden_states.to(final_hidden_states.dtype))
+        return final_hidden_states
+
+
+def _swap_gemma4_moe_experts(model: torch.nn.Module) -> int:
+    """Replace every HF ``Gemma4TextExperts`` submodule with the per-expert
+    placeholder above. No-op (returns 0) for non-Gemma4-MoE models."""
+    n = 0
+    for name, module in list(model.named_modules()):
+        if type(module).__name__ != "Gemma4TextExperts":
+            continue
+        replacement = _GoldenGemma4MoEExperts(module.num_experts,
+                                              module.hidden_dim,
+                                              module.intermediate_dim,
+                                              module.act_fn)
+        _set_submodule(model, name, replacement)
+        n += 1
+    return n
+
+
 def _load_quantized_state(model: torch.nn.Module,
                           ckpt: str,
                           quantize_activations: bool = True) -> None:
@@ -638,6 +716,15 @@ def _load_quantized_state(model: torch.nn.Module,
             v
             for k, v in state.items()
         }
+
+    # Gemma4 MoE: swap HF's stacked-parameter Gemma4TextExperts for per-expert
+    # Linear placeholders first, so the generic prefix loop below can see and
+    # patch each expert's separately-quantized projections (see
+    # _GoldenGemma4MoEExperts).
+    n_moe_swapped = _swap_gemma4_moe_experts(model)
+    if n_moe_swapped:
+        print(f"[golden] swapped {n_moe_swapped} Gemma4TextExperts module(s) "
+              "for per-expert placeholders")
 
     # Find quantized projection prefixes (relative to the CausalLM module).
     # FP family carries ``.weight_scale``; INT4 AWQ/GPTQ carry ``.qweight``.

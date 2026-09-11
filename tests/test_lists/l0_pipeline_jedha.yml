@@ -2,6 +2,15 @@ tests:
   - tests/defs/test_common.py::test_build_project
   - tests/defs/test_common.py::test_unit_tests
 
+  # gemma-4-26B-A4B-NVFP4 MoE: re-enabled. Was disabled for a large-magnitude
+  # corruption in Nvfp4MoePlugin's FC2 grouped-GEMM output (despite stable
+  # routing), root-caused to a missing wait on the FC2 bulk-reduction async
+  # copy (#828); fixed by !1457 (merged to main), verified 8/8 clean repro
+  # runs locally. The CuteDslNvfp4MoeSm110Runner kernels are named/targeted
+  # for SM110 (this is Jedha); the corruption was only observed on a local
+  # B200 (SM100), so this also checks the fix holds on SM110.
+  - tests/defs/test_few_layer_validation.py::test_few_layer_validation[gemma-4-26B-A4B-NVFP4]
+
   - tests/defs/test_vlm_pipeline.py::test_engine_build[Phi-4-multimodal-instruct-FP8-fp8-mxsl4096-mxbs2-mxil4096-mnit256-mxit4096-mxpiit512]
   - tests/defs/test_vlm_pipeline.py::test_inference[Phi-4-multimodal-instruct-FP8-fp8-mxsl4096-mxbs2-mxil4096-mnit256-mxit4096-mxpiit512-vlm_basic]
   - tests/defs/test_vlm_pipeline.py::test_inference[Phi-4-multimodal-instruct-FP8-fp8-mxsl4096-mxbs2-mxil4096-mnit256-mxit4096-mxpiit512-mmmu-bs2]
