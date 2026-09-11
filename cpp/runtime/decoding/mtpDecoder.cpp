@@ -845,7 +845,7 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     int32_t const baseNumPages = kvMgrBase.numPages();
     int32_t const baseMaxPagesPerSeq = basePageTable.maxPagesPerSeq();
 
-    decoder_utils::clampAcceptLengthsToRemainingGeneration(context, mHostAcceptLengths, mAcceptLength, context.stream);
+    decoder_utils::clampAcceptLengthsToRemainingGeneration(context, mAcceptLength, context.stream);
 
     // Few-layer-validation teacher forcing (no-op unless EDGELLM_FORCE_TOKENS_FILE is set). Must
     // run before the KV-cache commit below: trimming the acceptance is what keeps a replaced

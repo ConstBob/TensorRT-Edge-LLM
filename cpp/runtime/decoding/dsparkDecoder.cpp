@@ -1066,8 +1066,7 @@ bool DSparkDecoder::runBaseVerification(DecodingInferenceContext& context)
             mAcceptedTokenIndices, mAcceptLength, std::nullopt, mRuntime.sampling.workspace.rawPointer(),
             mRuntime.sampling.workspace.getMemoryCapacity(), context.stream);
 
-        decoder_utils::clampAcceptLengthsToRemainingGeneration(
-            context, mHostAcceptLengths, mAcceptLength, context.stream);
+        decoder_utils::clampAcceptLengthsToRemainingGeneration(context, mAcceptLength, context.stream);
         commitAcceptedTreePath(context, verifyLen, maxAcceptLength);
         // The hidden compaction leaves rows at stride maxAcceptLength, not verifyLen.
         mLastBaseVerifyHiddenStride = maxAcceptLength;
@@ -1161,7 +1160,7 @@ bool DSparkDecoder::runBaseVerification(DecodingInferenceContext& context)
             baseVocabSize, context.stream);
     }
 
-    decoder_utils::clampAcceptLengthsToRemainingGeneration(context, mHostAcceptLengths, mAcceptLength, context.stream);
+    decoder_utils::clampAcceptLengthsToRemainingGeneration(context, mAcceptLength, context.stream);
     mRuntime.base.cacheManager.commitSequenceLength(mAcceptLength, context.stream);
 
     check::check(mRuntime.base.pipelineIO.baseHiddenStates.reshape({activeBatchSize, verifyLen, mBaseOutputHiddenDim}),

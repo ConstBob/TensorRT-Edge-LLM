@@ -751,8 +751,7 @@ bool DFlashDecoder::runBaseVerification(DecodingInferenceContext& context)
             return false;
         }
 
-        decoder_utils::clampAcceptLengthsToRemainingGeneration(
-            context, mHostAcceptLengths, mAcceptLength, context.stream);
+        decoder_utils::clampAcceptLengthsToRemainingGeneration(context, mAcceptLength, context.stream);
 
         if (useTreeVerification())
         {

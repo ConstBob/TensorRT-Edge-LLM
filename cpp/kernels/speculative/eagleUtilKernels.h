@@ -154,6 +154,28 @@ void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const&
 void eagleBaseAssembleHiddenState(rt::Tensor const& acceptedIndices, rt::Tensor const& acceptLengths,
     rt::Tensor& hiddenState, cudaStream_t stream);
 
+constexpr int32_t kMaxAcceptLengthBudgetsPerLaunch{64};
+
+//! Remaining generation budgets for up to kMaxAcceptLengthBudgetsPerLaunch consecutive slots. Passed to
+//! clampAcceptLengths by value so the budgets ride the launch itself: no staging buffer, no H2D copy and no host
+//! synchronization inside the verify round.
+struct AcceptLengthBudgets
+{
+    int32_t remaining[kMaxAcceptLengthBudgetsPerLaunch];
+};
+
+//! Clamp acceptLengths[slotOffset + i] into [0, budgets.remaining[i]] for i in [0, numSlots).
+//! Inputs:
+//!     acceptLengths [GPU, Int32]: Accept lengths, shape [batch]; updated in place.
+//!     budgets: Remaining generation budget of each slot, indexed relative to slotOffset.
+//!     slotOffset: First slot to clamp.
+//!     numSlots: Number of slots to clamp, at most kMaxAcceptLengthBudgetsPerLaunch.
+//!     stream: CUDA stream to execute the kernel.
+//!
+//! @throws std::runtime_error if the tensor is not on the GPU or not Int32, or if the slot range is out of bounds
+void clampAcceptLengths(rt::Tensor& acceptLengths, AcceptLengthBudgets const& budgets, int32_t slotOffset,
+    int32_t numSlots, cudaStream_t stream);
+
 //! The kernel will initialize the draft table for a new round of drafting.
 //! First-level draft logits are translated to target-vocabulary token ids. During eagle spec-decode draft tree
 //! construction, we build multiple full data tables to record the complete description of a draft tree. The full table will contain

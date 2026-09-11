@@ -124,6 +124,36 @@ TEST_F(EagleAssemblyTest, AcceptsTheWholeChainInOneVerificationWhenTheBaseAgrees
     EXPECT_EQ(response.outputIds[0].size(), static_cast<size_t>(maxAcceptedPerRound));
 }
 
+// Given a base that agrees with the whole chain but a request whose budget is one token short of a full round
+// When one round runs
+// Then the commit stops at the budget instead of the accepted chain
+TEST_F(EagleAssemblyTest, ClampsAFullyAcceptedRoundToTheRemainingGenerationBudget)
+{
+    using ::testing::_;
+
+    auto baseEngine = makeEngine();
+    auto draftEngine = makeEngine();
+    auto& base = *baseEngine;
+
+    EXPECT_CALL(base, prepare(kPrefillProfile, _, _, _)).Times(1);
+    EXPECT_CALL(base, prepare(kDecodeProfile, _, _, _)).Times(1);
+
+    auto artifacts = makeArtifacts(std::move(baseEngine), std::move(draftEngine));
+    auto const maxAcceptedPerRound = artifacts.deployment.maxAcceptedTokensPerRound();
+    ASSERT_GT(maxAcceptedPerRound, 1);
+    int64_t const maxGenerateLength = maxAcceptedPerRound - 1;
+
+    auto runtime = makeRuntime(std::move(artifacts));
+
+    auto const request = makeGreedyRequest("a", maxGenerateLength);
+    rt::LLMGenerationResponse response;
+    ASSERT_TRUE(runtime.handleRequest(request, response, mStream));
+
+    ASSERT_EQ(response.outputIds.size(), 1U);
+    EXPECT_EQ(response.outputIds[0].size(), static_cast<size_t>(maxGenerateLength));
+    EXPECT_EQ(response.finishReasons[0], rt::FinishReason::kLength);
+}
+
 // Given a base that disagrees with the draft from the second proposed position onward
 // When the same token budget is generated
 // Then it takes more than one verification
