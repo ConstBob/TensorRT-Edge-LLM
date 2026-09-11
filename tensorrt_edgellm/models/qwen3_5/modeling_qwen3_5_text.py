@@ -1022,14 +1022,15 @@ def _is_jetspec_base_export(config: ModelConfig) -> bool:
 def _is_spec_tree_base_export(config: ModelConfig) -> bool:
     """Return True when exporting DDTree metadata for Qwen3.5 hybrid state.
 
-    DFlash, JetSpec, and MTP tree bases consume the same
+    DFlash, JetSpec, MTP, and DSpark tree bases consume the same
     ``tree_parent_ids`` / ``tree_depths`` verify inputs.
     """
     dflash2_base = (bool(getattr(config, "dflash_base", False)) and getattr(
         config, "dflash_version", DFlashVersion.V1) == DFlashVersion.V2)
     return (dflash2_base or bool(getattr(config, "dflash_tree_base", False))
             or bool(getattr(config, "jetspec_tree_base", False))
-            or bool(getattr(config, "mtp_tree_base", False)))
+            or bool(getattr(config, "mtp_tree_base", False))
+            or bool(getattr(config, "dspark_tree_base", False)))
 
 
 def _make_flat_wrapper_hybrid_ragged(model: nn.Module, Na: int, Ng: int,
