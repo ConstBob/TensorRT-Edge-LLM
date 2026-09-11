@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import (TYPE_CHECKING, Any, Dict, Iterator, List, Mapping,
                     Optional, Sequence, Tuple, Union)
 
-from ..config import ContextCacheConfig
+from ..config import DEFAULT_MAX_QUEUED_REQUESTS, ContextCacheConfig
 from ..parsing.tool_calling import (ToolConfig, parse_assistant_output,
                                     validate_tool_request)
 from .engine_layout import BundleLayout, EngineType, inspect_bundle
@@ -520,6 +520,41 @@ def _ensure_plugin_path() -> None:
             return
 
 
+def ifb_unsupported_reason(layout,
+                           model_type: Optional[str] = None) -> Optional[str]:
+    """Why ``--enable-in-flight-batching`` cannot serve this deployment, or
+    ``None`` when it can.
+
+    The deployment-level half of the IFB support matrix, decided in one place
+    and once, at load time: the request engine drives one vanilla text
+    runtime, so a deployment whose runtime is reached beyond
+    ``handleRequest`` (the speculative decoders, standalone TTS) cannot honour
+    the flag. A Qwen3-Omni bundle is not refused: its Thinker is a text
+    runtime the engine serves, so the deployment runs text-only and the
+    speech endpoints refuse per request (``speech_available``). Request-level
+    refusals (per-request LoRA, speech output, trajectories) live in the
+    engine's ``submit()``.
+    """
+    if model_type == "qwen3_tts":
+        return ("standalone TTS models are not supported under in-flight "
+                "batching")
+    if layout is not None and layout.engine_type == EngineType.SPEC_DECODE:
+        return "speculative decoding is not supported under in-flight batching"
+    return None
+
+
+_IFB_TEXT_ONLY_MESSAGE = (
+    "speech output is unavailable under in-flight batching: the engine serves "
+    "text only, so the Omni talker/code_predictor/code2wav engines were not "
+    "loaded. Start without --enable-in-flight-batching to use speech output.")
+
+
+def _ifb_unsupported_error(reason: str) -> ValueError:
+    return ValueError(
+        "--enable-in-flight-batching is not supported for this deployment: "
+        f"{reason}. Start without the flag to use the blocking path.")
+
+
 def _import_runtime():
     """Import the C++ pybind module."""
     try:
@@ -796,6 +831,7 @@ class LLM:
         speculative_config: Optional[Any] = None,
         context_cache_config: Optional[Union[ContextCacheConfig,
                                              Mapping[str, Any]]] = None,
+        enable_in_flight_batching: bool = False,
     ):
         if not model:
             raise ValueError("'model' must be provided")
@@ -823,6 +859,7 @@ class LLM:
         self._max_kv_cache_capacity = max_kv_cache_capacity
         self._context_cache_config = ContextCacheConfig.parse(
             context_cache_config)
+        self._enable_in_flight_batching = enable_in_flight_batching
         self._admission_sem = threading.Semaphore(1)
         self._infer_lock = threading.Lock()
         self._close_lock = threading.Lock()
@@ -836,6 +873,7 @@ class LLM:
         self._prev_ctx_admitted_sequences = 0
         self._closed = False
         self._runtime = None
+        self._engine = None
 
         from .engine_build import BuildOptions, cache_root, prepare_model
 
@@ -921,6 +959,13 @@ class LLM:
         context_cache_config = _native_context_cache_config(
             self._rt, self._context_cache_config)
         logger.info("Loading runtime bundle from %s", self._bundle_dir)
+        # Asked for and not available is a configuration error, not a silent
+        # fallback: the operator would otherwise believe requests overlap when
+        # they are being served one at a time.
+        if getattr(self, "_enable_in_flight_batching", False):
+            reason = ifb_unsupported_reason(self._layout)
+            if reason:
+                raise _ifb_unsupported_error(reason)
         if self._layout.engine_type == EngineType.SPEC_DECODE:
             logger.info(
                 "Speculative decoding enabled (top_k=%d, step=%d, "
@@ -942,7 +987,44 @@ class LLM:
                 context_cache_config,
                 self._dflash_block_size,
             )
-        else:
+        elif self._use_ifb():
+            # In-flight batching: the engine owns the runtime and the one
+            # thread driving it, so requests overlap at step boundaries
+            # instead of queueing on a Python lock. The deployment passed
+            # ifb_unsupported_reason above; the engine itself refuses what it
+            # cannot admit into. An Omni bundle runs text-only here (see
+            # speech_available).
+            try:
+                self._engine = self._rt.RequestEngine(
+                    self._bundle_dir,
+                    self._media_dir,
+                    {},
+                    self._model_dir,
+                    context_cache_config,
+                    max_batch_size=self._max_batch_size,
+                )
+                logger.info("In-flight batching enabled (max_batch_size=%d)",
+                            self._max_batch_size)
+                # The engine overlaps requests, so the gate no longer serialises
+                # them; it only bounds how many direct-API requests hold decoded
+                # media at once: the running batch plus the same queue depth the
+                # server allows (running + queued, as vLLM, SGLang and
+                # TensorRT-LLM count it). Callers past that block rather than
+                # being refused; the server path has its own gate and never
+                # takes this one.
+                self._admission_sem = threading.Semaphore(
+                    self._max_batch_size + DEFAULT_MAX_QUEUED_REQUESTS)
+                if self._layout.has_speech:
+                    logger.warning("Omni speech-output engines not loaded: %s",
+                                   _IFB_TEXT_ONLY_MESSAGE)
+            except RuntimeError as error:
+                # The engine refused the deployment at construction (a batch it
+                # cannot reseat). The flag was explicit, so this is a startup
+                # error with the engine's own reason, not a quiet return to
+                # the blocking path.
+                raise _ifb_unsupported_error(str(error)) from error
+        if (getattr(self, "_engine", None) is None
+                and getattr(self, "_runtime", None) is None):
             self._runtime = self._rt.LLMRuntime(
                 self._bundle_dir,
                 self._media_dir,
@@ -950,13 +1032,43 @@ class LLM:
                 self._model_dir,
                 context_cache_config,
             )
-        self._runtime.capture_decoding_cuda_graph()
-        self._load_omni_runtime()
+        if getattr(self, "_runtime", None) is not None:
+            self._runtime.capture_decoding_cuda_graph()
+            self._load_omni_runtime()
         logger.info("Engine loaded and ready.")
+
+    def _use_ifb(self) -> bool:
+        """In-flight batching is opt-in: ``--enable-in-flight-batching``.
+
+        The flag is the whole decision: whether the deployment can honour it
+        was settled once in ``_load_runtime`` (``ifb_unsupported_reason``),
+        which raises rather than falling back. When enabled it serves text and
+        multimodal-input deployments; a media request joins a running batch
+        like any other — its encoders run at admission — except under a
+        visual-token pruner, where media is founder-only because a seated
+        prefill would skip pruning and diverge from the founding path.
+        """
+        return bool(getattr(self, "_enable_in_flight_batching", False))
+
+    @property
+    def speech_available(self) -> bool:
+        """Whether this process can produce speech: the Omni stack is in the
+        bundle and the runtime is the blocking one that drives it. Under
+        in-flight batching the engine owns the runtime and serves text only.
+        """
+        return bool(self._layout.has_speech
+                    and getattr(self, "_engine", None) is None)
 
     def _load_omni_runtime(self) -> None:
         """Load the Qwen3-Omni audio-output stack when its engines exist."""
         if not self._layout.has_speech:
+            return
+        if getattr(self, "_engine", None) is not None:
+            # Text-only mode: the Talker pipeline drives the runtime outside
+            # handleRequest, which the engine's actor does not mediate, so the
+            # speech engines stay unloaded and the speech endpoints refuse.
+            logger.warning("Omni speech-output engines not loaded: %s",
+                           _IFB_TEXT_ONLY_MESSAGE)
             return
         logger.info("Auto-detected Omni engines: talker=%s",
                     self._layout.talker_dir)
@@ -1146,7 +1258,8 @@ class LLM:
 
     def _count_prepared_prompt_tokens(self, request) -> Optional[int]:
         """Count tokens only for an explicit token-count API request."""
-        if not hasattr(self._runtime, "count_prompt_tokens"):
+        counter = getattr(self, "_engine", None) or self._runtime
+        if not hasattr(counter, "count_prompt_tokens"):
             return None
         rows = getattr(request, "requests", ())
         if any(
@@ -1155,7 +1268,7 @@ class LLM:
                 or getattr(row, "past_trajectory", None) is not None
                 for row in rows):
             return None
-        counts = self._runtime.count_prompt_tokens(request)
+        counts = counter.count_prompt_tokens(request)
         return counts[0] if counts else None
 
     def _parse_generation_output(
@@ -1194,8 +1307,9 @@ class LLM:
         *,
         tool_parser: str = "auto",
         reasoning_parser: str = "none",
+        on_handle=None,
     ) -> CompletionOutput:
-        response = self._handle_request(request)
+        response = self._handle_request(request, on_handle=on_handle)
         text = response.output_texts[0] if response.output_texts else ""
         token_ids = response.output_ids[0] if response.output_ids else []
         prompt_tokens = (response.prompt_token_counts[0]
@@ -1223,7 +1337,9 @@ class LLM:
     def _admission(self):
         """Per-instance gate from media decode through inference completion:
         queued requests must not each pin decoded frames. Semaphore, not Lock --
-        streaming releases from the worker/SSE side."""
+        streaming releases from the worker/SSE side. One slot on the blocking
+        path, batch plus queue depth under in-flight batching (see
+        ``_load_runtime``)."""
         return self._admission_sem
 
     def _infer_guard(self):
@@ -1231,7 +1347,9 @@ class LLM:
         return self._infer_lock
 
     def _ensure_open(self) -> None:
-        if self._closed or self._runtime is None:
+        # getattr: callable on duck-typed non-LLM objects in the server tests.
+        if self._closed or (self._runtime is None
+                            and getattr(self, "_engine", None) is None):
             raise RuntimeError("Edge-LLM runtime is closed")
 
     @staticmethod
@@ -1282,15 +1400,33 @@ class LLM:
             int(cc.hybrid_restores),
         )
 
-    def _handle_request(self, request):
-        """Serialized entry to the C++ runtime."""
-        with self._infer_guard():
+    def _handle_request(self, request, on_handle=None):
+        """Entry to the C++ runtime: submitted to the engine's actor under
+        in-flight batching, serialized under a lock on the blocking path.
+
+        ``on_handle`` receives the engine's RequestHandle as soon as the
+        request is submitted, so a caller that gives up on the result (a
+        disconnected client) can cancel it instead of leaving it decoding in
+        its batch seat until ``max_tokens``.
+        """
+        engine = getattr(self, "_engine", None)
+        if engine is not None:
             self._ensure_open()
-            response = self._runtime.handle_request(request)
+            handle = engine.submit(request)
+            if on_handle is not None:
+                on_handle(handle)
+            response = handle.get()
+        else:
+            with self._infer_guard():
+                self._ensure_open()
+                response = self._runtime.handle_request(request)
         # Callable on duck-typed non-LLM objects in the server tests, which have
         # no config to inherit a class default from.
         cache_config = getattr(self, "_context_cache_config", None)
-        if cache_config is not None and cache_config.enabled:
+        # Reuse metrics come off the runtime handle; the engine does not expose
+        # them, so under in-flight batching the log line is simply absent.
+        if (cache_config is not None and cache_config.enabled
+                and self._runtime is not None):
             self._log_context_reuse_metrics()
         return response
 
@@ -1300,6 +1436,12 @@ class LLM:
             if self._closed:
                 return
             self._closed = True
+            if getattr(self, "_engine", None) is not None:
+                # DRAIN lets accepted requests finish; the join inside makes
+                # this the same "no work in flight afterwards" guarantee the
+                # lock pair gives the blocking path.
+                self._engine.shutdown(self._rt.ShutdownMode.DRAIN)
+                self._engine = None
             with self._admission_sem:
                 with self._infer_lock:
                     self._runtime = None
@@ -1410,14 +1552,24 @@ class LLM:
     ) -> Iterator[StreamDelta]:
         """Stream generation deltas for a single message list.
 
-        Runs ``handleRequest`` in a background thread with a
-        ``StreamChannel`` attached, yielding ``StreamDelta`` objects as
-        tokens are produced.
+        Yields ``StreamDelta`` objects as tokens are produced. Under
+        in-flight batching the request is submitted to the engine and this
+        thread reads the attached ``StreamChannel`` directly; on the blocking
+        path ``handleRequest`` runs in a background thread instead.
         """
         params = sampling_params or SamplingParams()
         state = {}
 
         def _cancel():
+            # close() after a clean EOF must stay a no-op: a founder's outcome
+            # is published only when its whole batch drains, and a cancel flag
+            # planted in that window records a completed request as cancelled.
+            if state.get("finished_cleanly"):
+                return
+            state["cancelled_by_caller"] = True
+            handle = state.get("handle")
+            if handle is not None:
+                handle.cancel()
             channel = state.get("channel")
             if channel is not None:
                 channel.cancel()
@@ -1429,7 +1581,11 @@ class LLM:
             channel.set_skip_special_tokens(params.skip_special_tokens)
 
             # The HTTP layer owns admission for a prebuilt request. Direct
-            # callers acquire the per-LLM gate here.
+            # callers take the per-LLM gate here; under in-flight batching it
+            # is wide enough for a batch plus a queue, and there is no worker
+            # thread: the engine queues the request and this thread just reads
+            # the channel it attached.
+            engine = getattr(self, "_engine", None)
             sem = None if prebuilt_request is not None else self._admission()
             if sem is not None:
                 sem.acquire()
@@ -1452,29 +1608,54 @@ class LLM:
                 raise
 
             error_holder = [None]
+            worker = None
 
-            def _run():
-                try:
-                    self._handle_request(request)
-                except Exception as exc:
-                    error_holder[0] = exc
-                    channel.cancel()
-                finally:
-                    if sem is not None:
-                        sem.release()
+            if engine is not None:
+                state["handle"] = engine.submit(request)
+            else:
 
-            worker = threading.Thread(target=_run, daemon=True)
-            worker.start()
+                def _run():
+                    try:
+                        self._handle_request(request)
+                    except Exception as exc:
+                        error_holder[0] = exc
+                        channel.cancel()
+                    finally:
+                        if sem is not None:
+                            sem.release()
 
+                worker = threading.Thread(target=_run, daemon=True)
+                worker.start()
+
+            saw_finished = False
             try:
                 while True:
                     chunk = channel.wait_pop(timeout_ms=200)
                     if chunk is None:
                         if channel.is_finished() or channel.is_cancelled():
                             break
-                        continue
+                        # A terminal outcome with a silent channel means the
+                        # request retired without ever reaching the runtime
+                        # (rejected, or a founder that failed before decoding);
+                        # nothing will touch this channel again. Without this,
+                        # the consumer waits out its transport timeout. Drain
+                        # once more before breaking: push/finish/publish can
+                        # all land between the checks above, leaving the
+                        # terminal chunk in the channel.
+                        handle = state.get("handle")
+                        if handle is not None and handle.ready():
+                            chunk = channel.wait_pop(timeout_ms=0)
+                            if chunk is None:
+                                break
+                        else:
+                            continue
                     reason = finish_reason_name(
                         self._rt, chunk.reason) if chunk.finished else None
+                    if chunk.finished:
+                        # Before the yield: a consumer that closes the stream
+                        # right after the terminal delta must not be taken for
+                        # a disconnect and cancel a request that completed.
+                        state["finished_cleanly"] = True
                     yield StreamDelta(
                         text=chunk.text,
                         token_ids=list(chunk.token_ids),
@@ -1486,14 +1667,38 @@ class LLM:
                         logprobs=_convert_logprobs(chunk.logprobs),
                     )
                     if chunk.finished:
+                        saw_finished = True
                         break
             finally:
-                if not (channel.is_finished() or channel.is_cancelled()):
+                # The producer pushes the finished chunk before it marks the
+                # channel finished; a consumer that raced past that window
+                # must not cancel a stream that ended cleanly, or the tail
+                # below would mistake it for an actor failure and block on
+                # get() until the whole batch drains.
+                if not (saw_finished or channel.is_finished()
+                        or channel.is_cancelled()):
                     channel.cancel()
-                worker.join()
+                if worker is not None:
+                    worker.join()
+                elif sem is not None:
+                    # Engine path: the stream is over (or abandoned) and the
+                    # request's decoded media may be released; the blocking
+                    # path releases from its worker instead.
+                    sem.release()
 
             if error_holder[0] is not None:
                 raise error_holder[0]
+
+            # The outcome is the request's verdict, the channel only its
+            # tokens: a sequence that ended in FinishReason.ERROR, or whose
+            # response failed to materialize, still delivered a terminal chunk.
+            # Every stream the caller did not cancel therefore collects its
+            # outcome — get() raises the real reason for a failure and returns
+            # promptly otherwise, since a resident's outcome is published at
+            # the tick that evicts it, not when the whole batch drains.
+            handle = state.get("handle")
+            if handle is not None and not state.get("cancelled_by_caller"):
+                handle.get()
 
         return _CancellableIterator(_iterate(), _cancel)
 
@@ -1516,6 +1721,9 @@ class LLM:
         if not self._layout.has_speech:
             raise ValueError("Omni audio output not available: talker / "
                              "code_predictor / code2wav engines not loaded.")
+        if self._engine is not None:
+            # In-flight batching: the engine serves text only.
+            raise ValueError(_IFB_TEXT_ONLY_MESSAGE)
         params = sampling_params or SamplingParams()
         state = {}
 
@@ -1590,6 +1798,9 @@ class LLM:
         if not self._layout.has_speech:
             raise ValueError("TTS not available: Omni audio components "
                              "(talker/code_predictor/code2wav) not loaded")
+        if self._engine is not None:
+            # In-flight batching: the engine serves text only.
+            raise ValueError(_IFB_TEXT_ONLY_MESSAGE)
         sem = self._admission()
         return _stream_tts(self._rt,
                            self._runtime,
@@ -1600,8 +1811,9 @@ class LLM:
                            ensure_open=self._ensure_open)
 
     def list_voices(self) -> List[str]:
-        """Speaker names accepted as ``voice``; empty when not Omni-capable."""
-        if not self._layout.has_speech:
+        """Speaker names accepted as ``voice``; empty when not Omni-capable
+        (or when in-flight batching left the speech stack unloaded)."""
+        if not self.speech_available:
             return []
         self._ensure_open()
         return sorted(self._runtime.get_speaker_names())
@@ -1678,6 +1890,10 @@ class LLM:
     @property
     def has_draft_model(self) -> bool:
         """Whether speculative decoding is active."""
+        # The engine only serves vanilla deployments, so under in-flight
+        # batching there is no runtime handle and the answer is simply no.
+        if self._runtime is None:
+            return False
         return self._runtime.has_draft_model()
 
     @property
@@ -1685,8 +1901,35 @@ class LLM:
         """Whether this runtime reuses matching text prefixes."""
         return self._context_cache_config.enabled
 
+    def get_scheduling_metrics(self):
+        """Engine scheduling counters as a dict, or ``None`` on the blocking path."""
+        engine = getattr(self, "_engine", None)
+        if engine is None or not hasattr(engine, "metrics"):
+            return None
+        m = engine.metrics()
+        counters = {
+            field: getattr(m, field)
+            for field in ("submitted", "refused", "stalls_incompatible",
+                          "stalls_guided", "stalls_no_capacity",
+                          "admitted_mid_flight", "completed", "cancelled",
+                          "failed", "queue_latency_max_us")
+        }
+        counters["queue_latency_avg_us"] = (m.queue_latency_total_us //
+                                            m.queue_latency_count
+                                            if m.queue_latency_count else 0)
+        # Live gauges alongside the counters: current depth is what an
+        # operator reading /health actually wants first.
+        counters["queued"] = getattr(engine, "queued", 0)
+        counters["resident"] = getattr(engine, "resident", 0)
+        return counters
+
     def get_context_cache_metrics(self):
         """Return native reuse counters, or ``None`` when reuse is disabled."""
+        # The engine exposes no metrics passthrough; reuse counters are a
+        # blocking-path feature until the context cache is wired into
+        # admission.
+        if self._runtime is None:
+            return None
         with self._infer_guard():
             self._ensure_open()
             return self._runtime.get_context_cache_metrics()
@@ -1851,6 +2094,9 @@ def load_model(**kwargs):
         if kwargs.pop("speculative_config", None):
             raise ValueError(
                 "standalone TTS models do not support speculative decoding")
+        if kwargs.pop("enable_in_flight_batching", False):
+            raise _ifb_unsupported_error(
+                ifb_unsupported_reason(None, model_type=model_type))
         context_cache = ContextCacheConfig.parse(
             kwargs.pop("context_cache_config", None))
         if context_cache.enabled:

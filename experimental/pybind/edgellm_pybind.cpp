@@ -43,6 +43,7 @@
 #endif
 #include "runtime/qwen3OmniTTSRuntime.h"
 #include "runtime/streaming.h"
+#include "scheduler/requestEngine.h"
 
 #include <algorithm>
 #include <chrono>
@@ -493,6 +494,101 @@ private:
     std::unique_ptr<NemotronAsrRuntime> mRuntime;
 };
 #endif
+
+//! Python-facing owner of the IFB request engine.
+//!
+//! Builds the runtime the same way PyLLMRuntime's vanilla constructor does, then hands it to a
+//! RequestEngine together with the CUDA stream; the engine owns the runtime, this class owns the
+//! engine and the stream. Speculative deployments stay on PyLLMRuntime: the engine cannot admit
+//! into them, so nothing is gained by carrying that constructor here.
+class PyRequestEngine
+{
+public:
+    PyRequestEngine(std::string const& engineDir, std::string const& multimodalEngineDir,
+        std::unordered_map<std::string, std::string> const& loraWeightsMap, std::string const& checkpointDir,
+        ContextCacheConfig const& contextCacheConfig, int32_t maxBatchSize, int32_t maxPendingRequests,
+        int32_t commandQueueCapacity, bool captureCudaGraph)
+    {
+        mPluginHandle = loadEdgellmPluginLib();
+        // Single rank only in this release: tensor-parallel deployments stay on the blocking path
+        // until the stepped command stream reaches the other ranks (see the IFB support matrix).
+        auto runtime = std::make_unique<LLMInferenceRuntime>(
+            engineDir, multimodalEngineDir, loraWeightsMap, mStream.get(), contextCacheConfig, checkpointDir);
+        // Capture happens here because after the constructor hands the runtime over, nothing but
+        // the actor may touch it, and the actor has no pre-first-request hook to capture from.
+        if (captureCudaGraph && !runtime->captureDecodingCUDAGraph(mStream.get()))
+        {
+            LOG_WARNING("CUDA graph capture failed for decoding, proceeding without.");
+        }
+        mTokenizerView = runtime.get();
+        scheduler::EngineConfig config;
+        config.maxBatchSize = maxBatchSize;
+        config.maxPendingRequests = maxPendingRequests;
+        config.commandQueueCapacity = commandQueueCapacity;
+        mEngine = std::make_unique<scheduler::RequestEngine>(std::move(runtime), mStream.get(), config);
+    }
+
+    scheduler::RequestHandle submit(LLMGenerationRequest request)
+    {
+        return mEngine->submit(std::move(request));
+    }
+
+    void cancel(scheduler::RequestId id)
+    {
+        mEngine->cancel(id);
+    }
+
+    void shutdown(scheduler::ShutdownMode mode)
+    {
+        mEngine->shutdown(mode);
+    }
+
+    int32_t queued() const noexcept
+    {
+        return mEngine->queued();
+    }
+
+    int32_t resident() const noexcept
+    {
+        return mEngine->resident();
+    }
+
+    bool running() const noexcept
+    {
+        return mEngine->running();
+    }
+
+    std::vector<int32_t> countPromptTokens(LLMGenerationRequest const& request) const
+    {
+        return mTokenizerView->countPromptTokens(request);
+    }
+
+    scheduler::EngineMetrics metrics() const noexcept
+    {
+        return mEngine->metrics();
+    }
+
+    ~PyRequestEngine()
+    {
+        // pybind runs this with the GIL held, and the engine's destructor joins the actor, which
+        // may be inside a generation for a while. Release the GIL for that wait so the other Python
+        // threads (and the asyncio loop) keep running; the actor itself never takes the GIL.
+        py::gil_scoped_release release;
+        mEngine.reset();
+    }
+
+private:
+    CudaStreamWrapper mStream;
+    std::unique_ptr<void, DlDeleter> mPluginHandle;
+    //! The engine owns the runtime and only the actor may drive it; this view exists for exactly
+    //! one call, countPromptTokens, which is const all the way down (template + encode on a
+    //! tokenizer with no mutable state), so it can run concurrently with the actor's own
+    //! tokenization. Valid as long as mEngine is, which owns the pointee.
+    LLMInferenceRuntime const* mTokenizerView{nullptr};
+    //! Last member on purpose: its destructor joins the actor, which is still driving mStream,
+    //! so it has to run before the stream (and the plugin library) are torn down.
+    std::unique_ptr<scheduler::RequestEngine> mEngine;
+};
 
 imageUtils::ImageData loadImageFromPath(std::string const& path)
 {
@@ -1045,6 +1141,76 @@ PYBIND11_MODULE(_edgellm_runtime, m)
             py::return_value_policy::reference_internal) // deprecated alias
         .def("get_multimodal_metrics", &PyLLMRuntime::getMultimodalMetrics)
         .def("get_context_cache_metrics", &PyLLMRuntime::getContextCacheMetrics);
+
+    // ========================================================================
+    // Request engine: in-flight batching over the same runtime
+    // ========================================================================
+
+    // submit() refusing is backpressure, not failure; give it its own exception type so the
+    // server can translate it into "busy" without pattern-matching RuntimeError strings.
+    py::register_exception<scheduler::SubmitError>(m, "SubmitError");
+
+    py::class_<scheduler::EngineMetrics>(m, "EngineMetrics",
+        "A point-in-time copy of the engine's counters; per-field accurate, not a single atomic cut.")
+        .def_readonly("submitted", &scheduler::EngineMetrics::submitted)
+        .def_readonly("refused", &scheduler::EngineMetrics::refused)
+        .def_readonly("stalls_incompatible", &scheduler::EngineMetrics::stallsIncompatible)
+        .def_readonly("stalls_guided", &scheduler::EngineMetrics::stallsGuided)
+        .def_readonly("stalls_founder_only", &scheduler::EngineMetrics::stallsFounderOnly)
+        .def_readonly("stalls_no_capacity", &scheduler::EngineMetrics::stallsNoCapacity)
+        .def_readonly("admitted_mid_flight", &scheduler::EngineMetrics::admittedMidFlight)
+        .def_readonly("completed", &scheduler::EngineMetrics::completed)
+        .def_readonly("cancelled", &scheduler::EngineMetrics::cancelled)
+        .def_readonly("failed", &scheduler::EngineMetrics::failed)
+        .def_readonly("queue_latency_total_us", &scheduler::EngineMetrics::queueLatencyTotalUs)
+        .def_readonly("queue_latency_max_us", &scheduler::EngineMetrics::queueLatencyMaxUs)
+        .def_readonly("queue_latency_count", &scheduler::EngineMetrics::queueLatencyCount);
+
+    py::enum_<scheduler::ShutdownMode>(m, "ShutdownMode")
+        .value("DRAIN", scheduler::ShutdownMode::kDrain)
+        .value("CANCEL", scheduler::ShutdownMode::kCancel);
+
+    // GIL rules: every blocking call (get(), shutdown(), and StreamChannel.wait_pop() above)
+    // releases the GIL, and the actor thread never takes it (no Python callbacks cross this
+    // boundary). submit() and cancel() only post to the command queue, but they still release:
+    // they can contend on the admission gate, and nothing they touch is Python state.
+    py::class_<scheduler::RequestHandle>(
+        m, "RequestHandle", "A claim on one in-flight request. Move-only in C++; treat it as the single consumer.")
+        .def_property_readonly("id", &scheduler::RequestHandle::id)
+        .def("stream", &scheduler::RequestHandle::streamShared,
+            "The token channel for this request; tokens appear as they are produced.")
+        .def("get", &scheduler::RequestHandle::get, py::call_guard<py::gil_scoped_release>(),
+            "Block until the request is terminal, then return its response. Raises on error or cancellation.")
+        .def("ready", &scheduler::RequestHandle::ready, "True once get() would return without blocking.")
+        .def("cancel", &scheduler::RequestHandle::cancel, py::call_guard<py::gil_scoped_release>(),
+            "Ask the engine to stop this request. Non-blocking and idempotent.")
+        .def("valid", &scheduler::RequestHandle::valid);
+
+    py::class_<PyRequestEngine>(m, "RequestEngine",
+        "Owns a runtime and the actor thread that drives it; submissions from any thread, "
+        "responses through RequestHandle.")
+        .def(py::init<std::string const&, std::string const&, std::unordered_map<std::string, std::string> const&,
+                 std::string const&, ContextCacheConfig const&, int32_t, int32_t, int32_t, bool>(),
+            py::arg("engine_dir"), py::arg("multimodal_engine_dir") = "",
+            py::arg("lora_weights_map") = std::unordered_map<std::string, std::string>{},
+            py::arg("checkpoint_dir") = "", py::arg("context_cache_config") = ContextCacheConfig{},
+            py::arg("max_batch_size") = 1, py::arg("max_pending_requests") = 256,
+            py::arg("command_queue_capacity") = 64, py::arg("capture_cuda_graph") = true)
+        .def("submit", &PyRequestEngine::submit, py::arg("request"), py::call_guard<py::gil_scoped_release>(),
+            "Queue a request. Returns immediately with a RequestHandle; raises SubmitError when refused.")
+        .def("cancel", &PyRequestEngine::cancel, py::arg("request_id"), py::call_guard<py::gil_scoped_release>(),
+            "Ask the actor to terminate a request by id.")
+        .def("shutdown", &PyRequestEngine::shutdown, py::arg("mode") = scheduler::ShutdownMode::kDrain,
+            py::call_guard<py::gil_scoped_release>(),
+            "Stop the actor and join it. DRAIN lets queued requests finish; CANCEL abandons them.")
+        .def("count_prompt_tokens", &PyRequestEngine::countPromptTokens, py::arg("request"),
+            py::call_guard<py::gil_scoped_release>(),
+            "Tokenize and count without generating; safe alongside in-flight requests.")
+        .def("metrics", &PyRequestEngine::metrics,
+            "Scheduling counters: queue latency, admission stalls by reason, and outcome distribution.")
+        .def_property_readonly("queued", &PyRequestEngine::queued)
+        .def_property_readonly("resident", &PyRequestEngine::resident)
+        .def_property_readonly("running", &PyRequestEngine::running);
 
     py::class_<PyTTSRuntime>(
         m, "TTSRuntime", "TTS-only runtime (Qwen3-TTS-style): Talker + CodePredictor + Code2Wav, no Thinker engine")

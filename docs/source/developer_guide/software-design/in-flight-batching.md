@@ -38,7 +38,8 @@ refuse each request with a message naming the flag;
 | Text LLM, tensor parallelism (thread- or MPI-launched) | blocking path | The stepped plane runs on one rank in this release; `RequestEngine` refuses a multi-rank runtime at construction and the server keeps the deployment on `handleRequest`. Follow-up: #981 (broadcast the stepped commands to every rank). |
 | Vision / audio **input** (multimodal) | served | Encoders run at admission; see the visual-token-pruner row below. |
 | Speculative decoding (draft engine, MTP, EAGLE, DFlash) | blocking path | The draft-side per-slot state has no seating swap yet; the engine refuses `maxBatchSize > 1` for these deployments. Follow-up: #980. |
-| Diffusion backbone, by-value Mamba state | blocking path | Cannot reseat mid-request; same construction-time refusal. |
+| Diffusion backbone | blocking path | Cannot reseat mid-request; same construction-time refusal. |
+| Hybrid Mamba (Nemotron-H) | served, **unverified** | Since the ragged runtime landed, joiners prefill in place and no per-slot state is relocated, so the engine admits hybrid deployments. Greedy outputs under batching are not yet bit-exact with single-request runs on GB100; verify before advertising. |
 | Speech **output**, Qwen3-Omni bundle | **text-only** | The Thinker is a text runtime the engine serves, so the deployment starts under IFB with the Talker/code2wav engines unloaded; `/v1/audio/speech` and audio output on chat are refused per request with a message naming the flag, and the capabilities report no speech. The Talker pipeline calls the runtime beyond `handleRequest`, which the actor does not mediate. Follow-up: #978. |
 | Speech **output**, standalone Qwen3-TTS model | blocking path | No request engine exists for a TTS-only runtime; the flag is refused at startup. Follow-up: #978. |
 | Context cache (prefix reuse) | served | Joiners lease their pages at admission; cache visibility commits with the step that produced it. |

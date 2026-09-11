@@ -1180,7 +1180,12 @@ try:
     status, _, body = request('/health', method='GET')
     health = json.loads(body)
     assert status == 200 and health['status'] == 'healthy'
-    assert health['capabilities']['max_num_seqs'] == 1
+    # Under in-flight batching the overlap dimension is the engine batch; the
+    # blocking path serves one sequence at a time.
+    expected_seqs = ({config.max_batch_size}
+                     if health['capabilities'].get('in_flight_batching')
+                     else 1)
+    assert health['capabilities']['max_num_seqs'] == expected_seqs, health
 
     status, _, body = request('/v1/models', method='GET')
     models = json.loads(body)
