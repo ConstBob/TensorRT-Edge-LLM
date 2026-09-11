@@ -22,6 +22,7 @@ checkpoint's own recipe while the caller believes it asked for weight-only, so
 both hops are covered here.
 """
 
+import onnx
 import pytest
 import torch
 
@@ -29,7 +30,10 @@ from tensorrt_edgellm.config import (QUANT_FP8, QUANT_INT8_SQ, QUANT_MXFP8,
                                      QUANT_NVFP4, ModelConfig, QuantConfig,
                                      set_default_quantize_activations)
 from tensorrt_edgellm.models.linear import (LinearBase, NVFP4LinearMethod,
-                                            make_linear)
+                                            TPMode, make_linear)
+from tensorrt_edgellm.onnx.dynamo_translations import \
+    build_custom_translation_table
+from tensorrt_edgellm.onnx.export import _permissive_inline_opset
 
 # (quant_type, group_size) for the four recipes that quantize activations. INT4
 # AWQ / GPTQ are weight-only by construction and have no Q to drop.
@@ -119,6 +123,40 @@ def test_row_parallel_nvfp4_rejects_weight_only():
     with pytest.raises(NotImplementedError, match="no-quantize-activations"):
         NVFP4LinearMethod(group_size=16).apply_linear_allreduce(
             _Stub(), torch.zeros(1, 64, dtype=torch.float16))
+
+
+def test_tp2_dense_nvfp4_token_matrix_exports_rank2_gemm(tmp_path):
+    """Qwen3 TP2 MLP flattening must not broadcast the dense NVFP4 weight."""
+    config = _model_config(QuantConfig(quant_type=QUANT_NVFP4,
+                                       group_size=16)).for_rank(0, 2)
+    layer = make_linear(config,
+                        64,
+                        config.intermediate_size,
+                        tp_mode=TPMode.COL).eval()
+    with _permissive_inline_opset():
+        program = torch.onnx.export(
+            layer, (torch.zeros(7, 64, dtype=torch.float16), ),
+            dynamo=True,
+            opset_version=24,
+            custom_translation_table=build_custom_translation_table(),
+            optimize=False)
+
+    output = tmp_path / "tp2-dense-nvfp4-rank2.onnx"
+    program.save(str(output))
+    graph = onnx.shape_inference.infer_shapes(onnx.load(str(output))).graph
+    values = {
+        value.name: value
+        for value in (*graph.input, *graph.value_info, *graph.output)
+    }
+    gemms = [node for node in graph.node if node.op_type == "Gemm"]
+    assert len(gemms) == 1
+    gemm = gemms[0]
+    assert [
+        len(values[name].type.tensor_type.shape.dim)
+        for name in (*gemm.input[:2], gemm.output[0])
+    ] == [2, 2, 2]
+    producers = {name: node for node in graph.node for name in node.output}
+    assert producers[gemm.input[1]].op_type != "Unsqueeze"
 
 
 def test_golden_linears_share_the_switch():

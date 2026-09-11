@@ -812,7 +812,6 @@ class NemotronHMoEMLP(nn.Module):
         self._export_ready = True
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        batch, seq_len, _ = hidden_states.shape
         # Router logits are computed from the original hidden states. When
         # moe_latent_size is set, only the routed expert payload is projected
         # down into latent space.

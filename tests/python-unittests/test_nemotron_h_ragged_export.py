@@ -17,8 +17,9 @@ import math
 
 import onnx
 
-from tensorrt_edgellm.config import (LAYER_ATTN, LAYER_MAMBA, MambaConfig,
-                                     ModelConfig)
+from tensorrt_edgellm.config import (LAYER_ATTN, LAYER_MAMBA, LAYER_MOE,
+                                     QUANT_NVFP4, MambaConfig, ModelConfig,
+                                     QuantConfig)
 from tensorrt_edgellm.models.nemotron_h.modeling_nemotron_h import \
     NemotronHCausalLM
 from tensorrt_edgellm.models.nemotron_h.modeling_nemotron_h_mtp import \
@@ -48,6 +49,18 @@ def _config() -> ModelConfig:
                                              n_groups=1))
 
 
+def _moe_config() -> ModelConfig:
+    config = _config()
+    config.num_hidden_layers = 3
+    config.layer_types = [LAYER_MAMBA, LAYER_MOE, LAYER_ATTN]
+    config.quant = QuantConfig(quant_type=QUANT_NVFP4, group_size=16)
+    config.n_routed_experts = 2
+    config.num_experts_per_tok = 1
+    config.moe_intermediate_size = 16
+    config.moe_shared_expert_intermediate_size = 16
+    return config
+
+
 def test_nemotron_h_export_uses_token_major_resident_state_contract():
     spec = NemotronHCausalLM(_config()).onnx_export_spec()
     args = dict(zip(spec.input_names, spec.args))
@@ -71,6 +84,52 @@ def test_nemotron_h_export_uses_token_major_resident_state_contract():
     assert outputs[1].shape == args["past_key_values_0"].shape
     assert outputs[2].shape == args["conv_state_0"].shape
     assert outputs[3].shape == args["recurrent_state_0"].shape
+
+
+def test_nemotron_h_moe_exports_token_major_hidden_states(tmp_path):
+    output = tmp_path / "nemotron-h-moe-ragged.onnx"
+
+    _export_model(NemotronHCausalLM(_moe_config()),
+                  str(output),
+                  optimize=False)
+
+    graph = onnx.load(str(output), load_external_data=False).graph
+    moe = next(node for node in graph.node if node.op_type == "Nvfp4MoePlugin")
+    assert moe.input[1]
+    producers = {value: node for node in graph.node for value in node.output}
+    value_info = {
+        value.name: value
+        for value in list(graph.input) + list(graph.value_info)
+    }
+    assert len(value_info[moe.input[0]].type.tensor_type.shape.dim) == 2
+    assert len(value_info[moe.input[1]].type.tensor_type.shape.dim) == 2
+    assert producers[moe.input[1]].op_type != "Unsqueeze"
+    assert not any(node.op_type == "Reshape" and node.input[0] == moe.output[0]
+                   for node in graph.node)
+    nvfp4_activations = {
+        value
+        for node in graph.node if node.op_type == "DequantizeLinear"
+        for value in node.output if value.startswith("nvfp4_act_qdq")
+    }
+    assert nvfp4_activations
+    nvfp4_gemms = [
+        node for node in graph.node
+        if node.op_type == "Gemm" and node.input[0] in nvfp4_activations
+    ]
+    assert nvfp4_gemms
+    assert all([
+        len(value_info[name].type.tensor_type.shape.dim)
+        for name in (*node.input[:2], node.output[0])
+    ] == [2, 2, 2] for node in nvfp4_gemms)
+    assert all(producers[node.input[1]].op_type != "Unsqueeze"
+               for node in nvfp4_gemms)
+    dynamic_quantize = [
+        node for node in graph.node if node.op_type == "TRT_FP4DynamicQuantize"
+    ]
+    assert dynamic_quantize
+    assert all(
+        len(value_info[node.input[0]].type.tensor_type.shape.dim) == 2
+        for node in dynamic_quantize)
 
 
 def test_nemotron_h_export_routes_ragged_metadata_to_plugins(tmp_path):

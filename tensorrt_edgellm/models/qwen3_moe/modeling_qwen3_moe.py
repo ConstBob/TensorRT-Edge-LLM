@@ -582,13 +582,11 @@ class Qwen3SparseMoeBlock(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_dim = hidden_states.shape[-1]
         hidden_flat = hidden_states.reshape(-1, hidden_dim)
-        plugin_hidden_states = (hidden_states if hidden_states.ndim == 3 else
-                                hidden_flat.unsqueeze(0))
         router_logits = self.gate_linear(hidden_flat).float()
         if self._use_fp16_moe:
             routed = fp16_moe_plugin(
                 router_logits,
-                plugin_hidden_states,
+                hidden_states,
                 self.fc1_weights,
                 self.fc2_weights,
                 self.num_experts,
@@ -598,14 +596,14 @@ class Qwen3SparseMoeBlock(nn.Module):
                 self.activation_type,
                 1,
                 self.max_routed_rows,
-            ).reshape_as(hidden_states)
+            )
             if self._has_shared_expert:
                 routed = routed + self._shared_expert_forward(hidden_states)
             return routed
         if self._use_nvfp4_a16_moe:
             routed = nvfp4_a16_moe_plugin(
                 router_logits,
-                plugin_hidden_states,
+                hidden_states,
                 self.fc1_qweights,
                 self.fc1_block_scales,
                 self.fc1_global_scales,
@@ -624,7 +622,7 @@ class Qwen3SparseMoeBlock(nn.Module):
                 1.0,
                 _NVFP4_ROUTING_MODE_SOFTMAX_TOPK,
                 self.max_routed_rows,
-            ).reshape_as(hidden_states)
+            )
             if self._has_shared_expert:
                 routed = routed + self._shared_expert_forward(hidden_states)
             return routed
@@ -633,7 +631,7 @@ class Qwen3SparseMoeBlock(nn.Module):
                       if use_geforce_nvfp4_moe() else nvfp4_moe_plugin)
             routed = moe_op(
                 router_logits,
-                plugin_hidden_states,
+                hidden_states,
                 self.fc1_qweights,
                 self.fc1_blocks_scale,
                 self.fc1_alpha,
@@ -656,13 +654,13 @@ class Qwen3SparseMoeBlock(nn.Module):
                 self.backend,
                 self.io_dtype,
                 self.max_routed_rows,
-            ).reshape_as(hidden_states)
+            )
             if self._has_shared_expert:
                 routed = routed + self._shared_expert_forward(hidden_states)
             return routed
         routed = int4_moe_plugin(
             router_logits,
-            plugin_hidden_states,
+            hidden_states,
             self.fc_gate_up_qweights,
             self.fc_gate_up_scales,
             self.fc_down_qweights,
@@ -673,7 +671,7 @@ class Qwen3SparseMoeBlock(nn.Module):
             self.moe_intermediate_size,
             self.activation_type,
             self.group_size,
-        ).reshape_as(hidden_states)
+        )
         if self._has_shared_expert:
             routed = routed + self._shared_expert_forward(hidden_states)
         return routed

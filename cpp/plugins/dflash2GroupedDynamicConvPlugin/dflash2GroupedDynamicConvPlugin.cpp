@@ -291,7 +291,8 @@ int32_t DFlash2GroupedDynamicConvPlugin::configurePlugin(DynamicPluginTensorDesc
                             : (offset == 1 ? inputs[kIN_RESIDUAL].opt : inputs[kIN_RESIDUAL].max))
             : nullptr;
         int32_t const blockSize = runtimeBlockSize(*dims);
-        if (blockSize <= 0 || blockSize > mBlockSize
+        // TensorRT bounds dimensions independently, so min/max may overestimate a quotient-derived block axis.
+        if (blockSize <= 0 || (offset == 1 && blockSize > mBlockSize)
             || !validateShapes(*dims, delta, base, nullptr, mKernelSize, mGroupSize, false)
             || (residual != nullptr && !dimsEqual(*dims, *residual)))
         {

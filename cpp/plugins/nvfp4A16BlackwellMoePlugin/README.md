@@ -10,8 +10,8 @@ weight layouts and distinct ONNX identities: an engine never carries both.
 | Field | Value |
 |---|---|
 | SM | 110 only (rejected at `configurePlugin` elsewhere) |
-| hidden_states / output | FP16 `[B, S, H]`, `H % 128 == 0` |
-| router_logits / expert_score_bias | FP32 `[B*S, E]` / `[E]` |
+| hidden_states / output | FP16 `[T, H]`, `H % 128 == 0` |
+| router_logits / expert_score_bias | FP32 `[T, E]` / `[E]` |
 | `activation_type` | 4 (ReLU2) |
 | `routing_mode` | 1 (sigmoid group top-k); `n_group`, `topk_group`, `norm_topk_prob`, `routed_scaling_factor` as in `Nvfp4A16MoePlugin` |
 | `num_experts` / `top_k` | {128, 256, 512} / 1..32 |

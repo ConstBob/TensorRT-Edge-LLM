@@ -67,6 +67,14 @@ def _parameter_value(value, dtype):
     return np.ascontiguousarray(value, dtype=dtype)
 
 
+def _validate_token_layout(router_logits: Tensor,
+                           hidden_states: Tensor) -> None:
+    if router_logits.ndim != 2:
+        raise ValueError("router_logits must have shape [T, E]")
+    if hidden_states.ndim != 2:
+        raise ValueError("hidden_states must have shape [T, H]")
+
+
 def fp16_moe(router_logits: Tensor,
              hidden_states: Tensor,
              weights: dict,
@@ -85,6 +93,7 @@ def fp16_moe(router_logits: Tensor,
              routed_scaling_factor: float = 1.0,
              e_score_correction_bias: Tensor | None = None) -> Tensor:
     """Run the FP16 grouped-GEMM MoE implementation."""
+    _validate_token_layout(router_logits, hidden_states)
     inputs = [
         router_logits,
         hidden_states,
@@ -127,6 +136,7 @@ def int4_moe(router_logits: Tensor,
              weight_bindings: dict,
              zero_point_offset: int = 1) -> Tensor:
     """Run GPTQ-Marlin mixture-of-experts."""
+    _validate_token_layout(router_logits, hidden_states)
 
     inputs = [
         router_logits,
@@ -166,6 +176,7 @@ def nvfp4_a16_moe(router_logits: Tensor, hidden_states: Tensor,
                   routed_scaling_factor: float, routing_mode: MoeRouting, *,
                   weight_prefix: str) -> Tensor:
     """Run weight-only NVFP4 MoE with FP16 activations."""
+    _validate_token_layout(router_logits, hidden_states)
     order = [
         ("fc1_qweights", np.int8),
         ("fc1_block_scales", np.int8),
@@ -212,7 +223,7 @@ def nvfp4_moe(router_logits: Tensor,
               *,
               weight_prefix: str,
               weight_bindings: "dict[str, dict] | None" = None) -> Tensor:
-    """Run NVFP4 mixture-of-experts and return ``[B,S,H]`` FP16.
+    """Run NVFP4 mixture-of-experts and return token-major ``[T,H]`` FP16.
 
     ``moe_weights`` provides the 9 constant inputs as numpy arrays:
     ``fc1_qweights, fc1_blocks_scale, fc1_alpha, fc2_qweights,
@@ -223,6 +234,7 @@ def nvfp4_moe(router_logits: Tensor,
     be rebuilt at runtime. Padded or fused expert banks omit them and remain
     constants in checkpoint-direct builds.
     """
+    _validate_token_layout(router_logits, hidden_states)
 
     order = [
         ("fc1_qweights", np.int8),

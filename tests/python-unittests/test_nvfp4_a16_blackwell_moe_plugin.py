@@ -15,8 +15,8 @@
 """``Nvfp4A16BlackwellMoePlugin`` (Thor SM110 W4A16 routed MoE).
 
 The positive tests build one dynamic-profile engine, round-trip its
-serialization and execute decode (S=1), the smallest grouped-GEMM prefill
-(S=9) and a longer prefill (S=64). Weights are real ModelOpt-style NVFP4
+serialization and execute one token, the smallest grouped-GEMM token set
+(T=9), and a longer token set (T=64). Weights are real ModelOpt-style NVFP4
 tensors repacked with ``repack_nvfp4_a16_blackwell_moe_experts`` (random
 codes, no tile-constant trick) and the reference dequantizes the original
 codes with ``decode_modelopt_nvfp4``. They run on SM110 only; the attribute
@@ -214,14 +214,19 @@ def _plugin_fields(case: MoeCase):
     ]
 
 
-def _io_specs(case: MoeCase, *, hidden_dtype=None, global_dtype=None):
+def _io_specs(case: MoeCase,
+              *,
+              hidden_dtype=None,
+              global_dtype=None,
+              legacy_rank3=False):
     hidden_dtype = trt.float16 if hidden_dtype is None else hidden_dtype
     global_dtype = trt.float32 if global_dtype is None else global_dtype
     e, h, i_pad, i = (case.num_experts, case.hidden_size,
                       case.inter_size_padded, case.moe_inter_size)
     return [
         ("router_logits", trt.float32, (-1, e)),
-        ("hidden_states", hidden_dtype, (-1, -1, h)),
+        ("hidden_states", hidden_dtype, (-1, -1, h) if legacy_rank3 else
+         (-1, h)),
         ("fc1_qweights", trt.int8, (e, i_pad // _TILE_N, h // _TILE_K, _TILE_N,
                                     32)),
         ("fc1_block_scales", trt.int8, (e, i_pad // _TILE_N, h // _TILE_K,
@@ -238,14 +243,23 @@ def _io_specs(case: MoeCase, *, hidden_dtype=None, global_dtype=None):
 
 def _profiles(case: MoeCase, input_specs):
     profiles = {}
+    legacy_rank3 = next(shape for name, _, shape in input_specs
+                        if name == "hidden_states")[0:2] == (-1, -1)
     for name, _, shape in input_specs:
         if name == "router_logits":
-            profiles[name] = ((1, case.num_experts), (1, case.num_experts),
-                              (_MAX_SEQUENCE_LENGTH, case.num_experts))
+            max_tokens = 16 * 9 if legacy_rank3 else _MAX_SEQUENCE_LENGTH
+            opt_tokens = 9 if legacy_rank3 else 1
+            profiles[name] = ((1, case.num_experts), (opt_tokens,
+                                                      case.num_experts),
+                              (max_tokens, case.num_experts))
         elif name == "hidden_states":
-            profiles[name] = ((1, 1, case.hidden_size), (1, 1,
-                                                         case.hidden_size),
-                              (1, _MAX_SEQUENCE_LENGTH, case.hidden_size))
+            if len(shape) == 3:
+                profiles[name] = ((1, 1, case.hidden_size),
+                                  (1, 9, case.hidden_size), (16, 9,
+                                                             case.hidden_size))
+            else:
+                profiles[name] = ((1, case.hidden_size), (1, case.hidden_size),
+                                  (_MAX_SEQUENCE_LENGTH, case.hidden_size))
         else:
             profiles[name] = (shape, shape, shape)
     return profiles
@@ -287,11 +301,11 @@ def _execute_case(case: MoeCase) -> None:
         name: tensor.to("cuda").contiguous()
         for name, tensor in fixture.packed_inputs.items()
     }
-    # S=1 -> decode kernels, S=9 (tn8) and S=64 (tn32) -> grouped tcgen05 GEMM.
+    # T=1 uses decode kernels; larger token sets use grouped tcgen05 GEMM.
     for sequence_length in (1, 9, _MAX_SEQUENCE_LENGTH):
         generator = torch.Generator().manual_seed(40000 + sequence_length)
         hidden_states = torch.randn(
-            (1, sequence_length, case.hidden_size),
+            (sequence_length, case.hidden_size),
             generator=generator,
             dtype=torch.float32).to(torch.float16).to("cuda")
         router_logits = torch.randn((sequence_length, case.num_experts),
@@ -313,12 +327,51 @@ def _execute_case(case: MoeCase) -> None:
         runner.execute(tensors)
         assert bool(torch.isfinite(actual.to(torch.float32)).all())
         assert_close(
-            f"{case.name}[backend={case.backend}][S={sequence_length}]",
+            f"{case.name}[backend={case.backend}][T={sequence_length}]",
             expected,
             actual,
             atol=0.05,
             rtol=0.02,
             cos_threshold=0.999)
+
+
+def _execute_legacy_rank3_case(case: MoeCase) -> None:
+    fixture = _make_fixture(case)
+    runner = _build_runner(case, legacy_rank3=True)
+    _round_trip_engine(runner)
+    static_inputs = {
+        name: tensor.to("cuda").contiguous()
+        for name, tensor in fixture.packed_inputs.items()
+    }
+    for batch_size, sequence_length in ((1, 9), (2, 4), (16, 1)):
+        num_tokens = batch_size * sequence_length
+        generator = torch.Generator().manual_seed(50000 + num_tokens)
+        hidden_states = torch.randn(
+            (batch_size, sequence_length, case.hidden_size),
+            generator=generator,
+            dtype=torch.float32).to(torch.float16).to("cuda")
+        router_logits = torch.randn((num_tokens, case.num_experts),
+                                    generator=generator,
+                                    dtype=torch.float32).to("cuda")
+        expert_score_bias = (torch.randn(
+            (case.num_experts, ), generator=generator, dtype=torch.float32) *
+                             0.05).to("cuda")
+        expected = _moe_reference(fixture, hidden_states, router_logits,
+                                  expert_score_bias)
+        actual = torch.empty_like(hidden_states)
+        runner.execute({
+            "router_logits": router_logits,
+            "hidden_states": hidden_states,
+            "expert_score_bias": expert_score_bias,
+            "output": actual,
+            **static_inputs,
+        })
+        assert_close(f"{case.name}[legacy B={batch_size},S={sequence_length}]",
+                     expected,
+                     actual,
+                     atol=0.05,
+                     rtol=0.02,
+                     cos_threshold=0.999)
 
 
 @pytest.mark.parametrize("backend", [0, 1, 2],
@@ -339,6 +392,12 @@ def test_grouped_routing_decode_and_prefill_dynamic_engine():
                 name="small_relu2_grouped",
                 n_group=2,
                 topk_group=1))
+
+
+def test_rank3_hidden_states_are_rejected():
+    if not _is_thor():
+        pytest.skip("Nvfp4A16BlackwellMoePlugin requires SM110 (Thor)")
+    _expect_build_rejected(_SMALL_CASE, legacy_rank3=True)
 
 
 def test_nemotron_shape_decode_and_prefill_dynamic_engine():
