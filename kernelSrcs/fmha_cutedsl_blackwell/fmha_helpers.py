@@ -1272,3 +1272,93 @@ def calculate_skip_softmax_flag(
                     cute.arch.atomic_add(skip_softmax_count.iterator.llvm_ptr, Int32(1))
                 cute.arch.atomic_add(total_softmax_count.iterator.llvm_ptr, Int32(1))
     return warp_wants_skip, row_max
+
+
+@dsl_user_op
+def ex2_emulation_packed_f32x2(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    """Compute (2^x, 2^y) on the FMA pipe instead of the SFU (MUFU.EX2).
+
+    Split each input into integer and fractional parts, approximate 2^frac
+    with a cubic polynomial (FFMAs), then apply the 2^int scaling by adding
+    the integer directly onto the FP32 exponent field:
+
+        2^x ~= ((0.077·f + 0.228)·f + 0.695)·f + 1,  f = x - floor(x) ∈ [0, 1)
+
+    Inputs are clamped to >= -127 so the exponent add below cannot wrap; at
+    -127 the exponent field reaches 0, so an -inf masked score yields +0.0. The
+    upper side is already bounded because callers pass x = (s - row_max)·scale
+    (+ a small prescale/skip-correction headroom).
+    """
+    xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
+
+    # Adding 2^23 + 2^22 shifts the ones digit to the mantissa LSB, so the
+    # round-toward-minus-infinity add computes floor(x) in the low mantissa
+    # bits. Subtracting it back (round-to-nearest) recovers floor(x) as a
+    # float, and x - floor(x) gives the fractional part in [0, 1).
+    fp32_round_int = float(2**23 + 2**22)
+    xy_rounded = cute.arch.add_packed_f32x2(
+        xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm"
+    )
+    xy_rounded_back = cute.arch.sub_packed_f32x2(
+        xy_rounded, (fp32_round_int, fp32_round_int)
+    )
+    xy_frac = cute.arch.sub_packed_f32x2(xy_clamped, xy_rounded_back)
+
+    @dsl_user_op
+    @cute.jit
+    def polynomial_deg3_packed_f32x2(
+        x: Float32, y: Float32, *, loc=None, ip=None
+    ) -> Tuple[Float32, Float32]:
+        # 2^x ~= ((0.077 * x + 0.228) * x + 0.695) * x + 1, for x in [0, 1)
+        coeff = (
+            1.0,  # coeff of deg0
+            0.695146143436431884765625,  # coeff of deg1
+            0.227564394474029541015625,  # coeff of deg2
+            0.077119089663028717041015625,  # coeff of deg3
+        )
+        deg = len(coeff) - 1  # started with highest degree
+        out = (coeff[deg], coeff[deg])
+        for i in cutlass.range_constexpr(deg - 1, -1, -1):
+            out = cute.arch.fma_packed_f32x2(
+                out, (x, y), (coeff[i], coeff[i]), loc=loc, ip=ip
+            )
+        return out
+
+    xy_frac_ex2 = polynomial_deg3_packed_f32x2(*xy_frac, loc=loc, ip=ip)
+
+    @dsl_user_op
+    def combine_int_frac_ex2(
+        x_rounded: Float32, frac_ex2: Float32, *, loc=None, ip=None
+    ) -> Float32:
+        # x_rounded still carries floor(x) in its low mantissa bits (from the
+        # 2^23 + 2^22 add). Shifting it left by 23 places that integer in the
+        # exponent field; integer-adding it to frac_ex2 (a normalized value in
+        # [1, 2), exponent bits 01111111) multiplies frac_ex2 by 2^floor(x).
+        return cutlass.Float32(
+            llvm.inline_asm(
+                T.f32(),
+                [
+                    Float32(x_rounded).ir_value(loc=loc, ip=ip),
+                    Float32(frac_ex2).ir_value(loc=loc, ip=ip),
+                ],
+                "{\n\t"
+                ".reg .s32 x_rounded_i, frac_ex_i, x_rounded_e, out_i;\n\t"
+                "mov.b32 x_rounded_i, $1;\n\t"
+                "mov.b32 frac_ex_i, $2;\n\t"
+                "shl.b32 x_rounded_e, x_rounded_i, 23;\n\t"
+                "add.s32 out_i, x_rounded_e, frac_ex_i;\n\t"
+                "mov.b32 $0, out_i;\n\t"
+                "}\n",
+                "=f,f,f",
+                has_side_effects=False,
+                is_align_stack=False,
+                asm_dialect=llvm.AsmDialect.AD_ATT,
+            )
+        )
+
+    x_out = combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0], loc=loc, ip=ip)
+    y_out = combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1], loc=loc, ip=ip)
+
+    return x_out, y_out
