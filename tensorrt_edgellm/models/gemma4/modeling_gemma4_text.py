@@ -1012,14 +1012,14 @@ class Gemma4NvFP4MoEBlock(nn.Module):
         moe_inter_size_alignment = (NVFP4_MOE_INTERMEDIATE_SIZE_ALIGNMENT
                                     if use_geforce_plugin else
                                     NVFP4_MOE_INTERLEAVE_SIZE_ALIGNMENT)
-        fc1_qweights, fc1_blocks_scale, fc2_qweights, fc2_blocks_scale = (
-            repack_nvfp4_gated_moe_experts(
-                self.experts,
-                self.hidden_size,
-                self.moe_intermediate_size,
-                self.group_size,
-                fc1_layout=fc1_layout,
-                moe_inter_size_alignment=moe_inter_size_alignment))
+        (fc1_qweights, fc1_blocks_scale, fc1_alpha, fc2_qweights,
+         fc2_blocks_scale, fc2_alpha) = repack_nvfp4_gated_moe_experts(
+             self.experts,
+             self.hidden_size,
+             self.moe_intermediate_size,
+             self.group_size,
+             fc1_layout=fc1_layout,
+             moe_inter_size_alignment=moe_inter_size_alignment)
         self._padded_moe_intermediate_size = int(fc2_qweights.shape[-1]) * 2
 
         device = self.router.proj.weight.device
@@ -1032,16 +1032,11 @@ class Gemma4NvFP4MoEBlock(nn.Module):
         self.register_buffer("fc2_blocks_scale",
                              fc2_blocks_scale.to(device).contiguous())
 
-        # w4a16: weights are NVFP4, activations stay FP16.
-        # repack_nvfp4_gated_moe_experts decodes weights to dense (folding
-        # weight_scale_2 in) then re-quantizes → alpha must be 1.0.
-        # No activation quantization → input scales are also 1.0.
-        self.register_buffer(
-            "fc1_alpha",
-            torch.ones(self.num_experts, dtype=torch.float32, device=device))
-        self.register_buffer(
-            "fc2_alpha",
-            torch.ones(self.num_experts, dtype=torch.float32, device=device))
+        # Per-expert FP32 weight_scale_2, applied as alpha in the kernel
+        # epilogue; the FP4 weights and FP8 block scales above are the
+        # checkpoint bytes. No activation quantization → input scales are 1.0.
+        self.register_buffer("fc1_alpha", fc1_alpha.to(device).contiguous())
+        self.register_buffer("fc2_alpha", fc2_alpha.to(device).contiguous())
         self.register_buffer(
             "input_global_scale",
             torch.ones(self.num_experts, dtype=torch.float32, device=device))
