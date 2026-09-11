@@ -33,6 +33,9 @@ from gdn_prefill_sm12x_helpers import (
 )
 from gdn_prefill_sm12x_inverse import CollectiveInverse
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from cutedsl_utils import aot_placeholders  # isort: skip
+
 
 @dataclass
 class WorkDesc:
@@ -2126,16 +2129,89 @@ def _to_cute_tensors(placeholders):
     }
 
 
-def compile_gdn_prefill_blackwell_geforce(gpu_arch=""):
-    placeholders = _make_placeholders(
-        AOT_PLACEHOLDER_N,
-        AOT_PLACEHOLDER_T,
-        AOT_PLACEHOLDER_HQK,
-        AOT_PLACEHOLDER_HV,
-    )
-    tensors = _to_cute_tensors(placeholders)
-    stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
-    options = ("--gpu-arch " + gpu_arch) if gpu_arch else None
+def _make_aot_cute_tensors(n, t, hqk, hv):
+    """Storage-free trace tensors mirroring _make_placeholders/_to_cute_tensors."""
+
+    def _compact(dtype, shape, assumed_align=16):
+        # Default stride order: C-contiguous, matching the cupy placeholders.
+        return aot_placeholders.make_compact_tensor(
+            dtype, shape, assumed_align=assumed_align,
+        )
+
+    def _mark_4d(dtype, shape):
+        order = (0, 1, 2, 3)
+        return (
+            _compact(dtype, shape)
+            .mark_layout_dynamic(leading_dim=3)
+            .mark_compact_shape_dynamic(mode=0, stride_order=order)
+            .mark_compact_shape_dynamic(mode=1, stride_order=order)
+            .mark_compact_shape_dynamic(mode=2, stride_order=order)
+        )
+
+    def _mark_3d(dtype, shape):
+        order = (0, 1, 2)
+        return (
+            _compact(dtype, shape)
+            .mark_layout_dynamic(leading_dim=2)
+            .mark_compact_shape_dynamic(mode=0, stride_order=order)
+            .mark_compact_shape_dynamic(mode=1, stride_order=order)
+            .mark_compact_shape_dynamic(mode=2, stride_order=order)
+        )
+
+    def _mark_state(dtype, shape):
+        order = (0, 1, 2, 3)
+        return (
+            _compact(dtype, shape)
+            .mark_compact_shape_dynamic(mode=0, stride_order=order)
+            .mark_compact_shape_dynamic(mode=1, stride_order=order)
+        )
+
+    def _mark_1d(dtype, shape, assumed_align=16):
+        return _compact(dtype, shape, assumed_align=assumed_align) \
+            .mark_compact_shape_dynamic(mode=0, stride_order=(0,))
+
+    d = AOT_HEAD_DIM
+    return {
+        "q": _mark_4d(cutlass.Float16, (n, t, hqk, d)),
+        "k": _mark_4d(cutlass.Float16, (n, t, hqk, d)),
+        "v": _mark_4d(cutlass.Float16, (n, t, hv, d)),
+        "a": _mark_3d(cutlass.Float16, (n, t, hv)),
+        "b": _mark_3d(cutlass.Float16, (n, t, hv)),
+        "A_log": _mark_1d(cutlass.Float32, (hv,)),
+        "dt_bias": _mark_1d(cutlass.Float16, (hv,)),
+        "h0_in": _mark_state(cutlass.Float32, (n, hv, d, d)),
+        "h0_out": _mark_state(cutlass.Float32, (n, hv, d, d)),
+        "context_lengths": _mark_1d(cutlass.Int32, (n,)),
+        "o": _mark_4d(cutlass.Float16, (n, t, hv, d)),
+        "tensormap_scratch": _mark_1d(
+            cutlass.Uint8, (AOT_TENSORMAP_BYTES,), assumed_align=128
+        ),
+    }
+
+
+def compile_gdn_prefill_blackwell_geforce(gpu_arch="", export_only=False):
+    if export_only:
+        tensors = _make_aot_cute_tensors(
+            AOT_PLACEHOLDER_N,
+            AOT_PLACEHOLDER_T,
+            AOT_PLACEHOLDER_HQK,
+            AOT_PLACEHOLDER_HV,
+        )
+        stream = aot_placeholders.make_stream()
+    else:
+        placeholders = _make_placeholders(
+            AOT_PLACEHOLDER_N,
+            AOT_PLACEHOLDER_T,
+            AOT_PLACEHOLDER_HQK,
+            AOT_PLACEHOLDER_HV,
+        )
+        tensors = _to_cute_tensors(placeholders)
+        stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
+    # Only the export path may pin a foreign target arch in the compile
+    # options; a native JIT run must compile for the local GPU.
+    options = aot_placeholders.compile_options(
+        ("--gpu-arch " + gpu_arch) if gpu_arch else ""
+    ) if export_only else None
     args = (
         tensors["q"], tensors["k"], tensors["v"],
         tensors["a"], tensors["b"],
@@ -2160,7 +2236,9 @@ def export_gdn_prefill_blackwell_geforce(
         % (gpu_arch or "auto")
     )
     start = time.time()
-    compiled = compile_gdn_prefill_blackwell_geforce(gpu_arch=gpu_arch)
+    compiled = compile_gdn_prefill_blackwell_geforce(
+        gpu_arch=gpu_arch, export_only=True
+    )
     print(
         "[gdn_prefill_blackwell_geforce] Compilation time: %.4fs"
         % (time.time() - start)

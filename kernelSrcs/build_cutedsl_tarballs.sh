@@ -183,29 +183,6 @@ PY
     ensured_venv_dir="${venv_dir}"
 }
 
-gpu_checked=0
-
-ensure_gpu_visible() {
-    local python="$1"
-
-    if [[ "${gpu_checked}" == "1" ]]; then
-        return
-    fi
-    if ! "${python}" - <<'PY'
-import cupy
-
-if cupy.cuda.runtime.getDeviceCount() == 0:
-    raise SystemExit("no CUDA device visible")
-PY
-    then
-        echo "No CUDA GPU is visible to this process. Kernel AOT export requires" \
-            "a GPU (device tensor allocation + local helper compiles)." >&2
-        echo "In Docker, run with: docker run --gpus all ..." >&2
-        exit 1
-    fi
-    gpu_checked=1
-}
-
 validate_artifact() {
     local python="$1"
     local artifact_dir="$2"
@@ -402,7 +379,6 @@ build_target() {
     ensure_venv "${artifact_cuda_major}"
     venv_dir="${ensured_venv_dir}"
     python="${venv_dir}/bin/python"
-    ensure_gpu_visible "${python}"
     build_command=(
         "${python}"
         kernelSrcs/build_cutedsl.py

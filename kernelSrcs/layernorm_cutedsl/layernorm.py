@@ -30,11 +30,9 @@ from pathlib import Path
 from typing import Callable
 
 import cuda.bindings.driver as cuda
-import cupy
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int64
-from cutlass.cute.runtime import from_dlpack
 
 # The launch geometry lives in a sibling module with no CuTe DSL, cupy or CUDA
 # imports so it can be unit-tested on a host with no GPU. Kernel scripts are
@@ -42,8 +40,11 @@ from cutlass.cute.runtime import from_dlpack
 _LAYERNORM_DIR = Path(__file__).resolve().parent
 if str(_LAYERNORM_DIR) not in sys.path:
     sys.path.insert(0, str(_LAYERNORM_DIR))
+if str(_LAYERNORM_DIR.parent) not in sys.path:
+    sys.path.insert(0, str(_LAYERNORM_DIR.parent))
 
 import layernorm_config  # noqa: E402
+from cutedsl_utils import aot_placeholders  # noqa: E402
 
 COPY_BITS = 128
 AOT_ROWS = 2
@@ -442,19 +443,12 @@ def _create_layernorm_jit(dtype, hidden_size, target_sm, schedule=None):
     return aot_adapter
 
 
-def _allocate_placeholder(shape, dtype):
-    if dtype == cutlass.Float16:
-        return cupy.zeros(shape, dtype=cupy.float16)
-    if dtype == cutlass.BFloat16:
-        # CuPy has no native BF16 storage. CuTe interprets these bits as BF16
-        # after the tensor element type is retagged below.
-        return cupy.zeros(shape, dtype=cupy.uint16)
-    raise ValueError(f"Unsupported LayerNorm dtype: {dtype}")
-
-
-def _to_cute_tensor(array, dtype, *, dynamic_rows):
-    tensor = from_dlpack(array, assumed_align=16)
-    tensor.element_type = dtype
+def _make_placeholder_tensor(shape, dtype, *, dynamic_rows):
+    """Create a storage-free row-major tensor descriptor for the AOT ABI."""
+    if dtype not in (cutlass.Float16, cutlass.BFloat16):
+        raise ValueError(f"Unsupported LayerNorm dtype: {dtype}")
+    # Default stride order: C-contiguous row-major, matching the real path.
+    tensor = aot_placeholders.make_compact_tensor(dtype, shape, assumed_align=16)
     if dynamic_rows:
         # The row count is the only dynamic shape component in the AOT ABI.
         tensor = tensor.mark_compact_shape_dynamic(
@@ -466,16 +460,11 @@ def _to_cute_tensor(array, dtype, *, dynamic_rows):
 
 
 def compile_layernorm(dtype, hidden_size, target_sm, schedule=None):
-    output_storage = _allocate_placeholder((AOT_ROWS, hidden_size), dtype)
-    x_storage = _allocate_placeholder((AOT_ROWS, hidden_size), dtype)
-    gamma_storage = _allocate_placeholder((hidden_size,), dtype)
-    beta_storage = _allocate_placeholder((hidden_size,), dtype)
-
-    output = _to_cute_tensor(output_storage, dtype, dynamic_rows=True)
-    x = _to_cute_tensor(x_storage, dtype, dynamic_rows=True)
-    gamma = _to_cute_tensor(gamma_storage, dtype, dynamic_rows=False)
-    beta = _to_cute_tensor(beta_storage, dtype, dynamic_rows=False)
-    stream = cuda.CUstream(cupy.cuda.get_current_stream().ptr)
+    output = _make_placeholder_tensor((AOT_ROWS, hidden_size), dtype, dynamic_rows=True)
+    x = _make_placeholder_tensor((AOT_ROWS, hidden_size), dtype, dynamic_rows=True)
+    gamma = _make_placeholder_tensor((hidden_size,), dtype, dynamic_rows=False)
+    beta = _make_placeholder_tensor((hidden_size,), dtype, dynamic_rows=False)
+    stream = aot_placeholders.make_stream()
 
     layernorm = _create_layernorm_jit(dtype, hidden_size, target_sm, schedule)
     return cute.compile(

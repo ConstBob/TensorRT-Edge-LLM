@@ -45,6 +45,9 @@ from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from cutedsl_utils import aot_placeholders  # isort: skip
+
 
 """QSA sparse-GQA prefill and split-K decode kernels (CuTe DSL), AOT-export build.
 
@@ -1942,6 +1945,7 @@ def _create_bsnd_tensor(
     dtype: Type[cutlass.Numeric],
     *,
     fill_random: bool,
+    storage_free: bool = False,
 ):
     """Allocate a BSND CuPy tensor and return the ``cute.Tensor`` wrapper.
 
@@ -1951,20 +1955,28 @@ def _create_bsnd_tensor(
     cp.async source pointers.
     """
     shape = (b, s, h, d)
-    cp_dtype = _cutlass_to_cupy_dtype(dtype)
-    if fill_random:
-        if dtype == cutlass.Float16:
-            arr = cp.random.uniform(-1.0, 1.0, shape).astype(cp_dtype)
-        else:
-            f32 = cp.random.uniform(-1.0, 1.0, shape).astype(cp.float32)
-            arr = cp.ascontiguousarray(
-                (f32.view(cp.uint32) >> 16).astype(cp.uint16)
-            )
+    if storage_free:
+        if fill_random:
+            raise ValueError("storage_free tensors carry no data to randomize")
+        arr = None
+        t = aot_placeholders.make_compact_tensor(
+            dtype, shape, stride_order=(3, 2, 1, 0), assumed_align=16
+        )
     else:
-        arr = cp.zeros(shape, dtype=cp_dtype)
+        cp_dtype = _cutlass_to_cupy_dtype(dtype)
+        if fill_random:
+            if dtype == cutlass.Float16:
+                arr = cp.random.uniform(-1.0, 1.0, shape).astype(cp_dtype)
+            else:
+                f32 = cp.random.uniform(-1.0, 1.0, shape).astype(cp.float32)
+                arr = cp.ascontiguousarray(
+                    (f32.view(cp.uint32) >> 16).astype(cp.uint16)
+                )
+        else:
+            arr = cp.zeros(shape, dtype=cp_dtype)
 
-    t = from_dlpack(arr, assumed_align=16)
-    t.element_type = dtype
+        t = from_dlpack(arr, assumed_align=16)
+        t.element_type = dtype
     so = (0, 1, 2, 3)
     t = (
         t.mark_compact_shape_dynamic(mode=0, stride_order=so)
@@ -1977,19 +1989,41 @@ def _create_bsnd_tensor(
 def _wrap_indices_tensor(arr: cp.ndarray):
     """Wrap a contiguous ``(B, S, topk)`` Int32 index tensor (all modes dynamic)."""
     t = from_dlpack(arr, assumed_align=16)
+    return _mark_indices_dynamic(t)
+
+
+def _make_indices_placeholder(batch_size: int, seqlen: int, topk: int):
+    """Storage-free ``(B, S, topk)`` Int32 index-tensor descriptor."""
+    t = aot_placeholders.make_compact_tensor(
+        cutlass.Int32, (batch_size, seqlen, topk), stride_order=(2, 1, 0),
+        assumed_align=16,
+    )
+    return _mark_indices_dynamic(t)
+
+
+def _mark_indices_dynamic(t):
     so = (0, 1, 2)
-    t = (
+    return (
         t.mark_layout_dynamic(leading_dim=2)
         .mark_compact_shape_dynamic(mode=0, stride_order=so)
         .mark_compact_shape_dynamic(mode=1, stride_order=so)
         .mark_compact_shape_dynamic(mode=2, stride_order=so)
     )
-    return t
 
 
 def _wrap_ctx_lengths_tensor(arr: cp.ndarray):
     """Wrap a ``(B,)`` Int32 context-lengths tensor."""
     t = from_dlpack(arr, assumed_align=16)
+    return t.mark_layout_dynamic(leading_dim=0).mark_compact_shape_dynamic(
+        mode=0, stride_order=(0,)
+    )
+
+
+def _make_ctx_lengths_placeholder(batch_size: int):
+    """Storage-free ``(B,)`` Int32 context-lengths descriptor."""
+    t = aot_placeholders.make_compact_tensor(
+        cutlass.Int32, (batch_size,), stride_order=(0,), assumed_align=16
+    )
     return t.mark_layout_dynamic(leading_dim=0).mark_compact_shape_dynamic(
         mode=0, stride_order=(0,)
     )
@@ -2145,7 +2179,7 @@ def run(
             f"m_block_size ({m_block_size})"
         )
 
-    if cp.cuda.runtime.getDeviceCount() == 0:
+    if not export_only and cp.cuda.runtime.getDeviceCount() == 0:
         raise RuntimeError("GPU is required to run this kernel.")
 
     if softmax_scale <= 0.0:
@@ -2174,32 +2208,42 @@ def run(
         print(f"{_tag}   CuPy random seed=20260829")
 
     q_dyn, q_arr = _create_bsnd_tensor(
-        batch_size, seqlen, h_q, head_dim, dtype, fill_random=not export_only
+        batch_size, seqlen, h_q, head_dim, dtype,
+        fill_random=not export_only, storage_free=export_only,
     )
     k_dyn, k_arr = _create_bsnd_tensor(
-        batch_size, seqlen, h_kv, head_dim, dtype, fill_random=not export_only
+        batch_size, seqlen, h_kv, head_dim, dtype,
+        fill_random=not export_only, storage_free=export_only,
     )
     v_dyn, v_arr = _create_bsnd_tensor(
-        batch_size, seqlen, h_kv, head_dim, dtype, fill_random=not export_only
+        batch_size, seqlen, h_kv, head_dim, dtype,
+        fill_random=not export_only, storage_free=export_only,
     )
     o_dyn, o_arr = _create_bsnd_tensor(
-        batch_size, seqlen, h_q, head_dim, dtype, fill_random=False
+        batch_size, seqlen, h_q, head_dim, dtype,
+        fill_random=False, storage_free=export_only,
     )
 
-    if ragged and batch_size > 1:
-        rng = np.random.default_rng(20260829)
-        ctx_host = np.sort(
-            rng.integers(1, seqlen + 1, size=batch_size).astype(np.int32)
-        )[::-1].copy()
-        ctx_host[0] = seqlen
+    if export_only:
+        ctx_host = None
+        idx_host = None
+        ctx_dyn = _make_ctx_lengths_placeholder(batch_size)
+        idx_dyn = _make_indices_placeholder(batch_size, seqlen, topk)
     else:
-        ctx_host = np.full(batch_size, seqlen, dtype=np.int32)
-    ctx_arr = cp.asarray(ctx_host)
-    ctx_dyn = _wrap_ctx_lengths_tensor(ctx_arr)
+        if ragged and batch_size > 1:
+            rng = np.random.default_rng(20260829)
+            ctx_host = np.sort(
+                rng.integers(1, seqlen + 1, size=batch_size).astype(np.int32)
+            )[::-1].copy()
+            ctx_host[0] = seqlen
+        else:
+            ctx_host = np.full(batch_size, seqlen, dtype=np.int32)
+        ctx_arr = cp.asarray(ctx_host)
+        ctx_dyn = _wrap_ctx_lengths_tensor(ctx_arr)
 
-    idx_host = _generate_qsa_indices(batch_size, seqlen, topk, ctx_host)
-    idx_arr = cp.asarray(idx_host)
-    idx_dyn = _wrap_indices_tensor(idx_arr)
+        idx_host = _generate_qsa_indices(batch_size, seqlen, topk, ctx_host)
+        idx_arr = cp.asarray(idx_host)
+        idx_dyn = _wrap_indices_tensor(idx_arr)
 
     if not export_only:
         # Poison everything the kernel must never read: K/V rows at or past
@@ -2225,7 +2269,19 @@ def run(
         pipe_depth=pipe_depth,
     )
 
-    current_stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
+    current_stream = (
+        aot_placeholders.make_stream()
+        if export_only
+        else cuda.CUstream(cp.cuda.get_current_stream().ptr)
+    )
+    # Runtime persistent-grid size (sm_count kernel argument): AOT callers pass
+    # the deployment GPU's multiprocessor count at launch; only the non-export
+    # smoke path seeds it from the local device.
+    _sm_count = (
+        aot_placeholders.runtime_int32()
+        if export_only
+        else cutlass.Int32(utils.HardwareInfo().get_device_multiprocessor_count())
+    )
 
     _ptx_parts = []
     if os.getenv("QSA_PTXAS_VERBOSE"):
@@ -2248,7 +2304,7 @@ def run(
         idx_dyn,
         ctx_dyn,
         cutlass.Float32(softmax_scale),
-        cutlass.Int32(utils.HardwareInfo().get_device_multiprocessor_count()),
+        _sm_count,
         current_stream,
         **compile_options,
     )

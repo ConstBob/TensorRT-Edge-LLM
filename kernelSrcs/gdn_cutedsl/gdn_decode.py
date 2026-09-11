@@ -43,6 +43,9 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from cutedsl_utils import aot_placeholders  # isort: skip
+
 TILE_K = 128
 TILE_V = 32
 TILE_V_PADDED = 36
@@ -1422,6 +1425,61 @@ def _to_cute_tensors(ph):
     }
 
 
+def _make_aot_cute_tensors(n, h, hv, k, v, varlen):
+    if varlen:
+        shapes = {
+            "q": (1, n, h, k),
+            "k": (1, n, h, k),
+            "v": (1, n, hv, v),
+            "a": (n, hv),
+            "b": (n, hv),
+            "o": (1, n, hv, v),
+        }
+    else:
+        shapes = {
+            "q": (n, 1, h, k),
+            "k": (n, 1, h, k),
+            "v": (n, 1, hv, v),
+            "a": (n, 1, hv),
+            "b": (n, 1, hv),
+            "o": (n, 1, hv, v),
+        }
+
+    def compact(dtype, name, assumed_align=16):
+        shape = shapes[name]
+        return aot_placeholders.make_compact_tensor(
+            dtype,
+            shape,
+            stride_order=tuple(reversed(range(len(shape)))),
+            assumed_align=assumed_align,
+        )
+
+    q = compact(cutlass.Float16, "q")
+    v_tensor = compact(cutlass.Float16, "v")
+    h0_source = aot_placeholders.make_compact_tensor(
+        cutlass.Float32, (n, hv, k, v), stride_order=(3, 2, 1, 0), assumed_align=32
+    )
+    context_lengths = aot_placeholders.make_compact_tensor(
+        cutlass.Int32, (n,), stride_order=(0,), assumed_align=16
+    )
+    return {
+        "q": _mark_gdn_qv_dynamic(q),
+        "k": compact(cutlass.Float16, "k").mark_layout_dynamic(leading_dim=3),
+        "v": _mark_gdn_qv_dynamic(v_tensor),
+        "a": compact(cutlass.Float16, "a").mark_layout_dynamic(leading_dim=len(shapes["a"]) - 1),
+        "b": compact(cutlass.Float16, "b").mark_layout_dynamic(leading_dim=len(shapes["b"]) - 1),
+        "A_log": aot_placeholders.make_compact_tensor(
+            cutlass.Float32, (hv,), stride_order=(0,), assumed_align=16
+        ).mark_layout_dynamic(leading_dim=0),
+        "dt_bias": aot_placeholders.make_compact_tensor(
+            cutlass.Float16, (hv,), stride_order=(0,), assumed_align=16
+        ).mark_layout_dynamic(leading_dim=0),
+        "h0_source": _mark_h0_source_dynamic(h0_source),
+        "context_lengths": _mark_gdn_1d_dynamic(context_lengths),
+        "o": compact(cutlass.Float16, "o").mark_layout_dynamic(leading_dim=3),
+    }
+
+
 def _select_kernel(use_small_batch, varlen):
     run_small, run_small_varlen, run_large, run_large_varlen = _get_jit_functions()
     if use_small_batch:
@@ -1429,16 +1487,24 @@ def _select_kernel(use_small_batch, varlen):
     return run_large_varlen if varlen else run_large
 
 
-def _compile_decode(n, h, hv, k, v, use_small_batch, varlen, stream, gpu_arch=""):
+def _compile_decode(n, h, hv, k, v, use_small_batch, varlen, stream, gpu_arch="", export_only=False):
     key = (use_small_batch, varlen)
     if key in _compiled_kernels:
         return _compiled_kernels[key]
 
-    ph = _make_placeholder_tensors(n, h, hv, k, v, varlen)
-    t = _to_cute_tensors(ph)
+    if export_only:
+        t = _make_aot_cute_tensors(n, h, hv, k, v, varlen)
+    else:
+        ph = _make_placeholder_tensors(n, h, hv, k, v, varlen)
+        t = _to_cute_tensors(ph)
     kernel_func = _select_kernel(use_small_batch, varlen)
 
-    compile_opts = ("--gpu-arch " + gpu_arch) if gpu_arch else None
+    # Only the export path may pin a foreign target arch in the compile
+    # options; a native JIT run must compile for the local GPU (see the
+    # native-vs-cross note in cutedsl_utils/cutedsl_compile_wrapper.py).
+    compile_opts = aot_placeholders.compile_options(
+        f"--gpu-arch={gpu_arch}" if gpu_arch else ""
+    ) if export_only else None
     compiled = cute.compile(
         kernel_func,
         t["q"], t["k"], t["v"], t["a"], t["b"],
@@ -1458,10 +1524,12 @@ def _compile_decode(n, h, hv, k, v, use_small_batch, varlen, stream, gpu_arch=""
 def export_gdn_decode(n, h, hv, k, v,
                       output_dir, file_name, function_prefix,
                       varlen=False, use_small_batch=False, gpu_arch=""):
-    stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
+    stream = aot_placeholders.make_stream()
     print("[gdn_decode] AOT compile varlen=%s small_batch=%s gpu_arch=%r" % (varlen, use_small_batch, gpu_arch or "default"))
     t0 = time.time()
-    compiled = _compile_decode(n, h, hv, k, v, use_small_batch, varlen, stream, gpu_arch=gpu_arch)
+    compiled = _compile_decode(
+        n, h, hv, k, v, use_small_batch, varlen, stream, gpu_arch=gpu_arch, export_only=True
+    )
     print("[gdn_decode] Compilation time: %.4fs" % (time.time() - t0))
 
     os.makedirs(output_dir, exist_ok=True)
@@ -1665,9 +1733,6 @@ def run_test_decode(n, h, hv, k, v, varlen=False,
 
 def main():
     args = _parsed_args
-    if cp.cuda.runtime.getDeviceCount() == 0:
-        raise RuntimeError("GPU required.")
-    cp.random.seed(42)
     np.random.seed(42)
 
     if args.export_only:
@@ -1685,6 +1750,10 @@ def main():
             gpu_arch=args.gpu_arch,
         )
         return
+
+    if cp.cuda.runtime.getDeviceCount() == 0:
+        raise RuntimeError("GPU required.")
+    cp.random.seed(42)
 
     run_test_decode(
         n=args.n, h=args.h, hv=args.hv, k=args.k, v=args.v,

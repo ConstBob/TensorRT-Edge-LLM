@@ -93,8 +93,10 @@ build_cutedsl_docker_matrix:
     - .cutedsl_builder_version
   needs:
     - job: build_cutedsl_docker_image
+  # AOT generation is GPU-free (explicit target archs + storage-free
+  # descriptors), so the kernel matrix runs on a CPU runner.
   tags:
-    - a30-edgellm-nvks
+    - cpu-k8s
   image:
     name: "$CUTE_DSL_BUILDER_IMAGE"
     entrypoint: [""]
@@ -106,7 +108,7 @@ build_cutedsl_docker_matrix:
   script:
     - echo "Pipeline start time:$(date)"
     - 'echo "Runner node:${NODE_NAME:-$(hostname)}"'
-    - nvidia-smi
+    - echo "CuTe DSL AOT generation is GPU-free (explicit target archs + storage-free descriptors); no GPU runner required"
     - >-
       sh "$CI_PROJECT_DIR/.gitlab/ci/scripts/ci_run.sh" 0
       "Build CuTeDSL kernel matrix" --

@@ -50,8 +50,8 @@ for installation commands and CUDA 12/13 host-runtime guidance.
 From the repository root:
 
 ```bash
-# Build all groups supported by the current GPU
-python kernelSrcs/build_cutedsl.py
+# Build all groups for a target SM (no GPU required on the build host)
+python kernelSrcs/build_cutedsl.py --gpu_arch sm_100
 
 # Build one group for a specific target SM
 python kernelSrcs/build_cutedsl.py --kernels gdn --gpu_arch sm_87
@@ -66,7 +66,8 @@ python kernelSrcs/build_cutedsl.py --kernels ALL \
 ## Docker Artifact Builder
 
 The image build installs dependencies only. Kernel generation runs under
-`docker run` because the AOT scripts require a visible GPU:
+`docker run`. The AOT scripts compile against explicit target architectures
+with storage-free tensor descriptors, so no GPU needs to be mounted:
 
 ```bash
 # Context = kernelSrcs/ (small, self-contained); the repo root would drag
@@ -79,7 +80,7 @@ docker build \
   kernelSrcs
 
 mkdir -p cutedsl-out
-docker run --rm --gpus all \
+docker run --rm \
   --user "$(id -u):$(id -g)" \
   -v "$PWD/cutedsl-out:/out" \
   "tensorrt-edge-llm/cutedsl-kernel-builder:${CUTE_DSL_BUILDER_VERSION}"
@@ -104,14 +105,14 @@ cutedsl_aarch64_sm_121_cuda12.tar.gz
 cutedsl_aarch64_sm_121_cuda13.tar.gz
 ```
 
-List the configured outputs without a GPU, or override the matrix:
+List the configured outputs, or override the matrix:
 
 ```bash
 docker run --rm \
   "tensorrt-edge-llm/cutedsl-kernel-builder:${CUTE_DSL_BUILDER_VERSION}" \
   --list
 
-docker run --rm --gpus all \
+docker run --rm \
   -v "$PWD/cutedsl-out:/out" \
   -e CUTE_DSL_MATRIX="x86_64:sm_100:12,aarch64:sm_110:13" \
   -e CUTE_DSL_JOBS=2 \
@@ -161,7 +162,7 @@ docker build \
   -t "tensorrt-edge-llm/cutedsl-kernel-builder:${CUTE_DSL_BUILDER_VERSION}" \
   kernelSrcs
 
-docker run --rm --gpus all \
+docker run --rm \
   --user "$(id -u):$(id -g)" \
   -v "$PWD/kernelSrcs:/workspace/kernelSrcs:ro" \
   -v "$PWD/cpp/kernels/cuteDSLArtifact:/artifacts" \
@@ -232,12 +233,12 @@ a clean full-matrix rebuild so stale archive members cannot be retained.
 | Flag | Default | Description |
 |---|---|---|
 | `--kernels GROUPS` | `ALL` | A registered group such as `f16_moe`, `fmha`, `gdn`, `gemm`, `gemm_nvfp4`, `int4_fp16_gemm`, `nvfp4_a16_blackwell_gemm`, `nvfp4_a16_blackwell_moe`, `nvfp4_moe`, `nvfp4_fused_moe`, or `ssd`; a comma-separated list; or `ALL`. `fmha` is the attention family: the FMHA-v2 kernels plus the optimized Blackwell kernels on SM100/SM101/SM110. Variants whose `supported_sms` excludes the target SM are skipped. |
-| `--gpu_arch SM[,SM...]` | auto-detected | One target GPU SM (for example `sm_100`), or an ordered comma-separated set for one runtime-dispatched artifact (for example `sm_110,sm_120`). The CuTe DSL compile architectures are derived automatically, including required Blackwell `a` suffixes. Multi-SM generation uses one worker pool and requires `--clean` when replacing an existing artifact. |
+| `--gpu_arch SM[,SM...]` | required | One target GPU SM (for example `sm_100`), or an ordered comma-separated set for one runtime-dispatched artifact (for example `sm_110,sm_120`). The CuTe DSL compile architectures are derived automatically, including required Blackwell `a` suffixes. Multi-SM generation uses one worker pool and requires `--clean` when replacing an existing artifact. |
 | `--arch ARCH` | auto-detected | Target CPU arch `x86_64` or `aarch64`. If it differs from the build host, kernels are cross-compiled (target host objects). |
 | `--cuda-version VERSION` | host CUDA | Artifact CUDA flavor used to select `cu12` or `cu13` runtime objects. |
 | `--runtime-libs-version VERSION` | CuTe DSL package version | Target-architecture runtime-libs wheel version; use when compiler and runtime-libs package versions differ. |
 | `--output_dir DIR` | `cpp/kernels/cuteDSLArtifact` | Root output dir (artifacts go under `{DIR}/{arch}/sm_<NN>/`). |
-| `-j JOBS` | CPU count | Parallel compile jobs, defaulting to the CPUs available to the process (use `-j 1` if GPU memory is limited). |
+| `-j JOBS` | CPU count | Parallel compile jobs, defaulting to the CPUs available to the process. |
 | `--verbose` | off | Show per-variant kernel script output. |
 | `--clean` | off | Remove the selected target artifact directory before building. |
 

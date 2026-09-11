@@ -678,11 +678,17 @@ def test_layernorm_compile_command_carries_the_target_sm(sm):
         assert command[command.index("--target_sm") + 1] == str(sm)
 
 
-def test_only_layernorm_variants_request_the_target_sm():
-    """No other kernel script is handed a flag its argparse would reject."""
+def test_only_sm_specialized_variants_request_the_target_sm():
+    """No other kernel script is handed a flag its argparse would reject.
+
+    LayerNorm and RMSNorm both specialize their compile-time launch geometry
+    (schedule / cluster shape / async-copy budget) on the target SM, so their
+    scripts accept --target_sm; every other script's argparse would reject it.
+    """
     offenders = sorted(
         variant.name for variant in build_cutedsl.KERNEL_VARIANTS
-        if variant.wants_target_sm and variant.group != "layernorm")
+        if variant.wants_target_sm and variant.group not in ("layernorm",
+                                                             "rmsnorm"))
 
     assert offenders == []
 
@@ -735,15 +741,12 @@ def test_build_allows_f16_moe_for_foreign_target_sm(tmp_path, monkeypatch):
         cuda_version="13",
     )
 
-    def fail_native_sm_detection():
-        pytest.fail(
-            "an explicit target SM must not require native SM detection")
-
     def stop_at_dependency_check(**_kwargs):
         raise RuntimeError("dependency check reached")
 
-    monkeypatch.setattr(build_cutedsl, "detect_gpu_sm",
-                        fail_native_sm_detection)
+    # GPU probing was removed outright: an explicit target SM is required and
+    # artifact generation never queries the build host's GPU.
+    assert not hasattr(build_cutedsl, "detect_gpu_sm")
     monkeypatch.setattr(build_cutedsl, "check_dependencies",
                         stop_at_dependency_check)
 

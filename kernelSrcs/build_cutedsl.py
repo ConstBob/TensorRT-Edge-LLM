@@ -35,16 +35,15 @@ Kernel groups:
   rmsnorm          — FP16/BF16 RMSNorm for production hidden sizes
 
 Usage (run from the repo root):
-  python kernelSrcs/build_cutedsl.py                      # build all groups for this GPU
-  python kernelSrcs/build_cutedsl.py --kernels gdn        # single group
-  python kernelSrcs/build_cutedsl.py --kernels fmha,gdn   # multiple groups
-  python kernelSrcs/build_cutedsl.py --gpu_arch sm_110    # override SM detection
-  python kernelSrcs/build_cutedsl.py --gpu_arch sm_110,sm_120  # one dual-SM artifact
-  python kernelSrcs/build_cutedsl.py --gpu_arch sm_110 --arch aarch64  # cross-compile host objects
-  python kernelSrcs/build_cutedsl.py --clean --verbose    # clean rebuild
+  python kernelSrcs/build_cutedsl.py --gpu_arch sm_100                     # all supported groups
+  python kernelSrcs/build_cutedsl.py --gpu_arch sm_110 --kernels gdn       # single group
+  python kernelSrcs/build_cutedsl.py --gpu_arch sm_110 --kernels fmha,gdn  # multiple groups
+  python kernelSrcs/build_cutedsl.py --gpu_arch sm_110,sm_120              # one dual-SM artifact
+  python kernelSrcs/build_cutedsl.py --gpu_arch sm_110 --arch aarch64      # cross-compile host objects
+  python kernelSrcs/build_cutedsl.py --gpu_arch sm_100 --clean --verbose   # clean rebuild
 
-The GPU SM is auto-detected via cupy / nvidia-smi and only matching variants
-are built.  See KERNEL_VARIANTS below for the full variant list.
+The target GPU SM is explicit so artifact generation can run without a GPU.
+Only matching variants are built. See KERNEL_VARIANTS below for the full list.
 
 Output (under {output_dir}/{arch}/{artifact_tag}/):
   libcutedsl_{arch}.a   — merged static archive (kernel objects + CuTe DSL
@@ -1893,6 +1892,7 @@ for _rmsnorm_dtype in ("fp16", "bf16"):
                         "--weight_before_cast", str(_rmsnorm_weight_before_cast),
                         "--export_only",
                     ],
+                    wants_target_sm=True,
                 )
             )
 
@@ -2108,56 +2108,6 @@ def _parse_sms(gpu_arch_str):
         if sm not in sms:
             sms.append(sm)
     return sms
-
-
-def detect_gpu_sm() -> int:
-    """Auto-detect the current GPU SM.
-
-    Returns the SM as an integer, e.g. 87 for SM87, 100 for SM100, 110 for SM110.
-
-    Detection order:
-      1. cupy.cuda.Device — works on all platforms (Linux, QNX, etc.) since cupy is
-         already a required dependency.  compute_capability returns e.g. "87", "100".
-      2. nvidia-smi --query-gpu=compute_cap — fallback for environments where cupy
-         is not yet importable at this point in the script (rare).
-
-    Raises RuntimeError if both methods fail; caller should re-run with --gpu_arch.
-    """
-    # 1. Try cupy first — platform-agnostic, already a required dep.
-    try:
-        import cupy  # noqa: PLC0415
-        cap = cupy.cuda.Device(0).compute_capability  # e.g. "87", "100", "110"
-        sm = int(cap)
-        if sm > 0:
-            return sm
-    except Exception:
-        pass
-
-    # 2. Fall back to nvidia-smi (Linux/x86; not available on QNX).
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=10,
-        )
-    except FileNotFoundError:
-        raise RuntimeError(
-            "Could not detect GPU SM: cupy unavailable and nvidia-smi not found. "
-            "Pass --gpu_arch explicitly (e.g. --gpu_arch sm_87)."
-        )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"nvidia-smi failed: {result.stderr.strip() or result.stdout.strip()}. "
-            "Pass --gpu_arch explicitly to override."
-        )
-    # compute_cap format from nvidia-smi is "8.7" → 87, "10.0" → 100.
-    line = result.stdout.strip().splitlines()[0].strip()
-    parts = line.split(".")
-    if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
-        raise RuntimeError(
-            f"Unexpected nvidia-smi compute_cap format: {line!r}. "
-            "Pass --gpu_arch explicitly to override."
-        )
-    return int(parts[0]) * 10 + int(parts[1])
 
 
 def select_variants(sm: int, kernels_arg: str):
@@ -3098,7 +3048,7 @@ def _build_multi_sm(args, sms):
     print(f"Build host  : {host_arch}")
     print(f"Target arch : {arch}")
     print(f"Build mode  : {'cross' if arch != host_arch else 'native'}")
-    print(f"GPU SMs     : {', '.join(f'SM{sm}' for sm in sms)} (--gpu_arch override)")
+    print(f"GPU SMs     : {', '.join(f'SM{sm}' for sm in sms)} (explicit offline targets)")
     print(
         "Compile arch: "
         + ", ".join(compile_gpu_arches[sm] for sm in sms)
@@ -3242,17 +3192,12 @@ def _build_multi_sm(args, sms):
 
 
 def build(args):
-    # Resolve SM: explicit override or auto-detect from the running GPU.
-    if args.gpu_arch:
-        sms = _parse_sms(args.gpu_arch)
-        if len(sms) > 1:
-            _build_multi_sm(args, sms)
-            return
-        sm = sms[0]
-        sm_source = "--gpu_arch override"
-    else:
-        sm = detect_gpu_sm()
-        sm_source = "auto-detected"
+    # Resolve SM from the explicit offline target (no GPU probing).
+    sms = _parse_sms(args.gpu_arch)
+    if len(sms) > 1:
+        _build_multi_sm(args, sms)
+        return
+    sm = sms[0]
 
     host_arch = detect_arch()
     arch = detect_arch(args.arch)
@@ -3266,7 +3211,7 @@ def build(args):
     print(f"Build host  : {host_arch}")
     print(f"Target arch : {arch}")
     print(f"Build mode  : {'cross' if is_cross_compile else 'native'}")
-    print(f"GPU SM      : SM{sm} ({sm_source})")
+    print(f"GPU SM      : SM{sm} (explicit offline target)")
     if compile_gpu_arch:
         print(f"Compile arch: {compile_gpu_arch}")
     if host_target:
@@ -3443,11 +3388,10 @@ def main():
     )
     p.add_argument(
         "--gpu_arch",
-        default=None,
-        help="Override target GPU SM (e.g. sm_87, sm_100), or provide a "
-             "comma-separated list for one runtime-dispatched artifact "
-             "(e.g. sm_110,sm_120). "
-             "Default: auto-detect via cupy / nvidia-smi. "
+        required=True,
+        help="Target GPU SM (e.g. sm_87, sm_100), or a comma-separated list "
+             "for one runtime-dispatched artifact (e.g. sm_110,sm_120). "
+             "Required: artifact generation is offline and never probes a GPU. "
              "Each value selects variants and the corresponding AOT compile architecture.",
     )
     p.add_argument(
@@ -3477,7 +3421,7 @@ def main():
         "-j", "--jobs",
         type=int,
         default=_default_jobs(),
-        help="Parallel compile jobs (use -j 1 if GPU memory is limited). "
+        help="Parallel compile jobs. "
              "Default: the number of CPUs available to this process.",
     )
     p.add_argument(

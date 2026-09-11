@@ -25,19 +25,15 @@ import sys
 
 def export_fc1(args: argparse.Namespace) -> tuple[str, str]:
     import cuda.bindings.driver as cuda
-    import cupy as cp
     import cutlass
     import cutlass.cute as cute
 
     globals().update({"cuda": cuda, "cutlass": cutlass, "cute": cute})
 
+    from cutedsl_utils import aot_placeholders
     from export_common import (
         M_TILE_SIZE,
         SF_VEC_SIZE,
-        allocate,
-        atom_scale_bytes,
-        get_max_active_clusters,
-        make_ptr,
         resolve_activation_type,
         verify_export,
     )
@@ -45,51 +41,32 @@ def export_fc1(args: argparse.Namespace) -> tuple[str, str]:
         BlockScaledContiguousGatherGroupedGemmKernel,
     )
 
-    cp.cuda.Device(0).use()
-
     activation_type = resolve_activation_type(args.activation)
     is_gated = args.activation in ("swiglu", "geglu")
     dummy_orig_m = args.dummy_tokens
     dummy_m = M_TILE_SIZE * args.dummy_experts
     dummy_k = args.dummy_hidden_size
     dummy_n = args.dummy_intermediate_size * 2 if is_gated else args.dummy_intermediate_size
-    dummy_intermediate = dummy_n // 2 if is_gated else dummy_n
     cluster_shape_mn = (1, 1)
     mma_tiler_mn = (M_TILE_SIZE, args.mma_tiler_n)
 
-    buffers: list = []
-    a = allocate((dummy_orig_m, dummy_k // 2), cp.uint8, buffers)
-    b = allocate((args.dummy_experts, dummy_n, dummy_k // 2), cp.uint8, buffers)
-    a_sf = allocate((dummy_orig_m, dummy_k // SF_VEC_SIZE), cp.uint8, buffers)
-    b_sf = allocate(atom_scale_bytes(dummy_n, dummy_k, args.dummy_experts), cp.uint8, buffers)
-    c = allocate((dummy_m, dummy_intermediate // 2), cp.uint8, buffers)
-    c_sf = allocate(atom_scale_bytes(dummy_m, dummy_intermediate), cp.uint8, buffers)
-    output = allocate((dummy_orig_m, dummy_k), cp.float16, buffers)
-    alpha = allocate((args.dummy_experts,), cp.float32, buffers)
-    tile_group = allocate((dummy_m // M_TILE_SIZE,), cp.int32, buffers)
-    tile_limit = allocate((dummy_m // M_TILE_SIZE,), cp.int32, buffers)
-    token_map = allocate((dummy_m,), cp.int32, buffers)
-    num_tiles = allocate((1,), cp.int32, buffers)
-    input_global_scale = allocate((args.dummy_experts,), cp.float32, buffers)
-    down_input_scale = allocate((args.dummy_experts,), cp.float32, buffers)
-
     input_ptrs = (
-        make_ptr(cutlass.Float4E2M1FN, a.data.ptr, assumed_align=32),
-        make_ptr(cutlass.Float4E2M1FN, b.data.ptr, assumed_align=32),
-        make_ptr(cutlass.Float8E4M3FN, a_sf.data.ptr, assumed_align=16),
-        make_ptr(cutlass.Float8E4M3FN, b_sf.data.ptr, assumed_align=16),
-        make_ptr(cutlass.Float4E2M1FN, c.data.ptr, assumed_align=32),
-        make_ptr(cutlass.Float8E4M3FN, c_sf.data.ptr, assumed_align=16),
+        aot_placeholders.make_ptr(cutlass.Float4E2M1FN, assumed_align=32),  # a
+        aot_placeholders.make_ptr(cutlass.Float4E2M1FN, assumed_align=32),  # b
+        aot_placeholders.make_ptr(cutlass.Float8E4M3FN, assumed_align=16),  # a_sf
+        aot_placeholders.make_ptr(cutlass.Float8E4M3FN, assumed_align=16),  # b_sf
+        aot_placeholders.make_ptr(cutlass.Float4E2M1FN, assumed_align=32),  # c
+        aot_placeholders.make_ptr(cutlass.Float8E4M3FN, assumed_align=16),  # c_sf
     )
-    output_ptr = make_ptr(cutlass.Float16, output.data.ptr, assumed_align=16)
+    output_ptr = aot_placeholders.make_ptr(cutlass.Float16, assumed_align=16)
     trailing_ptrs = (
-        make_ptr(cutlass.Float32, alpha.data.ptr, assumed_align=16),
-        make_ptr(cutlass.Float32, input_global_scale.data.ptr, assumed_align=16),
-        make_ptr(cutlass.Float32, down_input_scale.data.ptr, assumed_align=16),
-        make_ptr(cutlass.Int32, tile_group.data.ptr),
-        make_ptr(cutlass.Int32, tile_limit.data.ptr),
-        make_ptr(cutlass.Int32, token_map.data.ptr),
-        make_ptr(cutlass.Int32, num_tiles.data.ptr),
+        aot_placeholders.make_ptr(cutlass.Float32, assumed_align=16),  # alpha
+        aot_placeholders.make_ptr(cutlass.Float32, assumed_align=16),  # input_global_scale
+        aot_placeholders.make_ptr(cutlass.Float32, assumed_align=16),  # down_input_scale
+        aot_placeholders.make_ptr(cutlass.Int32, assumed_align=4),  # tile_group
+        aot_placeholders.make_ptr(cutlass.Int32, assumed_align=4),  # tile_limit
+        aot_placeholders.make_ptr(cutlass.Int32, assumed_align=4),  # token_map
+        aot_placeholders.make_ptr(cutlass.Int32, assumed_align=4),  # num_tiles
     )
 
     kernel = BlockScaledContiguousGatherGroupedGemmKernel(
@@ -102,7 +79,7 @@ def export_fc1(args: argparse.Namespace) -> tuple[str, str]:
         b_tensor_l_sizes=(args.dummy_experts,),
         activation_type=activation_type,
     )
-    stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
+    stream = aot_placeholders.make_stream()
 
     @cute.jit
     def single_b_wrapper(
@@ -179,10 +156,11 @@ def export_fc1(args: argparse.Namespace) -> tuple[str, str]:
         args.dummy_experts,
         tile_size=M_TILE_SIZE,
         scaling_vector_size=SF_VEC_SIZE,
-        max_active_clusters=get_max_active_clusters(cluster_shape_mn),
+        max_active_clusters=aot_placeholders.runtime_int32(),
         enable_pdl=cutlass.Int32(1),
         stream=stream,
         activation_type=activation_type,
+        options=aot_placeholders.compile_options(),
     )
 
     os.makedirs(args.output_dir, exist_ok=True)
