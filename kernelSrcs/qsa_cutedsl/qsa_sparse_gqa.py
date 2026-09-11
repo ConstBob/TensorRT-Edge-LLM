@@ -2457,6 +2457,98 @@ def _wrap_partials_tensor(arr: cp.ndarray):
     )
 
 
+def _make_decode_aot_tensors(
+    dtype,
+    *,
+    batch_size: int,
+    num_head: int,
+    num_kv_head: int,
+    head_dim: int,
+    pool_head_dim: int,
+    num_flat_pages: int,
+    max_pages: int,
+    topk: int,
+    max_splits: int,
+    m_block_size: int,
+):
+    """Create storage-free descriptors matching the decode runtime layouts."""
+    q, _ = _create_bsnd_tensor(
+        batch_size,
+        1,
+        num_head,
+        head_dim,
+        dtype,
+        fill_random=False,
+        storage_free=True,
+    )
+    output, _ = _create_bsnd_tensor(
+        batch_size,
+        1,
+        num_head,
+        head_dim,
+        dtype,
+        fill_random=False,
+        storage_free=True,
+    )
+
+    pool = aot_placeholders.make_compact_tensor(
+        dtype,
+        (num_flat_pages, 128, num_kv_head, pool_head_dim),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=16,
+    )
+    pool_stride_order = (0, 1, 2, 3)
+    pool = (
+        pool.mark_layout_dynamic(leading_dim=3)
+        .mark_compact_shape_dynamic(mode=0, stride_order=pool_stride_order)
+        .mark_compact_shape_dynamic(mode=1, stride_order=pool_stride_order)
+        .mark_compact_shape_dynamic(mode=2, stride_order=pool_stride_order)
+        .mark_compact_shape_dynamic(mode=3, stride_order=pool_stride_order)
+    )
+
+    page_table = aot_placeholders.make_compact_tensor(
+        cutlass.Int32,
+        (batch_size, 2, max_pages),
+        stride_order=(2, 1, 0),
+        assumed_align=16,
+    )
+    page_table_stride_order = (0, 1, 2)
+    page_table = (
+        page_table.mark_layout_dynamic(leading_dim=2)
+        .mark_compact_shape_dynamic(mode=0, stride_order=page_table_stride_order)
+        .mark_compact_shape_dynamic(mode=2, stride_order=page_table_stride_order)
+    )
+
+    num_partials = batch_size * num_kv_head * max_splits
+
+    def _make_partials(shape):
+        tensor = aot_placeholders.make_compact_tensor(
+            cutlass.Float32,
+            shape,
+            stride_order=(2, 1, 0),
+            assumed_align=16,
+        )
+        return tensor.mark_layout_dynamic(
+            leading_dim=2
+        ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2))
+
+    return {
+        "q": q,
+        "pool": pool,
+        "page_table": page_table,
+        "indices": _make_indices_placeholder(batch_size, 1, topk),
+        "context_lengths": _make_ctx_lengths_placeholder(batch_size),
+        "output": output,
+        "partial_output": _make_partials(
+            (num_partials, m_block_size, head_dim)
+        ),
+        "partial_stats": _make_partials(
+            (num_partials, 2, m_block_size)
+        ),
+        "counters": _make_ctx_lengths_placeholder(batch_size * num_kv_head),
+    }
+
+
 def _generate_decode_indices(
     batch_size: int,
     ctx_lengths,
@@ -2569,7 +2661,7 @@ def run_decode(
         raise ValueError(f"{_tag} num_head must be divisible by kv_group_size")
     if pool_head_dim < head_dim or pool_head_dim % 8 != 0:
         raise ValueError(f"{_tag} pool_head_dim must be >= head_dim and /8")
-    if cp.cuda.runtime.getDeviceCount() == 0:
+    if not export_only and cp.cuda.runtime.getDeviceCount() == 0:
         raise RuntimeError("GPU is required to run this kernel.")
     if softmax_scale <= 0.0:
         softmax_scale = 1.0 / math.sqrt(head_dim)
@@ -2580,6 +2672,53 @@ def run_decode(
     max_pages = (cap + 127) // 128
     num_pages = batch_size * max_pages + 1  # +1 poison page
     num_flat_pages = 2 * num_pages
+
+    if export_only:
+        tensors = _make_decode_aot_tensors(
+            dtype,
+            batch_size=batch_size,
+            num_head=h_q,
+            num_kv_head=h_kv,
+            head_dim=head_dim,
+            pool_head_dim=pool_head_dim,
+            num_flat_pages=num_flat_pages,
+            max_pages=max_pages,
+            topk=topk,
+            max_splits=max_splits,
+            m_block_size=m_block_size,
+        )
+        dec = QSASparseGQADecode(
+            head_dim=head_dim,
+            m_block_size=m_block_size,
+            n_block_size=n_block_size,
+            num_threads=num_threads,
+            pipe_depth=pipe_depth,
+            max_splits=max_splits,
+        )
+        current_stream = aot_placeholders.make_stream()
+        compiled = cute.compile(
+            dec,
+            tensors["q"],
+            tensors["pool"],
+            tensors["page_table"],
+            tensors["indices"],
+            tensors["context_lengths"],
+            tensors["output"],
+            tensors["partial_output"],
+            tensors["partial_stats"],
+            tensors["counters"],
+            cutlass.Float32(softmax_scale),
+            current_stream,
+        )
+        os.makedirs(output_dir, exist_ok=True)
+        compiled.export_to_c(
+            file_path=output_dir,
+            file_name=file_name,
+            function_prefix=function_prefix,
+        )
+        print(f"{_tag} Exported to {output_dir}/{file_name}.h and .o")
+        return None
+
     cp_dtype = _cutlass_to_cupy_dtype(dtype)
     nan_val = _nan_pattern(dtype)
 
@@ -2590,8 +2729,7 @@ def run_decode(
         f"Br={m_block_size}, Bc={n_block_size}, threads={num_threads}, "
         f"depth={pipe_depth}"
     )
-    if not export_only:
-        cp.random.seed(20260830)
+    cp.random.seed(20260830)
 
     # Pool: fully NaN-poisoned; only mapped K/V rows' [0:head_dim) get data.
     pool_arr = cp.full(
@@ -2640,13 +2778,10 @@ def run_decode(
             pool_arr[int(pt_host[b, 0, pg]), row, :, :head_dim] = k_dense[b, t]
             pool_arr[int(pt_host[b, 1, pg]), row, :, :head_dim] = v_dense[b, t]
 
-    if not export_only:
-        for b in range(batch_size):
-            _write_tokens(b, 0, int(ctx_host[b]))
+    for b in range(batch_size):
+        _write_tokens(b, 0, int(ctx_host[b]))
 
-    q_arr = _rand((batch_size, 1, h_q, head_dim)) if not export_only else cp.zeros(
-        (batch_size, 1, h_q, head_dim), dtype=cp_dtype
-    )
+    q_arr = _rand((batch_size, 1, h_q, head_dim))
     o_arr = cp.zeros((batch_size, 1, h_q, head_dim), dtype=cp_dtype)
     idx_host = _generate_decode_indices(batch_size, ctx_host, topk)
     idx_arr = cp.asarray(idx_host)
@@ -2689,15 +2824,6 @@ def run_decode(
         current_stream,
     )
     print(f"{_tag} Compilation time: {time.time() - t0:.4f}s")
-
-    if export_only:
-        os.makedirs(output_dir, exist_ok=True)
-        compiled.export_to_c(
-            file_path=output_dir, file_name=file_name,
-            function_prefix=function_prefix,
-        )
-        print(f"{_tag} Exported to {output_dir}/{file_name}.h and .o")
-        return None
 
     def _launch():
         compiled(

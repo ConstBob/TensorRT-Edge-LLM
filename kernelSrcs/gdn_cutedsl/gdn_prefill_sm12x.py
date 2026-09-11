@@ -2181,6 +2181,7 @@ def _make_aot_cute_tensors(n, t, hqk, hv):
         "dt_bias": _mark_1d(cutlass.Float16, (hv,)),
         "h0_in": _mark_state(cutlass.Float32, (n, hv, d, d)),
         "h0_out": _mark_state(cutlass.Float32, (n, hv, d, d)),
+        "state_indices": _mark_1d(cutlass.Int32, (n,)),
         "context_lengths": _mark_1d(cutlass.Int32, (n,)),
         "o": _mark_4d(cutlass.Float16, (n, t, hv, d)),
         "tensormap_scratch": _mark_1d(
