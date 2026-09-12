@@ -214,6 +214,18 @@ handled automatically by export and runtime.
 
 </details>
 
+<details>
+<summary><b>Muse-Glimmer</b></summary>
+
+The FP16 checkpoint supports text, image, and video
+input; the NVFP4 checkpoint is text-only. Compatible DFlash and DFlash2 drafts
+are listed under [Speculative Draft Checkpoints](#speculative-draft-checkpoints).
+
+- [meta-models/Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B)
+- [RadixArk/Muse-Glimmer-NVFP4](https://huggingface.co/RadixArk/Muse-Glimmer-NVFP4)
+
+</details>
+
 ## Speech Recognition
 
 - **Qwen3-ASR:** [Qwen/Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B), [Qwen/Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B)
@@ -254,17 +266,18 @@ handled automatically by export and runtime.
 | [z-lab/Qwen3.5-27B-DFlash](https://huggingface.co/z-lab/Qwen3.5-27B-DFlash) | [Qwen/Qwen3.5-27B](https://huggingface.co/Qwen/Qwen3.5-27B) |
 | [z-lab/Qwen3.5-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.5-35B-A3B-DFlash) | [Qwen/Qwen3.5-35B-A3B-GPTQ-Int4](https://huggingface.co/Qwen/Qwen3.5-35B-A3B-GPTQ-Int4) |
 | [nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash) | [nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4) |
+| [meta-models/Muse-Glimmer-30B-assistant](https://huggingface.co/meta-models/Muse-Glimmer-30B-assistant) | [meta-models/Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B) or [RadixArk/Muse-Glimmer-NVFP4](https://huggingface.co/RadixArk/Muse-Glimmer-NVFP4) |
 
 ### DFlash2 Draft Models
 
 DFlash2 uses the public DFlash engine/runtime mode. The draft checkpoint
 selects the versioned contract, while the runtime may choose any block size
-covered by the engine profile. The published Qwen3.8 checkpoint defaults to
-block 8, block 16 is also supported, and DFlash2 does not support DDTree.
+covered by the engine profile. DFlash2 does not support DDTree.
 
 | Draft checkpoint | Base model |
 |---|---|
 | [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) | [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B), including matched NVFP4 or INT4 quantized checkpoints |
+| [incoai/Muse-Glimmer-30B-DFlash2](https://huggingface.co/incoai/Muse-Glimmer-30B-DFlash2) | [meta-models/Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B) or [RadixArk/Muse-Glimmer-NVFP4](https://huggingface.co/RadixArk/Muse-Glimmer-NVFP4) |
 
 ### DSpark Draft Models
 

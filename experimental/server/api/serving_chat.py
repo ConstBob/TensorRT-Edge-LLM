@@ -241,8 +241,12 @@ class OpenAIServingChat:
                 )
             audio_params = AudioParams(**request.audio.generation_kwargs())
 
+        configured_parser = REASONING_PARSERS.resolve(
+            self._config.reasoning_parser, self._model_dir)
         reasoning_parser = (self._config.reasoning_parser
-                            if request.enable_thinking else "none")
+                            if request.enable_thinking or
+                            (configured_parser is not None
+                             and configured_parser.always_enabled) else "none")
         try:
             parser = REASONING_PARSERS.resolve(reasoning_parser,
                                                self._model_dir)

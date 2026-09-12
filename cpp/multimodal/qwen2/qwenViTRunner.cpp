@@ -91,22 +91,39 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
     if (mModelType != multimodal::ModelType::QWEN2_5_VL && mModelType != multimodal::ModelType::QWEN2_VL
         && mModelType != multimodal::ModelType::QWEN3_VL && mModelType != multimodal::ModelType::QWEN3_5
         && mModelType != multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER
-        && mModelType != multimodal::ModelType::COSMOS3_EDGE)
+        && mModelType != multimodal::ModelType::COSMOS3_EDGE && mModelType != multimodal::ModelType::MUSE_GLIMMER)
     {
         LOG_ERROR("Invalid model type: %s", modelTypeStr.c_str());
         return false;
     }
 
-    mConfig.visionStartTokenId = jsonConfig["vision_start_token_id"].get<int32_t>();
+    bool const isMuseGlimmer = mModelType == multimodal::ModelType::MUSE_GLIMMER;
+    if (isMuseGlimmer)
+    {
+        mConfig.visionStartTokenId = jsonConfig.value("vision_start_token_id", 0);
+    }
+    else
+    {
+        mConfig.visionStartTokenId = jsonConfig["vision_start_token_id"].get<int32_t>();
+    }
     mConfig.visionEndTokenId = jsonConfig.value("vision_end_token_id", 0);
     mConfig.imageTokenId = jsonConfig["image_token_id"].get<int32_t>();
-    mConfig.videoTokenId = jsonConfig["video_token_id"].get<int32_t>();
+    mConfig.videoTokenId
+        = isMuseGlimmer ? jsonConfig.value("video_token_id", 0) : jsonConfig["video_token_id"].get<int32_t>();
 
     auto const& subConfig = (jsonConfig.contains("text_config") && jsonConfig["text_config"].is_object())
         ? jsonConfig["text_config"]
         : jsonConfig;
-    mConfig.vocabSize = subConfig["vocab_size"].get<int32_t>();
-    mConfig.mropeTheta = subConfig["rope_theta"].get<float>();
+    if (isMuseGlimmer)
+    {
+        mConfig.vocabSize = subConfig.value("vocab_size", int32_t{0});
+        mConfig.mropeTheta = subConfig.value("rope_theta", 10000.0F);
+    }
+    else
+    {
+        mConfig.vocabSize = subConfig["vocab_size"].get<int32_t>();
+        mConfig.mropeTheta = subConfig["rope_theta"].get<float>();
+    }
 
     // Read mrope_section from rope_parameters or rope_scaling
     auto const& ropeParams = subConfig.contains("rope_scaling") ? subConfig["rope_scaling"] : subConfig;
@@ -119,7 +136,20 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
             mConfig.mropeSectionW = section[2];
         }
     }
-    if (mConfig.mropeSectionH <= 0 || mConfig.mropeSectionW <= 0)
+    if (isMuseGlimmer)
+    {
+        // Muse-Glimmer uses 1D RoPE; image tokens take sequential positions, so
+        // the spatial mrope_section split does not apply. Default to 1.
+        if (mConfig.mropeSectionH <= 0)
+        {
+            mConfig.mropeSectionH = 1;
+        }
+        if (mConfig.mropeSectionW <= 0)
+        {
+            mConfig.mropeSectionW = 1;
+        }
+    }
+    else if (mConfig.mropeSectionH <= 0 || mConfig.mropeSectionW <= 0)
     {
         LOG_ERROR("Failed to parse mrope_section in text_config. Got H=%d, W=%d", mConfig.mropeSectionH,
             mConfig.mropeSectionW);
@@ -350,7 +380,7 @@ void QwenViTRunner::formatPatch(
     }
 
     kernel::transposeToPatchQwenViT(mNormalizedImageDevice, mVitInput, prevPatchBase * mConfig.inputDim,
-        mConfig.temporalPatchSize, mConfig.patchSize, mConfig.mergeSize, stream);
+        mConfig.temporalPatchSize, mConfig.patchSize, vitInputMergeSize(), vitPatchTemporalFirst(), stream);
 }
 
 void QwenViTRunner::buildCuSeqlens(
@@ -500,11 +530,7 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, std
         if (mHasRotaryPosEmb)
         {
             check::check(mRotaryPosEmb.reshape({totalSeqLength, mConfig.vitPosEmbDim}), "Tensor reshape failed");
-            for (auto const& s : spans)
-            {
-                kernel::initRotaryPosEmbQwenViT(mRotaryPosEmb, {s.vit.gridT, s.vit.gridH, s.vit.gridW},
-                    mConfig.mergeSize, s.vit.patchStart, 10000.0f, 1.0f, stream);
-            }
+            buildRotaryPosEmb(spans, stream);
         }
 
         // Build model-specific ViT inputs.
@@ -743,13 +769,25 @@ bool QwenViTRunner::preprocess(rt::LLMGenerationRequest const& request,
         }
         if (!imageOnly)
         {
-            if (!mropeCosSinOut.has_value())
-            {
-                LOG_ERROR("mropeCosSinOut is required when imageOnly=false.");
-                return false;
-            }
+            // Splice the image-token placeholders into the input IDs for all
+            // models (needed so image embeddings land at the right positions).
             textPreprocess(request, batchedInputIds, spans, spansPerRequest, tokenizer);
-            generateMropeParams(batchedInputIds, spans, spansPerRequest, mropeCosSinOut.value().get(), stream);
+            if (mModelType == multimodal::ModelType::MUSE_GLIMMER)
+            {
+                // Muse-Glimmer uses 1D per-layer RoPE with standard sequential
+                // positions (image tokens advance like text), so there is no
+                // Qwen 3D M-RoPE cos/sin to produce here; the LLM engine applies
+                // RoPE from its own rope cache.
+            }
+            else
+            {
+                if (!mropeCosSinOut.has_value())
+                {
+                    LOG_ERROR("mropeCosSinOut is required when imageOnly=false.");
+                    return false;
+                }
+                generateMropeParams(batchedInputIds, spans, spansPerRequest, mropeCosSinOut.value().get(), stream);
+            }
         }
     }
     catch (std::exception const& e)
@@ -899,6 +937,25 @@ void QwenViTRunner::buildExtraInputs(std::vector<VisionSpan> const& /*spans*/, i
 bool QwenViTRunner::bindExtraInputShapes()
 {
     return true;
+}
+
+int64_t QwenViTRunner::vitInputMergeSize() const
+{
+    return mConfig.mergeSize;
+}
+
+bool QwenViTRunner::vitPatchTemporalFirst() const
+{
+    return false;
+}
+
+void QwenViTRunner::buildRotaryPosEmb(std::vector<VisionSpan> const& spans, cudaStream_t stream)
+{
+    for (auto const& s : spans)
+    {
+        kernel::initRotaryPosEmbQwenViT(mRotaryPosEmb, {s.vit.gridT, s.vit.gridH, s.vit.gridW}, mConfig.mergeSize,
+            s.vit.patchStart, 10000.0f, 1.0f, stream);
+    }
 }
 
 rt::OptionalInputTensors QwenViTRunner::getDeepstackFeatures()

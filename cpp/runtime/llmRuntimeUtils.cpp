@@ -419,6 +419,10 @@ RopeConfig collectRopeConfig(nlohmann::json const& config)
             {
                 ropeConfig.type = RopeType::kDefault;
             }
+            else if (ropeTypeStr == "nope")
+            {
+                ropeConfig.type = RopeType::kNoRope;
+            }
             else if (ropeTypeStr == "proportional")
             {
                 ropeConfig.type = RopeType::kProportional;

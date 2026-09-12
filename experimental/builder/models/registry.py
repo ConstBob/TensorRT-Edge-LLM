@@ -454,6 +454,26 @@ FAMILIES: Tuple[ModelFamily, ...] = (
         },
     ),
     ModelFamily(
+        "muse_glimmer",
+        {
+            "muse_glimmer": _set(Component.LLM, Component.VISUAL),
+            "muse_glimmer_text": _set(Component.LLM),
+            "muse_glimmer_vision": _set(Component.VISUAL),
+            "muse_glimmer_assistant": _set(Component.LLM),
+        },
+        {
+            Component.LLM:
+            _component("muse_glimmer.modeling_muse_glimmer_text",
+                       "MuseGlimmerForCausalLM"),
+            Component.VISUAL:
+            _component("muse_glimmer.modeling_muse_glimmer_visual",
+                       "MuseGlimmerVisualModel"),
+        },
+        configuration="muse_glimmer.configuration",
+        artifact_writer="muse_glimmer.artifacts",
+        weight_conversion="muse_glimmer.weights",
+    ),
+    ModelFamily(
         "gemma4_unified",
         {
             "gemma4_unified":
@@ -626,6 +646,7 @@ FAMILY_SPECULATIVE_WEIGHT_CONVERSIONS = {
     ("qwen3_5_moe", "mtp"): "qwen3_5_moe.weights",
     ("qwen3_omni_moe", "mtp"): "qwen3_omni.weights",
     ("qwen3_omni_next", "mtp"): "qwen3_omni_next.weights",
+    ("muse_glimmer", "dflash"): "muse_glimmer.dflash_weights",
 }
 
 FAMILY_SPECULATIVE_CONFIGURATIONS = {
@@ -633,6 +654,7 @@ FAMILY_SPECULATIVE_CONFIGURATIONS = {
     ("qwen3_5_moe", "mtp"): "qwen3_5_moe.configuration",
     ("qwen3_omni_moe", "mtp"): "qwen3_omni.configuration",
     ("qwen3_omni_next", "mtp"): "qwen3_omni_next.configuration",
+    ("muse_glimmer", "dflash"): "muse_glimmer.configuration",
 }
 
 

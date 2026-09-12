@@ -339,3 +339,27 @@ def test_reasoning_parser_uses_model_metadata_after_relocation(tmp_path):
     (checkpoint / "config.json").write_text(
         '{"text_config":{"model_type":"qwen3_moe"}}', encoding="utf-8")
     assert REASONING_PARSERS.resolve("auto", str(checkpoint)) is not None
+
+
+def test_muse_glimmer_reasoning_parser_splits_atem_channels(tmp_path):
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text('{"model_type":"muse_glimmer"}',
+                                            encoding="utf-8")
+    parser = REASONING_PARSERS.resolve("auto", str(checkpoint))
+    assert parser.always_enabled
+
+    text = (" to=self<|message|>plan"
+            "<|eom|><|start|>assistant to=user<|message|>answer<|eot|>")
+    assert parser.extract(text) == ("plan", "answer")
+
+    stream = parser.stream()
+    deltas = []
+    for chunk in (" to=se", "lf<|message|>plan<|eo", "m|><|start|>assistant ",
+                  "to=user<|message|>answer<|eo", "t|>"):
+        deltas.extend(stream.feed(chunk))
+    deltas.extend(stream.flush())
+    assert "".join(delta.text for delta in deltas
+                   if delta.field == "reasoning") == "plan"
+    assert "".join(delta.text for delta in deltas
+                   if delta.field == "content") == "answer"

@@ -50,6 +50,8 @@ from experimental.builder.models.gemma4.modeling_gemma4_assistant import \
 from experimental.builder.models.gemma4.modeling_gemma4_text import \
     Gemma4ForCausalLM
 from experimental.builder.models.llama.modeling_llama import LlamaForCausalLM
+from experimental.builder.models.muse_glimmer.modeling_muse_glimmer_text import \
+    MuseGlimmerForCausalLM
 from experimental.builder.models.nemotron_h.modeling_nemotron_h import \
     NemotronHForCausalLM
 from experimental.builder.models.nemotron_omni.modeling_nemotron_omni_text import \
@@ -803,6 +805,29 @@ def test_llama_tree_bindings_match_runtime_names_and_token_major_ranks():
     assert inputs["packed_attention_mask"].shape == (-1, -1)
     assert "attention_pos_id" not in inputs
     assert "attention_mask" not in inputs
+
+
+def test_muse_glimmer_base_uses_dual_rope_and_ragged_tree_bindings():
+    cfg = _dense_config(
+        root_model_type="muse_glimmer",
+        model_type="muse_glimmer_text",
+        engine_role="base",
+        spec_decode_type="dflash",
+        dflash_tree_base=True,
+        sliding_rope_config={"rope_type": "default"},
+        full_rope_config={"rope_type": "nope"},
+    )
+
+    inputs = _network_inputs(MuseGlimmerForCausalLM, cfg)
+
+    _assert_decoder_contract(
+        inputs,
+        required_portals=("rope_rotary_cos_sin_sliding",
+                          "rope_rotary_cos_sin_full", "attention_position_ids",
+                          "packed_attention_mask", "tree_parent_ids",
+                          "tree_depths", "valid_tree_counts"))
+    assert inputs["rope_rotary_cos_sin_sliding"].shape == (-1, 4)
+    assert inputs["rope_rotary_cos_sin_full"].shape == (-1, 4)
 
 
 @pytest.mark.parametrize(

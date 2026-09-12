@@ -71,6 +71,14 @@ def test_sample_indices():
     assert idx == sorted(idx)
 
 
+def test_muse_sampling_matches_provider_contract():
+    assert vs.muse_nframes(300, 30.0) == 20
+    assert vs.muse_nframes(3600, 30.0) == 96
+    assert vs.muse_nframes(5, 30.0) == 2
+    assert vs.muse_nframes(300, 30.0, target_fps=4, nframes=12) == 12
+    assert vs.sample_indices_muse(11, 4) == [0, 3, 6, 10]
+
+
 # --- resolve_video_source --------------------------------------------------
 
 
@@ -182,6 +190,33 @@ _NEMOTRON_LIMITS = {
     "video_target_num_patches": 1024,  # 256 tokens/tubelet after /downsample^2
     "downsample_ratio": 0.5,
 }
+
+_MUSE_LIMITS = {
+    "model_type": "muse_glimmer_vision",
+    "min_image_tokens": 4,
+    "max_image_tokens": 1024,
+    "max_image_tokens_per_image": 512,
+    "max_image_tokens_checkpoint": 4096,
+    "max_video_frame_tokens": 144,
+    "patch_size": 14,
+    "merge_size": 2,
+    "temporal_patch_size": 2,
+}
+
+
+def test_clamp_muse_uses_provider_video_resize_cap():
+    image_tokens = vs._estimate_qwen2d_frame_tokens(1280, 720, _MUSE_LIMITS)
+    video_tokens = vs._estimate_qwen2d_frame_tokens(1280,
+                                                    720,
+                                                    _MUSE_LIMITS,
+                                                    is_video=True)
+    assert image_tokens <= 512
+    assert video_tokens <= 144
+    assert video_tokens < image_tokens
+    frames, tokens = vs.clamp_nframes_to_profile(20, "muse", 1280, 720,
+                                                 _MUSE_LIMITS)
+    assert frames == 14
+    assert tokens <= 1024
 
 
 def test_clamp_qwen25_total_budget():

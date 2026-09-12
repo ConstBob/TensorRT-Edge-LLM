@@ -1144,7 +1144,9 @@ def write_runtime_artifacts(model: "CausalLM",
             embed = getattr(getattr(model, "backbone", None), "embeddings",
                             None)
         if embed is not None:
-            weight = embed.weight.data.detach().cpu()
+            runtime_weight = getattr(embed, "runtime_weight", None)
+            weight = (runtime_weight() if callable(runtime_weight) else
+                      embed.weight.data).detach().cpu()
             embedding_scale = _runtime_embedding_scale(model)
             if embedding_scale != 1.0:
                 weight = weight * embedding_scale

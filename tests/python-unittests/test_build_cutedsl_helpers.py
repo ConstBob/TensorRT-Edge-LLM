@@ -74,6 +74,7 @@ _FMHA_V2_SPECIAL_VARIANTS = {
     "fmha_v2_vit_d64",
     "fmha_v2_vit_d72",
     "fmha_v2_vit_d80",
+    "fmha_v2_vit_d96",
     "fmha_v2_vit_d128",
     "fmha_v2_d256_bidirectional",
     "fmha_v2_d512_bidirectional",

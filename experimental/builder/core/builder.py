@@ -19,13 +19,14 @@ weights, installs context and generation optimization profiles, and serializes
 the engine.
 """
 
+import contextlib
 import ctypes
 import functools
 import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Iterator, Optional, Tuple
 
 import numpy as np
 import tensorrt as trt
@@ -65,6 +66,55 @@ def _active_cuda_compute_capability() -> Tuple[int, int]:
     logger.info("Detected CUDA device %d with compute capability %d.%d",
                 device, values[0], values[1])
     return values[0], values[1]
+
+
+def _append_lunowud_flag(flags: str, flag: str) -> str:
+    """Append a space-separated flag unless it is already present."""
+    if flag in flags:
+        return flags
+    if flags:
+        flags += " "
+    return flags + flag
+
+
+def _apply_compile_workarounds(max_batch_size: int) -> str:
+    """Apply the same TensorRT workarounds as the C++ builders."""
+    flags = os.environ.get("__LUNOWUD", "")
+    existing = bool(flags)
+    trt_major, trt_minor = (int(p) for p in trt.__version__.split(".")[:2])
+    sm_major, sm_minor = _active_cuda_compute_capability()
+    sm_version = sm_major * 10 + sm_minor
+    if trt_major == 10 and trt_minor in (13, 14):
+        flags = _append_lunowud_flag(flags, "-peep:match_dual_gemm=off")
+    if trt_major >= 11:
+        if sm_version >= 100:
+            flags = _append_lunowud_flag(flags, "-peep:match_dual_gemm=off")
+    if trt_major >= 11 or (trt_major == 10 and trt_minor >= 15):
+        flags = _append_lunowud_flag(flags, "-mlir:autotune:num_threads=1")
+        flags = _append_lunowud_flag(flags, "-mlir:collective:fp4=off")
+        flags = _append_lunowud_flag(flags, "-cask_fusion:async_policy=1")
+    if trt_major >= 11 or (trt_major == 10 and trt_minor >= 13):
+        if max_batch_size == 1:
+            flags = _append_lunowud_flag(flags, "-peep:fc_h_fusion=off")
+    if existing or flags:
+        os.environ["__LUNOWUD"] = flags
+    return flags
+
+
+@contextlib.contextmanager
+def _compile_workarounds(max_batch_size: int) -> Iterator[str]:
+    """Scope TensorRT build workarounds to engine serialization."""
+    saved = os.environ.get("__LUNOWUD")
+    flags = _apply_compile_workarounds(max_batch_size)
+    if flags:
+        logger.info("Using __LUNOWUD=%s", flags)
+    try:
+        yield flags
+    finally:
+        if saved is None:
+            os.environ.pop("__LUNOWUD", None)
+        else:
+            os.environ["__LUNOWUD"] = saved
 
 
 @dataclass
@@ -305,6 +355,13 @@ def build_engine(args: BuildArgs,
                  bundle: Optional[BundleConfig] = None,
                  plugin_handle: Optional[ctypes.CDLL] = None) -> BuildResult:
     """Build an engine and return its runtime artifacts."""
+    with _compile_workarounds(args.max_batch_size):
+        return _build_engine(args, cfg, bundle, plugin_handle)
+
+
+def _build_engine(args: BuildArgs, cfg: Optional[DeviceConfig],
+                  bundle: Optional[BundleConfig],
+                  plugin_handle: Optional[ctypes.CDLL]) -> BuildResult:
     build_start = time.perf_counter()
     args.validate()
     plugin_handle = plugin_handle or load_plugin_library(args.plugin_path)
@@ -841,6 +898,9 @@ def _setup_component_profile(builder, config, network,
             gemma_visual = "pooling_weights" in input_shapes
             gemma_unified = "pixel_position_ids" in input_shapes
             visual_input = input_shapes.get("input", ())
+            # Muse window indices span patches rather than merged tokens.
+            muse_glimmer = ("fast_pos_embed_idx" in input_shapes
+                            and "window_index" in input_shapes)
             if gemma_visual:
                 patches_per_token = 9
                 soft_opt = max(
@@ -879,7 +939,8 @@ def _setup_component_profile(builder, config, network,
                 return 2, max(2, max_images // 2), max_images
             if name in ("cu_window_seqlens", "kv_lengths_window"):
                 return 2, args.max_image_tokens, args.max_image_tokens
-            if name in ("window_index", "reverse_window_index"):
+            if name in ("window_index",
+                        "reverse_window_index") and not muse_glimmer:
                 return (args.min_image_tokens,
                         (args.min_image_tokens + args.max_image_tokens) // 2,
                         args.max_image_tokens)

@@ -118,6 +118,25 @@ tensorrt-edgellm-serve Qwen/Qwen3.5-4B \
   '{"method":"dflash","model":"z-lab/Qwen3.5-4B-DFlash","num_speculative_tokens":3}'
 ```
 
+Muse-Glimmer DFlash and DFlash2 examples:
+
+```bash
+tensorrt-edgellm-serve meta-models/Muse-Glimmer-30B \
+  --cache-dir /data/edgellm-cache \
+  --speculative-config \
+  '{"method":"dflash","model":"meta-models/Muse-Glimmer-30B-assistant"}'
+
+tensorrt-edgellm-serve meta-models/Muse-Glimmer-30B \
+  --cache-dir /data/edgellm-cache \
+  --speculative-config \
+  '{"method":"dflash","model":"incoai/Muse-Glimmer-30B-DFlash2"}'
+
+tensorrt-edgellm-serve RadixArk/Muse-Glimmer-NVFP4 \
+  --cache-dir /data/edgellm-cache \
+  --speculative-config \
+  '{"method":"dflash","model":"incoai/Muse-Glimmer-30B-DFlash2"}'
+```
+
 JetSpec example:
 
 ```bash
@@ -289,6 +308,21 @@ tensorrt-edgellm-serve Qwen/Qwen3-VL-2B-Instruct \
   --cache-dir /data/edgellm-cache \
   --allowed-local-media-path /data/media
 ```
+
+Muse-Glimmer image and video chat use its FP16 multimodal checkpoint; the
+NVFP4 checkpoint is text-only:
+
+```bash
+tensorrt-edgellm-serve meta-models/Muse-Glimmer-30B \
+  --cache-dir /data/edgellm-cache \
+  --max-image-tokens 4096 \
+  --max-image-tokens-per-image 4096 \
+  --allowed-local-media-path /data/media
+```
+
+Use an `image_url` block for an image or a `video_url` block for a video.
+Muse-Glimmer samples video at 2 FPS, up to 96 frames; `fps` and `nframes` on
+the video content block override those defaults.
 
 OpenAI content blocks accept `image_url`, `video_url`, `input_audio`, and
 `audio_url` forms described in [Input Format](../format/input-format.md). Data

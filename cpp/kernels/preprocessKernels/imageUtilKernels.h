@@ -56,7 +56,8 @@ void transposeToPatchGemma4ViT(rt::Tensor const& originalImage, rt::Tensor& inpu
 //!         inputDim = channels * temporalPatchSize * patchSize * patchSize
 //! \throws std::runtime_error if image has invalid shape, data type or location
 void transposeToPatchQwenViT(rt::Tensor const& originalImage, rt::Tensor& inputPatches, int64_t const inputOffset,
-    int64_t const temporalPatchSize, int64_t const patchSize, int64_t const mergeSize, cudaStream_t stream);
+    int64_t const temporalPatchSize, int64_t const patchSize, int64_t const mergeSize, bool temporalFirst,
+    cudaStream_t stream);
 
 //! The kernel will initialize the rotary position embeddings for Qwen2.5-VL VIT
 //! Inputs:
@@ -71,6 +72,42 @@ void transposeToPatchQwenViT(rt::Tensor const& originalImage, rt::Tensor& inputP
 //! \throws std::runtime_error if image has invalid shape, data type or location
 void initRotaryPosEmbQwenViT(rt::Tensor& rotaryPosEmb, std::vector<int64_t> const& gridTHW, int64_t const mergeSize,
     int64_t const startIdx, float const rotaryBaseFrequency, float const scale, cudaStream_t stream);
+
+//! The kernel will initialize the rotary position embeddings for Muse-Glimmer VIT.
+//! Unlike initRotaryPosEmbQwenViT (which lays out per-token frequencies as concat(freq_h, freq_w) in
+//! 2x2-merge-grouped token order with no position offset), Muse-Glimmer runs its encoder at
+//! spatial_merge_size == 1 (raster token order) and its reference RoPE lays each token's row out as
+//! concat(freq_w, freq_h) with a +1 position offset (mirrors position_ids.flip(-1) + 1). The rotary
+//! frequency itself (inv_freq = 1 / theta^(2*k / vitPosEmbDim)) is identical; only the layout differs.
+//! Inputs:
+//!     gridTHW: Image grid dimensions [T, H, W] in patch units (H, W are the full patch grid, not merged)
+//!     startIdx: Start patch index for the current image (raster token offset)
+//!     rotaryBaseFrequency: Rotary base frequency (theta)
+//!     stream: CUDA stream for execution
+//! Outputs:
+//!     rotaryPosEmb [GPU, Float]: Rotary position embeddings tensor [totalSeqLength, vitPosEmbDim];
+//!         each row = concat(freq_w[vitPosEmbDim/2], freq_h[vitPosEmbDim/2]).
+//! \throws std::runtime_error if the tensor has an invalid shape, data type or location
+void initRotaryPosEmbMuseGlimmerViT(rt::Tensor& rotaryPosEmb, std::vector<int64_t> const& gridTHW,
+    int64_t const startIdx, float const rotaryBaseFrequency, cudaStream_t stream);
+
+//! The kernel will initialize the fast (interpolated) position embeddings for Muse-Glimmer VIT.
+//! Unlike initFastPosEmbedQwenViT (align_corners == True mapping over 2x2-merge-grouped tokens), Muse-Glimmer
+//! interpolates its num_grid_per_side x num_grid_per_side learned position table with align_corners == False
+//! and "zeros" padding over raster (spatial_merge_size == 1) tokens, matching the reference
+//! get_vision_bilinear_indices_and_weights / F.grid_sample(align_corners=False, padding="zeros").
+//! Out-of-range floor/ceil taps are index-clamped but their weights are zeroed (the padding="zeros" behavior).
+//! Inputs:
+//!     gridTHW: Image grid dimensions [T, H, W] in patch units (only H and W drive the interpolation)
+//!     numGridPerSide: Side length of the square learned position table (pos_emb_height == pos_emb_width)
+//!     startIdx: Start patch index for the current image (raster token offset)
+//!     stream: CUDA stream for execution
+//! Outputs:
+//!     fastPosEmbedIdx [GPU, Int64]: Fast position embeddings index tensor [4, totalSeqLength]
+//!     fastPosEmbedWeight [GPU, Half]: Fast position embeddings weight tensor [4, totalSeqLength]
+//! \throws std::runtime_error if a tensor has an invalid shape, data type or location
+void initFastPosEmbedMuseGlimmerViT(rt::Tensor& fastPosEmbedIdx, rt::Tensor& fastPosEmbedWeight,
+    std::vector<int64_t> const& gridTHW, int64_t const numGridPerSide, int64_t const startIdx, cudaStream_t stream);
 
 //! The kernel will initialize Gemma4 vision 2-D rotary angle embeddings from pixel position ids
 //! Inputs:

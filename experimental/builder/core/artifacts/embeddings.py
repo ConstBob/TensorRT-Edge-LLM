@@ -141,7 +141,11 @@ def ple_embedding_binding(weights: Weights, cfg: DeviceConfig) -> dict:
 
 def write_embedding(weights: Weights, cfg: DeviceConfig, args,
                     engine_dir: str) -> None:
-    weight = weights.f16("model.embed_tokens.weight")
+    # Runtime embeddings are FP16, including dequantized NVFP4 checkpoints.
+    if weights.is_nvfp4("model.embed_tokens"):
+        weight = weights.linear_fp16("model.embed_tokens")[0]
+    else:
+        weight = weights.f16("model.embed_tokens.weight")
     weight = np.ascontiguousarray(weight * np.float16(cfg.embedding_scale))
     path = os.path.join(engine_dir, "embedding.safetensors")
     if args.fp8_embedding:
