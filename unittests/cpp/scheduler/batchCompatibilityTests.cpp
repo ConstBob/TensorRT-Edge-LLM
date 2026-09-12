@@ -71,6 +71,7 @@ TEST(BatchCompatibilityTests, EveryComparedFieldBlocksBatching)
     EXPECT_EQ(firstDifference([](auto& r) { r.loraWeightsName = "adapter-b"; }), "loraWeightsName");
     EXPECT_EQ(firstDifference([](auto& r) { r.disableSpecDecode = true; }), "disableSpecDecode");
     EXPECT_EQ(firstDifference([](auto& r) { r.numLogprobs = 5; }), "numLogprobs");
+    EXPECT_EQ(firstDifference([](auto& r) { r.skipSpecialTokens = false; }), "skipSpecialTokens");
     EXPECT_EQ(firstDifference([](auto& r) { r.maxGenerateLength = 256; }), "maxGenerateLength");
 
     // Context-cache behaviour travels with the coordinator request, so it is batch-wide too.

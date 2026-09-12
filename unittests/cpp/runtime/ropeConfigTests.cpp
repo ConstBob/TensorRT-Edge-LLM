@@ -96,6 +96,11 @@ TEST(RopeConfigTest, ExplicitUseRopeTrueStillDispatchesOnRopeScaling)
     EXPECT_EQ(collectRopeConfig(config).type, RopeType::kProportional);
 }
 
+TEST(RopeConfigTest, NopeRopeTypeUsesIdentityCache)
+{
+    EXPECT_EQ(collectRopeConfig(withScaling({{"rope_type", "nope"}})).type, RopeType::kNoRope);
+}
+
 // A checkpoint with no rope_scaling section is the common plain-Llama shape.
 TEST(RopeConfigTest, AbsentRopeScalingFallsBackToDefaultType)
 {

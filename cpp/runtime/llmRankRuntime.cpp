@@ -1314,6 +1314,7 @@ LLMRankRuntime::GenerationSession::PendingSeat LLMRankRuntime::GenerationSession
     try
     {
         slot = mContext.appendSlot(std::move(seed), SequenceIdentity{intent.requestId, *intent.resident});
+        mContext.slotStreams[static_cast<size_t>(slot)].skipSpecialTokens = mRequest.skipSpecialTokens;
     }
     catch (...)
     {
@@ -1479,7 +1480,7 @@ LLMGenerationResponse LLMRankRuntime::GenerationSession::materializeResult(
     int32_t const generateLength = std::min(result.generateLength, totalLength);
 
     response.outputIds.emplace_back(result.tokenIds.end() - generateLength, result.tokenIds.end());
-    response.outputTexts.push_back(mRuntime.mTokenizer->decode(response.outputIds.front(), true));
+    response.outputTexts.push_back(mRuntime.mTokenizer->decode(response.outputIds.front(), mRequest.skipSpecialTokens));
     response.logprobs.push_back(result.logprobs);
     response.finishReasons.push_back(result.terminalReason);
     response.inputTokenCounts.push_back(static_cast<int32_t>(result.rawBatchedInputIds.size()));
@@ -1993,6 +1994,7 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
             }
         }
         context.slotStreams[i].maxStopLen = maxLen;
+        context.slotStreams[i].skipSpecialTokens = request.skipSpecialTokens;
     }
 
     generation->kvHeadroom = decodingStrategy.requiredKvHeadroom();
@@ -2306,7 +2308,8 @@ bool LLMRankRuntime::finishGeneration(SteppedGeneration& generation, LLMGenerati
         check::check(totalLength >= genLength, "Total length should be greater than or equal to generated length");
         response.outputIds[originalIdx] = std::vector<int32_t>(
             batchResult.tokenIds.begin() + (totalLength - genLength), batchResult.tokenIds.end());
-        response.outputTexts[originalIdx] = mTokenizer->decode(response.outputIds[originalIdx], true);
+        response.outputTexts[originalIdx]
+            = mTokenizer->decode(response.outputIds[originalIdx], request.skipSpecialTokens);
         response.logprobs[originalIdx] = batchResult.logprobs;
         response.finishReasons[originalIdx] = batchResult.terminalReason;
         // Prompt length after chat templating and media expansion (OpenAI usage).

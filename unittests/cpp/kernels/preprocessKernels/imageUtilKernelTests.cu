@@ -190,7 +190,8 @@ static void BuildPhi4mmBatchedInputs(std::vector<std::pair<int32_t, int32_t>> co
 }
 
 void TestTransposeToPatchQwenViT(int32_t const height, int32_t const width, int32_t const channels = 3,
-    int32_t const T = 2, int32_t const temporalPatchSize = 2, int32_t const patchSize = 14, int32_t const mergeSize = 2)
+    int32_t const T = 2, int32_t const temporalPatchSize = 2, int32_t const patchSize = 14, int32_t const mergeSize = 2,
+    bool const temporalFirst = false)
 {
     cudaStream_t stream{nullptr};
 
@@ -199,8 +200,8 @@ void TestTransposeToPatchQwenViT(int32_t const height, int32_t const width, int3
     std::vector<half> inputPatchesRef(T * height * width * channels);
     uniformFloatInitialization<half>(originalImage, 0, 1);
 
-    transposeToPatchQwenReference(
-        originalImage, inputPatchesRef, 0, T, height, width, channels, temporalPatchSize, patchSize, mergeSize);
+    transposeToPatchQwenReference(originalImage, inputPatchesRef, 0, T, height, width, channels, temporalPatchSize,
+        patchSize, mergeSize, temporalFirst);
 
     // GPU tensors
     rt::Tensor originalImageDevice({T, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
@@ -215,7 +216,7 @@ void TestTransposeToPatchQwenViT(int32_t const height, int32_t const width, int3
     rt::Tensor inputPatchesDevice({totalSeqLength, inputDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
     kernel::transposeToPatchQwenViT(
-        originalImageDevice, inputPatchesDevice, 0, temporalPatchSize, patchSize, mergeSize, stream);
+        originalImageDevice, inputPatchesDevice, 0, temporalPatchSize, patchSize, mergeSize, temporalFirst, stream);
 
     std::vector<half> inputPatches(T * height * width * channels);
     CUDA_CHECK(cudaMemcpyAsync(inputPatches.data(), inputPatchesDevice.rawPointer(), inputPatches.size() * sizeof(half),
@@ -242,6 +243,13 @@ TEST(TransposeToPatchQwen, AccuracyT4)
     TestTransposeToPatchQwenViT(/*height*/ 224, /*width*/ 224, /*channels*/ 3, /*T*/ 4);
 }
 
+TEST(TransposeToPatchQwen, AccuracyTemporalFirst)
+{
+    TestTransposeToPatchQwenViT(
+        /*height*/ 224, /*width*/ 224, /*channels*/ 3, /*T*/ 4, /*temporalPatchSize*/ 2, /*patchSize*/ 14,
+        /*mergeSize*/ 1, /*temporalFirst*/ true);
+}
+
 void BenchmarkTransposeToPatchQwenViT(int32_t const height, int32_t const width, int32_t const channels = 3,
     int32_t const T = 2, int32_t const temporalPatchSize = 2, int32_t const patchSize = 14, int32_t const mergeSize = 2)
 {
@@ -263,7 +271,7 @@ void BenchmarkTransposeToPatchQwenViT(int32_t const height, int32_t const width,
 
     auto launch = [&]() {
         kernel::transposeToPatchQwenViT(
-            originalImageDevice, inputPatchesDevice, 0, temporalPatchSize, patchSize, mergeSize, stream);
+            originalImageDevice, inputPatchesDevice, 0, temporalPatchSize, patchSize, mergeSize, false, stream);
     };
 
     constexpr int32_t numWarmup = 10;

@@ -197,6 +197,18 @@ def test_video_model_family_nemotron(tmp_path):
         image_only._video_model_family()
 
 
+def test_video_model_family_muse(tmp_path):
+    eng = _engine()
+    root = tmp_path / "muse"
+    (root / "visual").mkdir(parents=True)
+    (root / "visual" /
+     "config.json").write_text('{"model_type": "muse_glimmer_vision"}')
+    (root / "visual" / "visual.engine").touch()
+    llm = eng.LLM.__new__(eng.LLM)
+    llm._media_dir = str(root)
+    assert llm._video_model_family() == "muse"
+
+
 def test_load_image_buffers_nemotron_minimum():
     # A Nemotron video buffer is built and its EVS token estimate is honored
     # against the request-wide engine minimum (no cu_seqlens binding).

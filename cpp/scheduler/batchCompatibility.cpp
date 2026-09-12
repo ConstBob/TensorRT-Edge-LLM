@@ -67,6 +67,9 @@ constexpr ComparedField kComparedFields[] = {
     // Shapes the logits output for the whole batch.
     {"numLogprobs", [](auto const& a, auto const& b) { return a.numLogprobs == b.numLogprobs; }},
 
+    // Final detokenization uses the founding request's policy for every resident.
+    {"skipSpecialTokens", [](auto const& a, auto const& b) { return a.skipSpecialTokens == b.skipSpecialTokens; }},
+
     // The context holds one batch-wide token callback, so a callback-bearing request never shares
     // a batch: the founder's callback would receive the joiner's tokens. Founder-only, like guided
     // decoding -- a callback on either side stalls the head until the batch turns over.

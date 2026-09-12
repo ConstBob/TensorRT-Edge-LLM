@@ -176,6 +176,8 @@ class ModelConfig:
     max_input_len: int = 4096
     max_batch_size: int = 1
     max_kv_cache_capacity: int = 8192
+    max_image_tokens: Optional[int] = None
+    max_image_tokens_per_image: Optional[int] = None
     draft_top_k: Optional[int] = None
     draft_step: Optional[int] = None
     verify_tree_size: Optional[int] = None
@@ -200,6 +202,8 @@ class ModelConfig:
             "max_input_len": self.max_input_len,
             "max_batch_size": self.max_batch_size,
             "max_kv_cache_capacity": self.max_kv_cache_capacity,
+            "max_image_tokens": self.max_image_tokens,
+            "max_image_tokens_per_image": self.max_image_tokens_per_image,
             "draft_top_k": self.draft_top_k,
             "draft_step": self.draft_step,
             "verify_tree_size": self.verify_tree_size,
@@ -285,7 +289,8 @@ def create_argument_parser() -> argparse.ArgumentParser:
     api.add_argument("--api-key", default="")
     api.add_argument(
         "--reasoning-parser",
-        choices=("auto", "none", "qwen3", "deepseek_r1", "nemotron"),
+        choices=("auto", "none", "qwen3", "deepseek_r1", "muse_glimmer",
+                 "nemotron"),
         default="auto",
     )
     api.add_argument(
@@ -329,6 +334,8 @@ def create_argument_parser() -> argparse.ArgumentParser:
     model.add_argument("--max-kv-cache-capacity",
                        type=_positive_int,
                        default=8192)
+    model.add_argument("--max-image-tokens", type=_positive_int)
+    model.add_argument("--max-image-tokens-per-image", type=_positive_int)
     model.add_argument("--draft-top-k", type=_positive_int)
     model.add_argument("--draft-step", type=_positive_int)
     model.add_argument("--verify-tree-size", type=_positive_int)
@@ -390,6 +397,8 @@ def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
         max_input_len=args.max_input_len,
         max_batch_size=args.max_batch_size,
         max_kv_cache_capacity=args.max_kv_cache_capacity,
+        max_image_tokens=args.max_image_tokens,
+        max_image_tokens_per_image=args.max_image_tokens_per_image,
         draft_top_k=args.draft_top_k,
         draft_step=draft_step,
         verify_tree_size=args.verify_tree_size,

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import json
+import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -515,3 +516,25 @@ def test_tp_default_bakes_small_fp16_parameters():
     assert fully_external.wants(weight_policy.EXTERNAL_WEIGHT_EMBEDDING)
     assert fully_external.wants(weight_policy.EXTERNAL_WEIGHT_LM_HEAD)
     assert fully_external.wants(weight_policy.EXTERNAL_WEIGHT_FP16)
+
+
+def test_compile_workarounds_are_scoped_to_the_build(monkeypatch):
+    from experimental.builder.core import builder
+
+    def sm80():
+        return (8, 0)
+
+    monkeypatch.setattr(builder, "trt", SimpleNamespace(__version__="10.16.0"))
+    monkeypatch.setattr(builder, "_active_cuda_compute_capability", sm80)
+    monkeypatch.delenv("__LUNOWUD", raising=False)
+
+    with builder._compile_workarounds(max_batch_size=4) as flags:
+        assert "-mlir:autotune:num_threads=1" in flags
+        assert os.environ["__LUNOWUD"] == flags
+    assert "__LUNOWUD" not in os.environ
+
+    monkeypatch.setenv("__LUNOWUD", "-user:flag")
+    with builder._compile_workarounds(max_batch_size=1) as flags:
+        assert flags.startswith("-user:flag ")
+        assert "-peep:fc_h_fusion=off" in flags
+    assert os.environ["__LUNOWUD"] == "-user:flag"

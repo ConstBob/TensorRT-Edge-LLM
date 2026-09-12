@@ -239,7 +239,7 @@ class _FakeRuntime:
         return True
 
     def has_draft_model(self):
-        return len(self.args) == 9
+        return len(self.args) == 10
 
 
 class _FakeContextCacheConfig:
@@ -298,3 +298,65 @@ def test_llm_pairs_cached_bundle_with_resolved_checkpoints(
     assert llm._runtime.args[-4:-2] == (str(base), str(draft))
     assert not llm._runtime.args[-2].enabled
     assert llm._runtime.args[-1] == 0
+
+
+def test_muse_glimmer_dflash2_server_loads_paired_runtime(
+        tmp_path, monkeypatch):
+    base = _checkpoint(tmp_path / "Muse-Glimmer-NVFP4", "muse_glimmer")
+    draft = _checkpoint(tmp_path / "Muse-Glimmer-30B-DFlash2", "qwen3")
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "spec_base.engine").touch()
+    (bundle / "spec_draft.engine").touch()
+    base_config = _engine_config(model="muse_glimmer_text", spec="dflash")
+    base_config["builder_config"]["max_verify_tree_size"] = 16
+    _write_json(bundle / "base_config.json", base_config)
+    _write_json(
+        bundle / "draft_config.json", {
+            "engine_role": "draft",
+            "builder_config": {
+                "max_draft_tree_size": 16
+            },
+            "dflash_config": {
+                "version": 2,
+                "block_size": 16,
+                "supports_probabilistic_sampling": True,
+            },
+            "checkpoint_identity": {
+                "version": 1,
+                "sources": {}
+            },
+        })
+    prepared_options = []
+
+    def prepare_model(_model, _cache_dir, options, **_kwargs):
+        prepared_options.append(options)
+        return PreparedModel(str(bundle), str(base), str(draft))
+
+    monkeypatch.setattr(
+        "experimental.server.runtime.engine_build.prepare_model",
+        prepare_model,
+    )
+    monkeypatch.setattr("experimental.server.runtime.engine._import_runtime",
+                        lambda: _FakeBindings)
+
+    llm = LLM(
+        model="RadixArk/Muse-Glimmer-NVFP4",
+        cache_dir=str(tmp_path / "cache"),
+        max_image_tokens=4096,
+        max_image_tokens_per_image=4096,
+        speculative_config={
+            "method": "dflash",
+            "model": "incoai/Muse-Glimmer-30B-DFlash2",
+        },
+    )
+
+    assert prepared_options[0].spec_type == "dflash"
+    assert prepared_options[0].draft_model_dir == \
+        "incoai/Muse-Glimmer-30B-DFlash2"
+    assert prepared_options[0].max_image_tokens == 4096
+    assert prepared_options[0].max_image_tokens_per_image == 4096
+    assert llm.has_draft_model
+    assert llm._runtime.args[3:6] == (1, 1, 16)
+    assert llm._runtime.args[-4:-2] == (str(base), str(draft))
+    assert llm._runtime.args[-1] == 16

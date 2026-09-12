@@ -527,7 +527,8 @@ class AutoModel:
                 dflash_draft_dir)
             config = make_dflash_draft_config(
                 dflash_draft_dir,
-                _default_attention_scale_for_model_dir(dflash_draft_dir))
+                _default_attention_scale_for_model_dir(dflash_draft_dir),
+                target_vocab_size=base_config.vocab_size)
             if base_config.model_type == "nemotron_h":
                 # Nemotron-3.5 target-hidden stays far inside FP16; run fc at the
                 # checkpoint's native NVFP4 rather than the dense-FP16 + FP32
@@ -541,7 +542,9 @@ class AutoModel:
             model_class = DFlashDraftModel
             model_dir = dflash_draft_dir
             if key_remap is None:
-                key_remap = _dflash_key_remap
+                key_remap = (_muse_glimmer_dflash_key_remap
+                             if config.model_type == "muse_glimmer_assistant"
+                             else _dflash_key_remap)
         elif variant == "dflash2_draft":
             if dflash_draft_dir is None:
                 raise ValueError(
@@ -639,6 +642,10 @@ class AutoModel:
                 if (key_remap is None
                         and config.model_type == "hunyuan_v1_dense"):
                     key_remap = _hunyuan_key_remap
+                if (key_remap is None
+                        and str(config.model_type).startswith("muse_glimmer")):
+                    from .models.muse_glimmer import MUSE_GLIMMER_KEY_REMAP
+                    key_remap = MUSE_GLIMMER_KEY_REMAP
 
         # 4-layer numeric validation: truncate to the first N decoder
         # layers.  The whole pipeline is config-driven (the Transformer builds
@@ -1096,9 +1103,13 @@ def _load_dflash_quantized_lm_head(model: nn.Module, lm_head: nn.Module,
     optional_tensors = {"g_idx", "int4_act_perm", "pre_quant_scale"}
 
     for target_name in target_state:
-        source_key = next((f"{prefix}.{target_name}"
+        source_names = [target_name]
+        if target_name == "weight_scale":
+            source_names.append("weight_scale_inv")
+        source_key = next((f"{prefix}.{source_name}"
                            for prefix in source_prefixes
-                           if f"{prefix}.{target_name}" in shard_map), None)
+                           for source_name in source_names
+                           if f"{prefix}.{source_name}" in shard_map), None)
         if source_key is None:
             if target_name not in optional_tensors:
                 missing.append(target_name)
@@ -1179,6 +1190,15 @@ def _dflash_key_remap(key: str) -> "str | None":
     if "rotary_emb" in key:
         return None
     return key
+
+
+def _muse_glimmer_dflash_key_remap(key: str) -> "str | None":
+    """Map the Muse-Glimmer assistant fusion projector onto DFlash names."""
+    if key.startswith("encoder.fc."):
+        return key.removeprefix("encoder.")
+    if key.startswith("encoder.output_norm_enc."):
+        return "hidden_norm." + key.removeprefix("encoder.output_norm_enc.")
+    return _dflash_key_remap(key)
 
 
 def _dspark_key_remap(key: str) -> "str | None":

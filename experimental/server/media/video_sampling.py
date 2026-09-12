@@ -141,6 +141,31 @@ def sample_indices(total_frames: int, nframes: int) -> List[int]:
     ]
 
 
+def muse_nframes(total_frames: int,
+                 video_fps: float,
+                 target_fps: float = DEFAULT_FPS,
+                 nframes: Optional[int] = None,
+                 max_frames: Optional[int] = None,
+                 frame_factor: int = FRAME_FACTOR) -> int:
+    """Muse-Glimmer frame count: provider FPS sampling, capped at 96 frames
+    by default and rounded down to complete temporal groups."""
+    cap = 96 if nframes is None else int(nframes)
+    if max_frames is not None:
+        cap = min(cap, int(max_frames))
+    count = min(int(total_frames * target_fps / video_fps), cap, total_frames)
+    count = max(frame_factor, count // frame_factor * frame_factor)
+    return min(count, total_frames)
+
+
+def sample_indices_muse(total_frames: int, nframes: int) -> List[int]:
+    """Integer ``linspace`` used by MuseGlimmerVideoProcessor."""
+    if nframes <= 0 or total_frames <= 0:
+        return []
+    if nframes == 1:
+        return [0]
+    return [i * (total_frames - 1) // (nframes - 1) for i in range(nframes)]
+
+
 def sample_indices_internvl(total_frames: int,
                             nframes: int,
                             initial_shift=True) -> List[int]:
@@ -317,8 +342,11 @@ def _check_aspect_ratio(width: int, height: int) -> None:
             "supported maximum of 200")
 
 
-def _estimate_qwen2d_frame_tokens(width: int, height: int,
-                                  limits: dict) -> int:
+def _estimate_qwen2d_frame_tokens(width: int,
+                                  height: int,
+                                  limits: dict,
+                                  *,
+                                  is_video: bool = False) -> int:
     """Per-frame visual tokens after the C++ 2D smart_resize (HF parity:
     round-to-factor, then min-pixels upscale or max-pixels downscale)."""
     patch = limits.get("patch_size", 0)
@@ -326,6 +354,29 @@ def _estimate_qwen2d_frame_tokens(width: int, height: int,
     if patch <= 0 or merge <= 0 or width <= 0 or height <= 0:
         return 0
     factor = patch * merge
+    if limits.get("model_type") == "muse_glimmer_vision":
+        checkpoint_cap = (limits.get("max_video_frame_tokens", 0) if is_video
+                          else limits.get("max_image_tokens_checkpoint", 0))
+        profile_cap = limits.get("max_image_tokens_per_image", 0)
+        caps = [x for x in (checkpoint_cap, profile_cap) if x > 0]
+        if not caps:
+            return 0
+        max_tokens = min(caps)
+        ideal_h = height / factor
+        ideal_w = width / factor
+        ratio = ideal_w / ideal_h
+        if ideal_h * ideal_w > max_tokens:
+            ideal_h = math.sqrt(max_tokens / ratio)
+            ideal_w = ideal_h * ratio
+        candidates = {(math.floor(ideal_h), math.floor(ideal_w)),
+                      (math.floor(ideal_h), math.ceil(ideal_w)),
+                      (math.ceil(ideal_h), math.floor(ideal_w)),
+                      (math.ceil(ideal_h), math.ceil(ideal_w))}
+        candidates = [(h, w) for h, w in candidates
+                      if h >= 1 and w >= 1 and h * w <= max_tokens]
+        h, w = min(candidates,
+                   key=lambda grid: abs(grid[0] / grid[1] - height / width))
+        return h * w
     # C++ reuses the global min_image_tokens as the per-image minimum.
     min_px = limits.get("min_image_tokens", 0) * factor * factor
     max_px = limits.get("max_image_tokens_per_image", 0) * factor * factor
@@ -615,7 +666,10 @@ def clamp_nframes_to_profile(
                 f"video needs ~{est} visual tokens but only {cap} remain in "
                 "the engine budget; reduce other media in the request")
         return n, est
-    frame_tokens = _estimate_qwen2d_frame_tokens(width, height, limits)
+    frame_tokens = _estimate_qwen2d_frame_tokens(width,
+                                                 height,
+                                                 limits,
+                                                 is_video=True)
     if frame_tokens <= 0:
         return nframes, 0
     tps = max(1, limits.get("temporal_patch_size", 2))
@@ -752,6 +806,14 @@ def sample_video(source: str,
                                         target_fps=target_fps,
                                         nframes=nframes,
                                         max_frames=max_frames))
+        elif family == "muse":
+            n = muse_nframes(total,
+                             video_fps,
+                             target_fps=target_fps,
+                             nframes=nframes,
+                             max_frames=max_frames,
+                             frame_factor=max(1, (frame_limits or {}).get(
+                                 "temporal_patch_size", 2)))
         else:
             n = smart_nframes(total,
                               video_fps,
@@ -783,6 +845,8 @@ def sample_video(source: str,
             wanted = set(sample_indices_internvl(total, n))
         elif family == "nemotron":
             wanted = set(sample_indices_nemotron(total, video_fps, nframes=n))
+        elif family == "muse":
+            wanted = set(sample_indices_muse(total, n))
         else:
             wanted = set(sample_indices(total, n))
         # Charge planned decode work by the distinct sampled positions (a
@@ -1051,8 +1115,10 @@ def load_video_buffer(rt_module,
                 # Estimate the post-resize per-frame tokens like the clip
                 # path does (the C++ smart resize enforces maxRatio too).
                 _check_aspect_ratio(width, height)
-                frame_tokens = _estimate_qwen2d_frame_tokens(
-                    width, height, limits)
+                frame_tokens = _estimate_qwen2d_frame_tokens(width,
+                                                             height,
+                                                             limits,
+                                                             is_video=True)
                 tps = max(1, limits.get("temporal_patch_size", 2))
                 _check_cu_budget(len(frame_paths), family, limits, cu_budget)
                 if frame_tokens > 0:
@@ -1088,7 +1154,7 @@ def load_video_buffer(rt_module,
         return buffer, est, frames_px, cu_used
 
     nframes = item.get("nframes")
-    if nframes is not None and "fps" in item:
+    if family != "muse" and nframes is not None and "fps" in item:
         # qwen_vl_utils rejects requests that pin both; a silent winner would
         # diverge from the HF sampling contract.
         raise ValueError("provide either fps or nframes for a video, not both")

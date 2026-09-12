@@ -824,6 +824,8 @@ class LLM:
         max_input_len: int = _DEFAULT_MAX_INPUT_LEN,
         max_batch_size: int = _DEFAULT_MAX_BATCH_SIZE,
         max_kv_cache_capacity: int = _DEFAULT_MAX_KV_CACHE_CAPACITY,
+        max_image_tokens: Optional[int] = None,
+        max_image_tokens_per_image: Optional[int] = None,
         draft_top_k: Optional[int] = None,
         draft_step: Optional[int] = None,
         verify_tree_size: Optional[int] = None,
@@ -881,6 +883,8 @@ class LLM:
             max_input_len=max_input_len,
             max_batch_size=max_batch_size,
             max_kv_cache_capacity=max_kv_cache_capacity,
+            max_image_tokens=max_image_tokens,
+            max_image_tokens_per_image=max_image_tokens_per_image,
         )
         spec_method = options.spec_type
         num_speculative_tokens = None
@@ -1117,6 +1121,8 @@ class LLM:
             os.path.join(root, "visual", "visual.engine"))
         if "internvl" in model_type and has_visual:
             family = "internvl"
+        elif model_type == "muse_glimmer_vision" and has_visual:
+            family = "muse"
         elif ("nemotron" in model_type and not is_audio_type and has_visual
               and config.get("supports_video", True)):
             family = "nemotron"
@@ -1130,7 +1136,7 @@ class LLM:
                 f"video input is not supported for model_type={model_type!r}"
                 " in this runtime bundle; supported families: Qwen-VL "
                 "(qwen2_vl/qwen2_5_vl/qwen3_vl/qwen3_5/qwen3_omni), InternVL, "
-                "and Nemotron-Omni")
+                "Nemotron-Omni, and Muse-Glimmer")
         self._video_family_cache = family
         return family
 
@@ -1154,6 +1160,15 @@ class LLM:
             except (OSError, ValueError):
                 pre = {}
         pre = pre.get("image_processor", pre)
+        processor: dict = {}
+        processor_path = os.path.join(root, "visual", "processor_config.json")
+        if os.path.isfile(processor_path):
+            try:
+                with open(processor_path) as f:
+                    processor = json.load(f)
+            except (OSError, ValueError):
+                processor = {}
+        video_processor = processor.get("video_processor") or {}
         if builder.get("max_image_tokens"):
             limits = {
                 "model_type":
@@ -1172,6 +1187,10 @@ class LLM:
                 int(pre.get("merge_size", 0)),
                 "temporal_patch_size":
                 int(pre.get("temporal_patch_size", 2)),
+                "max_image_tokens_checkpoint":
+                int(pre.get("max_image_tokens", 0)),
+                "max_video_frame_tokens":
+                int(video_processor.get("max_video_frame_tokens", 0)),
                 # Nemotron-Omni video geometry (top-level visual config.json).
                 "video_pruning_rate":
                 float(cfg.get("video_pruning_rate", 0.0)),
@@ -1251,6 +1270,7 @@ class LLM:
             self._rt, tool_config)
         request.parallel_tool_calls = tool_config.parallel_tool_calls
         request.disable_spec_decode = params.disable_spec_decode
+        request.skip_special_tokens = params.skip_special_tokens
         request.num_logprobs = params.num_logprobs
         _set_context_cache_request_policies(self._rt, request, params)
         request.context_cache_replay_tail_length = replay_tail_length

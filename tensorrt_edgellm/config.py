@@ -149,6 +149,11 @@ def _is_gemma4_assistant_model_type(model_type: str) -> bool:
     return str(model_type) in ("gemma4_assistant", "gemma4_unified_assistant")
 
 
+def _is_muse_glimmer_model_type(model_type: str) -> bool:
+    """Return whether a model type belongs to Muse-Glimmer."""
+    return str(model_type) in ("muse_glimmer", "muse_glimmer_text")
+
+
 def _check_num_attention_heads(num_attn_heads: int) -> None:
     if num_attn_heads <= 0:
         raise ValueError("num_attention_heads must be a positive integer, "
@@ -256,18 +261,19 @@ def _get_dual_rope_configs(llm_dict: Dict[str, Any]) -> dict[str, dict]:
 
 def _parse_attention_layer_types(config: dict, num_hidden_layers: int,
                                  model_type: str) -> List[str]:
-    """Preserve per-layer sliding/full attention labels for Gemma4 routing."""
+    """Preserve per-layer sliding/full attention labels when required."""
     raw = config.get("layer_types")
-    if not _is_gemma4_model_type(model_type):
+    if not (_is_gemma4_model_type(model_type)
+            or _is_muse_glimmer_model_type(model_type)):
         return []
 
     if not isinstance(raw, list):
         raise ValueError(
-            "Gemma4 config requires layer_types with one sliding/full attention entry per layer."
-        )
+            f"{model_type} requires layer_types with one sliding/full "
+            "attention entry per layer.")
     if len(raw) != num_hidden_layers:
         raise ValueError(
-            "Gemma4 layer_types length must match num_hidden_layers: "
+            f"{model_type} layer_types length must match num_hidden_layers: "
             f"{len(raw)} vs {num_hidden_layers}.")
 
     attention_layer_types: List[str] = []
@@ -275,7 +281,8 @@ def _parse_attention_layer_types(config: dict, num_hidden_layers: int,
         layer_type = str(layer_type)
         if layer_type not in _VALID_ATTENTION_LAYER_TYPES:
             raise ValueError(
-                "Gemma4 layer_types entries must be sliding_attention or full_attention; "
+                f"{model_type} layer_types entries must be sliding_attention "
+                "or full_attention; "
                 f"got {layer_type!r} at layer {layer_idx}.")
         attention_layer_types.append(layer_type)
     return attention_layer_types
@@ -685,6 +692,11 @@ class ModelConfig:
     embedding_scale: float = 1.0
     # Final logit softcapping: tanh(logits/cap)*cap.  None = disabled.
     final_logit_softcapping: Optional[float] = None
+    # Muse-Glimmer: pre-tanh logit multiplier (applied before the softcap).
+    output_multiplier: float = 1.0
+    # Muse-Glimmer: eps for the post-attention / post-FFN sandwich norms
+    # (None -> fall back to rms_norm_eps).
+    post_norm_eps: Optional[float] = None
     # Weight dtype in the checkpoint
     torch_dtype: str = "bfloat16"
     # When True, embed_tokens and lm_head share the same weight tensor
@@ -1102,7 +1114,12 @@ class ModelConfig:
         submodel_prefix = ""
         if root.get("thinker_config") is not None and llm_dict is not root:
             submodel_prefix = "thinker."
-        quant = _parse_quant(model_dir, llm_dict, submodel_prefix)
+        quant_dict = llm_dict
+        if ("quantization_config" not in quant_dict
+                and root.get("quantization_config") is not None):
+            quant_dict = dict(llm_dict)
+            quant_dict["quantization_config"] = root["quantization_config"]
+        quant = _parse_quant(model_dir, quant_dict, submodel_prefix)
         raw_layer_types = _parse_raw_layer_types(llm_dict)
         layer_types = _parse_layer_types(llm_dict)
         attention_layer_types = _parse_attention_layer_types(
@@ -1130,6 +1147,27 @@ class ModelConfig:
             llm_dict, head_dim, default_attention_scale_value)
         embedding_scale = _get_embedding_scale(llm_dict, model_type,
                                                hidden_size)
+
+        if _is_muse_glimmer_model_type(model_type):
+            qk_scale_factor = llm_dict.get("qk_scale_factor")
+            if qk_scale_factor is not None:
+                attention_scaling = float(qk_scale_factor) / math.sqrt(
+                    head_dim)
+            # Full-attention layers use NoPE; sliding layers use regular RoPE.
+            if not dual_rope_configs:
+                _mp = int(llm_dict.get("max_position_embeddings", 4096))
+                _sliding = {
+                    "rope_theta": _get_rope_theta(llm_dict),
+                    "rope_scaling": None,
+                    "partial_rotary_factor": 1.0,
+                    "max_position_embeddings": _mp,
+                }
+                _full = dict(_sliding)
+                _full["rope_scaling"] = {"rope_type": "nope", "type": "nope"}
+                dual_rope_configs = {
+                    "sliding_rope_config": _sliding,
+                    "full_rope_config": _full,
+                }
 
         generation_config_path = os.path.join(model_dir,
                                               "generation_config.json")
@@ -1294,6 +1332,10 @@ class ModelConfig:
             embedding_scale=embedding_scale,
             final_logit_softcapping=llm_dict.get("final_logit_softcapping",
                                                  None),
+            output_multiplier=float(llm_dict.get("output_multiplier", 1.0)),
+            post_norm_eps=(float(llm_dict["post_norm_eps"])
+                           if llm_dict.get("post_norm_eps") is not None else
+                           None),
             torch_dtype=llm_dict.get("torch_dtype",
                                      llm_dict.get("dtype", "bfloat16")),
             tie_word_embeddings=llm_dict.get("tie_word_embeddings", False),
@@ -1639,7 +1681,8 @@ def make_dspark_draft_config(
 
 def make_dflash_draft_config(
         draft_dir: str,
-        default_attention_scale: Callable[[int], float]) -> ModelConfig:
+        default_attention_scale: Callable[[int], float],
+        target_vocab_size: Optional[int] = None) -> ModelConfig:
     """Build a DFlash draft ModelConfig from the draft checkpoint directory.
 
     Now quantization-aware: if the draft directory contains
@@ -1690,6 +1733,10 @@ def make_dflash_draft_config(
     default_attention_scale_value = float(default_attention_scale(head_dim))
     default_mask_token_id = 4 if _is_gemma4_model_type(model_type) else 248070
 
+    vocab_size = llm_dict.get("vocab_size", target_vocab_size)
+    if vocab_size is None:
+        raise ValueError("DFlash draft config must provide vocab_size")
+
     return ModelConfig(
         model_type=model_type,
         hidden_size=llm_dict["hidden_size"],
@@ -1701,7 +1748,7 @@ def make_dflash_draft_config(
         global_head_dim=global_head_dim,
         num_global_key_value_heads=num_global_kv_heads,
         rms_norm_eps=llm_dict.get("rms_norm_eps", 1e-6),
-        vocab_size=llm_dict["vocab_size"],
+        vocab_size=int(vocab_size),
         rope_theta=_get_rope_theta(llm_dict),
         max_position_embeddings=llm_dict.get("max_position_embeddings", 4096),
         default_attention_scale=default_attention_scale_value,
@@ -2491,6 +2538,24 @@ def _parse_quant(model_dir: str,
     # Embedded block with ``quant_algo`` (export tool formats)
     if "quant_algo" in qc:
         algo = (qc.get("quant_algo") or "").upper()
+        if algo == "MIXED_PRECISION":
+            dominant, group_size, layer_overrides, layer_group_sizes = _parse_mixed_precision(
+                qc.get("quantized_layers", {}),
+                config.get("model_type") or "")
+            return QuantConfig(
+                quant_type=dominant,
+                group_size=group_size,
+                kv_cache_quant=_detect_llm_kv_cache_fp8(model_dir),
+                visual_mha_quant=_detect_visual_mha_fp8(model_dir),
+                excluded=_effective_excluded_modules(
+                    model_dir,
+                    _scope_exclusions(
+                        list(qc.get("exclude_modules", qc.get("ignore", []))),
+                        submodel_prefix)),
+                layer_overrides=layer_overrides,
+                layer_group_sizes=layer_group_sizes,
+                is_mixed_precision=True,
+            )
         if "W4A16" in algo and "AWQ" in algo:
             return QuantConfig(
                 quant_type=QUANT_INT4_AWQ_MODELOPT,
@@ -2632,25 +2697,34 @@ def _parse_mixed_precision(
     ``layer_overrides``.
     """
     from collections import Counter
-    algo_count: Counter = Counter()
-    algo_group_size: dict = {}
-    for layer_cfg in quantized_layers.values():
-        algo = layer_cfg.get("quant_algo", "").upper()
-        algo_count[algo] += 1
-
-        if algo not in algo_group_size:
-            algo_group_size[algo] = int(layer_cfg.get("group_size", 1))
-    if not algo_count:
-        return QUANT_FP16, 1, {}, {}
 
     def _mixed_quant_type(algo: str) -> str:
-        # Nemotron-H W4A16 layers require the Marlin path; other model families
-        # use their established NVFP4 export paths.
         qt = _algo_to_quant_type(algo)
         if (qt == QUANT_NVFP4 and "W4A16" in algo.upper()
                 and model_type.lower().startswith("nemotron_h")):
             return QUANT_NVFP4_A16
         return qt
+
+    def _group_size(layer_config: dict, quant_type: str) -> int:
+        configured = int(layer_config.get("group_size", 1))
+        if configured != 1:
+            return configured
+        if quant_type == QUANT_MXFP8:
+            return 32
+        if quant_type in (QUANT_NVFP4, QUANT_NVFP4_A16):
+            return 16
+        return configured
+
+    algo_count: Counter = Counter()
+    algo_group_size: dict = {}
+    for layer_cfg in quantized_layers.values():
+        algo = layer_cfg.get("quant_algo", "").upper()
+        algo_count[algo] += 1
+        if algo not in algo_group_size:
+            algo_group_size[algo] = _group_size(layer_cfg,
+                                                _mixed_quant_type(algo))
+    if not algo_count:
+        return QUANT_FP16, 1, {}, {}
 
     dominant_algo = algo_count.most_common(1)[0][0]
     dominant_type = _mixed_quant_type(dominant_algo)
@@ -2664,8 +2738,10 @@ def _parse_mixed_precision(
         algo = layer_cfg.get("quant_algo", "").upper()
         short_name = _normalize_module_name(name)
         quant_type = _mixed_quant_type(algo)
-        group_size = int(layer_cfg.get("group_size", 1))
-
+        group_size = _group_size(layer_cfg, quant_type)
+        if (_is_muse_glimmer_model_type(model_type)
+                and short_name.endswith(".self_attn.output_gate_proj")):
+            short_name = short_name[:-len(".output_gate_proj")] + ".gate_proj"
         if short_name.endswith(".self_attn.qkv_proj"):
             prefix = short_name[:-len("qkv_proj")]
             module_names = tuple(f"{prefix}{proj}"

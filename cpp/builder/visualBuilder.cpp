@@ -278,7 +278,8 @@ bool VisualBuilder::setupVisualOptimizationProfile(
     case multimodal::ModelType::QWEN3_VL:
     case multimodal::ModelType::QWEN3_5:
     case multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER:
-    case multimodal::ModelType::COSMOS3_EDGE: result = setupQwenViTProfile(*visualProfile, network); break;
+    case multimodal::ModelType::COSMOS3_EDGE:
+    case multimodal::ModelType::MUSE_GLIMMER: result = setupQwenViTProfile(*visualProfile, network); break;
 
     case multimodal::ModelType::INTERNVL:
     case multimodal::ModelType::PHI4MM: result = setupInternPhi4ViTProfile(*visualProfile); break;
@@ -423,6 +424,37 @@ bool VisualBuilder::setupQwenViTProfile(
         || mModelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER
         || mModelType == multimodal::ModelType::COSMOS3_EDGE)
     {
+        result &= setOptimizationProfile(&profile, binding_names::kFastPosEmbIdx, createDims({4, minHW}),
+            createDims({4, optHW}), createDims({4, maxHW}));
+        result &= setOptimizationProfile(&profile, binding_names::kFastPosEmbWeight, createDims({4, minHW}),
+            createDims({4, optHW}), createDims({4, maxHW}));
+    }
+    else if (mModelType == multimodal::ModelType::MUSE_GLIMMER)
+    {
+        // Muse window indices span unmerged visual tokens.
+        result &= setOptimizationProfile(
+            &profile, binding_names::kCuWindowSeqlens, createDims({2}), createDims({optHW}), createDims({maxHW}));
+        if (mBuilderConfig.useTrtNativeVitAttn)
+        {
+            bool hasKvLengthsWindow = false;
+            for (int32_t i = 0; i < network.getNbInputs(); ++i)
+            {
+                if (strcmp(network.getInput(i)->getName(), binding_names::kKvLengthsWindow) == 0)
+                {
+                    hasKvLengthsWindow = true;
+                    break;
+                }
+            }
+            if (hasKvLengthsWindow)
+            {
+                result &= setOptimizationProfile(&profile, binding_names::kKvLengthsWindow, createDims({2}),
+                    createDims({optHW}), createDims({maxHW}));
+            }
+        }
+        result &= setOptimizationProfile(
+            &profile, binding_names::kWindowIndex, createDims({minHW}), createDims({optHW}), createDims({maxHW}));
+        result &= setOptimizationProfile(&profile, binding_names::kReverseWindowIndex, createDims({minHW}),
+            createDims({optHW}), createDims({maxHW}));
         result &= setOptimizationProfile(&profile, binding_names::kFastPosEmbIdx, createDims({4, minHW}),
             createDims({4, optHW}), createDims({4, maxHW}));
         result &= setOptimizationProfile(&profile, binding_names::kFastPosEmbWeight, createDims({4, minHW}),

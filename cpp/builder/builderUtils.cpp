@@ -61,8 +61,8 @@ std::string applyCompileWorkarounds([[maybe_unused]] int32_t maxBatchSize)
     appendLunowudFlag(lunowudFlags, "-peep:match_dual_gemm=off");
 #endif
 #if NV_TENSORRT_MAJOR >= 11
-    // TRT dual-GEMM fusion miscompiles NVFP4 graphs; no known-good 11.x on sm12x
-    if (getSMVersion() / 10 == 12)
+    // Disable a broken TensorRT 11 dual-GEMM fusion on Blackwell.
+    if (getSMVersion() >= 100)
     {
         appendLunowudFlag(lunowudFlags, "-peep:match_dual_gemm=off");
     }

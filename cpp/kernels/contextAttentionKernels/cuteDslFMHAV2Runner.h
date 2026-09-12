@@ -172,6 +172,7 @@ private:
     static detail::LazyKernelModule<fmha_v2_vit_d64_Kernel_Module_t> sViT_d64;
     static detail::LazyKernelModule<fmha_v2_vit_d72_Kernel_Module_t> sViT_d72;
     static detail::LazyKernelModule<fmha_v2_vit_d80_Kernel_Module_t> sViT_d80;
+    static detail::LazyKernelModule<fmha_v2_vit_d96_Kernel_Module_t> sViT_d96;
     static detail::LazyKernelModule<fmha_v2_vit_d128_Kernel_Module_t> sViT_d128;
 #endif // defined(CUTE_DSL_FMHA_ENABLED)
 };

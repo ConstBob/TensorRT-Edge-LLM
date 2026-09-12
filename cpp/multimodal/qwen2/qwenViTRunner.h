@@ -187,6 +187,20 @@ protected:
     //! \return false on failure.
     virtual bool bindExtraInputShapes();
 
+    //! \brief Spatial merge size used when packing raw pixels into ViT input patches (the token ORDER the
+    //!        engine consumes). Qwen ViTs pack in 2x2-merge-grouped order (== mergeSize); models whose encoder
+    //!        runs at spatial_merge_size == 1 (raster token order, e.g. Muse-Glimmer) override this to 1.
+    virtual int64_t vitInputMergeSize() const;
+
+    //! \brief Whether flattened patch elements use temporal-major rather than channel-major order.
+    virtual bool vitPatchTemporalFirst() const;
+
+    //! \brief Fill mRotaryPosEmb for the given spans. Base = Qwen 2D rotary (concat(freq_h, freq_w) over
+    //!        2x2-merge-grouped tokens, no position offset). Subclasses with a different per-token rotary layout
+    //!        (e.g. Muse-Glimmer's concat(freq_w, freq_h) + 1 raster layout) override this. Called only when
+    //!        mHasRotaryPosEmb; mRotaryPosEmb is already reshaped to [totalSeqLength, vitPosEmbDim].
+    virtual void buildRotaryPosEmb(std::vector<VisionSpan> const& spans, cudaStream_t stream);
+
     //! \brief Append this image buffer's vision spans. \see VisionSpan.
     //! \return {totalSeqLen, totalGridT} of the appended spans (Σ gridT*gridH*gridW, Σ gridT) for formatPatch.
     virtual std::tuple<int64_t, int64_t> computeVisionSpans(

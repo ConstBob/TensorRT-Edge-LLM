@@ -1000,6 +1000,17 @@ KERNEL_VARIANTS = [
         ],
     ),
     KernelVariant(
+        name="fmha_v2_vit_d96",
+        group="fmha",
+        supported_sms=[80, 86, 87, 89, 90, 100, 101, 110, 120, 121],
+        script="fmha_v2_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "96",
+            "--m_block_size", "128", "--n_block_size", "64", "--num_threads", "128",
+            "--dtype", "Float16", "--fmha_v2_vit", "--skip_rescale", "--export_only",
+        ],
+    ),
+    KernelVariant(
         name="fmha_v2_vit_d128",
         group="fmha",
         supported_sms=[80, 86, 87, 89, 90, 100, 101, 110, 120, 121],

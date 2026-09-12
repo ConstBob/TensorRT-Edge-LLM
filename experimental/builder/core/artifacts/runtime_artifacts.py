@@ -198,7 +198,9 @@ def write_runtime_artifacts(cfg: DeviceConfig,
         else:
             writes_embedding = getattr(weight_conversion,
                                        "writes_runtime_embedding", None)
-            if externalizes_embedding(args, weight_conversion):
+            # NVFP4 embeddings are materialized as FP16 runtime artifacts.
+            if (externalizes_embedding(args, weight_conversion)
+                    and not weights.is_nvfp4("model.embed_tokens")):
                 logger.info("Embedding stays in the checkpoint; the runtime "
                             "loads it through its checkpoint binding")
             elif writes_embedding is None or writes_embedding(args):

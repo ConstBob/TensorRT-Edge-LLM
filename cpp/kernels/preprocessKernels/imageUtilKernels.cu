@@ -39,7 +39,7 @@ namespace kernel
 
 __global__ void transposeToPatchQwenKernel(half const* originalImage, half* inputPatches, int64_t const T,
     int64_t const H, int64_t const W, int64_t const C, int64_t const temporalPatchSize, int64_t const patchSize,
-    int64_t const mergeSize, int64_t const inputOffset)
+    int64_t const mergeSize, bool const temporalFirst, int64_t const inputOffset)
 {
     // This is a naive implementation of 9D transpose.
     // Each CTA get assigned 256 threads. Each thread processes one element
@@ -76,8 +76,11 @@ __global__ void transposeToPatchQwenKernel(half const* originalImage, half* inpu
     auto const mergeW = seqIdx % mergeSize;
 
     // Calculate coordinates within the patch
-    auto const cIdx = elemIdx / (temporalPatchSize * patchSize * patchSize);
-    auto const tPatchIdx = (elemIdx % (temporalPatchSize * patchSize * patchSize)) / (patchSize * patchSize);
+    auto const cIdx = temporalFirst ? (elemIdx % (C * patchSize * patchSize)) / (patchSize * patchSize)
+                                    : elemIdx / (temporalPatchSize * patchSize * patchSize);
+    auto const tPatchIdx = temporalFirst
+        ? elemIdx / (C * patchSize * patchSize)
+        : (elemIdx % (temporalPatchSize * patchSize * patchSize)) / (patchSize * patchSize);
     auto const patchH = (elemIdx % (patchSize * patchSize)) / patchSize;
     auto const patchW = elemIdx % patchSize;
 
@@ -175,7 +178,8 @@ void transposeToPatchGemma4ViT(rt::Tensor const& originalImage, rt::Tensor& inpu
 }
 
 void transposeToPatchQwenViT(rt::Tensor const& originalImage, rt::Tensor& inputPatches, int64_t const inputOffset,
-    int64_t const temporalPatchSize, int64_t const patchSize, int64_t const mergeSize, cudaStream_t stream)
+    int64_t const temporalPatchSize, int64_t const patchSize, int64_t const mergeSize, bool const temporalFirst,
+    cudaStream_t stream)
 {
     check::check(
         originalImage.getDeviceType() == rt::DeviceType::kGPU && inputPatches.getDeviceType() == rt::DeviceType::kGPU,
@@ -211,7 +215,8 @@ void transposeToPatchQwenViT(rt::Tensor const& originalImage, rt::Tensor& inputP
     uint32_t const gridSize = (totalElements + blockSize - 1) / blockSize;
 
     transposeToPatchQwenKernel<<<gridSize, blockSize, 0, stream>>>(originalImage.dataPointer<half>(),
-        inputPatches.dataPointer<half>(), T, H, W, C, temporalPatchSize, patchSize, mergeSize, inputOffset);
+        inputPatches.dataPointer<half>(), T, H, W, C, temporalPatchSize, patchSize, mergeSize, temporalFirst,
+        inputOffset);
 }
 
 __global__ void transposeToPatchInternVLPhi4MMKernel(half const* originalImage, half* inputPatches,
@@ -682,6 +687,155 @@ void initFastPosEmbedQwenViT(rt::Tensor& fastPosEmbedIdx, rt::Tensor& fastPosEmb
         initFastPosEmbedQwenViTKernel<<<gridSize, blockSize, 0, stream>>>(fastPosEmbedIdx.dataPointer<int64_t>(),
             fastPosEmbedWeight.dataPointer<half>(), llmGridH, llmGridW, mergeSize, numGridPerSide, lineSpaceH,
             lineSpaceW, startIdx + t * H * W, totalSeqLength);
+    }
+}
+
+__global__ void initRotaryPosEmbMuseGlimmerKernel(float* rotaryPosEmb, int64_t const T, int64_t const H,
+    int64_t const W, int64_t const startIdx, int64_t const vitPosEmbDim, float const rotaryBaseFrequency)
+{
+    // Each thread processes one element of rotaryPosEmb: [totalSeqLength, vitPosEmbDim]
+    //     [T, (H, W), (freq_w[vitPosEmbDim/2], freq_h[vitPosEmbDim/2])]
+    // Tokens are in raster order (spatial_merge_size == 1); positions are offset by +1 (mirrors the
+    // reference position_ids.flip(-1) + 1). inv_freq[k] = 1 / theta^(2*k / vitPosEmbDim).
+    auto const tid = blockIdx.x * blockDim.x + threadIdx.x;
+    auto const totalElements = T * H * W * vitPosEmbDim;
+    if (tid >= totalElements)
+        return;
+
+    auto const half = vitPosEmbDim / 2;
+    // Raster token position within a frame (T frames repeat the same spatial pattern).
+    auto const hwIdx = (tid / vitPosEmbDim) % (H * W);
+    auto const hIdx = hwIdx / W;
+    auto const wIdx = hwIdx % W;
+
+    auto const dimIdx = tid % vitPosEmbDim;
+    bool const isH = dimIdx >= half; // first half is freq_w, second half is freq_h
+    auto const freqIdx = dimIdx % half;
+    // +1 position offset folded in here.
+    int64_t const posId = isH ? (hIdx + 1) : (wIdx + 1);
+
+    float const exponent = 2.0f * static_cast<float>(freqIdx) / static_cast<float>(vitPosEmbDim);
+    rotaryPosEmb[startIdx * vitPosEmbDim + tid] = static_cast<float>(posId) / powf(rotaryBaseFrequency, exponent);
+}
+
+void initRotaryPosEmbMuseGlimmerViT(rt::Tensor& rotaryPosEmb, std::vector<int64_t> const& gridTHW,
+    int64_t const startIdx, float const rotaryBaseFrequency, cudaStream_t stream)
+{
+    check::check(rotaryPosEmb.getDeviceType() == rt::DeviceType::kGPU,
+        "Device type shall be GPU for the rotary position embeddings tensor.");
+    check::check(rotaryPosEmb.getDataType() == DataType::kFLOAT,
+        "Data type shall be float for the rotary position embeddings tensor.");
+    check::check(rotaryPosEmb.getShape().getNumDims() == 2,
+        "Rotary position embeddings shape shall be [totalSeqLength, vitPosEmbDim].");
+
+    check::check(gridTHW.size() == 3, "gridTHW must have exactly 3 elements [T, H, W]");
+    int64_t const T = gridTHW[0];
+    int64_t const H = gridTHW[1];
+    int64_t const W = gridTHW[2];
+
+    int64_t const vitPosEmbDim = rotaryPosEmb.getShape()[1];
+    check::check(vitPosEmbDim % 2 == 0, "Muse-Glimmer vitPosEmbDim must be even (concat(freq_w, freq_h)).");
+    int64_t const totalElements = T * H * W * vitPosEmbDim;
+
+    uint32_t const blockSize = 256;
+    uint32_t const gridSize = (totalElements + blockSize - 1) / blockSize;
+
+    initRotaryPosEmbMuseGlimmerKernel<<<gridSize, blockSize, 0, stream>>>(
+        rotaryPosEmb.dataPointer<float>(), T, H, W, startIdx, vitPosEmbDim, rotaryBaseFrequency);
+}
+
+__global__ void initFastPosEmbedMuseGlimmerKernel(int64_t* fastPosEmbedIdx, half* fastPosEmbedWeight, int64_t const H,
+    int64_t const W, int64_t const numGridPerSide, float const sideOverH, float const sideOverW, int64_t const startIdx,
+    int64_t const totalSeqLength)
+{
+    // Each thread processes one raster token (spatial_merge_size == 1) and emits its 4 bilinear taps.
+    // align_corners == False sampling of the numGridPerSide x numGridPerSide learned position table with
+    // "zeros" padding: out-of-range taps are index-clamped but contribute zero weight.
+    auto const tid = blockIdx.x * blockDim.x + threadIdx.x;
+    auto const totalElements = H * W;
+    if (tid >= totalElements)
+        return;
+
+    auto const hIdx = tid / W;
+    auto const wIdx = tid % W;
+
+    // grid coordinate = (i + 0.5) * (side / dim) - 0.5
+    float const hGrid = (static_cast<float>(hIdx) + 0.5f) * sideOverH - 0.5f;
+    float const wGrid = (static_cast<float>(wIdx) + 0.5f) * sideOverW - 0.5f;
+
+    // floor() (not truncation) so negative coordinates round the correct way.
+    int64_t const hFloor = static_cast<int64_t>(floorf(hGrid));
+    int64_t const wFloor = static_cast<int64_t>(floorf(wGrid));
+    int64_t const hCeil = hFloor + 1;
+    int64_t const wCeil = wFloor + 1;
+    float const hFrac = hGrid - static_cast<float>(hFloor);
+    float const wFrac = wGrid - static_cast<float>(wFloor);
+
+    // Validity is computed on the UNclamped floor/ceil (the padding="zeros" mask).
+    bool const hFloorValid = (hFloor >= 0) && (hFloor <= numGridPerSide - 1);
+    bool const hCeilValid = (hCeil >= 0) && (hCeil <= numGridPerSide - 1);
+    bool const wFloorValid = (wFloor >= 0) && (wFloor <= numGridPerSide - 1);
+    bool const wCeilValid = (wCeil >= 0) && (wCeil <= numGridPerSide - 1);
+
+    // Indices are gathered on the clamped taps.
+    int64_t const hFloorC = std::min(std::max(hFloor, int64_t{0}), numGridPerSide - 1);
+    int64_t const hCeilC = std::min(std::max(hCeil, int64_t{0}), numGridPerSide - 1);
+    int64_t const wFloorC = std::min(std::max(wFloor, int64_t{0}), numGridPerSide - 1);
+    int64_t const wCeilC = std::min(std::max(wCeil, int64_t{0}), numGridPerSide - 1);
+
+    int64_t const baseH = hFloorC * numGridPerSide;
+    int64_t const baseHCeil = hCeilC * numGridPerSide;
+    int64_t const targetIdx = startIdx + tid;
+
+    fastPosEmbedIdx[0 * totalSeqLength + targetIdx] = baseH + wFloorC;
+    fastPosEmbedIdx[1 * totalSeqLength + targetIdx] = baseH + wCeilC;
+    fastPosEmbedIdx[2 * totalSeqLength + targetIdx] = baseHCeil + wFloorC;
+    fastPosEmbedIdx[3 * totalSeqLength + targetIdx] = baseHCeil + wCeilC;
+
+    float const w0 = (1.0f - hFrac) * (1.0f - wFrac) * ((hFloorValid && wFloorValid) ? 1.0f : 0.0f);
+    float const w1 = (1.0f - hFrac) * wFrac * ((hFloorValid && wCeilValid) ? 1.0f : 0.0f);
+    float const w2 = hFrac * (1.0f - wFrac) * ((hCeilValid && wFloorValid) ? 1.0f : 0.0f);
+    float const w3 = hFrac * wFrac * ((hCeilValid && wCeilValid) ? 1.0f : 0.0f);
+    fastPosEmbedWeight[0 * totalSeqLength + targetIdx] = __float2half(w0);
+    fastPosEmbedWeight[1 * totalSeqLength + targetIdx] = __float2half(w1);
+    fastPosEmbedWeight[2 * totalSeqLength + targetIdx] = __float2half(w2);
+    fastPosEmbedWeight[3 * totalSeqLength + targetIdx] = __float2half(w3);
+}
+
+void initFastPosEmbedMuseGlimmerViT(rt::Tensor& fastPosEmbedIdx, rt::Tensor& fastPosEmbedWeight,
+    std::vector<int64_t> const& gridTHW, int64_t const numGridPerSide, int64_t const startIdx, cudaStream_t stream)
+{
+    check::check(fastPosEmbedIdx.getDeviceType() == rt::DeviceType::kGPU
+            && fastPosEmbedWeight.getDeviceType() == rt::DeviceType::kGPU,
+        "Device type shall all be GPU for these tensors.");
+    check::check(
+        fastPosEmbedIdx.getDataType() == DataType::kINT64 && fastPosEmbedWeight.getDataType() == DataType::kHALF,
+        "Data type check failed for the input tensors.");
+    check::check(fastPosEmbedIdx.getShape().getNumDims() == 2 && fastPosEmbedIdx.getShape()[0] == 4,
+        "Fast position embeddings index shapes shall be [4, totalSeqLength].");
+    check::check(fastPosEmbedWeight.getShape().getNumDims() == 2 && fastPosEmbedWeight.getShape()[0] == 4,
+        "Fast position embeddings weight shapes shall be [4, totalSeqLength].");
+
+    int64_t const totalSeqLength = fastPosEmbedIdx.getShape()[1];
+    check::check(totalSeqLength == fastPosEmbedWeight.getShape()[1], "Total sequence length mismatch.");
+
+    check::check(gridTHW.size() == 3, "gridTHW must have exactly 3 elements [T, H, W]");
+    int64_t const T = gridTHW[0];
+    int64_t const H = gridTHW[1];
+    int64_t const W = gridTHW[2];
+    check::check(numGridPerSide > 0, "numGridPerSide must be positive.");
+    float const sideOverH = static_cast<float>(numGridPerSide) / static_cast<float>(H);
+    float const sideOverW = static_cast<float>(numGridPerSide) / static_cast<float>(W);
+
+    uint32_t const blockSize = 256;
+    uint32_t const gridSize = (H * W + blockSize - 1) / blockSize;
+
+    // Spatial interpolation repeats per temporal frame (raster order, offset by the frame's patch base).
+    for (int64_t t = 0; t < T; ++t)
+    {
+        initFastPosEmbedMuseGlimmerKernel<<<gridSize, blockSize, 0, stream>>>(fastPosEmbedIdx.dataPointer<int64_t>(),
+            fastPosEmbedWeight.dataPointer<half>(), H, W, numGridPerSide, sideOverH, sideOverW, startIdx + t * H * W,
+            totalSeqLength);
     }
 }
 

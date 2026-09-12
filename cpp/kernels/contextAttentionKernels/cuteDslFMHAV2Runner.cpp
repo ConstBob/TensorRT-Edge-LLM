@@ -66,6 +66,7 @@ detail::LazyKernelModule<fmha_v2_d512_sw_paged_ragged_Kernel_Module_t> CuteDslFM
 detail::LazyKernelModule<fmha_v2_vit_d64_Kernel_Module_t> CuteDslFMHAV2Runner::sViT_d64{};
 detail::LazyKernelModule<fmha_v2_vit_d72_Kernel_Module_t> CuteDslFMHAV2Runner::sViT_d72{};
 detail::LazyKernelModule<fmha_v2_vit_d80_Kernel_Module_t> CuteDslFMHAV2Runner::sViT_d80{};
+detail::LazyKernelModule<fmha_v2_vit_d96_Kernel_Module_t> CuteDslFMHAV2Runner::sViT_d96{};
 detail::LazyKernelModule<fmha_v2_vit_d128_Kernel_Module_t> CuteDslFMHAV2Runner::sViT_d128{};
 
 namespace
@@ -139,7 +140,7 @@ bool CuteDslFMHAV2Runner::canImplementPaged(int32_t numQHeads, int32_t numKVHead
 bool CuteDslFMHAV2Runner::canImplementViT(int32_t headSize, int32_t smVersion, nvinfer1::DataType dataType)
 {
     return isFMHAV2SM(smVersion) && dataType == nvinfer1::DataType::kHALF
-        && (headSize == 64 || headSize == 72 || headSize == 80 || headSize == 128);
+        && (headSize == 64 || headSize == 72 || headSize == 80 || headSize == 96 || headSize == 128);
 }
 
 bool CuteDslFMHAV2Runner::preflightLlm(cudaStream_t stream, int32_t slidingWindowSize)
@@ -306,6 +307,9 @@ bool CuteDslFMHAV2Runner::preflightViT(cudaStream_t stream)
     case 80:
         return preflightVariant<fmha_v2_vit_d80_Kernel_Module_Load, fmha_v2_vit_d80_Kernel_Module_Unload>(
             sViT_d80, "fmha_v2_vit_d80", stream);
+    case 96:
+        return preflightVariant<fmha_v2_vit_d96_Kernel_Module_Load, fmha_v2_vit_d96_Kernel_Module_Unload>(
+            sViT_d96, "fmha_v2_vit_d96", stream);
     case 128:
         return preflightVariant<fmha_v2_vit_d128_Kernel_Module_Load, fmha_v2_vit_d128_Kernel_Module_Unload>(
             sViT_d128, "fmha_v2_vit_d128", stream);
@@ -981,6 +985,10 @@ bool CuteDslFMHAV2Runner::run(void const* qPtr, void const* kPtr, void const* vP
     case 80:
         ret = callFmhaV2Vit<cute_dsl_fmha_v2_vit_d80_wrapper, fmha_v2_vit_d80_Kernel_Module_Load,
             fmha_v2_vit_d80_Kernel_Module_Unload>(sViT_d80, "fmha_v2_vit_d80", params);
+        break;
+    case 96:
+        ret = callFmhaV2Vit<cute_dsl_fmha_v2_vit_d96_wrapper, fmha_v2_vit_d96_Kernel_Module_Load,
+            fmha_v2_vit_d96_Kernel_Module_Unload>(sViT_d96, "fmha_v2_vit_d96", params);
         break;
     case 128:
         ret = callFmhaV2Vit<cute_dsl_fmha_v2_vit_d128_wrapper, fmha_v2_vit_d128_Kernel_Module_Load,

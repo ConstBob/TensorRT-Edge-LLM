@@ -254,6 +254,8 @@ struct LLMGenerationRequest
     bool parallelToolCalls{true};      //!< Whether the model may emit parallel calls
     // Disable speculative decoding for this request when the loaded engine contract supports vanilla fallback.
     bool disableSpecDecode{false};
+    //! Preserve model control tokens when false so an output parser can consume them.
+    bool skipSpecialTokens{true};
 
     //! Number of top log-probabilities to return per generated token (0 = disabled, max = kMaxLogprobsK).
     //! Logprobs are computed as log(softmax(logits)) and returned in LLMGenerationResponse::logprobs.

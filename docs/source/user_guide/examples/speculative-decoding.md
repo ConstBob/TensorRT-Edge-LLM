@@ -31,6 +31,7 @@ cd "$REPO_DIR"
 | EAGLE3 | `Qwen/Qwen3-1.7B` | `AngelSlim/Qwen3-1.7B_eagle3` | 6 draft steps, top-10 tree, 60 verification positions |
 | DFlash | `Qwen/Qwen3.5-4B` | `z-lab/Qwen3.5-4B-DFlash` | One block-16 draft pass |
 | DFlash2 | `Qwen/Qwen3.8-27B` | `z-lab/Qwen3.8-27B-DFlash2` | One selector-guided block-8 draft pass |
+| DFlash2 | `RadixArk/Muse-Glimmer-NVFP4` | `incoai/Muse-Glimmer-30B-DFlash2` | One selector-guided block-16 draft pass |
 | DSpark | `Qwen/Qwen3-4B` | `deepseek-ai/dspark_qwen3_4b_block7` | Seven proposed tokens, eight verification positions |
 | JetSpec | `Qwen/Qwen3-8B` | `JetSpec/jetspec-qwen3-8b` | Block-16 draft, top-7 branching tree verification |
 
@@ -248,6 +249,11 @@ The public Nemotron 3.5 pair uses the same workflow. Set `MODEL_ID` to
 and `DRAFT_ID` to
 [`nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash).
 
+Muse-Glimmer uses the same block-16 workflow. Pair
+[`meta-models/Muse-Glimmer-30B-assistant`](https://huggingface.co/meta-models/Muse-Glimmer-30B-assistant)
+with either [`meta-models/Muse-Glimmer-30B`](https://huggingface.co/meta-models/Muse-Glimmer-30B)
+or [`RadixArk/Muse-Glimmer-NVFP4`](https://huggingface.co/RadixArk/Muse-Glimmer-NVFP4).
+
 A branching Qwen3.5 DDTree requires `--dflash-tree-base` during export and a
 runtime `--specDraftTopK` greater than 1. Linear and DDTree base engines are
 not interchangeable. See
@@ -299,8 +305,8 @@ tensorrt-edgellm-export \
 ```
 
 The engine profile supports DFlash2 blocks from 2 through 16. With no runtime
-override, the Qwen3.8 checkpoint selects block 8. Pass
-`--dflashBlockSize 16` to run the same engines with block 16.
+override, each draft uses its checkpoint block size: 8 for the listed Qwen3.8
+draft and 16 for Muse-Glimmer.
 
 The experimental ONNX-less builder is an optional alternative. One command
 builds the same matched base and draft engine layout:
@@ -343,18 +349,13 @@ verification). The profile JSON also contains aggregate speculative throughput
 and acceptance length. `--profileOutputFile` without `--dumpProfile` records
 wall-clock and memory only.
 
-Serve the same prebuilt external-weight pair through the OpenAI-compatible API:
+The experimental server downloads, builds, and loads the pair in one command:
 
 ```bash
-export EDGELLM_PLUGIN_PATH=/path/to/build/libNvInfer_edgellm_plugin.so
-python3 -m experimental.server "$MODEL_ROOT/engines" \
-  --checkpoint-dir "$MODEL_DIR" \
-  --draft-checkpoint-dir "$DRAFT_DIR" \
-  --served-model-name Qwen/Qwen3.8-27B \
-  --draft-step 1 \
-  --verify-tree-size 8 \
-  --max-batch-size 8 \
-  --port 8000
+tensorrt-edgellm-serve Qwen/Qwen3.8-27B \
+  --cache-dir /data/edgellm-cache \
+  --speculative-config \
+  '{"method":"dflash","model":"z-lab/Qwen3.8-27B-DFlash2"}'
 ```
 
 The public Qwen3.8 evaluation uses `temperature=1`, `top_p=0.95`,

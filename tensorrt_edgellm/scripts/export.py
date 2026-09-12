@@ -125,6 +125,7 @@ _VLM_MODEL_TYPES = frozenset([
     "gemma4",
     "gemma4_unified",
     "alpamayo_r1",
+    "muse_glimmer",
     *_NEMOTRON_OMNI_MODEL_TYPES,
 ])
 
@@ -2049,7 +2050,7 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
             "model_type"] = "qwen3_omni_vision_encoder"
     if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_omni", "qwen3_omni_moe",
                       "qwen3_omni_next", "qwen3_5", "qwen3_5_moe",
-                      "cosmos3_edge"):
+                      "cosmos3_edge", "muse_glimmer"):
         # C++ QwenViTRunner reads these token IDs and rope_theta from config.json.
         # For Qwen3-VL the token IDs are at the root level, but vocab_size and
         # rope_theta live inside text_config.  Fall back to text_config for any
