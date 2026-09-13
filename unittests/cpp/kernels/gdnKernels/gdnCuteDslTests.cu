@@ -2438,7 +2438,7 @@ GdnPdlRunResult runGdnPdlCase(int32_t seqLen, bool enablePdl, GdnPdlExecutionMod
             CUDA_CHECK(cudaEventElapsedTime(&elapsedMs, start, stop));
             samplesMs.push_back(elapsedMs);
             std::printf(
-                "{\"schema\":\"issue925_gdn_pdl_bench.v1\",\"kind\":\"sample\",\"pdl\":\"%s\","
+                "{\"schema\":\"gdn_pdl_bench.v1\",\"kind\":\"sample\",\"pdl\":\"%s\","
                 "\"sample\":%d,\"duration_ms\":%.9f,\"n\":1,\"seq_len\":2048,\"h\":16,\"hv\":32,"
                 "\"k\":128,\"v\":128}\n",
                 pdlMode, sample, static_cast<double>(elapsedMs));
@@ -2454,7 +2454,7 @@ GdnPdlRunResult runGdnPdlCase(int32_t seqLen, bool enablePdl, GdnPdlExecutionMod
         double const medianMs
             = 0.5 * static_cast<double>(sortedMs[measuredCount / 2 - 1] + sortedMs[measuredCount / 2]);
         std::printf(
-            "{\"schema\":\"issue925_gdn_pdl_bench.v1\",\"kind\":\"summary\",\"pdl\":\"%s\","
+            "{\"schema\":\"gdn_pdl_bench.v1\",\"kind\":\"summary\",\"pdl\":\"%s\","
             "\"warmups\":%d,\"samples\":%d,\"mean_ms\":%.9f,\"median_ms\":%.9f,\"min_ms\":%.9f,"
             "\"max_ms\":%.9f,\"n\":1,\"seq_len\":2048,\"h\":16,\"hv\":32,\"k\":128,\"v\":128}\n",
             pdlMode, warmupCount, measuredCount, sumMs / measuredCount, medianMs, static_cast<double>(sortedMs.front()),
@@ -2582,15 +2582,15 @@ void expectGdnPdlResultsBitwiseEqual(GdnPdlRunResult const& pdlOff, GdnPdlRunRes
     }
 }
 
-void runIssue925PdlFocusedBenchmark(bool enablePdl)
+void runPdlFocusedBenchmark(bool enablePdl)
 {
     int32_t const smVersion = getSMVersion();
     if (!isBlackwellGeforceSM(smVersion))
     {
-        GTEST_SKIP() << "Issue #925 focused benchmark requires SM120 or SM121, got SM" << smVersion;
+        GTEST_SKIP() << "Focused GDN PDL benchmark requires SM120 or SM121, got SM" << smVersion;
     }
 #if !SUPPORTS_PROGRAMMATIC_DEPENDENT_LAUNCH
-    GTEST_SKIP() << "Issue #925 focused benchmark requires toolchain PDL support";
+    GTEST_SKIP() << "Focused GDN PDL benchmark requires toolchain PDL support";
 #endif
 
     GdnPdlRunResult const result = runGdnPdlCase(
@@ -2600,7 +2600,7 @@ void runIssue925PdlFocusedBenchmark(bool enablePdl)
 
 } // namespace
 
-TEST(GDNCuteDsl, PdlMatchesDisabledForQwenShapeAndIssueShape)
+TEST(GDNCuteDsl, PdlMatchesDisabledForShortAndLongSequences)
 {
     int32_t const smVersion = getSMVersion();
     if (!isBlackwellGeforceSM(smVersion))
@@ -2634,14 +2634,14 @@ TEST(GDNCuteDsl, PdlEagerNonDefaultStreamResetStressIsDeterministic)
     expectGdnPdlResultsBitwiseEqual(pdlOff, pdlOn);
 }
 
-TEST(GDNCuteDsl, DISABLED_Issue925PdlFocusedBenchmarkOff)
+TEST(GDNCuteDsl, DISABLED_PdlFocusedBenchmarkOff)
 {
-    runIssue925PdlFocusedBenchmark(/*enablePdl=*/false);
+    runPdlFocusedBenchmark(/*enablePdl=*/false);
 }
 
-TEST(GDNCuteDsl, DISABLED_Issue925PdlFocusedBenchmarkOn)
+TEST(GDNCuteDsl, DISABLED_PdlFocusedBenchmarkOn)
 {
-    runIssue925PdlFocusedBenchmark(/*enablePdl=*/true);
+    runPdlFocusedBenchmark(/*enablePdl=*/true);
 }
 
 #if CUDART_VERSION >= 12030

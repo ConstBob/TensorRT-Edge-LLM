@@ -1282,8 +1282,8 @@ TEST(CuteDslNvfp4MoeSm110Test, DISABLED_pdlNsightProfile)
     {
         SCOPED_TRACE(::testing::Message() << "case=" << cfg.name);
         CaseData const c = buildBitwiseStablePdlCase(cfg);
-        std::string const offLabel = "issue739/" + cfg.name + "/pdl_off";
-        std::string const onLabel = "issue739/" + cfg.name + "/pdl_on";
+        std::string const offLabel = "nvfp4_moe_pdl/" + cfg.name + "/off";
+        std::string const onLabel = "nvfp4_moe_pdl/" + cfg.name + "/on";
         RunResult const pdlOff = runCase(c, /*enablePdl=*/false, ExecutionMode::kEager, offLabel.c_str());
         RunResult const pdlOn = runCase(c, /*enablePdl=*/true, ExecutionMode::kEager, onLabel.c_str());
         ASSERT_EQ(pdlOff.status, 0);

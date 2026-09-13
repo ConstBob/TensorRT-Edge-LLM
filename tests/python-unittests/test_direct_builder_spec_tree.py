@@ -571,12 +571,12 @@ def test_dspark_modern_attention_metadata_overrides_top_level():
 
 
 def test_dspark_resolver_respects_normalized_disabled_sliding_window():
-    values = dspark_config.resolve_dspark_config(
-        {
-            "sliding_window": 1024,
-            "use_sliding_window": False,
-            "layer_types": ["full_attention"],
-        }, -1)
+    draft = {
+        "sliding_window": None,
+        "use_sliding_window": False,
+        "layer_types": ["full_attention"],
+    }
+    values = dspark_config.resolve_dspark_config(draft)
 
     assert values["sliding_window_size"] == -1
     assert values["contiguous_query_swa"] is False

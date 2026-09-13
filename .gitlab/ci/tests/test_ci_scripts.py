@@ -355,6 +355,7 @@ def test_device_init_accepts_workspace_scoped_helper(tmp_path):
     env["HOME"] = str(home)
     env["REMOTE_WORKSPACE"] = str(remote_workspace)
     env["CI_APT_SCRIPT"] = str(apt_script)
+    env["BOARD_PASSWORD"] = "test-password"
 
     run_script("device_init.sh", env=env)
 

@@ -672,7 +672,7 @@ TEST_F(GuidedDecoderTest, FillMasksMarksOnlyLegalTokens)
 }
 
 //! ---------------------------------------------------------------------------------------------
-//! Speculative verification: one mask per draft-chain node (#677).
+//! Speculative verification: one mask per draft-chain node.
 //! ---------------------------------------------------------------------------------------------
 
 //! The schema `{"a": <integer>}` walks through four distinct grammar states, so the four verify
@@ -1105,7 +1105,7 @@ TEST_F(GuidedDecoderTest, ReportsUnsatisfiableGrammarAsAnAllZeroRow)
 }
 
 //! ---------------------------------------------------------------------------------------------
-//! Speculative verification over a branching draft tree (#677 phase 2).
+//! Speculative verification over a branching draft tree.
 //! ---------------------------------------------------------------------------------------------
 
 //! `root ::= "a" ("1" "b" | "2" ",") "a"` forks after `a`, so nodes 2 and 3 are siblings standing

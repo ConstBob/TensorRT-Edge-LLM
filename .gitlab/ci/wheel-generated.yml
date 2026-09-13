@@ -8,13 +8,13 @@ wheel_payload_x86:
   parallel:
     matrix:
       - BUILD_GROUP: "x86-ubuntu2204-cu13-sm80"
-        BUILD_RUNNER_TAG: "cpu-general-k8s"
+        BUILD_RUNNER_TAG: "cpu-k8s"
         BUILD_IMAGE: "$WHEEL_IMAGE_UBUNTU2204_CU13"
       - BUILD_GROUP: "x86-ubuntu2404-cu13-sm86-plus-2"
-        BUILD_RUNNER_TAG: "cpu-general-k8s"
+        BUILD_RUNNER_TAG: "cpu-k8s"
         BUILD_IMAGE: "$WHEEL_IMAGE_UBUNTU2404_CU13"
       - BUILD_GROUP: "x86-ubuntu2404-cu13-sm80-trt11-plus-3"
-        BUILD_RUNNER_TAG: "cpu-general-k8s"
+        BUILD_RUNNER_TAG: "cpu-k8s"
         BUILD_IMAGE: "$WHEEL_IMAGE_UBUNTU2404_CU13"
 
 wheel_payload_aarch64:
@@ -22,16 +22,16 @@ wheel_payload_aarch64:
   parallel:
     matrix:
       - BUILD_GROUP: "jetson-orin-jp72-cu13-sm87-plus-1"
-        BUILD_RUNNER_TAG: "cpu-general-k8s"
+        BUILD_RUNNER_TAG: "cpu-k8s"
         BUILD_IMAGE: "$WHEEL_IMAGE_JETPACK72"
       - BUILD_GROUP: "jetson-thor-jp70-cu13-sm110-plus-1"
-        BUILD_RUNNER_TAG: "cpu-general-k8s"
+        BUILD_RUNNER_TAG: "cpu-k8s"
         BUILD_IMAGE: "$WHEEL_IMAGE_JETPACK70"
       - BUILD_GROUP: "jetson-thor-jp71-cu13-sm110"
-        BUILD_RUNNER_TAG: "cpu-general-k8s"
+        BUILD_RUNNER_TAG: "cpu-k8s"
         BUILD_IMAGE: "$WHEEL_IMAGE_JETPACK71"
       - BUILD_GROUP: "drive-thor-d72-cu13-sm110"
-        BUILD_RUNNER_TAG: "cpu-general-k8s"
+        BUILD_RUNNER_TAG: "cpu-k8s"
         BUILD_IMAGE: "$WHEEL_IMAGE_DRIVE72"
       - BUILD_GROUP: "dgx-spark-cu13-sm121"
         BUILD_RUNNER_TAG: "local-spark"
@@ -64,11 +64,11 @@ wheel_integration_x86:
       artifacts: true
   parallel:
     matrix:
-      - VARIANT: "x86-ubuntu2404-cu13-sm100"
-        TEST_RUNNER_TAG: "b100-edgellm-nvks"
+      - VARIANT: "x86-ubuntu2404-cu13-sm86"
+        TEST_RUNNER_TAG: "rtx3090-edgellm-nvks"
         TEST_IMAGE: "$WHEEL_IMAGE_UBUNTU2404_CU13"
-      - VARIANT: "x86-ubuntu2404-cu13-sm100-trt11"
-        TEST_RUNNER_TAG: "b100-edgellm-nvks"
+      - VARIANT: "x86-ubuntu2404-cu13-sm120-trt11"
+        TEST_RUNNER_TAG: "rtx5080-edgellm-nvks"
         TEST_IMAGE: "$WHEEL_IMAGE_UBUNTU2404_CU13"
 
 wheel_integration_aarch64:

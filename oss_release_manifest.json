@@ -20,6 +20,7 @@
       "unittests/cpp/plugins/allReducePlugin/allReducePluginShmTest.cpp"
     ],
     "strip_paths": [
+      "AGENTS.md",
       ".dockerignore",
       "cmake/CuteDsl.cmake",
       "kernelSrcs/build_cutedsl.py",
@@ -45,7 +46,7 @@
       "tests/defs/config.py",
       "tests/defs/utils/command_execution.py",
       "tests/defs/utils/command_generation.py",
-      "tests/test_lists/l0_pipeline_super_thor.yml",
+      "tests/test_lists/l0_e2e_super_thor.yml",
       "unittests/cpp/runtime/multiDevice/parallelConfigTest.cpp"
     ],
     "forbidden_patterns": [

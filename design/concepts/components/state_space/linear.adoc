@@ -113,5 +113,5 @@ Execution has the same high-level phases as other recurrent sequence mixers:
   prefill, padding, and Qwen3.5-shaped Blackwell prefill paths.
 * `tests/test_lists/l0_checkpoint_export.yml` includes Qwen3.5 hybrid export
   coverage.
-* `tests/test_lists/l0_pipeline_jedha.yml` includes Qwen3.5 hybrid
+* `tests/test_lists/l0_e2e_jedha.yml` includes Qwen3.5 hybrid
   pipeline coverage.

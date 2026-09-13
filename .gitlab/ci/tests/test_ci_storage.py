@@ -64,32 +64,47 @@ def _source_environment(path, names):
     return dict(zip(names, (value.decode() for value in values)))
 
 
-def test_prepare_storage_preserves_external_root_and_creates_protected_layout(
+def test_prepare_storage_preserves_external_root_and_creates_shared_layout(
         storage_environment):
     assert ci_storage.main(["prepare-storage"]) == 0
     assert _mode(storage_environment / "L0") == EXTERNAL_ROOT_MODE
     mr_root = storage_environment / "L0" / "MR_42"
-    for path in (mr_root, mr_root / "onnx_cache", mr_root / "workspace"):
-        assert _mode(path) == 0o755
+    assert _mode(mr_root) == 0o755
+    assert _mode(mr_root / "onnx_cache") == 0o755
+    assert _mode(mr_root / "workspace") == 0o755
+    assert _mode(mr_root / "workspace" / "pipeline_100") == 0o1777
 
 
 def test_prepare_job_creates_cross_identity_boundary(storage_environment):
+    assert ci_storage.main(["prepare-storage"]) == 0
     assert ci_storage.main(["prepare-job"]) == 0
 
     pipeline_root = (storage_environment / "L0" / "MR_42" / "workspace" /
                      "pipeline_100")
     job_root = pipeline_root / "job_200_l0-drive-thor-1"
 
-    assert _mode(pipeline_root) == 0o755
+    assert _mode(pipeline_root) == 0o1777
     assert _mode(job_root) == 0o777
     for path in (job_root / "engines", job_root / "logs", job_root / "tmp"):
         assert not path.exists()
+
+
+def test_prepare_job_accepts_writable_mount_without_chmod(
+        storage_environment, monkeypatch):
+    assert ci_storage.main(["prepare-storage"]) == 0
+
+    def reject_chmod(path, mode, *, follow_symlinks=True):
+        raise PermissionError(f"mount does not support chmod for {path}")
+
+    monkeypatch.setattr(Path, "chmod", reject_chmod)
+    assert ci_storage.main(["prepare-job"]) == 0
 
 
 def test_prepare_job_publishes_resolved_paths(storage_environment,
                                               monkeypatch):
     environment_file = storage_environment.parent / "job.env"
     monkeypatch.setenv("L0_ONNX_CACHE_RELATIVE_PATH", "checkpoint_export/onnx")
+    assert ci_storage.main(["prepare-storage"]) == 0
 
     assert ci_storage.main(
         ["prepare-job", "--environment-file",
@@ -113,6 +128,7 @@ def test_prepare_job_omits_engine_path_for_non_engine_job(
         storage_environment, monkeypatch):
     environment_file = storage_environment.parent / "job.env"
     monkeypatch.delenv("L0_JOB_WRITES_ENGINES")
+    assert ci_storage.main(["prepare-storage"]) == 0
 
     assert ci_storage.main(
         ["prepare-job", "--environment-file",
@@ -177,6 +193,7 @@ def test_prune_skips_missing_mr_layout(storage_environment, capsys):
 
 def test_prune_preserves_cache_and_removes_older_mr_pipeline(
         storage_environment, monkeypatch):
+    assert ci_storage.main(["prepare-storage"]) == 0
     assert ci_storage.main(["prepare-job"]) == 0
     mr_root = storage_environment / "L0" / "MR_42"
     cache_marker = mr_root / "onnx_cache" / "cache-marker"
@@ -192,11 +209,13 @@ def test_prune_preserves_cache_and_removes_older_mr_pipeline(
 
 def test_prune_preserves_pipeline_newer_than_current(storage_environment,
                                                      monkeypatch):
+    assert ci_storage.main(["prepare-storage"]) == 0
     assert ci_storage.main(["prepare-job"]) == 0
     workspace_root = storage_environment / "L0" / "MR_42" / "workspace"
 
     monkeypatch.setenv("CI_PIPELINE_ID", "102")
     monkeypatch.setenv("CI_JOB_ID", "202")
+    assert ci_storage.main(["prepare-storage"]) == 0
     assert ci_storage.main(["prepare-job"]) == 0
 
     monkeypatch.setenv("CI_PIPELINE_ID", "101")
@@ -209,6 +228,7 @@ def test_prune_preserves_pipeline_newer_than_current(storage_environment,
 
 def test_prune_preserves_unknown_entry_and_removes_older_pipeline(
         storage_environment, monkeypatch):
+    assert ci_storage.main(["prepare-storage"]) == 0
     assert ci_storage.main(["prepare-job"]) == 0
     workspace_root = (storage_environment / "L0" / "MR_42" / "workspace")
     unmanaged = workspace_root / "manual-output"
@@ -223,6 +243,7 @@ def test_prune_preserves_unknown_entry_and_removes_older_pipeline(
 
 def test_prune_rejects_managed_pipeline_file_before_deleting(
         storage_environment, monkeypatch):
+    assert ci_storage.main(["prepare-storage"]) == 0
     assert ci_storage.main(["prepare-job"]) == 0
     workspace_root = (storage_environment / "L0" / "MR_42" / "workspace")
     invalid_pipeline = workspace_root / "pipeline_99"
@@ -238,6 +259,7 @@ def test_prune_rejects_managed_pipeline_file_before_deleting(
 def test_prune_leaves_stability_to_environment_lifecycle(
         storage_environment, monkeypatch):
     monkeypatch.setenv("L0_STORAGE_KIND", "stability")
+    assert ci_storage.main(["prepare-storage"]) == 0
     assert ci_storage.main(["prepare-job"]) == 0
     stability_root = (storage_environment / "L0" / "STABILITY" /
                       "2026-07-30T17-39-11Z_pipeline_100")
@@ -256,6 +278,7 @@ def test_delete_rejects_malformed_mr_id_without_writing(
 
 
 def test_delete_removes_only_selected_mr(storage_environment, monkeypatch):
+    assert ci_storage.main(["prepare-storage"]) == 0
     assert ci_storage.main(["prepare-job"]) == 0
     board_output = (storage_environment / "L0" / "MR_42" / "workspace" /
                     "pipeline_100" / "job_200_l0-drive-thor-1" / "logs" /
@@ -269,6 +292,7 @@ def test_delete_removes_only_selected_mr(storage_environment, monkeypatch):
     monkeypatch.setenv("CI_MERGE_REQUEST_IID", "43")
     monkeypatch.setenv("CI_PIPELINE_ID", "102")
     monkeypatch.setenv("CI_JOB_ID", "202")
+    assert ci_storage.main(["prepare-storage"]) == 0
     assert ci_storage.main(["prepare-job"]) == 0
 
     monkeypatch.setenv("CI_MERGE_REQUEST_IID", "42")
@@ -298,6 +322,7 @@ def test_stability_storage_is_isolated_by_pipeline(storage_environment,
                                                    monkeypatch):
     monkeypatch.setenv("L0_STORAGE_KIND", "stability")
     environment_file = storage_environment.parent / "stability.env"
+    assert ci_storage.main(["prepare-storage"]) == 0
     assert ci_storage.main(
         ["prepare-job", "--environment-file",
          str(environment_file)]) == 0
@@ -315,6 +340,7 @@ def test_stability_storage_is_isolated_by_pipeline(storage_environment,
     monkeypatch.setenv("CI_PIPELINE_ID", "101")
     monkeypatch.setenv("CI_PIPELINE_CREATED_AT", "2026-07-30T17:00:05-07:00")
     monkeypatch.setenv("CI_JOB_ID", "201")
+    assert ci_storage.main(["prepare-storage"]) == 0
     assert ci_storage.main(["prepare-job"]) == 0
     second_root = stability_root / "2026-07-31T00-00-05Z_pipeline_101"
 

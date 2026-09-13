@@ -33,44 +33,34 @@ TEMPLATES = yaml.load((CI_DIRECTORY / "templates.yml").read_text(),
                       Loader=GitLabCILoader)
 SETUP_JOBS = yaml.safe_load((CI_DIRECTORY / "setup-jobs.yml").read_text())
 L0_JOBS = yaml.safe_load((CI_DIRECTORY / "l0-jobs.yml").read_text())
-INHERITABLE_CONFIGS = TEMPLATES
-
-STORAGE_EXEMPT_JOBS = {
-    "quantization_sanity",
-    "l0_cross_build_d6l_cuda11.4",
-    "l0_cross_build_d7l_cuda12.8",
+LOCAL_BOARD_JOBS = yaml.safe_load(
+    (CI_DIRECTORY / "local-board-jobs.yml").read_text())
+INHERITABLE_CONFIGS = {
+    **TEMPLATES,
+    **{
+        name: config
+        for name, config in L0_JOBS.items() if isinstance(config, dict) and name.startswith(".")
+    },
 }
+
 L0_STORAGE_GATE = "init_l0_storage"
 L0_PRUNE_JOB = "prune_l0_pipeline_workspaces"
 EXPORT_PRODUCER_LANES = {
-    "l0_checkpoint_export": "checkpoint_export/onnx",
-    "l0_checkpoint_export_ampere": "checkpoint_export_ampere/onnx",
-    "l0_checkpoint_export_a30_trtrtx": "checkpoint_export_a30_trtrtx/onnx",
+    "l0_onnx_export_1": "onnx_export_1/onnx",
+    "l0_onnx_export_2": "onnx_export_2/onnx",
 }
 EXPECTED_EXPORT_JOBS = {
-    "l0_checkpoint_export": {
-        "l0_checkpoint_export",
-        "l0_dspark_a30",
-        "l0_rtx5080",
-        "l0_b100",
-        "l0_rtx5090",
-        "l0_nemo_eval_rtx5090",
-        "l0_drive_thor_1",
-        "l0_drive_thor_1_trt11",
-        "l0_drive_thor_2",
-        "l0_drive_thor_2_trt11",
-        "l0_jedha",
+    "l0_onnx_export_1": {
+        "l0_onnx_export_1",
+        "l0_e2e_a30_trtrtx",
+        "l0_e2e_drive_thor",
+        "l0_e2e_orin",
+        "l0_e2e_super_thor",
     },
-    "l0_checkpoint_export_ampere": {
-        "l0_checkpoint_export_ampere",
-        "l0_a30",
-        "l0_nemo_eval_a30",
-        "l0_rtx3090",
-        "l0_jetson_orin",
-    },
-    "l0_checkpoint_export_a30_trtrtx": {
-        "l0_checkpoint_export_a30_trtrtx",
-        "l0_a30_trtrtx",
+    "l0_onnx_export_2": {
+        "l0_onnx_export_2",
+        "l0_e2e_b100",
+        "l0_e2e_spark",
     },
 }
 ENGINE_BUILDING_JOB_TEMPLATES = {
@@ -79,17 +69,14 @@ ENGINE_BUILDING_JOB_TEMPLATES = {
     ".device_test_template",
 }
 UNIT_TEST_JOB_TEMPLATES = {
-    ".x86_unit_test_template",
-    ".device_unit_test_template",
+    ".python_unit_test_template",
+    ".cpp_unit_test_template",
+    ".device_cpp_unit_test_template",
 }
 NON_ENGINE_BUILDING_JOB_TEMPLATES = ({".checkpoint_export_template"}
                                      | UNIT_TEST_JOB_TEMPLATES)
 L0_JOB_TEMPLATES = (ENGINE_BUILDING_JOB_TEMPLATES
                     | NON_ENGINE_BUILDING_JOB_TEMPLATES)
-MANUAL_RUNNER_TAGS = {
-    "b100-edgellm-nvks",
-    "rtx5090-edgellm-nvks",
-}
 
 
 def _extends(config):
@@ -100,14 +87,16 @@ def _extends(config):
 def _needed_jobs(config):
     return {
         need if isinstance(need, str) else need["job"]
-        for need in config.get("needs", [])
+        for item in _configuration_hierarchy(config)
+        for need in item.get("needs", [])
     }
 
 
 def _artifact_source_jobs(config):
     return {
         need if isinstance(need, str) else need["job"]
-        for need in config.get("needs", [])
+        for item in _configuration_hierarchy(config)
+        for need in item.get("needs", [])
         if isinstance(need, str) or need.get("artifacts", True)
     }
 
@@ -130,6 +119,26 @@ def _visible_l0_jobs():
         name: config
         for name, config in L0_JOBS.items() if isinstance(config, dict)
         and not name.startswith(".") and config.get("stage") == "l0_test"
+    }
+
+
+def _visible_l0_onnx_jobs():
+    jobs = {**L0_JOBS, **LOCAL_BOARD_JOBS}
+    return {
+        name: config
+        for name, config in jobs.items()
+        if isinstance(config, dict) and not name.startswith(".") and
+        config.get("stage") == "l0_test" and _export_lane(config) is not None
+    }
+
+
+def _visible_l0_unit_jobs():
+    return {
+        name: config
+        for name, config in L0_JOBS.items()
+        if isinstance(config, dict) and not name.startswith(".") and any(
+            item.get("stage") == "l0_unit"
+            for item in _configuration_hierarchy(config))
     }
 
 
@@ -230,60 +239,26 @@ def test_storage_rules_select_context():
 
 def test_l0_scratch_jobs_reach_one_non_artifact_storage_gate():
     jobs = _visible_l0_jobs()
-    assert STORAGE_EXEMPT_JOBS <= set(jobs)
-    scratch_jobs = set(jobs) - STORAGE_EXEMPT_JOBS
-    graph = SETUP_JOBS | jobs
+    graph = SETUP_JOBS | {
+        name: config
+        for name, config in L0_JOBS.items() if isinstance(config, dict)
+    }
 
     for name, config in jobs.items():
-        if name in STORAGE_EXEMPT_JOBS:
-            assert L0_STORAGE_GATE not in _upstream_jobs(name, graph)
-        else:
-            assert L0_STORAGE_GATE in _upstream_jobs(name, graph)
+        assert L0_STORAGE_GATE in _upstream_jobs(name, graph)
         assert L0_PRUNE_JOB not in _upstream_jobs(name, graph)
         assert not _declared_environments(config)
 
-    storage_roots = {
-        name
-        for name in scratch_jobs
-        if not (_needed_jobs(jobs[name]) & scratch_jobs)
-    }
-    direct_gate_dependents = {
-        name
-        for name in scratch_jobs if L0_STORAGE_GATE in _needed_jobs(jobs[name])
-    }
-    assert direct_gate_dependents == storage_roots
-    assert all(L0_STORAGE_GATE not in _artifact_source_jobs(jobs[name])
-               for name in storage_roots)
-
 
 def test_l0_builder_receives_cutedsl_artifacts():
-    config = _visible_l0_jobs()["l0_builder_a30"]
+    config = _visible_l0_jobs()["l0_e2e_a30"]
 
     assert "build_cutedsl_docker_matrix" in _needed_jobs(config)
     assert "build_cutedsl_docker_matrix" in _artifact_source_jobs(config)
 
 
-def test_5090_and_b100_l0_jobs_are_optional_manual_jobs():
-    covered_tags = set()
-    for name, config in _visible_l0_jobs().items():
-        runner_tags = set(config.get("tags", []))
-        matrix = config.get("parallel", {}).get("matrix", [])
-        runner_tags.update(row["RUNNER_TAG"] for row in matrix
-                           if "RUNNER_TAG" in row)
-        matched_tags = runner_tags & MANUAL_RUNNER_TAGS
-        if not matched_tags:
-            continue
-        covered_tags.update(matched_tags)
-        assert config.get("when") == "manual", name
-        assert config.get("allow_failure") is True, name
-
-    assert covered_tags == MANUAL_RUNNER_TAGS
-
-
 def test_only_engine_writers_receive_l0_engine_storage():
     for name, config in _visible_l0_jobs().items():
-        if name in STORAGE_EXEMPT_JOBS:
-            continue
         job_templates = _inherited_config_names(config) & L0_JOB_TEMPLATES
         assert len(job_templates) == 1, name
 
@@ -301,12 +276,13 @@ def test_only_engine_writers_receive_l0_engine_storage():
 def test_unit_and_checkpoint_builder_jobs_have_no_onnx_storage():
     onnx_free_jobs = set()
     unit_jobs = set()
-    for name, config in _visible_l0_jobs().items():
+    jobs = _visible_l0_jobs() | _visible_l0_unit_jobs()
+    for name, config in jobs.items():
         inherited = _inherited_config_names(config)
         is_unit_job = not UNIT_TEST_JOB_TEMPLATES.isdisjoint(inherited)
         if is_unit_job:
             unit_jobs.add(name)
-        if name != "l0_builder_a30" and not is_unit_job:
+        if name != "l0_e2e_a30" and not is_unit_job:
             continue
         onnx_free_jobs.add(name)
         hierarchy = _configuration_hierarchy(config)
@@ -314,12 +290,12 @@ def test_unit_and_checkpoint_builder_jobs_have_no_onnx_storage():
                         & set(item.get("variables", {})))
                    for item in hierarchy), name
 
-    assert "l0_builder_a30" in onnx_free_jobs
+    assert "l0_e2e_a30" in onnx_free_jobs
     assert unit_jobs
 
 
 def test_cache_lanes_match_their_producer_dependencies():
-    jobs = _visible_l0_jobs()
+    jobs = _visible_l0_onnx_jobs()
     producer_lanes = {
         producer: _export_lane(jobs[producer])
         for producer in EXPORT_PRODUCER_LANES

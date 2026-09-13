@@ -45,7 +45,7 @@
 
 wheel_packaging_precheck:
   stage: precheck
-  extends: [.wheel_rules]
+  extends: [.wheel_rules, .cpu_runner_retry]
   tags: [cpu-k8s]
   image: python:3.12-bookworm
   interruptible: true
@@ -57,7 +57,7 @@ wheel_packaging_precheck:
 
 wheel_python_base:
   stage: wheel-build
-  extends: [.wheel_rules]
+  extends: [.wheel_rules, .cpu_runner_retry]
   tags: [cpu-k8s]
   parallel:
     matrix:
@@ -83,7 +83,7 @@ wheel_python_base:
 
 .wheel_payload_template:
   stage: wheel-build
-  extends: [.wheel_rules]
+  extends: [.ci_internal_submodules, .wheel_rules, .cpu_runner_retry]
   tags: [$BUILD_RUNNER_TAG]
   image: $BUILD_IMAGE
   interruptible: true
@@ -107,8 +107,8 @@ wheel_python_base:
 
 .wheel_assemble_template:
   stage: wheel-assemble
-  extends: [.wheel_rules]
-  tags: [cpu-general-k8s]
+  extends: [.wheel_rules, .cpu_runner_retry]
+  tags: [cpu-k8s]
   image: $CI_DEPENDENCY_WHEEL_UBUNTU2404_IMAGE
   interruptible: true
   script:
@@ -136,7 +136,7 @@ wheel_python_base:
 
 wheel_integration_gate:
   stage: l0_test
-  extends: [.wheel_rules]
+  extends: [.wheel_rules, .cpu_runner_retry]
   tags: [cpu-k8s]
   image: python:3.12-bookworm
   interruptible: true

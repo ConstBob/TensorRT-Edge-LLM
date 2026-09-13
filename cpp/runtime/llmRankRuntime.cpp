@@ -2826,7 +2826,7 @@ bool LLMRankRuntime::runHybridMtpPrefill(
     // lets it run again where the reference re-invokes prepareFirstDecodeStep (mirrors ref :2560/:2626). The final
     // invocation leaves speculativeDraftPrefillComplete = true so the outer initializeForGeneration and decode round 0
     // both skip it. Driving a re-run through a guard flag is a workaround for DecodingStrategy having no explicit
-    // "run the draft prefill now" entry point; see issue #655 for the intended interface.
+    // "run the draft prefill now" entry point.
     auto runFoldedDraftPrefill = [&]() -> bool {
         context.speculativeDraftPrefillComplete = false;
         return strategy.initializeForGeneration(context);

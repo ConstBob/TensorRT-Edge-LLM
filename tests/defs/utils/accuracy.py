@@ -136,10 +136,22 @@ def check_accuracy_with_dataset(output_json_file,
                 rouge_dir = os.path.join(edge_llm_cache_dir, 'rouge')
                 if os.path.exists(rouge_dir):
                     cmd.extend(['--rouge_dir', rouge_dir])
+            hf_cache = os.path.join(
+                os.path.dirname(os.path.abspath(output_json_file)),
+                '.hf_cache')
+            os.makedirs(hf_cache, exist_ok=True)
+            hf_cache_env = {
+                'HF_HOME': hf_cache,
+                'HF_MODULES_CACHE': os.path.join(hf_cache, 'modules'),
+                'HF_EVALUATE_CACHE': os.path.join(hf_cache, 'evaluate'),
+                'HF_METRICS_CACHE': os.path.join(hf_cache, 'metrics'),
+                'HF_DATASETS_CACHE': os.path.join(hf_cache, 'datasets'),
+            }
             cmd_result = run_command(cmd,
                                      remote_config=None,
                                      timeout=600,
-                                     logger=logger)
+                                     logger=logger,
+                                     env_vars=hf_cache_env)
 
             if not cmd_result['success']:
                 raise RuntimeError(

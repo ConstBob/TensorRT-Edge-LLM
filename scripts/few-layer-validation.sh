@@ -55,6 +55,8 @@
 #                       Engine maxKVCacheCapacity. Default: derived the same way from
 #                       prompt + generate length, floored at 256. Drives the KV-cache
 #                       sequence dim, so the dump size scales with it (see Dump size).
+#   --target-sm N       Target GPU compute capability used for target-specific NVFP4
+#                       dense and MoE layouts (for example, 100, 110, or 120).
 #   --mtp               Also export/build the checkpoint's MTP draft and run the engine with
 #                       speculative decoding. The PyTorch golden stays vanilla on purpose: MTP is
 #                       supposed to be output-equivalent, so the base model's committed KV and
@@ -109,6 +111,7 @@ RTOL=2e-2
 MAX_INPUT_LEN=0
 MAX_KV_CACHE_CAPACITY=0
 MAX_KV_CACHE_CAPACITY_OVERRIDDEN=0
+TARGET_SM=""
 VERBOSE=0
 QUANTIZE_ACTIVATIONS=1
 MTP=0
@@ -137,6 +140,7 @@ while [[ $# -gt 0 ]]; do
     --rtol)        RTOL="$2"; shift 2 ;;
     --max-input-len)          MAX_INPUT_LEN="$2"; shift 2 ;;
     --max-kv-cache-capacity)  MAX_KV_CACHE_CAPACITY="$2"; MAX_KV_CACHE_CAPACITY_OVERRIDDEN=1; shift 2 ;;
+    --target-sm)              TARGET_SM="$2"; shift 2 ;;
     --mtp)         MTP=1; shift ;;
     --context-reuse) CONTEXT_REUSE=1; shift ;;
     --spec-draft-step) SPEC_DRAFT_STEP="$2"; shift 2 ;;
@@ -262,6 +266,7 @@ if [[ "${CONTEXT_REUSE}" -eq 1 ]]; then
 fi
 echo "[few-layer] python      : ${PYBIN}"
 echo "[few-layer] workdir     : ${WORKDIR}"
+[[ -n "${TARGET_SM}" ]] && echo "[few-layer] target SM   : ${TARGET_SM}"
 echo
 
 # ---------------------------------------------------------------------------
@@ -318,10 +323,22 @@ stage_end
 stage_begin "2/5 EdgeLLM export"
 # --skip-visual / --skip-audio: only the LLM backbone is compared, so a VLM/omni
 # checkpoint's encoder towers are pure cost here. Both are no-ops for a text-only model.
+TARGET_ARGS=()
+if [[ -n "${TARGET_SM}" ]]; then
+  TARGET_ARGS=(--target-sm "${TARGET_SM}")
+  if (( TARGET_SM >= 120 )); then
+    export EDGELLM_NVFP4_MOE_TARGET=sm12x
+  elif (( TARGET_SM == 110 )); then
+    export EDGELLM_NVFP4_MOE_TARGET=sm110
+  elif (( TARGET_SM >= 100 )); then
+    export EDGELLM_NVFP4_MOE_TARGET=sm100
+  fi
+fi
 "${PYBIN}" -m tensorrt_edgellm.scripts.export \
   "${MODEL}" "${EXPORT_DIR}" \
   --num-decoder-layer "${NUM_LAYERS}" \
   --skip-visual --skip-audio \
+  ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} \
   ${WEIGHT_ONLY_ARGS[@]+"${WEIGHT_ONLY_ARGS[@]}"} \
   ${MTP_EXPORT_ARGS[@]+"${MTP_EXPORT_ARGS[@]}"}
 stage_end

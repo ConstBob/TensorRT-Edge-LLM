@@ -55,9 +55,10 @@ build_cutedsl_docker_image:
   stage: setup
   extends:
     - .cutedsl_artifact_rules
+    - .cpu_runner_retry
     - .cutedsl_builder_version
   tags:
-    - cpu-general-k8s
+    - cpu-k8s
   image:
     name: "moby/buildkit:rootless"
     entrypoint: [""]
@@ -90,6 +91,7 @@ build_cutedsl_docker_image:
 build_cutedsl_docker_matrix:
   extends:
     - .cutedsl_artifact_base
+    - .cpu_runner_retry
     - .cutedsl_builder_version
   needs:
     - job: build_cutedsl_docker_image

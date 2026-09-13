@@ -8,7 +8,11 @@
 stages:
   - setup
 
+include:
+  - local: '.gitlab/ci/templates.yml'
+
 pages:
+  extends: .cpu_runner_retry
   image: 
     name: python:3.12-bookworm
     entrypoint: ['/bin/bash']

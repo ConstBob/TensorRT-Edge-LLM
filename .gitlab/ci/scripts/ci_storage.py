@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 PROTECTED_MODE = 0o755
+SHARED_MODE = 0o1777
 JOB_MODE = 0o777
 
 DECIMAL_PATTERN = re.compile(r"^[0-9]+$")
@@ -163,16 +164,21 @@ def _optional_relative_path(environ: Mapping[str, str],
     return path
 
 
-def _protected_paths(layout: StorageLayout,
-                     pipeline_id: str) -> List[Tuple[Path, str]]:
-    paths = [
-        (layout.storage_root, "storage root"),
-        (layout.onnx_cache_root, "ONNX cache root"),
-        (layout.workspace_root, "workspace root"),
-    ]
+def _managed_paths(layout: StorageLayout,
+                   pipeline_id: str) -> List[Tuple[Path, str, int]]:
     pipeline_root = layout.pipeline_root(pipeline_id)
+    paths = [
+        (layout.storage_root, "storage root", PROTECTED_MODE),
+        (layout.onnx_cache_root, "ONNX cache root", PROTECTED_MODE),
+        (layout.workspace_root, "workspace root", SHARED_MODE
+         if pipeline_root == layout.workspace_root else PROTECTED_MODE),
+    ]
     if pipeline_root != layout.workspace_root:
-        paths.append((pipeline_root, "pipeline workspace root"))
+        paths.append((pipeline_root, "pipeline workspace root", SHARED_MODE))
+    if layout.storage_parent != layout.l0_root:
+        paths.insert(
+            0,
+            (layout.storage_parent, "storage context parent", PROTECTED_MODE))
     return paths
 
 
@@ -204,9 +210,10 @@ def _ensure_directory(path: Path, mode: int, purpose: str,
     except FileExistsError:
         pass
 
-    _assert_directory(path, purpose)
-    path.chmod(mode)
     path_stat = _assert_directory(path, purpose)
+    if stat.S_IMODE(path_stat.st_mode) != mode:
+        path.chmod(mode)
+        path_stat = _assert_directory(path, purpose)
     actual_mode = stat.S_IMODE(path_stat.st_mode)
     if actual_mode != mode:
         raise StorageContractError(
@@ -215,21 +222,16 @@ def _ensure_directory(path: Path, mode: int, purpose: str,
     return path_stat
 
 
-def _prepare_protected_paths(layout: StorageLayout, pipeline_id: str) -> int:
+def _prepare_managed_paths(layout: StorageLayout, pipeline_id: str) -> int:
     _assert_directory(layout.scratch_root, "scratch root")
     _assert_directory(layout.l0_root, "L0 root")
     if not os.access(layout.l0_root, os.W_OK | os.X_OK):
         raise StorageContractError(
             f"lifecycle identity cannot write and traverse {layout.l0_root}")
 
-    protected_paths = _protected_paths(layout, pipeline_id)
-    if layout.storage_parent != layout.l0_root:
-        protected_paths.insert(
-            0, (layout.storage_parent, "storage context parent"))
     owner_uid: Optional[int] = None
-    for path, purpose in protected_paths:
-        path_stat = _ensure_directory(path, PROTECTED_MODE, purpose,
-                                      "lifecycle")
+    for path, purpose, mode in _managed_paths(layout, pipeline_id):
+        path_stat = _ensure_directory(path, mode, purpose, "lifecycle")
         if owner_uid is None:
             owner_uid = path_stat.st_uid
         elif path_stat.st_uid != owner_uid:
@@ -242,13 +244,53 @@ def _prepare_protected_paths(layout: StorageLayout, pipeline_id: str) -> int:
     return owner_uid
 
 
+def _validate_managed_paths(layout: StorageLayout, pipeline_id: str) -> None:
+    _assert_directory(layout.scratch_root, "scratch root")
+    _assert_directory(layout.l0_root, "L0 root")
+
+    owner_uid: Optional[int] = None
+    for path, purpose, _ in _managed_paths(layout, pipeline_id):
+        path_stat = _assert_directory(path, purpose)
+        if owner_uid is None:
+            owner_uid = path_stat.st_uid
+        elif path_stat.st_uid != owner_uid:
+            raise StorageContractError(
+                f"{purpose} owner UID {path_stat.st_uid} does not match "
+                f"lifecycle UID {owner_uid}: {path}")
+
+    pipeline_root = layout.pipeline_root(pipeline_id)
+    if not os.access(pipeline_root, os.W_OK | os.X_OK):
+        raise StorageContractError(
+            f"runner identity cannot write and traverse {pipeline_root}")
+
+
+def _ensure_job_directory(path: Path) -> None:
+    try:
+        path.mkdir()
+    except FileExistsError:
+        pass
+
+    path_stat = _assert_directory(path, "job workspace root")
+    if stat.S_IMODE(path_stat.st_mode) != JOB_MODE:
+        try:
+            path.chmod(JOB_MODE)
+        except PermissionError:
+            pass
+    if not os.access(path, os.W_OK | os.X_OK):
+        path_stat = _assert_directory(path, "job workspace root")
+        raise StorageContractError(
+            "runner identity cannot write and traverse job workspace root: "
+            f"{_mode_details('runner', path, JOB_MODE, path_stat)}")
+
+
 def _prepare_storage(environ: Mapping[str, str]) -> None:
     layout = _storage_layout(environ)
     pipeline_id = _required_decimal(environ, "CI_PIPELINE_ID")
-    owner_uid = _prepare_protected_paths(layout, pipeline_id)
+    owner_uid = _prepare_managed_paths(layout, pipeline_id)
     print(f"Prepared L0 storage: kind={layout.storage_kind} "
           f"path={layout.storage_root} "
-          f"lifecycle_uid={owner_uid} mode={PROTECTED_MODE:04o}")
+          f"lifecycle_uid={owner_uid} "
+          f"shared_mode={SHARED_MODE:04o}")
 
 
 def _job_environment(layout: StorageLayout, pipeline_id: str, job_id: str,
@@ -292,10 +334,10 @@ def _prepare_job(environ: Mapping[str, str],
     job_slug = _required_slug(environ)
     job_environment = _job_environment(layout, pipeline_id, job_id, job_slug,
                                        environ)
-    _prepare_protected_paths(layout, pipeline_id)
+    _validate_managed_paths(layout, pipeline_id)
 
     job_root = layout.job_root(pipeline_id, job_id, job_slug)
-    _ensure_directory(job_root, JOB_MODE, "job workspace root", "runner")
+    _ensure_job_directory(job_root)
 
     if environment_file is not None:
         _write_environment_file(environment_file, job_environment)

@@ -20,6 +20,7 @@
 # Usage:
 #   ./scripts/run_coverage.sh [--trt-package-dir <path>] [--cuda-version <ver>]
 #                              [--build-dir <dir>] [--gtest-filter <filter>]
+#                              [--ctest-regex <regex>]
 #                              [--scope <cpp subdir>]
 #
 #   --scope reports on one subtree only, e.g. `--scope runtime`. It cuts report
@@ -29,8 +30,9 @@
 # Environment variables (alternative to flags):
 #   TRT_PACKAGE_DIR   Path to TensorRT package (required)
 #   CUDA_VERSION      CUDA version (default: 12.8)
-#   ENABLE_CUTE_DSL   CuTe DSL selection (default: fmha)
+#   ENABLE_CUTE_DSL   CuTe DSL selection (default: ALL)
 #   CUTE_DSL_ARTIFACT_TAG  Required artifact tag when selection is ambiguous
+#   CTEST_REGEX       Optional CTest name-selection regular expression
 #
 # After a successful run the build directory will contain:
 #   - sonarqube-coverage.xml  (SonarQube generic coverage format)
@@ -52,9 +54,10 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BUILD_DIR="${PROJECT_ROOT}/build_coverage"
 TRT_PACKAGE_DIR="${TRT_PACKAGE_DIR:-}"
 CUDA_VERSION="${CUDA_VERSION:-12.8}"
-ENABLE_CUTE_DSL="${ENABLE_CUTE_DSL:-fmha}"
+ENABLE_CUTE_DSL="${ENABLE_CUTE_DSL:-ALL}"
 CUTE_DSL_ARTIFACT_TAG="${CUTE_DSL_ARTIFACT_TAG:-}"
 GTEST_FILTER="${GTEST_FILTER:-*}"
+CTEST_REGEX="${CTEST_REGEX:-}"
 JOBS="$(nproc 2>/dev/null || echo 8)"
 SCOPE="${SCOPE:-}"
 
@@ -71,6 +74,8 @@ while [[ $# -gt 0 ]]; do
             BUILD_DIR="$2"; shift 2 ;;
         --gtest-filter)
             GTEST_FILTER="$2"; shift 2 ;;
+        --ctest-regex)
+            CTEST_REGEX="$2"; shift 2 ;;
         --jobs|-j)
             JOBS="$2"; shift 2 ;;
         --scope)
@@ -151,10 +156,13 @@ echo "==> Running unit tests (filter: ${GTEST_FILTER})"
 TEST_REPORT_DIR="${BUILD_DIR}/test_results"
 rm -rf "${TEST_REPORT_DIR}"
 mkdir -p "${TEST_REPORT_DIR}"
+CTEST_ARGS=(--test-dir "${BUILD_DIR}" --output-on-failure)
+if [[ -n "${CTEST_REGEX}" ]]; then
+    CTEST_ARGS+=(-R "${CTEST_REGEX}")
+fi
 GTEST_FILTER="${GTEST_FILTER}" \
     GTEST_OUTPUT="xml:${TEST_REPORT_DIR}/" \
-    ctest --test-dir "${BUILD_DIR}" \
-          --output-on-failure \
+    ctest "${CTEST_ARGS[@]}" \
     || TEST_EXIT=$?
 
 if [[ "${TEST_EXIT:-0}" -ne 0 ]]; then

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -13,11 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-# Runs the plugin Python unit tests ON an aarch64 board (Thor/Orin). Unlike the
-# pipeline tests, these drive the TensorRT Python API + torch CUDA directly, so
-# the pytest process must run where the GPU is. Executed over ssh with:
-#   REMOTE_WORKSPACE=... TRT_PACKAGE_DIR=... PRIORITY=... JUNIT_PREFIX=... bash -s
+
 set -euo pipefail
 
 : "${REMOTE_WORKSPACE:?REMOTE_WORKSPACE must be set}"
@@ -25,48 +21,117 @@ set -euo pipefail
 : "${PRIORITY:?PRIORITY must be set}"
 : "${JUNIT_PREFIX:?JUNIT_PREFIX must be set}"
 
-cd "$REMOTE_WORKSPACE"
-ci_run="$REMOTE_WORKSPACE/.gitlab/ci/scripts/ci_run.sh"
+cd "${REMOTE_WORKSPACE}"
+ci_run="${REMOTE_WORKSPACE}/.gitlab/ci/scripts/ci_run.sh"
 pip_timeout_seconds="${CI_PIP_INSTALL_TIMEOUT_SECONDS:-1200}"
 job_phase_timeout_seconds="${CI_JOB_PHASE_TIMEOUT_SECONDS:-0}"
+report_name="${PYTHON_PLUGIN_REPORT_NAME:-l0_python_plugin_ut}"
+report_dir="${PYTHON_PLUGIN_REPORT_DIR:-logs}"
 
-echo "Setting up python environment on $(hostname)"
-python3 -m venv ut_venv
-# shellcheck disable=SC1091
-source ut_venv/bin/activate
-bash "$ci_run" "$pip_timeout_seconds" "Upgrade pip" -- pip3 install --upgrade pip
-bash "$ci_run" "$pip_timeout_seconds" "Install unit-test dependencies" -- pip3 install \
-    -r tests/requirements.txt \
-    -r tests/requirements-ut.txt
+library_dir="${TRT_LIBRARY_DIR:-${TRT_PACKAGE_DIR}/lib}"
+export LD_LIBRARY_PATH="${library_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
-echo "Installing TensorRT python package from $TRT_PACKAGE_DIR"
-# Pick the wheel matching this board's python ABI (the package ships several
-# cp3XX wheels); fall back to whatever is there so the error names the wheel.
-PY_TAG="cp$(python3 -c 'import sys; print(f"{sys.version_info[0]}{sys.version_info[1]}")')"
-TRT_WHL=$(ls "$TRT_PACKAGE_DIR"/python/tensorrt-*"$PY_TAG"*aarch64*.whl 2>/dev/null | head -n 1 || true)
-if [ -z "$TRT_WHL" ]; then
-    echo "No $PY_TAG TensorRT wheel found, available wheels:"
-    ls "$TRT_PACKAGE_DIR"/python/
-    TRT_WHL=$(ls "$TRT_PACKAGE_DIR"/python/tensorrt-*aarch64*.whl | head -n 1 || true)
-    [ -n "$TRT_WHL" ] || { echo "No TensorRT aarch64 wheel found at all"; exit 1; }
+echo "Resolving Python plugin-test environment on $(hostname)"
+use_system_site_packages="${PYTHON_PLUGIN_USE_SYSTEM_SITE_PACKAGES:-0}"
+venv_args=()
+requirements=(tests/requirements.txt)
+if [[ "${use_system_site_packages}" == "1" ]]; then
+    venv_args+=(--system-site-packages)
+else
+    requirements+=(tests/requirements-ut.txt)
 fi
-bash "$ci_run" "$pip_timeout_seconds" "Install TensorRT Python package" -- pip3 install "$TRT_WHL"
 
-export LLM_SDK_DIR="$REMOTE_WORKSPACE"
-export LD_LIBRARY_PATH="$TRT_PACKAGE_DIR/lib:${LD_LIBRARY_PATH:-}"
-mkdir -p logs
+python_tag="cp$(python3 -c 'import sys; print(f"{sys.version_info[0]}{sys.version_info[1]}")')"
+trt_wheel=""
+if [[ -d "${TRT_PACKAGE_DIR}/python" ]]; then
+    trt_wheel=$(find "${TRT_PACKAGE_DIR}/python" -maxdepth 1 -type f \
+        -name "tensorrt-*${python_tag}*aarch64*.whl" -print -quit)
+fi
 
-# test_build_project_with_pybind (l0_python_ut list) builds _edgellm_runtime.
-export PYTHONPATH="$REMOTE_WORKSPACE/build/pybind${PYTHONPATH:+:$PYTHONPATH}"
+trt_source=""
+if [[ "${use_system_site_packages}" == "1" ]] \
+        && system_trt_version=$(python3 -c 'import tensorrt; print(tensorrt.__version__)' 2>/dev/null); then
+    trt_source="system:${system_trt_version}"
+elif [[ -n "${trt_wheel}" ]]; then
+    trt_source="wheel:$(sha256sum "${trt_wheel}" | cut -d' ' -f1)"
+elif [[ -n "${TRT_PYTHON_VERSION:-}" ]]; then
+    trt_source="package:${TRT_PYTHON_VERSION}"
+else
+    echo "No ${python_tag} TensorRT wheel found in ${TRT_PACKAGE_DIR}/python"
+    exit 1
+fi
 
-# Fail loudly if the board env is broken (no torch/TRT/GPU); otherwise the
-# harness skips every test at the module level and the job goes green empty.
+cache_root="${PYTHON_PLUGIN_VENV_CACHE_DIR:-${HOME}/.cache/tensorrt-edge-llm/python-plugin-venvs}"
+mkdir -p "${cache_root}"
+cache_key=$(
+    {
+        printf '%s\n' "device-plugin-venv-v1"
+        python3 -c 'import platform, sys; print(platform.python_implementation(), sys.version)'
+        printf 'system_site_packages=%s\n' "${use_system_site_packages}"
+        printf 'trt_source=%s\n' "${trt_source}"
+        for requirement in "${requirements[@]}"; do
+            sha256sum "${requirement}"
+        done
+    } | sha256sum | cut -d' ' -f1
+)
+venv_dir="${cache_root}/${cache_key}"
+ready_file="${venv_dir}/.ready"
+lock_file="${cache_root}/${cache_key}.lock"
+
+exec {cache_lock_fd}>"${lock_file}"
+flock "${cache_lock_fd}"
+if [[ -f "${ready_file}" ]] \
+        && "${venv_dir}/bin/python3" -c 'import pytest, tensorrt, torch' >/dev/null 2>&1; then
+    echo "Reusing cached Python plugin-test environment ${venv_dir}"
+else
+    echo "Creating cached Python plugin-test environment ${venv_dir}"
+    rm -rf "${venv_dir}"
+    python3 -m venv "${venv_args[@]}" "${venv_dir}"
+    bash "${ci_run}" "${pip_timeout_seconds}" "Upgrade pip" -- \
+        "${venv_dir}/bin/python3" -m pip install --upgrade pip
+    install_args=()
+    for requirement in "${requirements[@]}"; do
+        install_args+=(-r "${requirement}")
+    done
+    bash "${ci_run}" "${pip_timeout_seconds}" "Install plugin-test dependencies" -- \
+        "${venv_dir}/bin/python3" -m pip install "${install_args[@]}"
+
+    if ! "${venv_dir}/bin/python3" -c 'import tensorrt' >/dev/null 2>&1; then
+        if [[ -n "${trt_wheel}" ]]; then
+            bash "${ci_run}" "${pip_timeout_seconds}" "Install TensorRT Python package" -- \
+                "${venv_dir}/bin/python3" -m pip install "${trt_wheel}"
+        else
+            bash "${ci_run}" "${pip_timeout_seconds}" "Install TensorRT Python bindings" -- \
+                "${venv_dir}/bin/python3" -m pip install --no-deps \
+                "tensorrt_cu13==${TRT_PYTHON_VERSION}" \
+                "tensorrt_cu13_bindings==${TRT_PYTHON_VERSION}"
+        fi
+    fi
+    "${venv_dir}/bin/python3" -c 'import pytest, tensorrt, torch'
+    printf '%s\n' "${cache_key}" > "${ready_file}"
+fi
+flock -u "${cache_lock_fd}"
+exec {cache_lock_fd}>&-
+
+# shellcheck disable=SC1091
+source "${venv_dir}/bin/activate"
+
+export LLM_SDK_DIR="${REMOTE_WORKSPACE}"
+cpp_unit_build_dir="${CPP_UNIT_BUILD_DIR:-${REMOTE_WORKSPACE}/build-cpp-unit}"
+export EDGELLM_PLUGIN_LIB="${EDGELLM_PLUGIN_LIB:-${cpp_unit_build_dir}/libNvInfer_edgellm_plugin.so}"
+mkdir -p "${report_dir}"
+
+test -f "${EDGELLM_PLUGIN_LIB}"
+grep -qx 'ENABLE_CUTE_DSL:STRING=ALL' "${cpp_unit_build_dir}/CMakeCache.txt"
+if [[ -n "${TRT_PYTHON_VERSION:-}" ]]; then
+    python3 -c 'import os, tensorrt; assert tensorrt.__version__ == os.environ["TRT_PYTHON_VERSION"]'
+fi
 python3 -c "import tensorrt, torch; assert torch.cuda.is_available(), 'CUDA not available'"
 
-echo "Running unit tests with pytest. Time:$(date)"
-# Test selection is driven by the tests/test_lists/$PRIORITY.yml list.
-bash "$ci_run" "$job_phase_timeout_seconds" "Run device unit tests" -- \
-    python3 -m pytest tests/ --priority="$PRIORITY" -v --color=yes \
-    --html="logs/test_report_$PRIORITY.html" --self-contained-html \
-    --junit-prefix="$JUNIT_PREFIX" \
-    --junitxml="logs/test_report_$PRIORITY.xml"
+echo "Running Python plugin tests with pytest. Time:$(date)"
+bash "${ci_run}" "${job_phase_timeout_seconds}" "Run Python plugin tests" -- \
+    python3 -m pytest tests/python-unittests/*plugin*.py \
+    --priority="${PRIORITY}" -v --maxfail=1 --color=yes \
+    --html="${report_dir}/test_report_${report_name}.html" --self-contained-html \
+    --junit-prefix="${JUNIT_PREFIX}" \
+    --junitxml="${report_dir}/test_report_${report_name}.xml"

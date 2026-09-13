@@ -60,6 +60,7 @@ wheel_release_vault_smoke:
   extends:
     - .wheel_release_artifactory_secrets
     - .protected_release_or_rehearsal_rules
+    - .cpu_runner_retry
   tags: [cpu-k8s]
   image: python:3.12-bookworm
   interruptible: true
@@ -70,8 +71,8 @@ wheel_release_vault_smoke:
 
 wheel_release_validate:
   stage: publish
-  extends: [.wheel_rules]
-  tags: [cpu-general-k8s]
+  extends: [.wheel_rules, .cpu_runner_retry]
+  tags: [cpu-k8s]
   image: python:3.12-bookworm
   interruptible: true
   needs:
@@ -92,7 +93,7 @@ wheel_release_stage:
   extends:
     - .wheel_release_artifactory_secrets
     - .protected_release_or_rehearsal_rules
-  tags: [cpu-general-k8s]
+  tags: [cpu-k8s]
   image: python:3.12-bookworm
   interruptible: false
   needs:
@@ -117,7 +118,7 @@ wheel_release_stage:
 wheel_release_rehearse:
   stage: publish
   extends: [.wheel_release_kitmaker_secret]
-  tags: [cpu-general-k8s]
+  tags: [cpu-k8s]
   image: python:3.12-bookworm
   interruptible: false
   resource_group: wheel-publication
@@ -148,7 +149,7 @@ wheel_release_rehearse:
 wheel_release_publish:
   stage: publish
   extends: [.wheel_release_kitmaker_secret]
-  tags: [cpu-general-k8s]
+  tags: [cpu-k8s]
   image: python:3.12-bookworm
   interruptible: false
   resource_group: wheel-publication

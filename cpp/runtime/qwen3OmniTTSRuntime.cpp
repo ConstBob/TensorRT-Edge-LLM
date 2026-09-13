@@ -102,6 +102,69 @@ bool extractMLPWeightsFromTensors(std::vector<rt::Tensor>& tensors, rt::Tensor& 
     return true;
 }
 
+void reserveRaggedBatch(RaggedExecutionBatch& batch, int32_t maxSequences, int32_t maxPhysicalTokens)
+{
+    batch.positions.reserve(maxPhysicalTokens);
+    batch.queryStartOffsets.reserve(maxSequences + 1);
+    batch.queryLengths.reserve(maxSequences);
+    batch.pastLengths.reserve(maxSequences);
+    batch.attentionSequenceLengths.reserve(maxSequences);
+    batch.stateIndices.reserve(maxSequences);
+    batch.logitsIndices.reserve(maxSequences);
+}
+
+void prepareRaggedBindings(RaggedExecutionBatch& batch, PipelineIO& io, SharedResources& resources,
+    LLMEngineConfig const& config, std::vector<int32_t> const& queryLengths, std::vector<int32_t> const& pastLengths,
+    int32_t batchSize, int32_t queryWidth, ExecutionPhase phase, cudaStream_t stream)
+{
+    check::check(batchSize > 0 && batchSize <= config.maxSupportedBatchSize, "Invalid ragged TTS batch size");
+    check::check(queryWidth > 0 && batchSize <= config.maxPhysicalTokens / queryWidth,
+        "Ragged TTS step exceeds the engine token capacity");
+    check::check(
+        queryLengths.size() >= static_cast<size_t>(batchSize) && pastLengths.size() >= static_cast<size_t>(batchSize),
+        "Ragged TTS step is missing host sequence lengths");
+
+    bool const contextPhase = phase == ExecutionPhase::kContextPrefill || phase == ExecutionPhase::kContextChunk;
+    int32_t const physicalTokens = batchSize * queryWidth;
+    int32_t validTokens{0};
+    batch.layout = TokenLayoutBackend::kEntryPaddedCompatibility;
+    batch.positions.assign(physicalTokens, -1);
+    batch.queryStartOffsets.resize(batchSize + 1);
+    batch.queryLengths.resize(batchSize);
+    batch.pastLengths.resize(batchSize);
+    batch.attentionSequenceLengths.resize(batchSize);
+    batch.stateIndices.resize(batchSize);
+    batch.logitsIndices.resize(batchSize);
+
+    for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+    {
+        int32_t const queryLength = queryLengths[batchIdx];
+        int32_t const pastLength = pastLengths[batchIdx];
+        check::check(queryLength > 0 && queryLength <= queryWidth, "Invalid ragged TTS query length");
+        check::check(pastLength >= 0 && pastLength + queryLength <= config.maxKVCacheCapacity,
+            "Ragged TTS sequence exceeds the KV-cache capacity");
+
+        int32_t const physicalStart = batchIdx * queryWidth;
+        batch.queryStartOffsets[batchIdx] = physicalStart;
+        batch.queryLengths[batchIdx] = queryLength;
+        batch.pastLengths[batchIdx] = pastLength;
+        batch.attentionSequenceLengths[batchIdx] = pastLength + queryLength;
+        batch.stateIndices[batchIdx] = batchIdx;
+        batch.logitsIndices[batchIdx] = physicalStart + queryLength - 1;
+        validTokens += queryLength;
+        for (int32_t tokenIdx = 0; tokenIdx < queryLength; ++tokenIdx)
+        {
+            batch.positions[physicalStart + tokenIdx] = pastLength + tokenIdx;
+        }
+    }
+    batch.queryStartOffsets[batchSize] = physicalTokens;
+    batch.shape = RaggedStepShape{batchSize, validTokens, physicalTokens, queryWidth, contextPhase ? batchSize : 0,
+        contextPhase ? validTokens : 0, batchSize};
+    ++batch.stepId;
+
+    prepareRaggedExecutionBindings(io, resources, config, batch, /*kvCacheIndex=*/0, stream);
+}
+
 // Shared chunk accumulator + emitter for streaming RVQ codes.
 // Used by both runTalkerGenerationLoop (per-batch in TTS) and handleStreamingGeneration (bs=1 Omni)
 // so chunk semantics (threshold-triggered non-final emit + single final flush) live in one place.
@@ -349,7 +412,6 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
         std::unordered_map<std::string, std::string> emptyLoraMap;
         mTalkerSharedRes = rt::SharedResources::createForLLM(mTalkerLLMConfig, emptyLoraMap, mStream);
         mTalkerPipelineIO = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForLLM(mTalkerLLMConfig, mStream));
-        mTalkerStepPreparer = std::make_unique<rt::StepPreparer>(mTalkerLLMConfig);
         rt::buildTensorMap(
             mTalkerTensorMap, *mTalkerPipelineIO, *mTalkerSharedRes, mTalkerLLMConfig, /*kvCacheIndex=*/0);
         mTalkerSharedRes->externalWeightManager->load(talkerEngineDir, talkerConfigPath, mStream, checkpointDir);
@@ -392,7 +454,6 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
         mCodePredictorSharedRes = rt::SharedResources::createForLLM(mCodePredictorConfig, emptyLoraMap, mStream);
         mCodePredictorPipelineIO
             = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForLLM(mCodePredictorConfig, mStream));
-        mCodePredictorStepPreparer = std::make_unique<rt::StepPreparer>(mCodePredictorConfig);
         rt::buildTensorMap(mCodePredictorTensorMap, *mCodePredictorPipelineIO, *mCodePredictorSharedRes,
             mCodePredictorConfig, /*kvCacheIndex=*/0);
         mCodePredictorSharedRes->externalWeightManager->load(
@@ -834,6 +895,13 @@ bool Qwen3OmniTTSRuntime::allocateBuffer()
     int64_t const talkerHiddenSize = mTalkerConfig.talkerHiddenSize;
     int64_t const maxBS = mMaxBatchSize;
 
+    reserveRaggedBatch(mTalkerRaggedBatch, mMaxBatchSize, mTalkerLLMConfig.maxPhysicalTokens);
+    reserveRaggedBatch(mCodePredictorRaggedBatch, mMaxBatchSize, mCodePredictorConfig.maxPhysicalTokens);
+    mTalkerQueryLengths.assign(mMaxBatchSize, 1);
+    mTalkerPastLengths.assign(mMaxBatchSize, 0);
+    mCodePredictorQueryLengths.assign(mMaxBatchSize, 1);
+    mCodePredictorPastLengths.assign(mMaxBatchSize, 0);
+
     try
     {
         // Per-batch prefill workspace (reused sequentially per batch in buildTalkerPrefillFromSegments)
@@ -860,8 +928,8 @@ bool Qwen3OmniTTSRuntime::allocateBuffer()
             = rt::Tensor({maxBS}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "mSeenSeedHostScratch");
 
         // CodePredictor workspace — sized to maxBS so any batch in [1, maxBS] just reshapes per-call.
-        // Same pattern as Talker: framework primitives (EngineExecutor / StepPreparer) are
-        // batch-size-agnostic; the per-call reshape({activeBatchSize, ...}) makes them work.
+        // Same pattern as Talker: the executor and ragged metadata are batch-size-agnostic;
+        // the per-call reshape({activeBatchSize, ...}) makes them work.
         mCodePredictorLogits = rt::Tensor({maxBS, mTalkerConfig.codebookSize}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kFLOAT, "mCodePredictorLogits");
 
@@ -1339,27 +1407,23 @@ bool Qwen3OmniTTSRuntime::executeTalkerPrefillStep(rt::Tensor const& inputEmbeds
     check::check(mHostReuseKVCacheLengths.reshape({batchSize}), "Tensor reshape failed");
     std::fill_n(mHostReuseKVCacheLengths.dataPointer<int32_t>(), batchSize, 0);
     talkerCacheMgr.resetForNewSequences(mHostReuseKVCacheLengths, stream);
+    std::fill_n(mTalkerPastLengths.begin(), batchSize, 0);
 
     // Zero Mamba SSM buffers — engine inputs, not covered by resetForNewSequences.
     talkerCacheMgr.getMambaCacheManager().clearStates(stream);
 
-    // Stage per-batch context lengths into PipelineIO's host buffer.
-    // StepPreparer consumes hostContextLengths to fill GPU contextLengths + selectTokenIndices.
-    check::check(mTalkerPipelineIO->hostContextLengths.reshape({batchSize}), "Tensor reshape failed");
-    int32_t* hostContextLength = mTalkerPipelineIO->hostContextLengths.dataPointer<int32_t>();
+    check::check(perBatchContextLengths.empty() || perBatchContextLengths.size() >= static_cast<size_t>(batchSize),
+        "Talker prefill is missing per-batch context lengths");
     if (!perBatchContextLengths.empty())
     {
         for (int64_t i = 0; i < batchSize; ++i)
         {
-            hostContextLength[i] = static_cast<int32_t>(perBatchContextLengths[i]);
+            mTalkerQueryLengths[i] = static_cast<int32_t>(perBatchContextLengths[i]);
         }
     }
     else
     {
-        for (int64_t i = 0; i < batchSize; ++i)
-        {
-            hostContextLength[i] = static_cast<int32_t>(seqLen);
-        }
+        std::fill_n(mTalkerQueryLengths.begin(), batchSize, static_cast<int32_t>(seqLen));
     }
     // Reshape logits to match the prefill batch size (CUDA graph capture may leave it at maxBS).
     check::check(outputLogits.reshape({batchSize, outputLogits.getShape()[outputLogits.getShape().getNumDims() - 1]}),
@@ -1372,14 +1436,11 @@ bool Qwen3OmniTTSRuntime::executeTalkerPrefillStep(rt::Tensor const& inputEmbeds
     mTalkerTensorMap.set(binding_names::kLogits, outputLogits);
     mTalkerTensorMap.set(binding_names::kOutputHiddenStates, outputHiddenStates);
 
-    // Prepare per-step metadata (selectTokenIndices, contextLengths, kvcache_start_index sentinel).
-    mTalkerStepPreparer->prepare(
-        rt::InferencePhase::kPrefill, static_cast<int32_t>(batchSize), talkerCacheMgr, *mTalkerPipelineIO, stream);
-    mTalkerPipelineIO->recordStepHostUploads(stream);
+    prepareRaggedBindings(mTalkerRaggedBatch, *mTalkerPipelineIO, *mTalkerSharedRes, mTalkerLLMConfig,
+        mTalkerQueryLengths, mTalkerPastLengths, static_cast<int32_t>(batchSize), static_cast<int32_t>(seqLen),
+        ExecutionPhase::kContextPrefill, stream);
 
-    bool const kvAllEmpty = talkerCacheMgr.getKVCacheAllEmpty();
-    auto const prefillDims = mTalkerLLMConfig.prefillDims(
-        batchSize, seqLen, kvAllEmpty ? ExecutionPhase::kContextPrefill : ExecutionPhase::kContextChunk);
+    auto const prefillDims = mTalkerLLMConfig.prefillDims(batchSize, seqLen, ExecutionPhase::kContextPrefill);
     if (!mTalkerExec->prepare(/*prefillProfile=*/0, prefillDims, mTalkerTensorMap, stream))
     {
         LOG_ERROR("Talker prefill prepare failed");
@@ -1390,7 +1451,8 @@ bool Qwen3OmniTTSRuntime::executeTalkerPrefillStep(rt::Tensor const& inputEmbeds
         LOG_ERROR("Talker prefill execute failed");
         return false;
     }
-    talkerCacheMgr.commitSequenceLength(mTalkerPipelineIO->contextLengths, stream);
+    talkerCacheMgr.commitSequenceLength(mTalkerPipelineIO->queryLengths, stream);
+    std::copy_n(mTalkerQueryLengths.begin(), batchSize, mTalkerPastLengths.begin());
     return true;
 }
 
@@ -1410,8 +1472,10 @@ bool Qwen3OmniTTSRuntime::executeTalkerDecodingStep(
     mTalkerTensorMap.set(binding_names::kLogits, outputLogits);
     mTalkerTensorMap.set(binding_names::kOutputHiddenStates, outputHiddenStates);
 
-    mTalkerStepPreparer->prepare(
-        rt::InferencePhase::kDecode, static_cast<int32_t>(batchSize), talkerCacheMgr, *mTalkerPipelineIO, stream);
+    std::fill_n(mTalkerQueryLengths.begin(), batchSize, 1);
+    prepareRaggedBindings(mTalkerRaggedBatch, *mTalkerPipelineIO, *mTalkerSharedRes, mTalkerLLMConfig,
+        mTalkerQueryLengths, mTalkerPastLengths, static_cast<int32_t>(batchSize), /*queryWidth=*/1,
+        ExecutionPhase::kAutoregressiveDecode, stream);
 
     auto const decodeDims = mTalkerLLMConfig.decodeDims(batchSize);
     if (!mTalkerExec->prepare(/*decodeProfile=*/1, decodeDims, mTalkerTensorMap, stream))
@@ -1426,6 +1490,10 @@ bool Qwen3OmniTTSRuntime::executeTalkerDecodingStep(
     }
     // Vanilla decode advances the KV cache by exactly 1 token per call (matches kVANILLA_DECODE_INCREMENT).
     talkerCacheMgr.commitSequenceLength(/*increment=*/1, stream);
+    for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+    {
+        ++mTalkerPastLengths[batchIdx];
+    }
     return true;
 }
 
@@ -1451,11 +1519,8 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorPrefillStep(rt::Tensor const& inpu
     int32_t* reuseData = mHostReuseKVCacheLengths.dataPointer<int32_t>();
     std::fill_n(reuseData, batchSize, 0);
     cpCacheMgr.resetForNewSequences(mHostReuseKVCacheLengths, stream);
-
-    // Stage per-batch host context lengths (all = kCodePredictorPrefillSeqLen).
-    check::check(mCodePredictorPipelineIO->hostContextLengths.reshape({batchSize}), "Tensor reshape failed");
-    int32_t* hostCtxLen = mCodePredictorPipelineIO->hostContextLengths.dataPointer<int32_t>();
-    std::fill_n(hostCtxLen, batchSize, static_cast<int32_t>(seqLen));
+    std::fill_n(mCodePredictorPastLengths.begin(), batchSize, 0);
+    std::fill_n(mCodePredictorQueryLengths.begin(), batchSize, static_cast<int32_t>(seqLen));
 
     check::check(lmHeadIdx == 0, "CP prefill always uses lm_head 0");
     CUDA_CHECK(cudaMemsetAsync(mCpLmHeadIdx.rawPointer(), 0, sizeof(int32_t), stream));
@@ -1466,9 +1531,9 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorPrefillStep(rt::Tensor const& inpu
     mCodePredictorTensorMap.set(binding_names::kLmHeads, mCodePredictorLmHeads);
     mCodePredictorTensorMap.set(binding_names::kLmHeadIdx, mCpLmHeadIdx);
 
-    mCodePredictorStepPreparer->prepare(
-        rt::InferencePhase::kPrefill, static_cast<int32_t>(batchSize), cpCacheMgr, *mCodePredictorPipelineIO, stream);
-    mCodePredictorPipelineIO->recordStepHostUploads(stream);
+    prepareRaggedBindings(mCodePredictorRaggedBatch, *mCodePredictorPipelineIO, *mCodePredictorSharedRes,
+        mCodePredictorConfig, mCodePredictorQueryLengths, mCodePredictorPastLengths, static_cast<int32_t>(batchSize),
+        static_cast<int32_t>(seqLen), ExecutionPhase::kContextPrefill, stream);
 
     // The short CP prefill fits the widened generation profile. Keep its context
     // phase and ragged metadata intact when selecting that optimization profile.
@@ -1481,9 +1546,7 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorPrefillStep(rt::Tensor const& inpu
     mCpBoundSeqLen = -1;
     if (!prepared)
     {
-        bool const kvAllEmpty = cpCacheMgr.getKVCacheAllEmpty();
-        auto const prefillDims = mCodePredictorConfig.prefillDims(
-            batchSize, seqLen, kvAllEmpty ? ExecutionPhase::kContextPrefill : ExecutionPhase::kContextChunk);
+        auto const prefillDims = mCodePredictorConfig.prefillDims(batchSize, seqLen, ExecutionPhase::kContextPrefill);
         prepared = mCodePredictorExec->prepare(/*prefillProfile=*/0, prefillDims, mCodePredictorTensorMap, stream);
     }
     if (!prepared)
@@ -1496,7 +1559,8 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorPrefillStep(rt::Tensor const& inpu
         LOG_ERROR("CodePredictor prefill execute failed");
         return false;
     }
-    cpCacheMgr.commitSequenceLength(mCodePredictorPipelineIO->contextLengths, stream);
+    cpCacheMgr.commitSequenceLength(mCodePredictorPipelineIO->queryLengths, stream);
+    std::copy_n(mCodePredictorQueryLengths.begin(), batchSize, mCodePredictorPastLengths.begin());
     return true;
 }
 
@@ -1510,11 +1574,10 @@ bool Qwen3OmniTTSRuntime::prepareCpDecodeBindings(int32_t activeBatchSize, cudaS
     check::check(mCodePredictorCodecEmbed.reshape({activeBatchSize, 1, cpH}), "Tensor reshape failed");
     check::check(mCodePredictorHiddenStatesBuffer.reshape({activeBatchSize, 1, cpH}), "Tensor reshape failed");
 
-    // Shape the step metadata (kvcache_start_index et al) for decode BEFORE binding —
-    // they are prefill-shaped coming out of the frame's prefill, and a mismatch here
-    // changes the binding hash so execute() would never hit the captured graph.
-    mCodePredictorStepPreparer->prepare(rt::InferencePhase::kDecode, activeBatchSize,
-        *mCodePredictorSharedRes->cacheManagers[0], *mCodePredictorPipelineIO, stream);
+    std::fill_n(mCodePredictorQueryLengths.begin(), activeBatchSize, 1);
+    prepareRaggedBindings(mCodePredictorRaggedBatch, *mCodePredictorPipelineIO, *mCodePredictorSharedRes,
+        mCodePredictorConfig, mCodePredictorQueryLengths, mCodePredictorPastLengths, activeBatchSize,
+        /*queryWidth=*/1, ExecutionPhase::kAutoregressiveDecode, stream);
 
     mCodePredictorTensorMap.set(binding_names::kInputsEmbeds, mCodePredictorCodecEmbed);
     mCodePredictorTensorMap.set(binding_names::kLogits, mCodePredictorLogits);
@@ -1536,8 +1599,6 @@ bool Qwen3OmniTTSRuntime::prepareCpDecodeBindings(int32_t activeBatchSize, cudaS
 
 bool Qwen3OmniTTSRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
 {
-    std::string const emptyLoraWeightsName = "";
-
     // Talker: capture for all supported batch sizes (1..maxBatchSize).
     // EngineExecutor::captureGraph() hashes the current binding state, so each bs
     // produces its own graph slot automatically.
@@ -1551,6 +1612,8 @@ bool Qwen3OmniTTSRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
         std::vector<int32_t> reuseLens(bs, kSimulateCacheLength);
         rt::Tensor simulatedReuse(reuseLens.data(), rt::Coords{bs}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32);
         talkerCacheMgr.resetForNewSequences(simulatedReuse, stream);
+        std::fill_n(mTalkerPastLengths.begin(), bs, kSimulateCacheLength);
+        std::fill_n(mTalkerQueryLengths.begin(), bs, 1);
 
         check::check(mResidualEmbedBuffer.reshape({bs, 1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
         check::check(
@@ -1561,7 +1624,9 @@ bool Qwen3OmniTTSRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
         mTalkerTensorMap.set(binding_names::kLogits, mTalkerLogits);
         mTalkerTensorMap.set(binding_names::kOutputHiddenStates, mTalkerHiddenStatesBuffer);
 
-        mTalkerStepPreparer->prepare(rt::InferencePhase::kDecode, bs, talkerCacheMgr, *mTalkerPipelineIO, stream);
+        prepareRaggedBindings(mTalkerRaggedBatch, *mTalkerPipelineIO, *mTalkerSharedRes, mTalkerLLMConfig,
+            mTalkerQueryLengths, mTalkerPastLengths, bs, /*queryWidth=*/1, ExecutionPhase::kAutoregressiveDecode,
+            stream);
 
         auto const decodeDims = mTalkerLLMConfig.decodeDims(bs);
         captureStatus &= mTalkerExec->prepare(/*decodeProfile=*/1, decodeDims, mTalkerTensorMap, stream);
@@ -1576,6 +1641,7 @@ bool Qwen3OmniTTSRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
         rt::Tensor zeroReuse(
             zeroLens.data(), rt::Coords{mMaxBatchSize}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32);
         talkerCacheMgr.resetForNewSequences(zeroReuse, stream);
+        std::fill(mTalkerPastLengths.begin(), mTalkerPastLengths.end(), 0);
     }
 
     // CodePredictor: the head is gathered in-engine by the device lm_head_idx, so
@@ -1590,6 +1656,7 @@ bool Qwen3OmniTTSRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
         std::vector<int32_t> simLens(bs, simLen);
         rt::Tensor simReuse(simLens.data(), rt::Coords{bs}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32);
         cpCacheMgr.resetForNewSequences(simReuse, stream);
+        std::fill_n(mCodePredictorPastLengths.begin(), bs, simLen);
 
         CUDA_CHECK(cudaMemsetAsync(mCpLmHeadIdx.rawPointer(), 0, sizeof(int32_t), stream));
         captureStatus &= prepareCpDecodeBindings(bs, stream);
@@ -1630,6 +1697,7 @@ bool Qwen3OmniTTSRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
         rt::Tensor zeroReuse(
             zeroLens.data(), rt::Coords{mMaxBatchSize}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32);
         cpCacheMgr.resetForNewSequences(zeroReuse, stream);
+        std::fill(mCodePredictorPastLengths.begin(), mCodePredictorPastLengths.end(), 0);
     }
 
     if (captureStatus)
@@ -2926,14 +2994,20 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t activeBatch
             }
 
             // Engine forward: graph replay via the binding-hash cache (or enqueueV3 fallback).
-            mCodePredictorStepPreparer->prepare(
-                rt::InferencePhase::kDecode, activeBatchSize, cpCacheMgr, *mCodePredictorPipelineIO, stream);
+            std::fill_n(mCodePredictorQueryLengths.begin(), activeBatchSize, 1);
+            prepareRaggedBindings(mCodePredictorRaggedBatch, *mCodePredictorPipelineIO, *mCodePredictorSharedRes,
+                mCodePredictorConfig, mCodePredictorQueryLengths, mCodePredictorPastLengths, activeBatchSize,
+                /*queryWidth=*/1, ExecutionPhase::kAutoregressiveDecode, stream);
             if (!mCodePredictorExec->execute(stream))
             {
                 LOG_ERROR("CP decode execute failed (step=%d)", step);
                 return false;
             }
             cpCacheMgr.commitSequenceLength(/*increment=*/1, stream);
+            for (int32_t batchIdx = 0; batchIdx < activeBatchSize; ++batchIdx)
+            {
+                ++mCodePredictorPastLengths[batchIdx];
+            }
 
             // Sample code_step.
             check::check(mCodePredictorLogits.reshape({activeBatchSize, codebookSize}), "Tensor reshape failed");
@@ -3092,13 +3166,10 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorVerifyStep(rt::Tensor const& input
     auto const inputShape = inputsEmbeds.getShape();
     check::check(inputShape.getNumDims() == 3, "executeCodePredictorVerifyStep: inputsEmbeds must be 3D");
     int64_t const seqLen = inputShape[1];
-    auto& cpCacheMgr = *mCodePredictorSharedRes->cacheManagers[0];
-
-    check::check(mCodePredictorPipelineIO->hostContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
-    int32_t* const hostCtxLen = mCodePredictorPipelineIO->hostContextLengths.dataPointer<int32_t>();
     for (int32_t b = 0; b < activeBatchSize; ++b)
     {
-        hostCtxLen[b] = baseLens[b] + static_cast<int32_t>(seqLen);
+        mCodePredictorQueryLengths[b] = static_cast<int32_t>(seqLen);
+        mCodePredictorPastLengths[b] = baseLens[b];
     }
 
     bool const shapeChanged = mCpBoundBatch != activeBatchSize || mCpBoundSeqLen != static_cast<int32_t>(seqLen);
@@ -3111,20 +3182,9 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorVerifyStep(rt::Tensor const& input
         mCodePredictorTensorMap.set(binding_names::kLmHeadIdx, mCpLmHeadIdx);
     }
 
-    mCodePredictorStepPreparer->prepare(
-        rt::InferencePhase::kPrefill, activeBatchSize, cpCacheMgr, *mCodePredictorPipelineIO, stream);
-
-    // The preparer's prefill path derives the select index from the total context
-    // length; here that spans the already-cached prefix, so it would fall outside the
-    // seqLen new rows. Logits are unused during verification (the runtime applies the
-    // per-depth lm_heads itself), but the gather index must still be in range.
-    check::check(
-        mCodePredictorPipelineIO->hostSelectTokenIndices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
-    int64_t* const hostSelect = mCodePredictorPipelineIO->hostSelectTokenIndices.dataPointer<int64_t>();
-    std::fill_n(hostSelect, activeBatchSize, seqLen - 1);
-    CUDA_CHECK(cudaMemcpyAsync(mCodePredictorPipelineIO->selectTokenIndices.rawPointer(), hostSelect,
-        activeBatchSize * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
-    mCodePredictorPipelineIO->recordStepHostUploads(stream);
+    prepareRaggedBindings(mCodePredictorRaggedBatch, *mCodePredictorPipelineIO, *mCodePredictorSharedRes,
+        mCodePredictorConfig, mCodePredictorQueryLengths, mCodePredictorPastLengths, activeBatchSize,
+        static_cast<int32_t>(seqLen), ExecutionPhase::kContextChunk, stream);
 
     // Verification uses the widened generation profile while retaining context-chunk
     // semantics for its multi-token query.

@@ -8,6 +8,8 @@ l0_experimental_docker_jedha:
     - .device_controller_environment
     - .ci_internal_submodules
   needs:
+    - job: init_l0_storage
+      artifacts: false
     - job: build_cutedsl_docker_matrix
       artifacts: true
   tags:
@@ -42,7 +44,6 @@ l0_experimental_docker_jedha:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       changes:
         - .dockerignore
-        - .gitlab-ci.yml
         - .gitlab/ci/experimental-docker-jobs.yml
         - .gitlab/ci/scripts/experimental_docker_board.sh
         - experimental/server/**/*

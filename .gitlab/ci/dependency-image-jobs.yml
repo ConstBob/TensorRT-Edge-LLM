@@ -13,8 +13,10 @@
 
 build_ci_dependency_images:
   stage: setup
-  extends: .dependency_image_rules
-  tags: [cpu-general-k8s]
+  extends:
+    - .dependency_image_rules
+    - .cpu_runner_retry
+  tags: [cpu-k8s]
   image:
     name: "moby/buildkit:rootless"
     entrypoint: [""]
