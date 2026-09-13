@@ -82,6 +82,12 @@ _FMHA_V2_SPECIAL_VARIANTS = {
 _FMHA_V2_VARIANTS = (_FMHA_V2_DENSE_VARIANTS | _FMHA_V2_PAGED_VARIANTS
                      | _FMHA_V2_RAGGED_PAGED_VARIANTS
                      | _FMHA_V2_SPECIAL_VARIANTS)
+_BLACKWELL_PACKED_PAGED_VARIANTS = {
+    f"fmha_d{head_dim}_packed{sliding}_paged{fp8}"
+    for head_dim in (64, 128, 256, 512)
+    for sliding in ("", "_sw")
+    for fp8 in ("", "_fp8")
+}
 _LAYERNORM_SUPPORTED_SMS = [80, 86, 87, 90, 100, 101, 110, 120, 121]
 _LAYERNORM_HIDDEN_SIZES = {4096, 4097, 5120, 7168, 8192}
 _LAYERNORM_DTYPES = {"fp16", "bf16"}
@@ -462,6 +468,34 @@ def test_fmha_registry_has_one_d512_bidirectional_variant(sm):
     assert "--window_size" in bidirectional_variants[0].script_args
     assert all("visionblock" not in variant.name for variant in variants
                if variant.name.startswith("fmha_d512"))
+
+
+@pytest.mark.parametrize("sm", [100, 101, 110])
+def test_blackwell_packed_paged_registry_is_complete(sm):
+    variants = [
+        variant for variant in build_cutedsl.select_variants(sm, "fmha")
+        if variant.script == "fmha_cutedsl_blackwell/fmha.py"
+        and "_packed" in variant.name
+    ]
+
+    assert {variant.name
+            for variant in variants} == _BLACKWELL_PACKED_PAGED_VARIANTS
+    assert all("--packed_q" in variant.script_args for variant in variants)
+    assert all("--paged_kv" in variant.script_args for variant in variants)
+    assert {
+        variant.name
+        for variant in variants if "--window_size" in variant.script_args
+    } == {
+        name
+        for name in _BLACKWELL_PACKED_PAGED_VARIANTS if "_packed_sw_" in name
+    }
+    assert {
+        variant.name
+        for variant in variants if "--in_dtype" in variant.script_args
+    } == {
+        name
+        for name in _BLACKWELL_PACKED_PAGED_VARIANTS if name.endswith("_fp8")
+    }
 
 
 def test_fmha_v2_d512_registry_uses_32x32_tiles_and_two_warps():

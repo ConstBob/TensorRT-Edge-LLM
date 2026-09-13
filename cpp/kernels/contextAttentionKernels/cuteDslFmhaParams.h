@@ -89,6 +89,33 @@ struct LlmFmhaPagedParams
     cudaStream_t stream{};
 };
 
+//! Everything the optimized Blackwell packed-Q/O paged descriptors need for one ragged launch.
+struct LlmFmhaRaggedPagedParams
+{
+    void const* qPtr{};
+    void const* pagedKVPoolPtr{};
+    int32_t const* kvCachePageList{};
+    void* oPtr{};
+    int32_t const* cuQSeqLens{};
+    int32_t const* cuKVSeqLens{};
+    int32_t totalQSeqLen{};
+    int32_t maxQSeqLen{};
+    int32_t batchSize{};
+    int32_t numQHeads{};
+    int32_t numKVHeads{};
+    int32_t headDim{};
+    int32_t numFlatPages{};
+    int32_t maxPagesPerSeq{};
+    int32_t tokensPerPage{};
+    int32_t windowSizeLeft{};
+    float attentionScale{};
+    float scaleQ{};
+    float scaleK{};
+    float scaleV{};
+    float invScaleO{};
+    cudaStream_t stream{};
+};
+
 //! Everything the ViT descriptors need, gathered once per CuteDslFMHARunner ViT run() call.
 //! The ViT AOT variants are plain MHA, hence a single head count.
 struct VitFmhaParams

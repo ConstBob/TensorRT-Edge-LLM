@@ -921,6 +921,47 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
 
     @cute.jit
+    def __call_paged_ragged__(
+        self,
+        q_tensor: cute.Tensor,
+        kv_cache_pool: cute.Tensor,
+        kv_cache_page_list: cute.Tensor,
+        o_tensor: cute.Tensor,
+        cum_seqlen_k: cute.Tensor,
+        window_size_left: Int32,
+        attention_scale: Float32,
+        scale_q: Float32,
+        scale_k: Float32,
+        scale_v: Float32,
+        inv_scale_o: Float32,
+        sm_count: Int32,
+        stream: cuda.CUstream,
+        cum_seqlen_q: cute.Tensor,
+        max_seqlen_q: Int32,
+    ):
+        """LLM FMHA over packed Q/O and a native paged KV cache."""
+        self.__call_paged__(
+            q_tensor,
+            kv_cache_pool,
+            kv_cache_page_list,
+            o_tensor,
+            cum_seqlen_k,
+            window_size_left,
+            attention_scale,
+            scale_q,
+            scale_k,
+            scale_v,
+            inv_scale_o,
+            sm_count,
+            stream,
+            None,
+            None,
+            None,
+            cum_seqlen_q,
+            max_seqlen_q,
+        )
+
+    @cute.jit
     def __call_paged__(
         self,
         q_tensor: cute.Tensor,  # (B, S_q, H_q, D) — B,S_q,H_q dynamic; D static
@@ -940,6 +981,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         total_softmax_count: Optional[cute.Tensor] = None,  # (perf builds pass None ->
                                                             #  const_expr removes atomics)
         skip_softmax_scale_factor: Optional[Float32] = None,  # raw calibrated S; kernel derives per-seq lambda = S / seqlen_k
+        cum_seqlen_q: Optional[cute.Tensor] = None,  # (B+1,) Int32 for packed Q/O
+        max_seqlen_q: Optional[Int32] = None,
     ):
         """LLM FMHA over paged KV cache.
 
@@ -954,14 +997,24 @@ class BlackwellFusedMultiHeadAttentionForward:
         assert (skip_softmax_scale_factor is not None) == (
             self.skip_softmax_threshold is not None
         ), "pass skip_softmax_scale_factor iff the class was built with skip enabled"
+        assert (cum_seqlen_q is None) == (max_seqlen_q is None), (
+            "packed paged FMHA requires cum_seqlen_q and max_seqlen_q together"
+        )
         scale_softmax = scale_q * scale_k
         if attention_scale != 1.0:
             scale_softmax *= attention_scale
         scale_softmax_log2 = scale_softmax * self.log2_e
         scale_output = scale_v * inv_scale_o
-        b = q_tensor.layout.shape[0]
-        s_q = q_tensor.layout.shape[1]
-        h_q = q_tensor.layout.shape[2]
+        is_packed_qkv = cum_seqlen_q is not None
+        if cutlass.const_expr(is_packed_qkv):
+            total_s_q = q_tensor.layout.shape[0]
+            b = cum_seqlen_q.layout.shape[0] - 1
+            s_q = max_seqlen_q
+            h_q = q_tensor.layout.shape[1]
+        else:
+            b = q_tensor.layout.shape[0]
+            s_q = q_tensor.layout.shape[1]
+            h_q = q_tensor.layout.shape[2]
         num_pages = kv_cache_pool.layout.shape[0]
         h_k = kv_cache_pool.layout.shape[1]
         tokens_per_page = kv_cache_pool.layout.shape[2]
@@ -972,20 +1025,23 @@ class BlackwellFusedMultiHeadAttentionForward:
         o_iter = o_tensor.iterator
 
         h_r = h_q // h_k
-        qo_offset = 0
-        b_qo = b
-        stride_b_qo = h_r * h_k * s_q * d
-
         stride_kv_page = kv_cache_pool.layout.stride[0]
         stride_kv_head = kv_cache_pool.layout.stride[1]
         stride_kv_token = kv_cache_pool.layout.stride[2]
 
-        # (s, d, ((h_r, h_k), b))
-        q_layout = cute.make_layout(
-            (s_q, d, ((h_r, h_k), b_qo)),
-            stride=(d * h_r * h_k, 1, ((d, d * h_r), stride_b_qo)),
-        )
-        q = cute.make_tensor(q_iter + qo_offset, q_layout)
+        if cutlass.const_expr(is_packed_qkv):
+            q_layout = cute.make_layout(
+                (total_s_q, d, (h_r, h_k)),
+                stride=(d * h_r * h_k, 1, (d, d * h_r)),
+            )
+            q = cute.make_tensor(q_iter, q_layout)
+        else:
+            stride_b_qo = h_r * h_k * s_q * d
+            q_layout = cute.make_layout(
+                (s_q, d, ((h_r, h_k), b)),
+                stride=(d * h_r * h_k, 1, ((d, d * h_r), stride_b_qo)),
+            )
+            q = cute.make_tensor(q_iter, q_layout)
         # Pool K: (tokens_per_page, d, ((h_r, h_k), page)), 0-stride h_r broadcast.
         k_layout = cute.make_layout(
             (tokens_per_page, d, ((h_r, h_k), num_pages)),
@@ -998,14 +1054,20 @@ class BlackwellFusedMultiHeadAttentionForward:
             stride=(1, stride_kv_token, ((0, stride_kv_head), stride_kv_page)),
         )
         v = cute.make_tensor(kv_pool_iter, v_layout)
-        # (s, d, ((h_r, h_k), b))
-        o_layout = cute.make_layout(
-            (s_q, d, ((h_r, h_k), b_qo)),
-            stride=(d * h_r * h_k, 1, ((d, d * h_r), stride_b_qo)),
-        )
-        o = cute.make_tensor(o_iter + qo_offset, o_layout)
+        if cutlass.const_expr(is_packed_qkv):
+            o_layout = cute.make_layout(
+                (total_s_q, d, (h_r, h_k)),
+                stride=(d * h_r * h_k, 1, (d, d * h_r)),
+            )
+            o = cute.make_tensor(o_iter, o_layout)
+        else:
+            o_layout = cute.make_layout(
+                (s_q, d, ((h_r, h_k), b)),
+                stride=(d * h_r * h_k, 1, ((d, d * h_r), stride_b_qo)),
+            )
+            o = cute.make_tensor(o_iter, o_layout)
         lse = None
-        self.is_packed_qkv = False
+        self.is_packed_qkv = is_packed_qkv
 
         self.q_dtype = q.element_type
         self.k_dtype = k.element_type
@@ -1130,7 +1192,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             tma_atom_k, tma_tensor_k,
             tma_atom_v, tma_tensor_v,
             tma_atom_o, tma_tensor_o, o,
-            None, cum_seqlen_k, lse, kv_cache_page_list,
+            cum_seqlen_q, cum_seqlen_k, lse, kv_cache_page_list,
             scale_softmax_log2, scale_softmax, scale_output,
             _wsl, _wsr,
             q_smem_layout_staged, k_smem_layout_staged,
@@ -1467,7 +1529,16 @@ class BlackwellFusedMultiHeadAttentionForward:
                     if cutlass.const_expr(cum_seqlen_k is not None):
                         cuseqlen_k = cum_seqlen_k[batch_coord]
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
-                        if cutlass.const_expr(cum_seqlen_q is not None):
+                        # kv_cache_page_list is a compile-time constant here and is always a real
+                        # tensor for every current caller of __call_paged__ (run()'s paged_kv=True
+                        # branch), so this branch is unreachable in practice; it exists only to
+                        # keep this const_expr consistent with the non-paged __call__'s dense
+                        # packed-Q + packed-KV offset math should a future caller ever compile
+                        # __call_paged__ with kv_cache_page_list=None.
+                        if cutlass.const_expr(
+                            cum_seqlen_q is not None
+                            and kv_cache_page_list is None
+                        ):
                             logical_offset_mK = (
                                 cuseqlen_k,
                                 0,
@@ -4317,6 +4388,49 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
         )
 
     @cute.jit
+    def __call_paged_ragged__(
+        self,
+        q_tensor: cute.Tensor,
+        kv_cache_pool: cute.Tensor,
+        kv_cache_page_list: cute.Tensor,
+        o_tensor: cute.Tensor,
+        cum_seqlen_k: cute.Tensor,
+        window_size_left: Int32,
+        attention_scale: Float32,
+        scale_q: Float32,
+        scale_k: Float32,
+        scale_v: Float32,
+        inv_scale_o: Float32,
+        sm_count: Int32,
+        stream: cuda.CUstream,
+        cum_seqlen_q: cute.Tensor,
+        max_seqlen_q: Int32,
+    ):
+        """D512 LLM FMHA over packed Q/O and a native paged KV cache."""
+        self.__call_paged__(
+            q_tensor,
+            kv_cache_pool,
+            kv_cache_page_list,
+            o_tensor,
+            cum_seqlen_k,
+            None,
+            None,
+            window_size_left,
+            attention_scale,
+            scale_q,
+            scale_k,
+            scale_v,
+            inv_scale_o,
+            sm_count,
+            stream,
+            None,
+            None,
+            None,
+            cum_seqlen_q,
+            max_seqlen_q,
+        )
+
+    @cute.jit
     def __call_paged__(
         self,
         q_tensor: cute.Tensor,  # (B, S_q, H_q, D) — B,S_q,H_q dynamic; D static
@@ -4339,6 +4453,8 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
         total_softmax_count: Optional[cute.Tensor] = None,  # (perf builds pass None ->
         # the counting atomics are compile-time eliminated)
         skip_softmax_scale_factor: Optional[Float32] = None,  # raw calibrated S; kernel derives per-seq lambda = S / seqlen_k
+        cum_seqlen_q: Optional[cute.Tensor] = None,  # (B+1,) Int32 for packed Q/O
+        max_seqlen_q: Optional[Int32] = None,
     ):
         """LLM FMHA over paged KV cache.
 
@@ -4364,6 +4480,10 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
         if cutlass.const_expr((block_begin is None) != (block_end is None)):
             raise ValueError(
                 "block_begin and block_end must be both set or both None"
+            )
+        if cutlass.const_expr((cum_seqlen_q is None) != (max_seqlen_q is None)):
+            raise ValueError(
+                "packed paged FMHA requires cum_seqlen_q and max_seqlen_q together"
             )
         if cutlass.const_expr(
             self.mask_type is fmha_utils.MaskEnum.BIDIRECTIONAL
@@ -4399,9 +4519,16 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
             scale_softmax *= attention_scale
         scale_softmax_log2 = scale_softmax * self.log2_e
         scale_output = scale_v * inv_scale_o
-        b = q_tensor.layout.shape[0]
-        s_q = q_tensor.layout.shape[1]
-        h_q = q_tensor.layout.shape[2]
+        is_packed_qkv = cum_seqlen_q is not None
+        if cutlass.const_expr(is_packed_qkv):
+            total_s_q = q_tensor.layout.shape[0]
+            b = cum_seqlen_q.layout.shape[0] - 1
+            s_q = max_seqlen_q
+            h_q = q_tensor.layout.shape[1]
+        else:
+            b = q_tensor.layout.shape[0]
+            s_q = q_tensor.layout.shape[1]
+            h_q = q_tensor.layout.shape[2]
         num_pages = kv_cache_pool.layout.shape[0]
         h_k = kv_cache_pool.layout.shape[1]
         tokens_per_page = kv_cache_pool.layout.shape[2]
@@ -4412,20 +4539,23 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
         o_iter = o_tensor.iterator
 
         h_r = h_q // h_k
-        qo_offset = 0
-        b_qo = b
-        stride_b_qo = h_r * h_k * s_q * d
-
         stride_kv_page = kv_cache_pool.layout.stride[0]
         stride_kv_head = kv_cache_pool.layout.stride[1]
         stride_kv_token = kv_cache_pool.layout.stride[2]
 
-        # (s, d, ((h_r, h_k), b))
-        q_layout = cute.make_layout(
-            (s_q, d, ((h_r, h_k), b_qo)),
-            stride=(d * h_r * h_k, 1, ((d, d * h_r), stride_b_qo)),
-        )
-        q = cute.make_tensor(q_iter + qo_offset, q_layout)
+        if cutlass.const_expr(is_packed_qkv):
+            q_layout = cute.make_layout(
+                (total_s_q, d, (h_r, h_k)),
+                stride=(d * h_r * h_k, 1, (d, d * h_r)),
+            )
+            q = cute.make_tensor(q_iter, q_layout)
+        else:
+            stride_b_qo = h_r * h_k * s_q * d
+            q_layout = cute.make_layout(
+                (s_q, d, ((h_r, h_k), b)),
+                stride=(d * h_r * h_k, 1, ((d, d * h_r), stride_b_qo)),
+            )
+            q = cute.make_tensor(q_iter, q_layout)
         # Pool K: (tokens_per_page, d, ((h_r, h_k), page)), 0-stride h_r broadcast.
         k_layout = cute.make_layout(
             (tokens_per_page, d, ((h_r, h_k), num_pages)),
@@ -4438,14 +4568,20 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
             stride=(1, stride_kv_token, ((0, stride_kv_head), stride_kv_page)),
         )
         v = cute.make_tensor(kv_pool_iter, v_layout)
-        # (s, d, ((h_r, h_k), b))
-        o_layout = cute.make_layout(
-            (s_q, d, ((h_r, h_k), b_qo)),
-            stride=(d * h_r * h_k, 1, ((d, d * h_r), stride_b_qo)),
-        )
-        o = cute.make_tensor(o_iter + qo_offset, o_layout)
+        if cutlass.const_expr(is_packed_qkv):
+            o_layout = cute.make_layout(
+                (total_s_q, d, (h_r, h_k)),
+                stride=(d * h_r * h_k, 1, (d, d * h_r)),
+            )
+            o = cute.make_tensor(o_iter, o_layout)
+        else:
+            o_layout = cute.make_layout(
+                (s_q, d, ((h_r, h_k), b)),
+                stride=(d * h_r * h_k, 1, ((d, d * h_r), stride_b_qo)),
+            )
+            o = cute.make_tensor(o_iter, o_layout)
         lse = None
-        self.is_packed_qkv = False
+        self.is_packed_qkv = is_packed_qkv
 
         self.q_dtype = q.element_type
         self.k_dtype = k.element_type
@@ -4578,7 +4714,7 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
             tma_atom_k, tma_tensor_k,
             tma_atom_v, tma_tensor_v,
             tma_atom_o, tma_tensor_o, o,
-            None, cum_seqlen_k, lse, kv_cache_page_list,
+            cum_seqlen_q, cum_seqlen_k, lse, kv_cache_page_list,
             block_begin, block_end,
             scale_softmax_log2, scale_softmax, scale_output,
             _wsl, _wsr,
@@ -4934,8 +5070,16 @@ class BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256:
                     if cutlass.const_expr(cum_seqlen_k is not None):
                         cuseqlen_k = cum_seqlen_k[batch_coord]
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
+                        # kv_cache_page_list is a compile-time constant here and is always a real
+                        # tensor for every current caller of __call_paged__ (run()'s paged_kv=True
+                        # branch), so this branch is unreachable in practice; it exists only to
+                        # keep this const_expr consistent with the non-paged __call__'s dense
+                        # packed-Q + packed-KV offset math should a future caller ever compile
+                        # __call_paged__ with kv_cache_page_list=None.
                         if cutlass.const_expr(
-                            cum_seqlen_q is not None and self.is_packed_qkv
+                            cum_seqlen_q is not None
+                            and self.is_packed_qkv
+                            and kv_cache_page_list is None
                         ):
                             logical_offset_mK = (
                                 cuseqlen_k,
@@ -7123,6 +7267,9 @@ def run(
     enable_skip_correction: bool = True,
     enable_ex2_emulation: bool = False,
     paged_kv: bool = False,
+    packed_q: bool = False,
+    packed_q_seqlens: Optional[Tuple[int, ...]] = None,
+    packed_kv_seqlens: Optional[Tuple[int, ...]] = None,
     bidirectional: bool = False,
     skip_softmax_threshold: Optional[float] = None,
     load_qkv: Optional[str] = None,
@@ -7209,7 +7356,7 @@ def run(
             f"mma_tiler_mn={mma_tiler_mn}, persistent={is_persistent}, "
             f"bottom_right_align={bottom_right_align}, "
             f"sliding_window={window_size[0] != -1}, "
-            f"paged_kv={paged_kv}, bidirectional={bidirectional}")
+            f"paged_kv={paged_kv}, packed_q={packed_q}, bidirectional={bidirectional}")
     else:
         print(f"{_tag} Running Blackwell FMHA test with:")
         print(f"{_tag}   q_shape={q_shape}, k_shape={k_shape}")
@@ -7272,6 +7419,21 @@ def run(
         raise ValueError("variable_seqlen s_q must have the length of batch size")
     if isinstance(s_k, tuple) and len(s_k) != b:
         raise ValueError("variable_seqlen s_k must have the length of batch size")
+    if isinstance(s_q, tuple) or isinstance(s_k, tuple):
+        raise NotImplementedError(
+            "Variable-length sequences (nested tensors) require PyTorch. "
+            "Use fmha_runtimeargs_kvcache.py for variable-length support.")
+
+    q_sequence_lengths = packed_q_seqlens or (s_q,) * b
+    kv_sequence_lengths = packed_kv_seqlens or (s_k,) * b
+    if len(q_sequence_lengths) != b or len(kv_sequence_lengths) != b:
+        raise ValueError("packed sequence-length lists must have one entry per batch element")
+    if any(length <= 0 for length in q_sequence_lengths + kv_sequence_lengths):
+        raise ValueError("packed sequence lengths must be positive")
+    q_capacity = max(s_q) if isinstance(s_q, tuple) else s_q
+    kv_capacity = max(s_k) if isinstance(s_k, tuple) else s_k
+    if max(q_sequence_lengths) > q_capacity or max(kv_sequence_lengths) > kv_capacity:
+        raise ValueError("packed sequence lengths must not exceed q_shape or k_shape capacity")
 
     if in_dtype not in {cutlass.Float8E4M3FN, cutlass.Float16}:
         raise ValueError("in_dtype must be Float8E4M3FN or Float16")
@@ -7326,11 +7488,6 @@ def run(
     if not export_only:
         cp.random.seed(1111)
     np.random.seed(1111)
-
-    if isinstance(s_q, tuple) or isinstance(s_k, tuple):
-        raise NotImplementedError(
-            "Variable-length sequences (nested tensors) require PyTorch. "
-            "Use fmha_runtimeargs_kvcache.py for variable-length support.")
 
     def create_and_pad_tensor(shape, padding, dtype, is_dynamic_layout=True):
         shape_ = tuple(map(lambda x, y: x + y, shape, padding))
@@ -7389,22 +7546,26 @@ def run(
     kvcache_padding = (0, 0, 0, 0, 0, 0)
     lse_padding = (0, 0, 0, 0)
 
-    q_ref, q_tensor, q_cp, *_q_keep = create_and_pad_tensor(
-        qo_shape,
-        qo_padding,
-        in_dtype,
-        is_dynamic_layout=True,
-    )
+    if packed_q:
+        q_ref = q_tensor = q_cp = None
+        o_tensor = o_cp = None
+    else:
+        q_ref, q_tensor, q_cp, *_q_keep = create_and_pad_tensor(
+            qo_shape,
+            qo_padding,
+            in_dtype,
+            is_dynamic_layout=True,
+        )
+        _, o_tensor, o_cp, *_o_keep = create_and_pad_tensor(
+            qo_shape,
+            qo_padding,
+            out_dtype,
+            is_dynamic_layout=True,
+        )
     kvcache_ref, kvcache_tensor, kvcache_cp, *_kv_keep = create_and_pad_tensor(
         kvcache_shape,
         kvcache_padding,
         in_dtype,
-        is_dynamic_layout=True,
-    )
-    _, o_tensor, o_cp, *_o_keep = create_and_pad_tensor(
-        qo_shape,
-        qo_padding,
-        out_dtype,
         is_dynamic_layout=True,
     )
     if lse_calculation:
@@ -7509,8 +7670,18 @@ def run(
         mask_type = fmha_utils.MaskEnum.RESIDUAL_MASK
     if paged_kv and vit_mode:
         raise ValueError("paged_kv is only supported for LLM FMHA variants")
-    if paged_kv and not export_only:
-        raise NotImplementedError("paged_kv mode currently supports AOT export only")
+    if packed_q and not paged_kv:
+        raise ValueError("packed_q requires paged_kv")
+    if packed_q and (not is_causal or bidirectional):
+        raise ValueError("packed_q supports causal and sliding-causal LLM FMHA only")
+    if packed_q and skip_softmax_threshold is not None:
+        raise ValueError("packed_q does not support skip-softmax variants")
+    if packed_q and load_qkv is not None:
+        raise ValueError("packed_q runtime testing does not support --load_qkv")
+    if (packed_q_seqlens is not None or packed_kv_seqlens is not None) and not packed_q:
+        raise ValueError("packed sequence-length lists require --packed_q")
+    if packed_q and out_dtype != cutlass.Float16:
+        raise ValueError("packed_q requires Float16 output")
     if d == 256 and vit_mode:
         raise ValueError("head dimension 256 is not supported in ViT mode")
     # skip-softmax (BLASST) is a single switch: setting the threshold activates
@@ -7708,13 +7879,35 @@ def run(
         )
     else:
         # LLM: batched Q [B,S,H,D] + combined KV cache [B,2,H,Cap,D]
-        q_dyn = mark_bshd_dynamic(q_tensor)
-        o_dyn = mark_bshd_dynamic(o_tensor)
+        if packed_q:
+            total_s_q = sum(q_sequence_lengths)
+            q_packed_shape = (total_s_q, h_r * h_k, d)
+            q_packed_ref, q_packed_tensor, q_packed_cp, *_qp_keep = create_and_pad_tensor(
+                q_packed_shape, (0, 0, 0), in_dtype, is_dynamic_layout=True)
+            _, o_packed_tensor, o_packed_cp, *_op_keep = create_and_pad_tensor(
+                q_packed_shape, (0, 0, 0), out_dtype, is_dynamic_layout=True)
+            q_dyn = mark_shd_dynamic(q_packed_tensor)
+            o_dyn = mark_shd_dynamic(o_packed_tensor)
+            cu_q_seqlens_np = np.concatenate((np.array([0], dtype=np.int32),
+                                               np.cumsum(q_sequence_lengths, dtype=np.int32)))
+            if export_only:
+                cu_q_seqlens = aot_placeholders.make_compact_tensor(
+                    cutlass.Int32, (b + 1,), stride_order=(0,), assumed_align=16
+                )
+            else:
+                cu_q_seqlens_cp = cp.asarray(cu_q_seqlens_np)
+                cu_q_seqlens = from_dlpack(cu_q_seqlens_cp, assumed_align=16)
+            cu_q_seqlens = mark_1d_dynamic(cu_q_seqlens)
+            _max_seqlen_q = Int32(max(q_sequence_lengths))
+        else:
+            q_dyn = mark_bshd_dynamic(q_tensor)
+            o_dyn = mark_bshd_dynamic(o_tensor)
 
         _wsl = Int32(window_size_left) if window_size_left is not None else Int32(0)
 
-        _s_k = s_k if not isinstance(s_k, tuple) else max(s_k)
-        cu_kv_seqlens_np = np.arange(b + 1, dtype=np.int32) * _s_k
+        _s_k = max(kv_sequence_lengths)
+        cu_kv_seqlens_np = np.concatenate((np.array([0], dtype=np.int32),
+                                            np.cumsum(kv_sequence_lengths, dtype=np.int32)))
         if export_only:
             cu_kv_seqlens = aot_placeholders.make_compact_tensor(
                 cutlass.Int32, (b + 1,), stride_order=(0,), assumed_align=16
@@ -7736,7 +7929,7 @@ def run(
             max_pages_per_seq = (_s_k + tokens_per_page - 1) // tokens_per_page
             num_pages = b * 2 * max_pages_per_seq
             kv_pool_shape = (num_pages, h_k, tokens_per_page, d)
-            _, kv_pool_tensor, *_kvp_keep = create_and_pad_tensor(
+            _, kv_pool_tensor, kv_pool_cp, *_kvp_keep = create_and_pad_tensor(
                 kv_pool_shape, (0, 0, 0, 0), in_dtype, is_dynamic_layout=True)
             if export_only:
                 page_list_tensor = aot_placeholders.make_compact_tensor(
@@ -7747,6 +7940,21 @@ def run(
                 )
             else:
                 page_list_np = np.zeros((b, 2, max_pages_per_seq), dtype=np.int32)
+                pages_per_kv = b * max_pages_per_seq
+                for batch_idx in range(b):
+                    for page_idx in range(max_pages_per_seq):
+                        k_page = batch_idx * max_pages_per_seq + page_idx
+                        v_page = pages_per_kv + k_page
+                        page_list_np[batch_idx, 0, page_idx] = k_page
+                        page_list_np[batch_idx, 1, page_idx] = v_page
+                        token_begin = page_idx * tokens_per_page
+                        token_end = min(token_begin + tokens_per_page, kv_sequence_lengths[batch_idx])
+                        if token_begin < token_end:
+                            live_tokens = token_end - token_begin
+                            kv_pool_cp[k_page, :, :live_tokens] = kvcache_cp[
+                                batch_idx, 0, :, token_begin:token_end]
+                            kv_pool_cp[v_page, :, :live_tokens] = kvcache_cp[
+                                batch_idx, 1, :, token_begin:token_end]
                 page_list_cp = cp.asarray(page_list_np)
                 page_list_tensor = from_dlpack(page_list_cp, assumed_align=16)
             page_list_tensor = (page_list_tensor.mark_layout_dynamic(
@@ -7781,7 +7989,14 @@ def run(
                     block_end_dyn = mark_bs_dynamic(
                         from_dlpack(block_end_cp, assumed_align=16)
                     )
-            if isinstance(
+            if packed_q:
+                compiled_fmha = cute.compile(
+                    fmha.__call_paged_ragged__,
+                    q_dyn, kv_pool_dyn, page_list_tensor, o_dyn, cu_kv_seqlens,
+                    _wsl, scale_softmax, scale_q, scale_k, scale_v, inv_scale_o,
+                    _sm_count, current_stream, cu_q_seqlens, _max_seqlen_q,
+                )
+            elif isinstance(
                 fmha, BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256
             ):
                 compiled_fmha = cute.compile(
@@ -8035,6 +8250,109 @@ def run(
             iterations=iterations,
         )
         return exec_time
+
+    if paged_kv:
+        def invoke_paged(q_tensor_arg, kv_pool_tensor_arg, o_tensor_arg):
+            if packed_q:
+                return compiled_fmha(
+                    q_tensor_arg, kv_pool_tensor_arg, page_list_tensor, o_tensor_arg, cu_kv_seqlens,
+                    _wsl, scale_softmax, scale_q, scale_k, scale_v, inv_scale_o, _sm_count, current_stream,
+                    cu_q_seqlens, _max_seqlen_q,
+                )
+            if isinstance(fmha, BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256):
+                return compiled_fmha(
+                    q_tensor_arg, kv_pool_tensor_arg, page_list_tensor, o_tensor_arg, cu_kv_seqlens,
+                    None, None, _wsl, scale_softmax, scale_q, scale_k, scale_v, inv_scale_o,
+                    _sm_count, current_stream, None, None, _skip_arg,
+                )
+            return compiled_fmha(
+                q_tensor_arg, kv_pool_tensor_arg, page_list_tensor, o_tensor_arg, cu_kv_seqlens,
+                _wsl, scale_softmax, scale_q, scale_k, scale_v, inv_scale_o, _sm_count, current_stream,
+                None, None, _skip_arg,
+            )
+
+        if not skip_ref_check:
+            if in_dtype != cutlass.Float16:
+                raise ValueError("paged_kv FP8 runtime testing requires --skip_ref_check")
+            q_reference = q_packed_ref if packed_q else np.concatenate(q_ref, axis=0)
+            q_tensor_arg = q_packed_tensor if packed_q else q_tensor
+            o_tensor_arg = o_packed_tensor if packed_q else o_tensor
+            invoke_paged(q_tensor_arg, kv_pool_tensor, o_tensor_arg)
+            cp.cuda.get_current_stream().synchronize()
+            k_packed_ref = np.concatenate([
+                np.transpose(kvcache_ref[batch_idx, 0, :, :kv_sequence_lengths[batch_idx]], (1, 0, 2))
+                for batch_idx in range(b)
+            ])
+            v_packed_ref = np.concatenate([
+                np.transpose(kvcache_ref[batch_idx, 1, :, :kv_sequence_lengths[batch_idx]], (1, 0, 2))
+                for batch_idx in range(b)
+            ])
+            cu_q_reference = (cu_q_seqlens_np if packed_q else
+                              np.arange(b + 1, dtype=np.int32) * s_q)
+            o_ref, _ = run_numpy_single_shot_reference_packed(
+                q_reference,
+                k_packed_ref,
+                v_packed_ref,
+                cu_q_reference,
+                cu_kv_seqlens_np,
+                scale_softmax=scale_softmax,
+                scale_output=inv_scale_o,
+                is_causal=is_causal,
+                bottom_right_align=bottom_right_align,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
+            )
+            o_result = o_packed_cp.get() if packed_q else o_cp.get().reshape(-1, h_q, d)
+            np.testing.assert_allclose(o_result, o_ref, atol=tolerance, rtol=1e-05)
+            print(f"{_tag} Paged FMHA accuracy check passed.")
+
+        def generate_paged_tensors():
+            q_workspace_shape = q_packed_shape if packed_q else qo_shape
+            q_workspace_padding = (0, 0, 0) if packed_q else qo_padding
+            _, q_workspace, *_q_workspace_keep = create_and_pad_tensor(
+                q_workspace_shape, q_workspace_padding, in_dtype, is_dynamic_layout=True)
+            _, kv_pool_workspace, *_kv_workspace_keep = create_and_pad_tensor(
+                kv_pool_shape, (0, 0, 0, 0), in_dtype, is_dynamic_layout=True)
+            _, o_workspace, *_o_workspace_keep = create_and_pad_tensor(
+                q_workspace_shape, q_workspace_padding, out_dtype, is_dynamic_layout=True)
+            q_workspace_dyn = (mark_shd_dynamic(q_workspace)
+                               if packed_q else mark_bshd_dynamic(q_workspace))
+            kv_pool_workspace_dyn = mark_kv_pool_dynamic(kv_pool_workspace)
+            o_workspace_dyn = (mark_shd_dynamic(o_workspace)
+                               if packed_q else mark_bshd_dynamic(o_workspace))
+            if packed_q:
+                return testing.JitArguments(
+                    q_workspace_dyn, kv_pool_workspace_dyn, page_list_tensor, o_workspace_dyn, cu_kv_seqlens,
+                    _wsl, scale_softmax, scale_q, scale_k, scale_v, inv_scale_o, _sm_count, current_stream,
+                    cu_q_seqlens, _max_seqlen_q,
+                )
+            if isinstance(fmha, BlackwellFusedMultiHeadAttentionForwardHeadDimPerCta256):
+                return testing.JitArguments(
+                    q_workspace_dyn, kv_pool_workspace_dyn, page_list_tensor, o_workspace_dyn, cu_kv_seqlens,
+                    None, None, _wsl, scale_softmax, scale_q, scale_k, scale_v, inv_scale_o, _sm_count,
+                    current_stream, None, None, _skip_arg,
+                )
+            return testing.JitArguments(
+                q_workspace_dyn, kv_pool_workspace_dyn, page_list_tensor, o_workspace_dyn, cu_kv_seqlens,
+                _wsl, scale_softmax, scale_q, scale_k, scale_v, inv_scale_o, _sm_count, current_stream,
+                None, None, _skip_arg,
+            )
+
+        workspace_count = 1
+        if use_cold_l2:
+            one_workspace_bytes = (
+                (q_packed_cp.size * q_packed_cp.itemsize if packed_q else q_cp.size * q_cp.itemsize)
+                + kv_pool_cp.size * kv_pool_cp.itemsize
+                + (o_packed_cp.size * o_packed_cp.itemsize if packed_q else o_cp.size * o_cp.itemsize))
+            workspace_count = testing.get_workspace_count(one_workspace_bytes, warmup_iterations, iterations)
+        return testing.benchmark(
+            compiled_fmha,
+            workspace_generator=generate_paged_tensors,
+            workspace_count=workspace_count,
+            stream=current_stream,
+            warmup_iterations=warmup_iterations,
+            iterations=iterations,
+        )
 
     # LLM path only below: plugin-aligned multi-round prefill regression.
     if not skip_ref_check:
@@ -8848,6 +9166,27 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--packed_q",
+        action="store_true",
+        help="Run or export the packed-Q causal paged ABI: Q/O are [T,H,D] and "
+        "the runtime provides cu_q_seqlens and max_seqlen_q.",
+    )
+
+    parser.add_argument(
+        "--packed_q_seqlens",
+        type=parse_comma_separated_ints,
+        default=None,
+        help="Comma-separated per-request Q lengths for --packed_q runtime testing.",
+    )
+
+    parser.add_argument(
+        "--packed_kv_seqlens",
+        type=parse_comma_separated_ints,
+        default=None,
+        help="Comma-separated per-request KV lengths for --packed_q runtime testing.",
+    )
+
+    parser.add_argument(
         "--bidirectional",
         action="store_true",
         help="Compile the FP16 D512 paged BIDIRECTIONAL mask ABI with "
@@ -8970,6 +9309,9 @@ if __name__ == "__main__":
         enable_skip_correction=args.enable_skip_correction,
         enable_ex2_emulation=args.enable_ex2_emulation,
         paged_kv=args.paged_kv,
+        packed_q=args.packed_q,
+        packed_q_seqlens=args.packed_q_seqlens,
+        packed_kv_seqlens=args.packed_kv_seqlens,
         bidirectional=args.bidirectional,
         skip_softmax_threshold=args.skip_softmax_threshold,
         load_qkv=args.load_qkv,

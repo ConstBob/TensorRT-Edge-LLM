@@ -87,6 +87,8 @@ _LLM = ["--is_causal", "--is_persistent", "--export_only", "--bottom_right_align
 _LLM_FP8 = _LLM + ["--in_dtype", "Float8E4M3FN"]
 _LLM_PAGED = _LLM + ["--paged_kv"]
 _LLM_FP8_PAGED = _LLM_FP8 + ["--paged_kv"]
+_LLM_PACKED_PAGED = _LLM_PAGED + ["--packed_q"]
+_LLM_PACKED_FP8_PAGED = _LLM_FP8_PAGED + ["--packed_q"]
 _LLM_DENSE_PAGED = ["--is_persistent", "--export_only", "--paged_kv"]
 _LLM_DENSE_FP8_PAGED = _LLM_DENSE_PAGED + ["--in_dtype", "Float8E4M3FN"]
 _VIT = ["--is_persistent", "--export_only", "--vit_mode"]
@@ -601,6 +603,42 @@ KERNEL_VARIANTS = [
         script_args=["--q_shape", "1,1024,16,256", "--k_shape", "1,1024,2,256"]
                     + _LLM_FP8_PAGED + ["--window_size", "4096,-1"],
     ),
+    # Packed-Q causal paged KV variants. Q/O use [T,H,D] and carry real Q/KV cumulative lengths.
+    *[
+        KernelVariant(
+            name=name,
+            group="fmha",
+            supported_sms=[100, 101, 110],
+            script="fmha_cutedsl_blackwell/fmha.py",
+            script_args=["--q_shape", q_shape, "--k_shape", k_shape] + flags,
+        )
+        for name, q_shape, k_shape, flags in (
+            ("fmha_d64_packed_paged", "1,1024,14,64", "1,1024,1,64", _LLM_PACKED_PAGED),
+            ("fmha_d128_packed_paged", "1,1024,14,128", "1,1024,1,128", _LLM_PACKED_PAGED),
+            ("fmha_d256_packed_paged", "1,1024,16,256", "1,1024,2,256", _LLM_PACKED_PAGED),
+            ("fmha_d512_packed_paged", "1,1024,8,512", "1,1024,1,512", _LLM_PACKED_PAGED),
+            ("fmha_d64_packed_sw_paged", "1,1024,14,64", "1,1024,1,64",
+             _LLM_PACKED_PAGED + ["--window_size", "4096,-1"]),
+            ("fmha_d128_packed_sw_paged", "1,1024,14,128", "1,1024,1,128",
+             _LLM_PACKED_PAGED + ["--window_size", "4096,-1"]),
+            ("fmha_d256_packed_sw_paged", "1,1024,16,256", "1,1024,2,256",
+             _LLM_PACKED_PAGED + ["--window_size", "4096,-1"]),
+            ("fmha_d512_packed_sw_paged", "1,1024,8,512", "1,1024,1,512",
+             _LLM_PACKED_PAGED + ["--window_size", "4096,-1"]),
+            ("fmha_d64_packed_paged_fp8", "1,1024,14,64", "1,1024,1,64", _LLM_PACKED_FP8_PAGED),
+            ("fmha_d128_packed_paged_fp8", "1,1024,14,128", "1,1024,1,128", _LLM_PACKED_FP8_PAGED),
+            ("fmha_d256_packed_paged_fp8", "1,1024,16,256", "1,1024,2,256", _LLM_PACKED_FP8_PAGED),
+            ("fmha_d512_packed_paged_fp8", "1,1024,8,512", "1,1024,1,512", _LLM_PACKED_FP8_PAGED),
+            ("fmha_d64_packed_sw_paged_fp8", "1,1024,14,64", "1,1024,1,64",
+             _LLM_PACKED_FP8_PAGED + ["--window_size", "4096,-1"]),
+            ("fmha_d128_packed_sw_paged_fp8", "1,1024,14,128", "1,1024,1,128",
+             _LLM_PACKED_FP8_PAGED + ["--window_size", "4096,-1"]),
+            ("fmha_d256_packed_sw_paged_fp8", "1,1024,16,256", "1,1024,2,256",
+             _LLM_PACKED_FP8_PAGED + ["--window_size", "4096,-1"]),
+            ("fmha_d512_packed_sw_paged_fp8", "1,1024,8,512", "1,1024,1,512",
+             _LLM_PACKED_FP8_PAGED + ["--window_size", "4096,-1"]),
+        )
+    ],
     KernelVariant(
         name="vit_fmha_d64",
         group="fmha",

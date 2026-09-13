@@ -533,6 +533,15 @@ void assertPagedCapability(int32_t headDim, CuteDslFMHAV2MaskType maskType)
 
 TEST(ContextAttentionTest, fmhaV2CapabilityContract)
 {
+#if !defined(CUTE_DSL_FMHA_ENABLED)
+    EXPECT_FALSE(CuteDslFMHAV2Runner::canImplement(8, 2, 64, 100, DataType::kHALF, CuteDslFMHAV2MaskType::kCAUSAL));
+    EXPECT_FALSE(
+        CuteDslFMHAV2Runner::canImplementPaged(8, 2, 64, 100, DataType::kHALF, CuteDslFMHAV2MaskType::kCAUSAL));
+    EXPECT_FALSE(
+        CuteDslFMHAV2Runner::canImplementPagedRagged(8, 2, 64, 100, DataType::kHALF, CuteDslFMHAV2MaskType::kCAUSAL));
+    return;
+#endif
+
     std::vector<int32_t> const supportedSMs{80, 86, 87, 89, 90, 100, 101, 110, 120, 121};
     std::vector<int32_t> const supportedHeadDims{64, 128, 256, 512};
 
@@ -544,6 +553,15 @@ TEST(ContextAttentionTest, fmhaV2CapabilityContract)
                 8, 2, headDim, smVersion, DataType::kHALF, CuteDslFMHAV2MaskType::kCAUSAL));
             EXPECT_TRUE(CuteDslFMHAV2Runner::canImplementPaged(
                 8, 2, headDim, smVersion, DataType::kHALF, CuteDslFMHAV2MaskType::kSLIDING_CAUSAL));
+#if defined(CUTE_DSL_FMHA_ENABLED) && CUDA_VERSION >= 12000
+            EXPECT_TRUE(CuteDslFMHAV2Runner::canImplementPagedRagged(
+                8, 2, headDim, smVersion, DataType::kHALF, CuteDslFMHAV2MaskType::kCAUSAL));
+            EXPECT_TRUE(CuteDslFMHAV2Runner::canImplementPagedRagged(
+                8, 2, headDim, smVersion, DataType::kHALF, CuteDslFMHAV2MaskType::kSLIDING_CAUSAL));
+#else
+            EXPECT_FALSE(CuteDslFMHAV2Runner::canImplementPagedRagged(
+                8, 2, headDim, smVersion, DataType::kHALF, CuteDslFMHAV2MaskType::kCAUSAL));
+#endif
             EXPECT_TRUE(CuteDslFMHAV2Runner::canImplement(
                 8, 2, headDim, smVersion, DataType::kHALF, CuteDslFMHAV2MaskType::kCAUSAL));
             EXPECT_TRUE(CuteDslFMHAV2Runner::canImplement(
@@ -575,6 +593,10 @@ TEST(ContextAttentionTest, fmhaV2CapabilityContract)
         CuteDslFMHAV2Runner::canImplementPaged(8, 2, 64, 121, DataType::kFLOAT, CuteDslFMHAV2MaskType::kCAUSAL));
     EXPECT_FALSE(
         CuteDslFMHAV2Runner::canImplementPaged(7, 2, 64, 121, DataType::kHALF, CuteDslFMHAV2MaskType::kCAUSAL));
+    EXPECT_FALSE(
+        CuteDslFMHAV2Runner::canImplementPagedRagged(8, 2, 64, 121, DataType::kFP8, CuteDslFMHAV2MaskType::kCAUSAL));
+    EXPECT_FALSE(
+        CuteDslFMHAV2Runner::canImplementPagedRagged(8, 2, 64, 121, DataType::kHALF, CuteDslFMHAV2MaskType::kPADDING));
 }
 
 TEST(ContextAttentionTest, pagedAllHeadDimsCausal)

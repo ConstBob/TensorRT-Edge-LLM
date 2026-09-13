@@ -59,7 +59,10 @@ __global__ void calCuQCuKVSeqLensAndKVEndIdxsKernel(int32_t const* inputSeqLen, 
             cuKVSeqLens[i + 1] = runningCuKvCacheLen;
             // To keep semantic consistency with the packed QKV layout for RoPE, use runtimeSeqLen here.
             int32_t const kvEndIdx = kvCacheStartIdx + runtimeSeqLen;
-            kvCacheEndIndices[i] = kvEndIdx;
+            if (kvCacheEndIndices != nullptr)
+            {
+                kvCacheEndIndices[i] = kvEndIdx;
+            }
 
             if (paddedCuKVSeqLens != nullptr)
             {
@@ -68,6 +71,20 @@ __global__ void calCuQCuKVSeqLensAndKVEndIdxsKernel(int32_t const* inputSeqLen, 
             }
         }
     }
+}
+
+void calCuQCuKVSeqLens(rt::Tensor const& inputSeqLen, rt::Tensor const& kvCacheStartIndices, rt::Tensor& cuQSeqLens,
+    rt::Tensor& cuKVSeqLens, cudaStream_t stream)
+{
+    int32_t const runtimeBatchSize = static_cast<int32_t>(inputSeqLen.getShape()[0]);
+    check::check(cuQSeqLens.getShape()[0] == runtimeBatchSize + 1, "cuQSeqLens shall have shape [B+1].");
+    check::check(cuKVSeqLens.getShape()[0] == runtimeBatchSize + 1, "cuKVSeqLens shall have shape [B+1].");
+    check::check(kvCacheStartIndices.isEmpty() || kvCacheStartIndices.getShape()[0] == runtimeBatchSize,
+        "KVCacheStartIndices tensor shall have shape [B].");
+
+    calCuQCuKVSeqLensAndKVEndIdxsKernel<<<1, 1, 0, stream>>>(inputSeqLen.dataPointer<int32_t>(),
+        kvCacheStartIndices.dataPointer<int32_t>(), cuQSeqLens.dataPointer<int32_t>(),
+        cuKVSeqLens.dataPointer<int32_t>(), nullptr, nullptr, 0, runtimeBatchSize);
 }
 
 void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor const& kvCacheStartIndices,
