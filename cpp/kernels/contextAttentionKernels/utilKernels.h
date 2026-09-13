@@ -83,6 +83,14 @@ void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor con
     rt::Tensor& cuQSeqLens, rt::Tensor& cuKVSeqLens, rt::Tensor& kvCacheEndIdxs,
     rt::OptionalOutputTensor paddedCuKVSeqLens, int32_t const runtimeSeqLen, cudaStream_t stream);
 
+//! Build backend-neutral sequence metadata for ragged paged context attention.
+//!
+//! cuQSeqLens is the exclusive prefix sum of the active input lengths. cuKVSeqLens is the exclusive prefix sum of
+//! kvCacheStartIndices[b] + inputSeqLen[b], so it includes the complete logical KV history for chunked prefill. The
+//! outputs can be passed unchanged to either the optimized Blackwell or FMHA-v2 ragged paged backend.
+void calCuQCuKVSeqLens(rt::Tensor const& inputSeqLen, rt::Tensor const& kvCacheStartIndices, rt::Tensor& cuQSeqLens,
+    rt::Tensor& cuKVSeqLens, cudaStream_t stream);
+
 //! \brief Compute sequence metadata for paged SWA chunked prefill.
 //!
 //! The temporary KV source contains the previous resident window followed by the current chunk. The KV prefix sums

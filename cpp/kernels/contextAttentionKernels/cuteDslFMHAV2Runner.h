@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "cuteDslFmhaTypes.h"
+
 #include <cuda_runtime.h>
 
 #if defined(CUTE_DSL_FMHA_ENABLED)
@@ -44,15 +46,6 @@ extern "C" cudaError_t cudaLibraryUnload(cudaLibrary_t library);
 namespace trt_edgellm
 {
 
-//! Mask contracts implemented by the FMHA-v2 CuTe DSL context kernels.
-enum class CuteDslFMHAV2MaskType
-{
-    kCAUSAL,
-    kSLIDING_CAUSAL,
-    kPADDING,
-    kVISION_BLOCK
-};
-
 //! Runner for the CuTe DSL FMHA-v2 kernels.
 //!
 //! Dense LLM kernels consume separate BSND Q/K/V tensors, while native-paged LLM kernels consume
@@ -76,6 +69,10 @@ public:
 
     //! Returns whether the target AOT family covers native FP16 Edge-LLM paged KV for this context shape.
     static bool canImplementPaged(int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t smVersion,
+        nvinfer1::DataType dataType, CuteDslFMHAV2MaskType maskType);
+
+    //! Returns whether the target AOT family covers packed-Q/O native paged attention.
+    static bool canImplementPagedRagged(int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t smVersion,
         nvinfer1::DataType dataType, CuteDslFMHAV2MaskType maskType);
 
     //! Returns whether the target AOT family covers this packed ViT shape.
@@ -108,7 +105,13 @@ public:
         int32_t const* cuQSeqLens, int32_t const* cuKVSeqLens, int32_t numFlatPages, int32_t maxPagesPerSeq,
         int32_t tokensPerPage, cudaStream_t stream, float attentionScale, int32_t slidingWindowSize = INT_MAX);
 
-    //! Runs causal or sliding-causal attention over packed [total_q, H_q, D] Q/O and an FP16 NHD paged KV pool.
+    /**
+     * @brief Runs causal or sliding-causal attention over packed Q/O and an FP16 NHD paged KV pool.
+     *
+     * cuQSeqLens and cuKVSeqLens are monotonic prefix arrays of length batchSize + 1. cuQSeqLens starts at zero and
+     * ends at totalQSeqLen. cuKVSeqLens contains the complete logical KV history, including prior cached tokens.
+     * maxQSeqLen is the maximum adjacent difference in cuQSeqLens, not the packed buffer allocation capacity.
+     */
     bool runPagedRagged(void const* qPtr, void const* pagedKVPoolPtr, int32_t const* kvCachePageList, void* oPtr,
         int32_t const* cuQSeqLens, int32_t const* cuKVSeqLens, int32_t totalQSeqLen, int32_t maxQSeqLen,
         int32_t numFlatPages, int32_t maxPagesPerSeq, int32_t tokensPerPage, cudaStream_t stream, float attentionScale,

@@ -136,6 +136,22 @@ bool CuteDslFMHAV2Runner::canImplementPaged(int32_t numQHeads, int32_t numKVHead
     return false;
 }
 
+bool CuteDslFMHAV2Runner::canImplementPagedRagged(int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
+    int32_t smVersion, nvinfer1::DataType dataType, CuteDslFMHAV2MaskType maskType)
+{
+#if CUDA_VERSION < 12000
+    (void) numQHeads;
+    (void) numKVHeads;
+    (void) headSize;
+    (void) smVersion;
+    (void) dataType;
+    (void) maskType;
+    return false;
+#else
+    return canImplementPaged(numQHeads, numKVHeads, headSize, smVersion, dataType, maskType);
+#endif
+}
+
 bool CuteDslFMHAV2Runner::canImplementViT(int32_t headSize, int32_t smVersion, nvinfer1::DataType dataType)
 {
     return isFMHAV2SM(smVersion) && dataType == nvinfer1::DataType::kHALF
@@ -1012,6 +1028,12 @@ bool CuteDslFMHAV2Runner::canImplement(int32_t, int32_t, int32_t, int32_t, nvinf
 }
 
 bool CuteDslFMHAV2Runner::canImplementPaged(
+    int32_t, int32_t, int32_t, int32_t, nvinfer1::DataType, CuteDslFMHAV2MaskType)
+{
+    return false;
+}
+
+bool CuteDslFMHAV2Runner::canImplementPagedRagged(
     int32_t, int32_t, int32_t, int32_t, nvinfer1::DataType, CuteDslFMHAV2MaskType)
 {
     return false;

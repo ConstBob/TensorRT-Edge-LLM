@@ -168,6 +168,44 @@ TEST(UtilKernelTest, seqLens_chunkedPrefillVaryingLengths)
     });
 }
 
+TEST(UtilKernelTest, raggedPagedSeqLensUseRealKVLengths)
+{
+    int32_t constexpr batchSize = 3;
+    std::vector<int32_t> const inputSeqLen{3, 5, 2};
+    std::vector<int32_t> const startIndices{0, 6, 4};
+    rt::Tensor inputSeqLenTensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor startIndicesTensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor cuQSeqLensTensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor cuKVSeqLensTensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+    copyHostToDevice(inputSeqLenTensor, inputSeqLen);
+    copyHostToDevice(startIndicesTensor, startIndices);
+
+    cudaStream_t stream{nullptr};
+    kernel::calCuQCuKVSeqLens(inputSeqLenTensor, startIndicesTensor, cuQSeqLensTensor, cuKVSeqLensTensor, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    EXPECT_EQ(copyDeviceToHost<int32_t>(cuQSeqLensTensor), (std::vector<int32_t>{0, 3, 8, 10}));
+    EXPECT_EQ(copyDeviceToHost<int32_t>(cuKVSeqLensTensor), (std::vector<int32_t>{0, 3, 14, 20}));
+}
+
+TEST(UtilKernelTest, raggedPagedSeqLensSupportColdPrefillAndEmptyRows)
+{
+    int32_t constexpr batchSize = 4;
+    std::vector<int32_t> const inputSeqLen{3, 0, 5, 2};
+    rt::Tensor inputSeqLenTensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor cuQSeqLensTensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor cuKVSeqLensTensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+    copyHostToDevice(inputSeqLenTensor, inputSeqLen);
+
+    cudaStream_t stream{nullptr};
+    kernel::calCuQCuKVSeqLens(inputSeqLenTensor, rt::Tensor{}, cuQSeqLensTensor, cuKVSeqLensTensor, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<int32_t> const expected{0, 3, 3, 8, 10};
+    EXPECT_EQ(copyDeviceToHost<int32_t>(cuQSeqLensTensor), expected);
+    EXPECT_EQ(copyDeviceToHost<int32_t>(cuKVSeqLensTensor), expected);
+}
+
 TEST(UtilKernelTest, swaChunkedPrefillMetadataClampsResidentWindow)
 {
     int32_t constexpr batchSize = 3;
