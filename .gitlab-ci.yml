@@ -55,6 +55,13 @@ variables:
   CCACHE_DIR: "$CI_PROJECT_DIR/.cache/ccache"
   CI_CCACHE_MAX_SIZE: "2G"
   CI_CCACHE_SHARED_MAX_SIZE: "5Gi"
+  EDGE_LLM_ENGINE_CACHE_MODE: "off"
+  EDGE_LLM_ENGINE_CACHE_EPOCH: "1"
+  EDGE_LLM_ENGINE_MR_CACHE_BYTES: "21474836480"
+  EDGE_LLM_ENGINE_TRUSTED_CACHE_BYTES: "214748364800"
+  # Restoring and deserializing the measured RTX 3090 bundles cost more than
+  # rebuilding them. Keep that lane cold until materialization is improved.
+  EDGE_LLM_ENGINE_CACHE_EXCLUDED_GPUS: "NVIDIA GeForce RTX 3090"
 
 default:
   interruptible: true

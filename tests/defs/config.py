@@ -1470,6 +1470,8 @@ class TestConfig:
                 llm_engine_id += f"-mdts{self.max_draft_tree_size}"
         if self.max_kv_pool_pages is not None:
             llm_engine_id += f"-mxkvp{self.max_kv_pool_pages}"
+        if self.tp_size is not None and self.tp_size > 1:
+            llm_engine_id += f"-tp{self.tp_size}"
         return llm_engine_id
 
     @staticmethod

@@ -37,6 +37,7 @@
         L0_STORAGE_RESOURCE_GROUP: "l0-stability-${CI_PIPELINE_ID}"
         L0_STORAGE_RETENTION: "2 days"
         L0_ONNX_REUSE: "0"
+        EDGE_LLM_ENGINE_CACHE_MODE: "refresh"
     - if: $EDGE_LLM_SKIP_TESTS == "true"
       when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -46,6 +47,7 @@
         L0_STORAGE_RESOURCE_GROUP: "l0-mr-${CI_MERGE_REQUEST_IID}"
         L0_STORAGE_RETENTION: "30 days"
         L0_ONNX_REUSE: "1"
+        EDGE_LLM_ENGINE_CACHE_MODE: "read-write"
 
 .l1_environment:
   environment:
@@ -313,6 +315,7 @@
     - export LD_LIBRARY_PATH=$TRT_PACKAGE_DIR/lib:$LD_LIBRARY_PATH
     - echo "Setting up test environment"
     - if [ -n "$BASELINE_CSV" ]; then mkdir -p "$(dirname "$BASELINE_CSV")"; fi
+    - source .gitlab/ci/scripts/ci_engine_cache_mode.sh
     - echo "Running pipeline tests with pytest. Time:$(date)"
     - >-
       bash .gitlab/ci/scripts/ci_run.sh "$CI_JOB_PHASE_TIMEOUT_SECONDS"
