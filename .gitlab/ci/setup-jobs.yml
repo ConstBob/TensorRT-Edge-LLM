@@ -38,6 +38,7 @@ delete_l0_storage:
   script:
     - python3 .gitlab/ci/scripts/ci_storage.py delete-storage
     - EDGELLM_COMPILER_CACHE=AUTO sh .gitlab/ci/scripts/ci_ccache.sh delete-mr || true
+    - python3 .gitlab/ci/scripts/ci_engine_cache.py delete || true
   resource_group: "$L0_STORAGE_RESOURCE_GROUP"
   environment:
     name: "$L0_ENVIRONMENT_NAME"
@@ -91,5 +92,17 @@ prune_ci_ccache:
     - if: $CI_COMMIT_BRANCH =~ /^release\//
   script:
     - sh .gitlab/ci/scripts/ci_ccache.sh prune-ci
+  interruptible: true
+  allow_failure: true
+
+
+prune_trt_engine_cache:
+  stage: setup
+  script:
+    - python3 .gitlab/ci/scripts/ci_engine_cache.py prune
+  resource_group: "${L0_STORAGE_RESOURCE_GROUP}-trt-engine-cache-prune"
+  extends:
+    - .l0_storage_lifecycle
+    - .l0_rules
   interruptible: true
   allow_failure: true

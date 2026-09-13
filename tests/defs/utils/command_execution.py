@@ -37,6 +37,7 @@ from .baseline import (get_baseline, gpu_memory_metric_from_output,
                        map_accuracy_result_to_csv, parse_perf_from_output,
                        peak_gpu_memory_is_comparable,
                        promote_baseline_if_better, save_to_baseline)
+from .ci_engine_cache import EngineBundleCache
 from .command_generation import (generate_build_commands,
                                  generate_e2e_bench_commands,
                                  generate_inference_commands,
@@ -44,6 +45,16 @@ from .command_generation import (generate_build_commands,
                                  generate_vlmevalkit_commands)
 
 _ALPAMAYO_DATASET_PLACEHOLDER = "$ALPAMAYO_DATASET_DIR"
+
+
+def _engine_files(directory):
+    if not directory or not os.path.isdir(directory):
+        return set()
+    return {
+        os.path.relpath(os.path.join(root, name), directory)
+        for root, _, names in os.walk(directory)
+        for name in names if name.endswith(".engine")
+    }
 
 
 def _sync_remote_output_file(filepath: str,
@@ -599,6 +610,30 @@ def execute_build_test(
     commands = generate_build_commands(config, executable_files)
 
     all_outputs = []
+    remote_runner = None
+    trtexec_path = None
+    if remote_config is not None:
+
+        def remote_runner(command, timeout):
+            return run_with_trt_env(command, remote_config, timeout, logger,
+                                    env_config)
+
+        if env_config and env_config.trt_package_dir:
+            trtexec_path = os.path.join(env_config.trt_package_dir, 'bin',
+                                        'trtexec')
+    engine_cache = EngineBundleCache(config,
+                                     commands,
+                                     logger,
+                                     remote_runner=remote_runner,
+                                     trtexec_path=trtexec_path)
+    if engine_cache.restore_bundle():
+        return {
+            'success': True,
+            'error': None,
+            'output': 'complete TensorRT engine bundle restored from cache',
+            'test_type': TaskType.BUILD.value
+        }
+    engine_cache.prepare_build()
 
     engine_file_map = {
         executable_files['llm_build']: ["llm.engine"],
@@ -616,14 +651,16 @@ def execute_build_test(
         if logger:
             logger.info(f"Starting {task_name}: {' '.join(cmd)}")
 
+        cache_enabled = engine_cache is not None and engine_cache.enabled
         engine_candidates = engine_file_map.get(cmd[0], [])
         if cmd[0] == executable_files['llm_build']:
             engine_candidates = _llm_build_engine_candidates(
                 cmd, engine_candidates)
         engine_dir = next((arg.split('=', 1)[1]
                            for arg in cmd if arg.startswith('--engineDir=')),
-                          None) if engine_candidates else None
-        if engine_dir:
+                          None)
+        engines_before = _engine_files(engine_dir) if cache_enabled else set()
+        if engine_dir and not cache_enabled:
             skip = False
             for engine_filename in engine_candidates:
                 if check_file_exists(os.path.join(engine_dir, engine_filename),
@@ -651,6 +688,18 @@ def execute_build_test(
                 'output': '\n'.join(all_outputs),
                 'test_type': TaskType.BUILD.value
             }
+
+        if (cache_enabled and engine_dir
+                and not _engine_files(engine_dir) - engines_before):
+            return {
+                'success': False,
+                'error': f"{task_name} produced no TensorRT engine",
+                'output': '\n'.join(all_outputs),
+                'test_type': TaskType.BUILD.value
+            }
+
+    if engine_cache is not None and engine_cache.enabled:
+        engine_cache.publish_bundle()
 
     return {
         'success': True,
