@@ -34,7 +34,10 @@ FPS=15
 # First TensorRT whose ONNX parser imports trt::RotaryEmbedding natively.
 # Do not call this TRT_VERSION: the NGC images already export that with their
 # own (older) version, which silently won this variable in f9c8.
-EDGELLM_TRT_VERSION="${EDGELLM_TRT_VERSION:-10.16.1.11-1+cuda13.2}"
+# 10.16.1 +cuda13.2 parsed RotaryEmbedding then segfaulted in the builder
+# (f9c8). The node driver is CUDA 12.8 / 570; use the cuda12.9 build of the
+# same parser instead of the cuda13.2 one.
+EDGELLM_TRT_VERSION="${EDGELLM_TRT_VERSION:-10.16.1.11-1+cuda12.9}"
 EDGELLM_TRT_REPO="${EDGELLM_TRT_REPO:-https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64}"
 
 mkdir -p "${WORK_ROOT}" "${ONNX_DIR}" "${ENGINE_DIR}" "${BUILD_DIR}"
@@ -210,6 +213,8 @@ else
     fi
 
     echo "=== stage: engine build ==="
+    ldd "${POLICY_BUILD}" | grep -E "nvinfer|nvonnx|cudart|cuda" || true
+    ldd "${PLUGIN_SO}" | grep -E "nvinfer|nvonnx|cudart|cuda" || true
     "${POLICY_BUILD}" --onnxDir "${ONNX_DIR}" --engineDir "${ENGINE_DIR}"
     touch "${ENGINE_DIR}/READY"
     flock -u 8
