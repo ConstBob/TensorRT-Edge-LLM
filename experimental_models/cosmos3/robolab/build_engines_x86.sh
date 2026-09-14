@@ -34,18 +34,19 @@ FPS=15
 mkdir -p "${WORK_ROOT}" "${ONNX_DIR}" "${ENGINE_DIR}" "${BUILD_DIR}"
 NATIVE_DIR="${WORK_ROOT}/native"
 
-# The RoboLab policy-server image prepends /workspace/.venv/bin. That
-# interpreter has no pip: Friday's three H200 retries all compiled C++ then
-# died on `python -m pip`. Prefer uv + system python.
-unset VIRTUAL_ENV || true
-PATH="$(printf '%s' "${PATH}" | tr ':' '\n' | grep -v '/.venv/' | paste -sd:)"
-export PATH="/usr/local/bin:/usr/bin:${PATH:-/bin}"
-hash -r
-PY="$(command -v python3)"
-echo "python: ${PY} ($(${PY} -V 2>&1 || true))"
+# The RoboLab policy-server image's python is only in /workspace/.venv and
+# has no pip. Keep that interpreter; install deps with uv (does not need pip).
+# Do not strip the venv from PATH: there is no /usr/bin/python3 in this image
+# (v686 died immediately with PY=).
+if [ -x /workspace/.venv/bin/python3 ]; then
+    PY=/workspace/.venv/bin/python3
+else
+    PY="$(command -v python3)"
+fi
+echo "python: ${PY} ($(${PY} -V 2>&1))"
 
 py_install() {
-    uv pip install --python "${PY}" --system --no-cache-dir "$@"
+    uv pip install --python "${PY}" --no-cache-dir "$@"
 }
 
 echo "=== stage: toolchain ==="
