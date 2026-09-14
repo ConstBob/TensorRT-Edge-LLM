@@ -32,8 +32,10 @@ NUM_FRAMES=33
 FPS=15
 
 # First TensorRT whose ONNX parser imports trt::RotaryEmbedding natively.
-TRT_VERSION="${TRT_VERSION:-10.16.1.11-1+cuda13.2}"
-TRT_REPO="${TRT_REPO:-https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64}"
+# Do not call this TRT_VERSION: the NGC images already export that with their
+# own (older) version, which silently won this variable in f9c8.
+EDGELLM_TRT_VERSION="${EDGELLM_TRT_VERSION:-10.16.1.11-1+cuda13.2}"
+EDGELLM_TRT_REPO="${EDGELLM_TRT_REPO:-https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64}"
 
 mkdir -p "${WORK_ROOT}" "${ONNX_DIR}" "${ENGINE_DIR}" "${BUILD_DIR}"
 NATIVE_DIR="${WORK_ROOT}/native"
@@ -69,7 +71,7 @@ apt-get install -y --no-install-recommends \
 nvidia-smi -L || true
 nvcc --version | head -6 || true
 
-echo "=== stage: tensorrt ${TRT_VERSION} ==="
+echo "=== stage: tensorrt ${EDGELLM_TRT_VERSION} ==="
 # The exporter emits trt::RotaryEmbedding and trt::TensorScatter, which the
 # ONNX parser imports natively only from 10.16-GA on. pytorch:25.12-py3 ships
 # 10.14.1, whose parser falls back to the plugin registry and rejects every
@@ -79,7 +81,7 @@ echo "=== stage: tensorrt ${TRT_VERSION} ==="
 # a CUDA runtime newer than this node's driver, which is how 4v4w died with
 # cudaError 35. Unpacked libraries keep SONAME libnvinfer.so.10, so link order
 # alone selects them and the image CUDA 13.1 runtime stays untouched.
-TRT_STAGE="${WORK_ROOT}/tensorrt/${TRT_VERSION}"
+TRT_STAGE="${WORK_ROOT}/tensorrt/${EDGELLM_TRT_VERSION}"
 TRT_PACKAGE_DIR="${TRT_STAGE}/usr"
 exec 7>"${WORK_ROOT}/tensorrt.lock"
 flock 7
@@ -90,8 +92,8 @@ if [ ! -e "${TRT_STAGE}/READY" ]; then
                libnvinfer-dev libnvinfer10 \
                libnvinfer-plugin-dev libnvinfer-plugin10 \
                libnvonnxparsers-dev libnvonnxparsers10; do
-        deb="${pkg}_${TRT_VERSION}_amd64.deb"
-        curl -fsSL -o "${BUILD_DIR}/${deb}" "${TRT_REPO}/${deb}"
+        deb="${pkg}_${EDGELLM_TRT_VERSION}_amd64.deb"
+        curl -fsSL -o "${BUILD_DIR}/${deb}" "${EDGELLM_TRT_REPO}/${deb}"
         dpkg-deb -x "${BUILD_DIR}/${deb}" "${TRT_STAGE}"
     done
     touch "${TRT_STAGE}/READY"
@@ -127,7 +129,7 @@ fi
 POLICY_BUILD="${NATIVE_DIR}/cosmos3_policy_build"
 POLICY_INFER="${NATIVE_DIR}/cosmos3_policy_inference"
 PLUGIN_SO="${NATIVE_DIR}/libNvInfer_edgellm_plugin.so"
-NATIVE_KEY="sm${SM}-trt${TRT_VERSION}-cute${CUTE_MODE}"
+NATIVE_KEY="sm${SM}-trt${EDGELLM_TRT_VERSION}-cute${CUTE_MODE}"
 if [ -x "${POLICY_BUILD}" ] && [ -x "${POLICY_INFER}" ] && [ -e "${PLUGIN_SO}" ] \
    && [ "$(cat "${NATIVE_DIR}/KEY" 2>/dev/null || true)" = "${NATIVE_KEY}" ]; then
     echo "=== reusing native binaries from ${NATIVE_DIR} ==="
