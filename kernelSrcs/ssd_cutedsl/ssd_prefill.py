@@ -761,6 +761,8 @@ def chunk_scan_kernel(
                 val = val * z_val * sig_z
             # Store to global
             output[b, cutlass.Int32(c) * CHUNK_SIZE + gm, h, gn] = cutlass.Float16(val)
+        elif gn < DIM and cutlass.Int32(c) * CHUNK_SIZE + gm < output.shape[1]:
+            output[b, cutlass.Int32(c) * CHUNK_SIZE + gm, h, gn] = cutlass.Float16(0.0)
 
 
 @cute.jit

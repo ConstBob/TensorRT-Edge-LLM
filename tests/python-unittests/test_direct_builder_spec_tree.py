@@ -159,6 +159,27 @@ def test_dspark_runtime_config_preserves_official_proposal_contract():
     assert runtime["dspark_config"]["sample_from_anchor"] is False
 
 
+def test_dspark_draft_runtime_config_excludes_non_anchor_slot():
+    config = _target_config()
+    config.spec_decode_type = "dspark"
+    config.dspark_sample_from_anchor = False
+    args = SimpleNamespace(
+        resolved_spec_role=contracts.SpecRole.DRAFT,
+        spec_type="dspark",
+        tp_size=1,
+        max_input_len=256,
+        max_batch_size=2,
+        max_lora_rank=0,
+        max_kv_cache_capacity=1024,
+        max_verify_tree_size=9,
+        max_draft_tree_size=9,
+    )
+
+    runtime = build_runtime_config(config, args)
+
+    assert runtime["builder_config"]["max_draft_tree_size"] == 8
+
+
 def test_dspark_direct_sidecar_dequantizes_nvfp4_markov_w2(tmp_path):
     weight_key = "markov_head.markov_w2.weight"
     scale_key, scale_2_key = dspark_artifacts._NVFP4_HEAD_SCALES["markov_w2"]

@@ -80,13 +80,36 @@ bool isIoType(DataType type) noexcept
 
 int32_t getTokenCount(Dims const& dims) noexcept
 {
-    if (dims.nbDims != 3 || dims.d[0] <= 0 || dims.d[1] <= 0
-        || dims.d[0] > std::numeric_limits<int32_t>::max() / dims.d[1])
+    if (dims.nbDims != 2 && dims.nbDims != 3)
     {
         return 0;
     }
-    int64_t const tokens = static_cast<int64_t>(dims.d[0]) * dims.d[1];
-    return tokens <= std::numeric_limits<int32_t>::max() ? static_cast<int32_t>(tokens) : 0;
+    int64_t tokens = 1;
+    for (int32_t index = 0; index < dims.nbDims - 1; ++index)
+    {
+        if (dims.d[index] <= 0 || tokens > std::numeric_limits<int32_t>::max() / dims.d[index])
+        {
+            return 0;
+        }
+        tokens *= dims.d[index];
+    }
+    return static_cast<int32_t>(tokens);
+}
+
+bool sameTokenShape(Dims const& lhs, Dims const& rhs) noexcept
+{
+    if (lhs.nbDims != rhs.nbDims)
+    {
+        return false;
+    }
+    for (int32_t index = 0; index < lhs.nbDims - 1; ++index)
+    {
+        if (lhs.d[index] != rhs.d[index])
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 Nvfp4A16BlackwellGemvDataType toGemvType(DataType type)
@@ -427,10 +450,13 @@ int32_t Nvfp4A16BlackwellGemmPlugin::getOutputShapes(DimsExprs const* inputs, in
     {
         return -1;
     }
-    outputs[0].nbDims = 3;
-    outputs[0].d[0] = inputs[kInActivation].d[0];
-    outputs[0].d[1] = inputs[kInActivation].d[1];
-    outputs[0].d[2] = exprBuilder.constant(mGemmN);
+    int32_t const rank = inputs[kInActivation].nbDims;
+    if (rank != 2 && rank != 3)
+    {
+        return -1;
+    }
+    outputs[0] = inputs[kInActivation];
+    outputs[0].d[rank - 1] = exprBuilder.constant(mGemmN);
     return 0;
 }
 
@@ -442,7 +468,9 @@ bool Nvfp4A16BlackwellGemmPlugin::validateTensorDesc(int32_t pos, PluginTensorDe
     }
     switch (pos)
     {
-    case kInActivation: return isIoType(desc.type) && desc.dims.nbDims == 3 && desc.dims.d[2] == mGemmK;
+    case kInActivation:
+        return isIoType(desc.type) && (desc.dims.nbDims == 2 || desc.dims.nbDims == 3)
+            && desc.dims.d[desc.dims.nbDims - 1] == mGemmK;
     case kInQWeights:
         return desc.type == DataType::kINT8 && desc.dims.nbDims == 4 && desc.dims.d[0] == mGemmN / 128
             && desc.dims.d[1] == mGemmK / 64 && desc.dims.d[2] == 128 && desc.dims.d[3] == 32;
@@ -450,7 +478,9 @@ bool Nvfp4A16BlackwellGemmPlugin::validateTensorDesc(int32_t pos, PluginTensorDe
         return desc.type == DataType::kINT8 && desc.dims.nbDims == 4 && desc.dims.d[0] == mGemmN / 128
             && desc.dims.d[1] == mGemmK / 64 && desc.dims.d[2] == 128 && desc.dims.d[3] == 4;
     case kInGlobalScale: return desc.type == DataType::kFLOAT && desc.dims.nbDims == 1 && desc.dims.d[0] == 1;
-    case kOutOutput: return isIoType(desc.type) && desc.dims.nbDims == 3 && desc.dims.d[2] == mGemmN;
+    case kOutOutput:
+        return isIoType(desc.type) && (desc.dims.nbDims == 2 || desc.dims.nbDims == 3)
+            && desc.dims.d[desc.dims.nbDims - 1] == mGemmN;
     default: return false;
     }
 }
@@ -510,7 +540,8 @@ int32_t Nvfp4A16BlackwellGemmPlugin::configurePlugin(
         for (Dims const& dims : profileDims)
         {
             int32_t const m = getTokenCount(dims);
-            if (m <= 0 || dims.d[2] != mGemmK || !nvfp4_a16_blackwell::isTmaRepresentableProblem(m, mGemmN, mGemmK))
+            if (m <= 0 || dims.d[dims.nbDims - 1] != mGemmK
+                || !nvfp4_a16_blackwell::isTmaRepresentableProblem(m, mGemmN, mGemmK))
             {
                 LOG_ERROR(
                     "Nvfp4A16BlackwellGemmPlugin: profile M/N/K must be positive, match gemm_k, and be TMA "
@@ -655,7 +686,7 @@ int32_t Nvfp4A16BlackwellGemmPlugin::enqueue(PluginTensorDesc const* inputDesc, 
         Dims const& activationDims = inputDesc[kInActivation].dims;
         int32_t const m = getTokenCount(activationDims);
         if (m <= 0 || m > mMaxM || !nvfp4_a16_blackwell::isTmaRepresentableProblem(m, mGemmN, mGemmK)
-            || outputDesc[0].dims.d[0] != activationDims.d[0] || outputDesc[0].dims.d[1] != activationDims.d[1])
+            || !sameTokenShape(outputDesc[0].dims, activationDims))
         {
             LOG_ERROR("Nvfp4A16BlackwellGemmPlugin: invalid runtime M or output shape");
             return -1;

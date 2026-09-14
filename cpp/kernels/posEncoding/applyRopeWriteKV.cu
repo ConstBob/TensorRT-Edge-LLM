@@ -946,10 +946,15 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
             vSrc.load(packedQKV + packedVOffset + vecBase);
         }
 
-        // Skip all K/V writes for padding tokens (tree decoding), tail tokens, and ghost lanes.
-        if (!isPaddingToken && isActiveLane && !isTailToken)
+        if (isActiveLane && !isTailToken)
         {
             int32_t const scratchKVOffset = clampedTokenIdx * numKVHead * headDim + kvHeadIdx * headDim;
+            // Dense FMHA can load masked padding V; zero its scratch to keep 0 * NaN out of valid outputs.
+            if (isPaddingToken)
+            {
+                kRoped.data = {};
+                vSrc.data = {};
+            }
 
             // Optionally write to scratch K/V (for SEPARATE_Q_K_V FMHA to read directly).
             if (kScratch != nullptr)
@@ -961,7 +966,7 @@ __global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV
                 vSrc.store(vScratch + scratchKVOffset + vecBase);
             }
 
-            if (writeKVCache)
+            if (writeKVCache && !isPaddingToken)
             {
                 int32_t const kvCacheStartIdx = kvCacheEndLens != nullptr ? kvCacheEndLens[batchIdx] - qSeqLen : 0;
                 int32_t const tokenIdxInCache = kvCacheStartIdx + clampedTokenIdx % qSeqLen;

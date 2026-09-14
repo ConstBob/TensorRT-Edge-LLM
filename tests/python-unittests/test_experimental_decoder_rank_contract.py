@@ -28,6 +28,7 @@ from experimental.builder.models.dspark.modeling_dspark_draft import \
 from experimental.builder.models.phi4mm.modeling_phi4mm_text import \
     Phi4MultimodalMLP
 from experimental.builder.ops import functional as F
+from experimental.builder.ops.backend import Net
 from experimental.builder.ops.functional import core as functional_core
 from experimental.builder.ops.functional import moe as functional_moe
 from experimental.builder.ops.linear import Linear
@@ -355,6 +356,37 @@ def test_direct_weight_projection_preserves_explicit_rank(monkeypatch):
     F.linear_from_weights(_Tensor(2), object(), rank=3, name="vision_proj")
 
     assert ranks == [3]
+
+
+@pytest.mark.parametrize("sm110", [False, True], ids=["generic", "sm110"])
+def test_nvfp4_a16_backend_accepts_token_major_rank(monkeypatch, sm110):
+    from experimental.builder.weight_packing import nvfp4
+
+    packed = (np.zeros((1, ), dtype=np.int8), np.zeros(
+        (1, ), dtype=np.int8), np.zeros((1, ), dtype=np.float16), 16, 16)
+    monkeypatch.setattr(nvfp4, "pack_nvfp4_a16_linear", lambda *_args: packed)
+    monkeypatch.setattr(nvfp4, "pack_nvfp4_a16_blackwell_linear",
+                        lambda *_args: packed)
+    output = object()
+    layer = SimpleNamespace(get_output=lambda _index: output)
+    backend = SimpleNamespace(
+        const=lambda value, _name: value,
+        _unwrap=lambda value: value,
+        operation=lambda *_args: layer,
+        slice_last_dim=lambda value, *_args: value,
+        _add_bias=lambda value, *_args: value,
+    )
+    weights = SimpleNamespace(weight=np.zeros((1, ), dtype=np.int8),
+                              weight_scale=np.zeros((1, ), dtype=np.int8),
+                              weight_scale_2=np.zeros((1, ), dtype=np.float16),
+                              in_features=16,
+                              bias=None)
+
+    assert Net.nvfp4_a16_linear(backend,
+                                object(),
+                                weights,
+                                rank=2,
+                                sm110=sm110) is output
 
 
 def test_rmsnorm_uses_the_actual_activation_rank(monkeypatch):

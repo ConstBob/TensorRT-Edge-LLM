@@ -554,10 +554,13 @@ class DSparkDraftModel(nn.Module):
     def forward_ragged(self, inputs_embeds: torch.Tensor,
                        target_hidden_concat: torch.Tensor,
                        past_key_values: Tuple[torch.Tensor, ...], **metadata):
-        bias = (self.fc.bias.to(torch.float32)
-                if self.fc.bias is not None else None)
-        h_delta_acc = F.linear(target_hidden_concat.to(torch.float32),
-                               self.fc.weight.to(torch.float32), bias)
+        if self.fc_native_precision:
+            h_delta_acc = self.fc(target_hidden_concat.to(torch.float16))
+        else:
+            bias = (self.fc.bias.to(torch.float32)
+                    if self.fc.bias is not None else None)
+            h_delta_acc = F.linear(target_hidden_concat.to(torch.float32),
+                                   self.fc.weight.to(torch.float32), bias)
         h_delta = self.hidden_norm(h_delta_acc).to(inputs_embeds.dtype)
         hidden_states = inputs_embeds.to(h_delta.dtype)
         present = []

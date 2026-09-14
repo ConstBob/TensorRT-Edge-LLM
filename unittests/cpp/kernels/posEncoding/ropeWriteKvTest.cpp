@@ -933,6 +933,7 @@ void TestRopePackedFusedNorm(int32_t const batchSize, AttnParams const& attnPara
 TEST(RopePackedRaggedPrefill, SkipsPaddingBeforePagedWrite)
 {
     cudaStream_t stream{nullptr};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     int32_t constexpr batchSize = 2;
     int32_t constexpr qSeqLen = 128;
     int32_t constexpr numQHeads = 4;
@@ -956,6 +957,13 @@ TEST(RopePackedRaggedPrefill, SkipsPaddingBeforePagedWrite)
 
     rt::Tensor qScratchTensor(
         rt::Coords{batchSize, qSeqLen, numQHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor kScratchTensor(
+        rt::Coords{batchSize, qSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor vScratchTensor(
+        rt::Coords{batchSize, qSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    size_t constexpr scratchBytes = static_cast<size_t>(batchSize) * qSeqLen * numKVHeads * headDim * sizeof(half);
+    CUDA_CHECK(cudaMemsetAsync(kScratchTensor.rawPointer(), 0xFF, scratchBytes, stream));
+    CUDA_CHECK(cudaMemsetAsync(vScratchTensor.rawPointer(), 0xFF, scratchBytes, stream));
     half const sentinel = __float2half(777.0F);
     std::vector<half> kvCacheInit(
         static_cast<size_t>(2 * numPages) * rt::kTOKENS_PER_PAGE * numKVHeads * headDim, sentinel);
@@ -979,10 +987,12 @@ TEST(RopePackedRaggedPrefill, SkipsPaddingBeforePagedWrite)
 
     launchApplyRopeFromPackedToSplit(cosSinCacheTensor, rt::OptionalInputTensor{kvCacheEndLensTensor},
         rt::OptionalInputTensor{}, packedTensor, qScratchTensor, kvCacheTensor, 1.0F, 1.0F, stream,
-        pageTableTensor.dataPointer<int32_t>(), maxPagesPerSeq, nullptr, nullptr, nullptr, 1.0F, nullptr, nullptr,
-        1e-6F, false, rt::OptionalInputTensor{cuQSeqLensTensor});
+        pageTableTensor.dataPointer<int32_t>(), maxPagesPerSeq, kScratchTensor.rawPointer(),
+        vScratchTensor.rawPointer(), nullptr, 1.0F, nullptr, nullptr, 1e-6F, false,
+        rt::OptionalInputTensor{cuQSeqLensTensor});
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamDestroy(stream));
 
     auto const qOut = copyDeviceToHost<half>(qScratchTensor);
     for (int32_t row = 1; row < qSeqLen; ++row)
@@ -997,7 +1007,40 @@ TEST(RopePackedRaggedPrefill, SkipsPaddingBeforePagedWrite)
         }
     }
 
+    for (auto const* scratch : {&kScratchTensor, &vScratchTensor})
+    {
+        auto const values = copyDeviceToHost<half>(*scratch);
+        for (int32_t row = 1; row < qSeqLen; ++row)
+        {
+            for (int32_t column = 0; column < numKVHeads * headDim; ++column)
+            {
+                ASSERT_EQ(__half2float(values[static_cast<size_t>(row) * numKVHeads * headDim + column]), 0.0F)
+                    << "Dense attention scratch padding must not retain NaN";
+            }
+        }
+    }
+
     auto const kvOut = copyDeviceToHost<half>(kvCacheTensor);
+    auto const kOut = copyDeviceToHost<half>(kScratchTensor);
+    auto const vOut = copyDeviceToHost<half>(vScratchTensor);
+    for (int32_t batch = 0; batch < batchSize; ++batch)
+    {
+        int32_t const length = batch == 0 ? 1 : qSeqLen;
+        for (int32_t row = 0; row < length; ++row)
+        {
+            int32_t const page = batch == 0 ? 1 : 2;
+            int32_t const token = batch == 0 ? rt::kTOKENS_PER_PAGE - 1 : row;
+            for (int32_t dim = 0; dim < headDim; ++dim)
+            {
+                size_t const scratchIndex = (static_cast<size_t>(batch) * qSeqLen + row) * headDim + dim;
+                EXPECT_EQ(__half2float(kOut[scratchIndex]),
+                    __half2float(kvOut[pagedKvIndex(0, page, token, 0, dim, numPages, numKVHeads, headDim)]));
+                EXPECT_EQ(__half2float(vOut[scratchIndex]),
+                    __half2float(kvOut[pagedKvIndex(1, page, token, 0, dim, numPages, numKVHeads, headDim)]));
+            }
+        }
+    }
+
     for (int32_t page : {0, 3, 4, 7})
     {
         size_t const begin = static_cast<size_t>(page) * rt::kTOKENS_PER_PAGE * numKVHeads * headDim;

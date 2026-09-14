@@ -16,6 +16,7 @@
 import math
 
 import onnx
+import pytest
 
 from tensorrt_edgellm.config import (LAYER_ATTN, LAYER_MAMBA, LAYER_MOE,
                                      QUANT_NVFP4, MambaConfig, ModelConfig,
@@ -204,3 +205,46 @@ def test_nemotron_h_mtp_draft_exports_token_major_attention(tmp_path):
         "attention_sequence_lengths", "execution_phase_marker",
         "context_sequence_count_carrier"
     }
+
+
+@pytest.mark.parametrize("mode",
+                         ["vanilla", "dspark", "dspark_tree", "dflash", "mtp"])
+def test_nemotron_spec_state_metadata_matches_decoder_mode(tmp_path, mode):
+    config = _config()
+    if mode != "vanilla":
+        setattr(config, mode.split("_")[0] + "_base", True)
+    if mode.startswith("dspark"):
+        config.dspark_target_layer_ids = [0]
+        config.dspark_tree_base = mode == "dspark_tree"
+    if mode == "dflash":
+        config.dflash_target_layer_ids = [0]
+    model = NemotronHCausalLM(config)
+    spec = model.onnx_export_spec()
+    assert len(spec.input_names) == len(spec.args) == len(spec.dynamic_shapes)
+    state_names = {"tree_parent_ids", "tree_depths", "valid_tree_counts"}
+    has_tree_state = mode in {"dspark_tree", "dflash", "mtp"}
+    assert state_names.issubset(spec.input_names) == has_tree_state
+    if not has_tree_state:
+        assert state_names.isdisjoint(spec.input_names)
+    path = tmp_path / f"nemotron-{mode}.onnx"
+    _export_model(model, str(path), optimize=False)
+    graph = onnx.load(str(path), load_external_data=False).graph
+    graph_inputs = {value.name for value in graph.input}
+    assert state_names.issubset(graph_inputs) == has_tree_state
+    if not has_tree_state:
+        assert state_names.isdisjoint(graph_inputs)
+    if mode != "vanilla":
+        assert {"attention_position_ids",
+                "packed_attention_mask"}.issubset(graph_inputs)
+        assert any("replay" in value.name for value in graph.output)
+    state_nodes = [
+        node for node in graph.node
+        if node.op_type in {"causal_conv1d", "update_ssm_state"}
+    ]
+    assert len(state_nodes) == 2
+    for node in state_nodes:
+        attributes = {
+            attribute.name: attribute.i
+            for attribute in node.attribute
+        }
+        assert bool(attributes.get("use_ddtree", 0)) == has_tree_state
