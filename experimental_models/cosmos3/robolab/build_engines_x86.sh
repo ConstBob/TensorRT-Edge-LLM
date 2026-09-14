@@ -45,6 +45,11 @@ else
 fi
 echo "python: ${PY} ($(${PY} -V 2>&1))"
 
+if ! command -v uv >/dev/null 2>&1; then
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="${HOME}/.local/bin:${PATH}"
+fi
+
 py_install() {
     uv pip install --python "${PY}" --no-cache-dir "$@"
 }
@@ -53,8 +58,18 @@ echo "=== stage: toolchain ==="
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends \
-    git ca-certificates build-essential cmake ninja-build \
-    libnvinfer-dev libnvonnxparsers-dev
+    git ca-certificates build-essential cmake ninja-build
+# Do not apt-install latest libnvinfer-dev from the CUDA 13.4 repo: 4v4w
+# linked against that, then TensorRT builder died with cudaError 35
+# (driver too old for that runtime). Use headers already in the image.
+if [ ! -e /usr/include/NvInfer.h ] \
+   && [ ! -e /usr/include/x86_64-linux-gnu/NvInfer.h ] \
+   && [ ! -e /usr/local/tensorrt/include/NvInfer.h ]; then
+    echo "WARNING: NvInfer.h missing; installing distro TensorRT anyway" >&2
+    apt-get install -y --no-install-recommends libnvinfer-dev libnvonnxparsers-dev
+fi
+nvidia-smi -L || true
+nvcc --version | head -6 || true
 
 # TensorRT reports capability as "9.0"; artifact tags and nvcc want "90".
 SM="${SM:-$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')}"
@@ -82,8 +97,9 @@ fi
 POLICY_BUILD="${NATIVE_DIR}/cosmos3_policy_build"
 POLICY_INFER="${NATIVE_DIR}/cosmos3_policy_inference"
 PLUGIN_SO="${NATIVE_DIR}/libNvInfer_edgellm_plugin.so"
+NATIVE_KEY="${SM}-$(dpkg-query -W -f='${Package}=${Version}' libnvinfer11 2>/dev/null || echo image-trt)"
 if [ -x "${POLICY_BUILD}" ] && [ -x "${POLICY_INFER}" ] && [ -e "${PLUGIN_SO}" ] \
-   && [ "$(cat "${NATIVE_DIR}/SM" 2>/dev/null || true)" = "${SM}" ]; then
+   && [ "$(cat "${NATIVE_DIR}/KEY" 2>/dev/null || true)" = "${NATIVE_KEY}" ]; then
     echo "=== reusing native binaries from ${NATIVE_DIR} ==="
 else
     echo "=== stage: c++ build (cute_dsl=${CUTE_MODE}) ==="
@@ -101,6 +117,7 @@ else
     cp -f "${BUILD_DIR}/experimental_models/cosmos3/examples/cosmos3_policy_inference" "${POLICY_INFER}"
     cp -f "${BUILD_DIR}/libNvInfer_edgellm_plugin.so" "${PLUGIN_SO}"
     printf '%s\n' "${SM}" > "${NATIVE_DIR}/SM"
+    printf '%s\n' "${NATIVE_KEY}" > "${NATIVE_DIR}/KEY"
     chmod +x "${POLICY_BUILD}" "${POLICY_INFER}"
 fi
 export EDGELLM_PLUGIN_PATH="${PLUGIN_SO}"
@@ -110,33 +127,34 @@ if [ -e "${ENGINE_DIR}/READY" ]; then
 else
     echo "=== stage: checkpoint ==="
     mkdir -p "${CKPT_LOCAL}"
-    # The A-arm endpoint populates the same shared cache; take the same lock.
     exec 9>"${WORK_ROOT}/checkpoint.lock"
     flock 9
     uvx --with click hf@1.16.4 download "${CKPT_REPO}" \
         --repo-type model --revision main --local-dir "${CKPT_LOCAL}"
     flock -u 9
 
-    echo "=== stage: python package ==="
-    # Do not `pip install -e`: scikit-build would rebuild C++. The image
-    # transformers can import but is too old for Gemma4AudioConfig, which
-    # 0.10.1 export.py pulls in at module load (f45x failed here).
-    "${PY}" -c "import torch" || py_install "torch==2.13.0"
-    py_install \
-        "transformers==5.14.1" "onnx==1.19.0" "onnxscript==0.7.1" \
-        "safetensors==0.8.0" "numpy==2.2.6" "onnx-graphsurgeon==0.6.1" pillow
-    export PYTHONPATH="${EDGELLM_SRC}${PYTHONPATH:+:${PYTHONPATH}}"
-    "${PY}" -c "from transformers import Gemma4AudioConfig; import tensorrt_edgellm.scripts.export"
-
-    echo "=== stage: onnx export ==="
     exec 8>"${WORK_ROOT}/build.lock"
     flock 8
-    PYTHONNOUSERSITE=1 "${PY}" -m tensorrt_edgellm.scripts.export \
-        "${CKPT_LOCAL}" "${ONNX_DIR}" \
-        --task policy --dtype float16 \
-        --action-chunk-size "${ACTION_CHUNK_SIZE}" \
-        --num-frames "${NUM_FRAMES}" \
-        --fps "${FPS}"
+    if [ -e "${ONNX_DIR}/EXPORT_OK" ]; then
+        echo "=== onnx already present, skipping export ==="
+    else
+        echo "=== stage: python package ==="
+        "${PY}" -c "import torch" || py_install "torch==2.13.0"
+        py_install \
+            "transformers==5.14.1" "onnx==1.19.0" "onnxscript==0.7.1" \
+            "safetensors==0.8.0" "numpy==2.2.6" "onnx-graphsurgeon==0.6.1" pillow
+        export PYTHONPATH="${EDGELLM_SRC}${PYTHONPATH:+:${PYTHONPATH}}"
+        "${PY}" -c "from transformers import Gemma4AudioConfig; import tensorrt_edgellm.scripts.export"
+
+        echo "=== stage: onnx export ==="
+        PYTHONNOUSERSITE=1 "${PY}" -m tensorrt_edgellm.scripts.export \
+            "${CKPT_LOCAL}" "${ONNX_DIR}" \
+            --task policy --dtype float16 \
+            --action-chunk-size "${ACTION_CHUNK_SIZE}" \
+            --num-frames "${NUM_FRAMES}" \
+            --fps "${FPS}"
+        touch "${ONNX_DIR}/EXPORT_OK"
+    fi
 
     echo "=== stage: engine build ==="
     "${POLICY_BUILD}" --onnxDir "${ONNX_DIR}" --engineDir "${ENGINE_DIR}"
