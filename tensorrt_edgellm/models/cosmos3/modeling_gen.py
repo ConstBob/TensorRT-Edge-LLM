@@ -180,7 +180,7 @@ class Cosmos3GenAttention(nn.Module):
         rope_sin: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
-        from tensorrt_edgellm.models.ops import cosmos3_attention, cosmos3_rope
+        from tensorrt_edgellm.models.ops import attention_onnx, rope_onnx
 
         bsz, s_gen, _ = hidden_states.shape
         io_type = hidden_states.dtype
@@ -198,10 +198,10 @@ class Cosmos3GenAttention(nn.Module):
         k = self.norm_k(k)
 
         # Qwen3-style RoPE on the GEN-token positions (unified_3d_mrope cos/sin).
-        q = cosmos3_rope(q.to(compute_type), rope_cos, rope_sin,
-                         position_ids).to(io_type)
-        k = cosmos3_rope(k.to(compute_type), rope_cos, rope_sin,
-                         position_ids).to(io_type)
+        q = rope_onnx(q.to(compute_type), rope_cos, rope_sin,
+                      position_ids).to(io_type)
+        k = rope_onnx(k.to(compute_type), rope_cos, rope_sin,
+                      position_ids).to(io_type)
 
         q = q * self.qk_scale
 
@@ -214,12 +214,12 @@ class Cosmos3GenAttention(nn.Module):
         k_all = torch.cat([k_und, k], dim=2)
         v_all = torch.cat([v_und, v], dim=2)
 
-        attn_output = cosmos3_attention(q,
-                                        k_all,
-                                        v_all,
-                                        attn_mask=None,
-                                        is_causal=False,
-                                        scale=1.0)
+        attn_output = attention_onnx(q,
+                                     k_all,
+                                     v_all,
+                                     attn_mask=None,
+                                     is_causal=False,
+                                     scale=1.0)
         attn_output = attn_output.transpose(1, 2).reshape(bsz, s_gen, -1)
         return self.to_out(attn_output)
 
