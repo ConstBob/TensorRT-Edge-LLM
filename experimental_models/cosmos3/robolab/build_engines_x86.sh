@@ -71,6 +71,32 @@ fi
 nvidia-smi -L || true
 nvcc --version | head -6 || true
 
+# The exporter emits trt::RotaryEmbedding / trt::TensorScatter, which only the
+# onnx-tensorrt 10.16-GA parser and later import natively. An older parser
+# falls back to the plugin registry and rejects every rope node with
+# "Plugin not found" (f9c8). Report what this image actually ships so the
+# engine stage does not fail on a version guess.
+echo "=== stage: tensorrt inventory ==="
+TRT_HDR=""
+for cand in /usr/include/x86_64-linux-gnu/NvInferVersion.h \
+            /usr/include/NvInferVersion.h \
+            /usr/local/tensorrt/include/NvInferVersion.h; do
+    if [ -e "${cand}" ]; then
+        TRT_HDR="${cand}"
+        break
+    fi
+done
+if [ -n "${TRT_HDR}" ]; then
+    echo "header: ${TRT_HDR}"
+    grep -E "define NV_TENSORRT_(MAJOR|MINOR|PATCH|BUILD)" "${TRT_HDR}" || true
+else
+    echo "header: none found"
+fi
+dpkg -l 2>/dev/null | grep -iE "nvinfer|tensorrt" || echo "no nvinfer dpkg entries"
+ls -l /usr/lib/x86_64-linux-gnu/libnvinfer.so* \
+      /usr/lib/x86_64-linux-gnu/libnvonnxparser.so* 2>/dev/null || true
+apt-cache madison libnvinfer-dev libnvonnxparsers-dev 2>/dev/null | head -40 || true
+
 # TensorRT reports capability as "9.0"; artifact tags and nvcc want "90".
 SM="${SM:-$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')}"
 echo "target SM: ${SM}"
