@@ -112,8 +112,8 @@ def parse_quantization(model_dir: str,
             return QuantConfig(
                 quant_type=dominant,
                 group_size=group_size,
-                kv_cache_quant=_normalize_kv(
-                    quantization.get("kv_cache_quant_algo")),
+                kv_cache_quant=_resolve_kv_cache_quant(
+                    model_dir, quantization.get("kv_cache_quant_algo")),
                 excluded=tuple(
                     _effective_exclusions(
                         model_dir,
@@ -142,8 +142,8 @@ def parse_quantization(model_dir: str,
         return QuantConfig(
             quant_type=quant_type,
             group_size=group_size,
-            kv_cache_quant=_normalize_kv(
-                quantization.get("kv_cache_quant_algo")),
+            kv_cache_quant=_resolve_kv_cache_quant(
+                model_dir, quantization.get("kv_cache_quant_algo")),
             excluded=tuple(sorted(set(excluded))),
         )
 
@@ -208,8 +208,9 @@ def parse_quantization(model_dir: str,
             return QuantConfig(
                 quant_type=QUANT_NVFP4,
                 group_size=group_size,
-                kv_cache_quant=("fp8"
-                                if embedded.get("kv_cache_scheme") else None),
+                kv_cache_quant=_resolve_kv_cache_quant(
+                    model_dir,
+                    "fp8" if embedded.get("kv_cache_scheme") else None),
                 excluded=tuple(sorted(set(excluded))),
             )
         raise ValueError(
@@ -238,7 +239,8 @@ def parse_quantization(model_dir: str,
     return QuantConfig(
         quant_type=quant_type,
         group_size=group_size,
-        kv_cache_quant=("fp8" if embedded.get("kv_cache_scheme") else None),
+        kv_cache_quant=_resolve_kv_cache_quant(
+            model_dir, "fp8" if embedded.get("kv_cache_scheme") else None),
         excluded=tuple(
             _effective_exclusions(model_dir, list(embedded.get("ignore", [])),
                                   conversion)),
@@ -432,6 +434,34 @@ def _detect_gptq_zero_point_offset(model_dir: str, config: dict) -> int:
         unsigned = int(value) & 0xFFFFFFFF
         nibbles.extend((unsigned >> (4 * index)) & 0xF for index in range(8))
     return 0 if nibbles and all(value == 8 for value in nibbles) else 1
+
+
+_VISUAL_PATH_HINTS = ("visual", "vision_tower", "vision_model",
+                      "multi_modal_projector", "mlp1", "image_embed",
+                      "embed_vision")
+
+
+def _has_llm_kv_scales(model_dir: str) -> bool:
+    """Whether the checkpoint carries LLM (non-visual) KV-cache K scales.
+
+    ModelOpt writes ``kv_cache_quant_algo``/``kv_cache_scheme`` whenever any
+    ``k_bmm_quantizer`` is enabled, including a visual tower's, so the metadata
+    alone reports FP8 for checkpoints whose LLM attention has no K/V scales.
+    Mirrors ``tensorrt_edgellm.config._detect_llm_kv_cache_fp8``.
+    """
+    return any(
+        key.endswith(".k_proj.k_scale") and not any(
+            hint in key for hint in _VISUAL_PATH_HINTS)
+        for key in _checkpoint_keys(model_dir))
+
+
+def _resolve_kv_cache_quant(model_dir: str,
+                            claimed: Optional[str]) -> Optional[str]:
+    """Honor a checkpoint's KV-cache claim only when its scales are present."""
+    normalized = _normalize_kv(claimed)
+    if normalized is None:
+        return None
+    return normalized if _has_llm_kv_scales(model_dir) else None
 
 
 def _normalize_kv(value: Optional[str]) -> Optional[str]:
