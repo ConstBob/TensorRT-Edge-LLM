@@ -103,10 +103,22 @@ if [ -x "${POLICY_BUILD}" ] && [ -x "${POLICY_INFER}" ] && [ -e "${PLUGIN_SO}" ]
     echo "=== reusing native binaries from ${NATIVE_DIR} ==="
 else
     echo "=== stage: c++ build (cute_dsl=${CUTE_MODE}) ==="
+    CUDA_DIR="$(readlink -f /usr/local/cuda 2>/dev/null || true)"
+    if [ -z "${CUDA_DIR}" ] || [ ! -e "${CUDA_DIR}/include/cuda_runtime_api.h" ]; then
+        CUDA_DIR="$(cd "$(dirname "$(command -v nvcc)")/.." && pwd)"
+    fi
+    CUDA_CTK_VERSION="$(echo "${CUDA_DIR}" | sed -n 's/.*cuda-\([0-9][0-9.]*\).*/\1/p')"
+    CUDA_CTK_VERSION="${CUDA_CTK_VERSION:-13.0}"
+    TRT_PACKAGE_DIR=/usr
+    if [ -e /usr/local/tensorrt/include/NvInfer.h ]; then
+        TRT_PACKAGE_DIR=/usr/local/tensorrt
+    fi
+    echo "CUDA_DIR=${CUDA_DIR} CUDA_CTK_VERSION=${CUDA_CTK_VERSION} TRT_PACKAGE_DIR=${TRT_PACKAGE_DIR}"
     cmake -S "${EDGELLM_SRC}" -B "${BUILD_DIR}" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
-        -DTRT_PACKAGE_DIR=/usr \
-        -DCUDA_CTK_VERSION=13.0 \
+        -DTRT_PACKAGE_DIR="${TRT_PACKAGE_DIR}" \
+        -DCUDA_DIR="${CUDA_DIR}" \
+        -DCUDA_CTK_VERSION="${CUDA_CTK_VERSION}" \
         -DCMAKE_CUDA_ARCHITECTURES="${SM}" \
         -DBUILD_EXPERIMENTAL_MODELS=ON \
         "${CUTE_ARGS[@]}"
