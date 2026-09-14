@@ -118,15 +118,15 @@ else
     flock -u 9
 
     echo "=== stage: python package ==="
-    # Do not `pip install -e`: scikit-build would rebuild C++, and the image
-    # venv has no pip. Export only needs the in-tree package plus extras.
-    if ! "${PY}" -c "import torch, transformers, onnx, onnxscript, safetensors, numpy, onnx_graphsurgeon, PIL"; then
-        py_install \
-            "torch==2.13.0" "transformers==5.14.1" "onnx==1.19.0" \
-            "onnxscript==0.7.1" "safetensors==0.8.0" "numpy==2.2.6" \
-            "onnx-graphsurgeon==0.6.1" pillow
-    fi
+    # Do not `pip install -e`: scikit-build would rebuild C++. The image
+    # transformers can import but is too old for Gemma4AudioConfig, which
+    # 0.10.1 export.py pulls in at module load (f45x failed here).
+    "${PY}" -c "import torch" || py_install "torch==2.13.0"
+    py_install \
+        "transformers==5.14.1" "onnx==1.19.0" "onnxscript==0.7.1" \
+        "safetensors==0.8.0" "numpy==2.2.6" "onnx-graphsurgeon==0.6.1" pillow
     export PYTHONPATH="${EDGELLM_SRC}${PYTHONPATH:+:${PYTHONPATH}}"
+    "${PY}" -c "from transformers import Gemma4AudioConfig; import tensorrt_edgellm.scripts.export"
 
     echo "=== stage: onnx export ==="
     exec 8>"${WORK_ROOT}/build.lock"
