@@ -1427,6 +1427,101 @@ def _(query, key, value, attn_mask, is_causal, scale):
 
 
 # ---------------------------------------------------------------------------
+# Decomposed RoPE / attention for Cosmos3 policy export
+# ---------------------------------------------------------------------------
+# Native ``trt::RotaryEmbedding`` / ``trt::Attention`` ONNX nodes need TensorRT
+# >= 10.16. On neb-cdg H200s the node driver is 570 / CUDA 12.8; staging 10.16
+# parses those nodes then segfaults in the compiler backend (no TRT error).
+# Tracing the equivalent Gather/Mul/MatMul/Softmax graph lets the image 10.14
+# parser build engines. Set EDGELLM_COSMOS3_DECOMPOSE_NATIVE_ATTN=1.
+
+_DECOMPOSE_TRT_NATIVE_ENV = "EDGELLM_COSMOS3_DECOMPOSE_NATIVE_ATTN"
+
+
+def use_decomposed_trt_native_ops() -> bool:
+    val = os.environ.get(_DECOMPOSE_TRT_NATIVE_ENV, "").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
+def neox_rotary_embedding(
+    x: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> torch.Tensor:
+    """NeoX rotate-half RoPE matching TensorRT RotaryEmbedding.
+
+    x:            [batch, num_heads, seq_len, head_size]
+    cos/sin:      [max_pos, head_size // 2]
+    position_ids: [batch, seq_len]
+    """
+    half = x.shape[-1] // 2
+    x1 = x[..., :half]
+    x2 = x[..., half:]
+    idx = position_ids.to(dtype=torch.long)
+    cos = cos_cache[idx][:, None, :, :]
+    sin = sin_cache[idx][:, None, :, :]
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+
+
+def decomposed_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
+    is_causal: bool,
+    scale: float,
+) -> torch.Tensor:
+    """Explicit QK^T / softmax / PV attention (no SDPA, no ONNX Attention).
+
+    Tensors are [batch, heads, seq, head_dim]. GQA repeats K/V along heads.
+    """
+    nq, nkv = query.shape[1], key.shape[1]
+    if nq != nkv:
+        if nq % nkv != 0:
+            raise ValueError(f"GQA heads {nq} not divisible by kv heads {nkv}")
+        rep = nq // nkv
+        key = key.repeat_interleave(rep, dim=1)
+        value = value.repeat_interleave(rep, dim=1)
+    scores = torch.matmul(query, key.transpose(-2, -1)) * scale
+    if is_causal:
+        seq_q, seq_k = query.shape[-2], key.shape[-2]
+        q_idx = torch.arange(seq_q, device=query.device)[:, None]
+        k_idx = torch.arange(seq_k, device=query.device)[None, :]
+        causal = k_idx <= (q_idx + (seq_k - seq_q))
+        scores = scores.masked_fill(~causal, -65504.0)
+    if attn_mask is not None:
+        scores = scores + attn_mask
+    probs = torch.softmax(scores.float(), dim=-1).to(query.dtype)
+    return torch.matmul(probs, value)
+
+
+def cosmos3_rope(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> torch.Tensor:
+    if use_decomposed_trt_native_ops():
+        return neox_rotary_embedding(x, cos, sin, position_ids)
+    return rope_onnx(x, cos, sin, position_ids)
+
+
+def cosmos3_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
+    is_causal: bool,
+    scale: float,
+) -> torch.Tensor:
+    if use_decomposed_trt_native_ops():
+        return decomposed_attention(query, key, value, attn_mask, is_causal,
+                                    scale)
+    return attention_onnx(query, key, value, attn_mask, is_causal, scale)
+
+
+# ---------------------------------------------------------------------------
 # Custom op: trt_edgellm::gated_delta_net  (Qwen3.5 GDN linear attention)
 # ---------------------------------------------------------------------------
 

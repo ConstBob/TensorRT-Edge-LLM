@@ -67,7 +67,7 @@ class _UndAttn(nn.Module):
                                           rms_eps) if use_und_k_norm else None
 
     def forward(self, h, rope_cos, rope_sin, pos):
-        from tensorrt_edgellm.models.ops import attention_onnx, rope_onnx
+        from tensorrt_edgellm.models.ops import cosmos3_attention, cosmos3_rope
 
         b, s, _ = h.shape
         io = h.dtype
@@ -76,15 +76,16 @@ class _UndAttn(nn.Module):
         k = self.k_proj(h).view(b, s, self.n_kv, self.head_dim).transpose(1, 2)
         v = self.v_proj(h).view(b, s, self.n_kv, self.head_dim).transpose(1, 2)
         # UND has no qk-norm (qk_norm_und=false). Qwen3 RoPE (unified_3d_mrope cos/sin).
-        q = rope_onnx(q.to(torch.float16), rope_cos, rope_sin, pos).to(io)
-        k_self = rope_onnx(k.to(torch.float16), rope_cos, rope_sin, pos).to(io)
+        q = cosmos3_rope(q.to(torch.float16), rope_cos, rope_sin, pos).to(io)
+        k_self = cosmos3_rope(k.to(torch.float16), rope_cos, rope_sin,
+                              pos).to(io)
         q = q * self.qk_scale
-        attn = attention_onnx(q,
-                              k_self,
-                              v,
-                              attn_mask=None,
-                              is_causal=True,
-                              scale=1.0)
+        attn = cosmos3_attention(q,
+                                 k_self,
+                                 v,
+                                 attn_mask=None,
+                                 is_causal=True,
+                                 scale=1.0)
         attn = attn.transpose(1, 2).reshape(b, s, -1)
         out = self.o_proj(attn)
         # K exported for the GEN cross-attention. With use_und_k_norm_for_gen
@@ -93,8 +94,8 @@ class _UndAttn(nn.Module):
         # the reasoner's own self-attention above keeps the raw (un-normed) K.
         if self.k_norm_und_for_gen is not None:
             k_gen = self.k_norm_und_for_gen(k)
-            k_gen = rope_onnx(k_gen.to(torch.float16), rope_cos, rope_sin,
-                              pos).to(io)
+            k_gen = cosmos3_rope(k_gen.to(torch.float16), rope_cos, rope_sin,
+                                 pos).to(io)
         else:
             k_gen = k_self
         # Per-layer K/V (post-RoPE K, plain V) seq-major [B, S, H_kv, D] for the GEN graph.

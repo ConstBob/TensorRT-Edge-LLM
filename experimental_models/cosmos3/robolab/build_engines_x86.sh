@@ -31,14 +31,24 @@ ACTION_CHUNK_SIZE=32
 NUM_FRAMES=33
 FPS=15
 
-# First TensorRT whose ONNX parser imports trt::RotaryEmbedding natively.
-# Do not call this TRT_VERSION: the NGC images already export that with their
-# own (older) version, which silently won this variable in f9c8.
-# 10.16.1 +cuda13.2 parsed RotaryEmbedding then segfaulted in the builder
-# (f9c8). The node driver is CUDA 12.8 / 570; use the cuda12.9 build of the
-# same parser instead of the cuda13.2 one.
+# Native trt::RotaryEmbedding / Attention need TensorRT >= 10.16. Staging
+# 10.16 on neb-cdg (driver 570 / CUDA 12.8) parses then segfaults in the
+# compiler backend — both +cuda13.2 and +cuda12.9, even with a local copy.
+# Default: decompose those ops at export and build with the image 10.14.
+# Do not call the staged version TRT_VERSION: NGC images already export that.
+EDGELLM_COSMOS3_DECOMPOSE_NATIVE_ATTN="${EDGELLM_COSMOS3_DECOMPOSE_NATIVE_ATTN:-1}"
+export EDGELLM_COSMOS3_DECOMPOSE_NATIVE_ATTN
+ONNX_MODE="policy-32x8-decomp${EDGELLM_COSMOS3_DECOMPOSE_NATIVE_ATTN}"
 EDGELLM_TRT_VERSION="${EDGELLM_TRT_VERSION:-10.16.1.11-1+cuda12.9}"
 EDGELLM_TRT_REPO="${EDGELLM_TRT_REPO:-https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64}"
+EDGELLM_USE_IMAGE_TRT="${EDGELLM_USE_IMAGE_TRT:-}"
+if [ -z "${EDGELLM_USE_IMAGE_TRT}" ]; then
+    if [ "${EDGELLM_COSMOS3_DECOMPOSE_NATIVE_ATTN}" = "1" ]; then
+        EDGELLM_USE_IMAGE_TRT=1
+    else
+        EDGELLM_USE_IMAGE_TRT=0
+    fi
+fi
 
 mkdir -p "${WORK_ROOT}" "${ONNX_DIR}" "${ENGINE_DIR}" "${BUILD_DIR}"
 NATIVE_DIR="${WORK_ROOT}/native"
@@ -74,49 +84,42 @@ apt-get install -y --no-install-recommends \
 nvidia-smi -L || true
 nvcc --version | head -6 || true
 
-echo "=== stage: tensorrt ${EDGELLM_TRT_VERSION} ==="
-# The exporter emits trt::RotaryEmbedding and trt::TensorScatter, which the
-# ONNX parser imports natively only from 10.16-GA on. pytorch:25.12-py3 ships
-# 10.14.1, whose parser falls back to the plugin registry and rejects every
-# rope node with "Plugin not found" (f9c8).
-#
-# Unpack 10.16 side by side rather than apt-upgrading: the +cuda13.2 debs pull
-# a CUDA runtime newer than this node's driver, which is how 4v4w died with
-# cudaError 35. Unpacked libraries keep SONAME libnvinfer.so.10, so link order
-# alone selects them and the image CUDA 13.1 runtime stays untouched.
+echo "=== stage: tensorrt (image=${EDGELLM_USE_IMAGE_TRT} decompose=${EDGELLM_COSMOS3_DECOMPOSE_NATIVE_ATTN}) ==="
+# Decomposed export: stay on pytorch:25.12 image TRT 10.14.1 (matches driver).
+# Native-op export: unpack 10.16 side by side. Do not apt-upgrade (cudaError 35).
 TRT_STAGE="${WORK_ROOT}/tensorrt/${EDGELLM_TRT_VERSION}"
 TRT_LOCAL="${TRT_LOCAL:-/opt/edgellm-trt/${EDGELLM_TRT_VERSION}}"
-exec 7>"${WORK_ROOT}/tensorrt.lock"
-flock 7
-if [ ! -e "${TRT_STAGE}/READY" ]; then
-    rm -rf "${TRT_STAGE}"
-    mkdir -p "${TRT_STAGE}"
-    for pkg in libnvinfer-headers-dev libnvinfer-headers-plugin-dev \
-               libnvinfer-dev libnvinfer10 \
-               libnvinfer-plugin-dev libnvinfer-plugin10 \
-               libnvonnxparsers-dev libnvonnxparsers10; do
-        deb="${pkg}_${EDGELLM_TRT_VERSION}_amd64.deb"
-        curl -fsSL -o "${BUILD_DIR}/${deb}" "${EDGELLM_TRT_REPO}/${deb}"
-        dpkg-deb -x "${BUILD_DIR}/${deb}" "${TRT_STAGE}"
-    done
-    touch "${TRT_STAGE}/READY"
+if [ "${EDGELLM_USE_IMAGE_TRT}" = "1" ]; then
+    TRT_PACKAGE_DIR="${TRT_PACKAGE_DIR:-/usr}"
+    echo "using image TensorRT at ${TRT_PACKAGE_DIR}"
+else
+    exec 7>"${WORK_ROOT}/tensorrt.lock"
+    flock 7
+    if [ ! -e "${TRT_STAGE}/READY" ]; then
+        rm -rf "${TRT_STAGE}"
+        mkdir -p "${TRT_STAGE}"
+        for pkg in libnvinfer-headers-dev libnvinfer-headers-plugin-dev \
+                   libnvinfer-dev libnvinfer10 \
+                   libnvinfer-plugin-dev libnvinfer-plugin10 \
+                   libnvonnxparsers-dev libnvonnxparsers10; do
+            deb="${pkg}_${EDGELLM_TRT_VERSION}_amd64.deb"
+            curl -fsSL -o "${BUILD_DIR}/${deb}" "${EDGELLM_TRT_REPO}/${deb}"
+            dpkg-deb -x "${BUILD_DIR}/${deb}" "${TRT_STAGE}"
+        done
+        touch "${TRT_STAGE}/READY"
+    fi
+    flock -u 7
+    if [ ! -e "${TRT_LOCAL}/READY" ]; then
+        rm -rf "${TRT_LOCAL}"
+        mkdir -p "${TRT_LOCAL}"
+        tar -C "${TRT_STAGE}" --exclude='*.a' -cf - . | tar -C "${TRT_LOCAL}" -xf -
+    fi
+    TRT_PACKAGE_DIR="${TRT_LOCAL}/usr"
+    export LD_LIBRARY_PATH="${TRT_PACKAGE_DIR}/lib/x86_64-linux-gnu:${TRT_STAGE}/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 fi
-flock -u 7
-
-# Compile and link against a node-local copy. Serving the headers off NFS to
-# 128 parallel compiles dropped the C++ build from ~80 to ~4 objects a minute.
-# The static archives are dead weight here; everything links shared.
-if [ ! -e "${TRT_LOCAL}/READY" ]; then
-    rm -rf "${TRT_LOCAL}"
-    mkdir -p "${TRT_LOCAL}"
-    tar -C "${TRT_STAGE}" --exclude='*.a' -cf - . | tar -C "${TRT_LOCAL}" -xf -
-fi
-TRT_PACKAGE_DIR="${TRT_LOCAL}/usr"
-# Keep the NFS copy on the runtime path too: engines built here are loaded by
-# serving replicas that have no /opt copy of their own.
-export LD_LIBRARY_PATH="${TRT_PACKAGE_DIR}/lib/x86_64-linux-gnu:${TRT_STAGE}/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 ls -l "${TRT_PACKAGE_DIR}/lib/x86_64-linux-gnu/libnvinfer.so".* \
-      "${TRT_PACKAGE_DIR}/lib/x86_64-linux-gnu/libnvonnxparser.so".*
+      "${TRT_PACKAGE_DIR}/lib/x86_64-linux-gnu/libnvonnxparser.so".* \
+      2>/dev/null || ls -l "${TRT_PACKAGE_DIR}/lib/"*nvinfer* 2>/dev/null || true
 
 # TensorRT reports capability as "9.0"; artifact tags and nvcc want "90".
 SM="${SM:-$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')}"
@@ -144,7 +147,11 @@ fi
 POLICY_BUILD="${NATIVE_DIR}/cosmos3_policy_build"
 POLICY_INFER="${NATIVE_DIR}/cosmos3_policy_inference"
 PLUGIN_SO="${NATIVE_DIR}/libNvInfer_edgellm_plugin.so"
-NATIVE_KEY="sm${SM}-trt${EDGELLM_TRT_VERSION}-cute${CUTE_MODE}"
+if [ "${EDGELLM_USE_IMAGE_TRT}" = "1" ]; then
+    NATIVE_KEY="sm${SM}-trtIMAGE-cute${CUTE_MODE}-decomp${EDGELLM_COSMOS3_DECOMPOSE_NATIVE_ATTN}"
+else
+    NATIVE_KEY="sm${SM}-trt${EDGELLM_TRT_VERSION}-cute${CUTE_MODE}-decomp${EDGELLM_COSMOS3_DECOMPOSE_NATIVE_ATTN}"
+fi
 if [ -x "${POLICY_BUILD}" ] && [ -x "${POLICY_INFER}" ] && [ -e "${PLUGIN_SO}" ] \
    && [ "$(cat "${NATIVE_DIR}/KEY" 2>/dev/null || true)" = "${NATIVE_KEY}" ]; then
     echo "=== reusing native binaries from ${NATIVE_DIR} ==="
@@ -178,6 +185,11 @@ else
 fi
 export EDGELLM_PLUGIN_PATH="${PLUGIN_SO}"
 
+if [ "$(cat "${ONNX_DIR}/EXPORT_MODE" 2>/dev/null || true)" != "${ONNX_MODE}" ]; then
+    echo "=== onnx mode changed to ${ONNX_MODE}; invalidating old ONNX/engines ==="
+    rm -f "${ONNX_DIR}/EXPORT_OK" "${ENGINE_DIR}/READY"
+fi
+
 if [ -e "${ENGINE_DIR}/READY" ]; then
     echo "=== engines already present, skipping export/build ==="
 else
@@ -191,7 +203,8 @@ else
 
     exec 8>"${WORK_ROOT}/build.lock"
     flock 8
-    if [ -e "${ONNX_DIR}/EXPORT_OK" ]; then
+    if [ -e "${ONNX_DIR}/EXPORT_OK" ] \
+       && [ "$(cat "${ONNX_DIR}/EXPORT_MODE" 2>/dev/null || true)" = "${ONNX_MODE}" ]; then
         echo "=== onnx already present, skipping export ==="
     else
         echo "=== stage: python package ==="
@@ -202,17 +215,28 @@ else
         export PYTHONPATH="${EDGELLM_SRC}${PYTHONPATH:+:${PYTHONPATH}}"
         "${PY}" -c "from transformers import Gemma4AudioConfig; import tensorrt_edgellm.scripts.export"
 
-        echo "=== stage: onnx export ==="
+        echo "=== stage: onnx export (mode=${ONNX_MODE}) ==="
         PYTHONNOUSERSITE=1 "${PY}" -m tensorrt_edgellm.scripts.export \
             "${CKPT_LOCAL}" "${ONNX_DIR}" \
             --task policy --dtype float16 \
             --action-chunk-size "${ACTION_CHUNK_SIZE}" \
             --num-frames "${NUM_FRAMES}" \
             --fps "${FPS}"
+        printf '%s\n' "${ONNX_MODE}" > "${ONNX_DIR}/EXPORT_MODE"
         touch "${ONNX_DIR}/EXPORT_OK"
     fi
 
     echo "=== stage: engine build ==="
+    # Torch's bundled CUDA/TRT must not win over the builder's libnvinfer.
+    _engine_ld=""
+    IFS=':' read -ra _ld_parts <<< "${LD_LIBRARY_PATH:-}"
+    for _p in "${_ld_parts[@]}"; do
+        case "${_p}" in
+            *torch*|*torch_tensorrt*) continue ;;
+        esac
+        _engine_ld="${_engine_ld:+${_engine_ld}:}${_p}"
+    done
+    export LD_LIBRARY_PATH="${_engine_ld}"
     ldd "${POLICY_BUILD}" | grep -E "nvinfer|nvonnx|cudart|cuda" || true
     ldd "${PLUGIN_SO}" | grep -E "nvinfer|nvonnx|cudart|cuda" || true
     "${POLICY_BUILD}" --onnxDir "${ONNX_DIR}" --engineDir "${ENGINE_DIR}"
