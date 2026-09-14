@@ -1880,20 +1880,20 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         mActionKvBatchCollector->beginRequest(actionSlots, ropeDeltas);
     }
 
-    // Reject overlong inputs with the marker consumed by the Python server's
-    // HTTP 413 mapping, before TensorRT reports a less actionable shape error.
+    // Only the cache-miss suffix reaches a prefill call, so maxInputLen is checked in
+    // setUpForPrefillExecution; a whole prompt is bounded by KV capacity.
     for (size_t i = 0; i < context.rawBatchedInputIds.size(); ++i)
     {
         int32_t const inputLen = static_cast<int32_t>(context.rawBatchedInputIds[i].size());
-        if (inputLen > mDeployment.base.maxSupportedInputLength)
+        if (inputLen > mDeployment.base.maxKVCacheCapacity)
         {
             LOG_ERROR(
-                "Input length (%d) exceeds engine max input length (%d). "
-                "Rebuild the engine with a larger --maxInputLen.",
-                inputLen, mDeployment.base.maxSupportedInputLength);
+                "Input length (%d) exceeds engine KV cache capacity (%d). "
+                "Rebuild the engine with a larger --maxKVCacheCapacity.",
+                inputLen, mDeployment.base.maxKVCacheCapacity);
             throw std::runtime_error("EDGELLM_INPUT_TOO_LONG: input length " + std::to_string(inputLen)
-                + " exceeds engine max_input_len " + std::to_string(mDeployment.base.maxSupportedInputLength)
-                + " (rebuild engine with a larger --maxInputLen)");
+                + " exceeds engine max_kv_cache_capacity " + std::to_string(mDeployment.base.maxKVCacheCapacity)
+                + " (rebuild engine with a larger --maxKVCacheCapacity)");
         }
     }
 
@@ -3703,9 +3703,13 @@ bool LLMRankRuntime::setUpForPrefillExecution(DecodingInferenceContext& context,
         = *std::max_element(context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.end());
     if (maxInputLength > mDeployment.base.maxSupportedInputLength)
     {
-        LOG_ERROR("The max input length (%d) exceeds the max supported input length (%d) of the LLM Engine.",
+        LOG_ERROR(
+            "Prefill length after context reuse (%d) exceeds engine max input length (%d). "
+            "Rebuild the engine with a larger --maxInputLen.",
             maxInputLength, mDeployment.base.maxSupportedInputLength);
-        return false;
+        throw std::runtime_error("EDGELLM_INPUT_TOO_LONG: prefill length " + std::to_string(maxInputLength)
+            + " exceeds engine max_input_len " + std::to_string(mDeployment.base.maxSupportedInputLength)
+            + " (rebuild engine with a larger --maxInputLen)");
     }
 
     if (contextCachePrefillStarts == nullptr)
