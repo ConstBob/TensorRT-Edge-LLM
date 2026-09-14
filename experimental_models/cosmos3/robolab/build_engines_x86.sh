@@ -31,6 +31,10 @@ ACTION_CHUNK_SIZE=32
 NUM_FRAMES=33
 FPS=15
 
+# First TensorRT whose ONNX parser imports trt::RotaryEmbedding natively.
+TRT_VERSION="${TRT_VERSION:-10.16.1.11-1+cuda13.2}"
+TRT_REPO="${TRT_REPO:-https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64}"
+
 mkdir -p "${WORK_ROOT}" "${ONNX_DIR}" "${ENGINE_DIR}" "${BUILD_DIR}"
 NATIVE_DIR="${WORK_ROOT}/native"
 
@@ -51,7 +55,10 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 py_install() {
-    uv pip install --python "${PY}" --no-cache-dir "$@"
+    # NGC images expose the interpreter as the distro python3, which carries
+    # Debian's EXTERNALLY-MANAGED marker; there is no venv to install into.
+    uv pip install --python "${PY}" --no-cache-dir "$@" \
+        || uv pip install --python "${PY}" --no-cache-dir --break-system-packages "$@"
 }
 
 echo "=== stage: toolchain ==="
@@ -59,43 +66,40 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends \
     git ca-certificates build-essential cmake ninja-build
-# Do not apt-install latest libnvinfer-dev from the CUDA 13.4 repo: 4v4w
-# linked against that, then TensorRT builder died with cudaError 35
-# (driver too old for that runtime). Use headers already in the image.
-if [ ! -e /usr/include/NvInfer.h ] \
-   && [ ! -e /usr/include/x86_64-linux-gnu/NvInfer.h ] \
-   && [ ! -e /usr/local/tensorrt/include/NvInfer.h ]; then
-    echo "WARNING: NvInfer.h missing; installing distro TensorRT anyway" >&2
-    apt-get install -y --no-install-recommends libnvinfer-dev libnvonnxparsers-dev
-fi
 nvidia-smi -L || true
 nvcc --version | head -6 || true
 
-# The exporter emits trt::RotaryEmbedding / trt::TensorScatter, which only the
-# onnx-tensorrt 10.16-GA parser and later import natively. An older parser
-# falls back to the plugin registry and rejects every rope node with
-# "Plugin not found" (f9c8). Report what this image actually ships so the
-# engine stage does not fail on a version guess.
-echo "=== stage: tensorrt inventory ==="
-TRT_HDR=""
-for cand in /usr/include/x86_64-linux-gnu/NvInferVersion.h \
-            /usr/include/NvInferVersion.h \
-            /usr/local/tensorrt/include/NvInferVersion.h; do
-    if [ -e "${cand}" ]; then
-        TRT_HDR="${cand}"
-        break
-    fi
-done
-if [ -n "${TRT_HDR}" ]; then
-    echo "header: ${TRT_HDR}"
-    grep -E "define NV_TENSORRT_(MAJOR|MINOR|PATCH|BUILD)" "${TRT_HDR}" || true
-else
-    echo "header: none found"
+echo "=== stage: tensorrt ${TRT_VERSION} ==="
+# The exporter emits trt::RotaryEmbedding and trt::TensorScatter, which the
+# ONNX parser imports natively only from 10.16-GA on. pytorch:25.12-py3 ships
+# 10.14.1, whose parser falls back to the plugin registry and rejects every
+# rope node with "Plugin not found" (f9c8).
+#
+# Unpack 10.16 side by side rather than apt-upgrading: the +cuda13.2 debs pull
+# a CUDA runtime newer than this node's driver, which is how 4v4w died with
+# cudaError 35. Unpacked libraries keep SONAME libnvinfer.so.10, so link order
+# alone selects them and the image CUDA 13.1 runtime stays untouched.
+TRT_STAGE="${WORK_ROOT}/tensorrt/${TRT_VERSION}"
+TRT_PACKAGE_DIR="${TRT_STAGE}/usr"
+exec 7>"${WORK_ROOT}/tensorrt.lock"
+flock 7
+if [ ! -e "${TRT_STAGE}/READY" ]; then
+    rm -rf "${TRT_STAGE}"
+    mkdir -p "${TRT_STAGE}"
+    for pkg in libnvinfer-headers-dev libnvinfer-headers-plugin-dev \
+               libnvinfer-dev libnvinfer10 \
+               libnvinfer-plugin-dev libnvinfer-plugin10 \
+               libnvonnxparsers-dev libnvonnxparsers10; do
+        deb="${pkg}_${TRT_VERSION}_amd64.deb"
+        curl -fsSL -o "${BUILD_DIR}/${deb}" "${TRT_REPO}/${deb}"
+        dpkg-deb -x "${BUILD_DIR}/${deb}" "${TRT_STAGE}"
+    done
+    touch "${TRT_STAGE}/READY"
 fi
-dpkg -l 2>/dev/null | grep -iE "nvinfer|tensorrt" || echo "no nvinfer dpkg entries"
-ls -l /usr/lib/x86_64-linux-gnu/libnvinfer.so* \
-      /usr/lib/x86_64-linux-gnu/libnvonnxparser.so* 2>/dev/null || true
-apt-cache madison libnvinfer-dev libnvonnxparsers-dev 2>/dev/null | head -40 || true
+flock -u 7
+export LD_LIBRARY_PATH="${TRT_PACKAGE_DIR}/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+ls -l "${TRT_PACKAGE_DIR}/lib/x86_64-linux-gnu/libnvinfer.so".* \
+      "${TRT_PACKAGE_DIR}/lib/x86_64-linux-gnu/libnvonnxparser.so".*
 
 # TensorRT reports capability as "9.0"; artifact tags and nvcc want "90".
 SM="${SM:-$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')}"
@@ -123,7 +127,7 @@ fi
 POLICY_BUILD="${NATIVE_DIR}/cosmos3_policy_build"
 POLICY_INFER="${NATIVE_DIR}/cosmos3_policy_inference"
 PLUGIN_SO="${NATIVE_DIR}/libNvInfer_edgellm_plugin.so"
-NATIVE_KEY="${SM}-$(dpkg-query -W -f='${Package}=${Version}' libnvinfer11 2>/dev/null || echo image-trt)"
+NATIVE_KEY="sm${SM}-trt${TRT_VERSION}-cute${CUTE_MODE}"
 if [ -x "${POLICY_BUILD}" ] && [ -x "${POLICY_INFER}" ] && [ -e "${PLUGIN_SO}" ] \
    && [ "$(cat "${NATIVE_DIR}/KEY" 2>/dev/null || true)" = "${NATIVE_KEY}" ]; then
     echo "=== reusing native binaries from ${NATIVE_DIR} ==="
@@ -135,11 +139,8 @@ else
     fi
     CUDA_CTK_VERSION="$(echo "${CUDA_DIR}" | sed -n 's/.*cuda-\([0-9][0-9.]*\).*/\1/p')"
     CUDA_CTK_VERSION="${CUDA_CTK_VERSION:-13.0}"
-    TRT_PACKAGE_DIR=/usr
-    if [ -e /usr/local/tensorrt/include/NvInfer.h ]; then
-        TRT_PACKAGE_DIR=/usr/local/tensorrt
-    fi
     echo "CUDA_DIR=${CUDA_DIR} CUDA_CTK_VERSION=${CUDA_CTK_VERSION} TRT_PACKAGE_DIR=${TRT_PACKAGE_DIR}"
+    rm -rf "${BUILD_DIR}/CMakeCache.txt" "${BUILD_DIR}/CMakeFiles"
     cmake -S "${EDGELLM_SRC}" -B "${BUILD_DIR}" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DTRT_PACKAGE_DIR="${TRT_PACKAGE_DIR}" \
