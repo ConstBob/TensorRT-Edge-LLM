@@ -19,7 +19,10 @@ import onnx
 import pytest
 import torch
 
-from tensorrt_edgellm.config import ModelConfig
+from tensorrt_edgellm.checkpoint.repacking import \
+    repack_nvfp4_a16_marlin_linear
+from tensorrt_edgellm.config import QUANT_NVFP4_A16, ModelConfig, QuantConfig
+from tensorrt_edgellm.models import ops
 from tensorrt_edgellm.models.dflash.modeling_dflash_draft import \
     DFlashDraftModel
 from tensorrt_edgellm.models.dspark.modeling_dspark_draft import \
@@ -126,3 +129,64 @@ def test_dspark_ragged_attention_preserves_sink_and_contiguous_swa(tmp_path):
     assert attributes["enable_attention_sink"] == 1
     assert attributes["enable_contiguous_query_swa"] == 1
     assert list(attention.input)[-5].startswith("attention_sinks_fp32")
+
+
+def test_dspark_ragged_native_fc_exports_repacked_weights(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(ops, "_NVFP4_A16_EXPORT_TARGET_SM", 120)
+    config = _config("dspark")
+    config.hidden_size = 128
+    config.head_dim = 64
+    config.intermediate_size = 256
+    config.vocab_size = 256
+    config.default_attention_scale = 1.0 / math.sqrt(64.0)
+    config.dspark_target_layer_ids = [0, 1]
+    config.dspark_fc_native_precision = True
+    config.quant = QuantConfig(group_size=16,
+                               layer_overrides={"fc": QUANT_NVFP4_A16})
+    model = DSparkDraftModel(config)
+    packed = torch.full((128, 128), 0x22, dtype=torch.uint8)
+    scales = torch.full((128, 16), 0x28, dtype=torch.int8)
+    qweight, block_scales, global_scale, _, n_padded = repack_nvfp4_a16_marlin_linear(
+        packed, scales, torch.tensor([0.125], dtype=torch.float32))
+    model.fc.register_buffer("qweight", qweight)
+    model.fc.register_buffer("block_scales", block_scales)
+    model.fc.register_buffer("global_scale", global_scale)
+    model.fc.n_padded = n_padded
+    output = tmp_path / "dspark-packed-fc.onnx"
+    _export_model(model, str(output), optimize=False)
+    graph = onnx.load(str(output), load_external_data=False).graph
+    gemms = [
+        node for node in graph.node if node.op_type == "Nvfp4A16GemmPlugin"
+    ]
+    assert len(gemms) == 1
+    values = {
+        value.name: value
+        for value in [*graph.input, *graph.value_info, *graph.output]
+    }
+    assert len(values[gemms[0].input[0]].type.tensor_type.shape.dim) == 2
+    assert len(values[gemms[0].output[0]].type.tensor_type.shape.dim) == 2
+
+
+def test_dspark_ragged_default_fc_preserves_fp32_accumulation():
+    model = DSparkDraftModel(_config("dspark"))
+    with torch.no_grad():
+        model.fc.weight.fill_(100.0)
+    spec = model.onnx_export_spec()
+    args = list(spec.args)
+    index = spec.input_names.index("dflash_target_hidden_concat")
+    args[index] = torch.full_like(args[index], 1000.0)
+    observed = []
+    hook = model.hidden_norm.register_forward_pre_hook(
+        lambda _module, values: observed.append(values[0].detach().clone()))
+    try:
+        spec.wrapped(*args)
+    finally:
+        hook.remove()
+    expected = torch.nn.functional.linear(args[index].float(),
+                                          model.fc.weight.float())
+    assert len(observed) == 1
+    assert observed[0].dtype == torch.float32
+    assert torch.isfinite(observed[0]).all()
+    assert expected.min() > torch.finfo(torch.float16).max
+    torch.testing.assert_close(observed[0], expected)

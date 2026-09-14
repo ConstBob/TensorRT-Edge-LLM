@@ -414,7 +414,8 @@ TEST_P(SsdCuteDslTest, CorrectnessVsSerialReference)
     CUDA_CHECK(cudaMemcpy(dD, dHostFp16.data(), nheads * sizeof(half), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dDtBias, dtBiasHostFp16.data(), nheads * sizeof(half), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dState, stateHostFp16.data(), stateSize * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(dOutput, 0, outSize * sizeof(half)));
+    // Poison the destination to detect unwritten valid or padded elements.
+    CUDA_CHECK(cudaMemset(dOutput, 0xFF, outSize * sizeof(half)));
 
     // Allocate workspace for chunk scan intermediates
     size_t const wsSize = CuteDslSSDRunner::getWorkspaceSize(batch, seqLen, nheads, dim, dstate, ngroups);
@@ -470,17 +471,24 @@ TEST_P(SsdCuteDslTest, CorrectnessVsSerialReference)
     std::vector<half> gpuOut(outSize);
     CUDA_CHECK(cudaMemcpy(gpuOut.data(), dOutput, outSize * sizeof(half), cudaMemcpyDeviceToHost));
 
+    size_t nonFiniteOutputs = 0;
     float maxDiff = 0.f;
     float refMax = 0.f;
     for (size_t i = 0; i < outSize; ++i)
     {
         float const a = __half2float(gpuOut[i]);
         float const b = __half2float(refOut[i]);
+        if (!std::isfinite(a) || !std::isfinite(b))
+        {
+            ++nonFiniteOutputs;
+            continue;
+        }
         maxDiff = std::max(maxDiff, std::abs(a - b));
         refMax = std::max(refMax, std::abs(b));
     }
     float const relErr = maxDiff / (refMax + 1e-8f);
 
+    EXPECT_EQ(nonFiniteOutputs, 0) << "SSD must write finite outputs, including padded tokens.";
     EXPECT_LT(relErr, 0.05f) << "Relative error " << relErr << " exceeds threshold. "
                              << "maxDiff=" << maxDiff << " refMax=" << refMax;
 
@@ -506,7 +514,8 @@ TEST_P(SsdCuteDslTest, CorrectnessVsSerialReference)
 
 // SM80 test configurations — all D×N combos: {128,64} × {128,64}
 INSTANTIATE_TEST_SUITE_P(SsdCuteDslSM80, SsdCuteDslTest,
-    ::testing::Values(
+    ::testing::Values(SsdCuteDslTestConfig{4, 713, 64, 64, 128, 8, {144, 713, 167, 341}},
+        SsdCuteDslTestConfig{4, 574, 64, 64, 128, 8, {178, 435, 162, 574}},
         // batch, seqLen, nheads, dim, dstate, ngroups
         // D=128, N=128
         SsdCuteDslTestConfig{1, 128, 8, 128, 128, 1}, SsdCuteDslTestConfig{1, 256, 8, 128, 128, 1},

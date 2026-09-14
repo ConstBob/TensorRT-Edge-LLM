@@ -651,7 +651,7 @@ def test_block_draft_profiles_separate_proposal_and_delta_address_spaces():
     assert generation.shapes["skip_softmax_scale"] == ((0, ), (0, ), (64, ))
 
 
-def test_dspark_sample_without_anchor_profiles_the_extra_physical_row():
+def test_dspark_sample_without_anchor_uses_resolved_physical_capacity():
     network = _ProfileNetwork([
         _RecordedInput("inputs_embeds", None, (-1, 16)),
         _RecordedInput("positions", None, (-1, )),
@@ -666,12 +666,12 @@ def test_dspark_sample_without_anchor_profiles_the_extra_physical_row():
     _setup_llm_profiles(_ProfileBuilder(), config, network, cfg, args)
 
     for profile in config.profiles:
-        assert profile.shapes["inputs_embeds"] == ((8, 16), (24, 16), (24, 16))
-        assert profile.shapes["positions"] == ((8, ), (24, ), (24, ))
-        assert profile.shapes["rope_rotary_cos_sin"] == ((8, 4), (24, 4), (24,
+        assert profile.shapes["inputs_embeds"] == ((7, 16), (21, 16), (21, 16))
+        assert profile.shapes["positions"] == ((7, ), (21, ), (21, ))
+        assert profile.shapes["rope_rotary_cos_sin"] == ((7, 4), (21, 4), (21,
                                                                            4))
-        assert profile.shapes["packed_attention_mask"] == ((8, 1), (24, 1),
-                                                           (24, 1))
+        assert profile.shapes["packed_attention_mask"] == ((7, 1), (21, 1),
+                                                           (21, 1))
 
 
 def test_dspark_runtime_config_preserves_execution_contract():

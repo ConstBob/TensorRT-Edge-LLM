@@ -1867,7 +1867,7 @@ TEST_F(DeploymentConfigTest, DSparkCausalTreeRequiresFullBlockDraftProfile)
 TEST_F(DeploymentConfigTest, DSparkCausalTreeAccountsForNonAnchorInputSlot)
 {
     Json baseJson = makeDSparkBaseConfig(/*maxVerify=*/3, /*blockSize=*/16);
-    Json draftJson = makeDSparkDraftConfig(/*maxDraft=*/16, /*blockSize=*/16);
+    Json draftJson = makeDSparkDraftConfig(/*maxDraft=*/15, /*blockSize=*/16);
     baseJson["dspark_config"]["causal_head"] = true;
     draftJson["dspark_config"]["causal_head"] = true;
     baseJson["dspark_config"]["sample_from_anchor"] = false;
@@ -1884,7 +1884,7 @@ TEST_F(DeploymentConfigTest, DSparkCausalTreeAccountsForNonAnchorInputSlot)
                      std::optional<SpecDecodeDraftingConfig>{drafting}),
         std::runtime_error);
 
-    draftJson["builder_config"]["max_draft_tree_size"] = 17;
+    draftJson["builder_config"]["max_draft_tree_size"] = 16;
     draftPath = writeJsonToTempFile(draftJson, "draft_with_anchor_slot");
     EXPECT_NO_THROW(createDeploymentConfig(
         basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting}));

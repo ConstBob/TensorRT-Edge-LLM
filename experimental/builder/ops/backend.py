@@ -1492,9 +1492,9 @@ class Net:
                          rank: int = 3,
                          sm110: bool = False) -> "trt.ITensor":
         """Run a weight-only NVFP4 linear with FP16 activations."""
-        if rank != 3:
+        if rank not in (2, 3):
             raise NotImplementedError(
-                "NVFP4-A16 direct linear currently requires rank-3 input")
+                "NVFP4-A16 direct linear requires rank-2 or rank-3 input")
         from ..weight_packing import nvfp4 as nvfp4_pack
 
         raw = linear_weights

@@ -744,9 +744,11 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
                     "DSpark DDTree survival threshold must be in [0, 1): the root always survives, so a "
                     "floor of 1 would forbid all growth.");
             }
-            ELLM_CHECK(draftInputLen <= specConfig.maxDraftProposalSize,
+            int64_t const maxDraftInputLen
+                = static_cast<int64_t>(specConfig.maxDraftProposalSize) + (cfg.draft->dsparkSampleFromAnchor ? 0 : 1);
+            ELLM_CHECK(draftInputLen <= maxDraftInputLen,
                 "DSpark draft input length=" + std::to_string(draftInputLen)
-                    + " exceeds draft.maxDraftTreeSize=" + std::to_string(specConfig.maxDraftProposalSize)
+                    + " exceeds the profiled input length=" + std::to_string(maxDraftInputLen)
                     + ". The draft engine profile must cover the executed proposal prefix.");
 
             if (specConfig.dsparkSchedulerMode != DSparkSchedulerMode::kOff)

@@ -340,7 +340,10 @@ def build_runtime_config(cfg: DeviceConfig, args) -> Dict[str, Any]:
     if args.resolved_spec_role == contracts.SpecRole.BASE:
         builder_config["max_verify_tree_size"] = args.max_verify_tree_size
     if args.resolved_spec_role == contracts.SpecRole.DRAFT:
-        builder_config["max_draft_tree_size"] = args.max_draft_tree_size
+        slot_offset = (1 if args.spec_type == "dspark"
+                       and not cfg.dspark_sample_from_anchor else 0)
+        builder_config["max_draft_tree_size"] = (args.max_draft_tree_size -
+                                                 slot_offset)
     out["builder_config"] = builder_config
     if args.tp_size > 1:
         overrides = _tp_rank_overrides(out, args.tp_size)

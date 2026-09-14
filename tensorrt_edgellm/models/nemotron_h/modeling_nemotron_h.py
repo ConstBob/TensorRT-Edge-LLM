@@ -109,8 +109,11 @@ class RMSNorm(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def _make_flat_wrapper_mamba_ragged(model: nn.Module, Na: int, Nm: int,
-                                    tree_attention: bool) -> nn.Module:
+def _make_flat_wrapper_mamba_ragged(model: nn.Module,
+                                    Na: int,
+                                    Nm: int,
+                                    tree_attention: bool,
+                                    tree_state: bool = True) -> nn.Module:
     param_names = (
         ["inputs_embeds"] + [f"past_key_values_{i}" for i in range(Na)] + [
             "rope_rotary_cos_sin", "positions", "query_start_offsets",
@@ -120,10 +123,11 @@ def _make_flat_wrapper_mamba_ragged(model: nn.Module, Na: int, Nm: int,
         ] + [f"conv_state_{i}"
              for i in range(Nm)] + [f"recurrent_state_{i}" for i in range(Nm)])
     if tree_attention:
-        param_names += [
-            "attention_position_ids", "packed_attention_mask",
-            "tree_parent_ids", "tree_depths", "valid_tree_counts"
-        ]
+        param_names += ["attention_position_ids", "packed_attention_mask"]
+        if tree_state:
+            param_names += [
+                "tree_parent_ids", "tree_depths", "valid_tree_counts"
+            ]
     past_kv = "({},)".format(", ".join(f"past_key_values_{i}"
                                        for i in range(Na))) if Na else "()"
     conv = "({},)".format(", ".join(f"conv_state_{i}"
@@ -132,10 +136,11 @@ def _make_flat_wrapper_mamba_ragged(model: nn.Module, Na: int, Nm: int,
                                          for i in range(Nm))) if Nm else "()"
     tree_kwargs = (", attention_position_ids=attention_position_ids"
                    ", packed_attention_mask=packed_attention_mask"
-                   ", tree_parent_ids=tree_parent_ids"
-                   ", tree_depths=tree_depths"
-                   ", valid_tree_counts=valid_tree_counts"
                    if tree_attention else "")
+    if tree_attention and tree_state:
+        tree_kwargs += (", tree_parent_ids=tree_parent_ids"
+                        ", tree_depths=tree_depths"
+                        ", valid_tree_counts=valid_tree_counts")
     body = (
         f"    outputs = self._model.forward_ragged(\n"
         f"        inputs_embeds, {past_kv}, rope_rotary_cos_sin, positions, "
@@ -1540,6 +1545,8 @@ class NemotronHCausalLM(nn.Module):
             getattr(config, "mtp_base", False)
             or getattr(config, "dflash_base", False)
             or getattr(config, "dspark_base", False))
+        tree_state = not (getattr(config, "dspark_base", False)
+                          and not getattr(config, "dspark_tree_base", False))
         inputs_embeds = torch.zeros(physical_tokens,
                                     config.hidden_size,
                                     dtype=torch.float16,
@@ -1690,33 +1697,25 @@ class NemotronHCausalLM(nn.Module):
                                                 (query_length + 31) // 32,
                                                 dtype=torch.int32,
                                                 device=device)
-            tree_parent_ids = torch.full((physical_tokens, ),
-                                         -1,
-                                         dtype=torch.int32,
-                                         device=device)
-            tree_depths = torch.zeros(physical_tokens,
-                                      dtype=torch.int32,
-                                      device=device)
-            valid_tree_counts = query_lengths.clone()
-            args += (attention_position_ids, packed_attention_mask,
-                     tree_parent_ids, tree_depths, valid_tree_counts)
-            input_names += [
-                "attention_position_ids", "packed_attention_mask",
-                "tree_parent_ids", "tree_depths", "valid_tree_counts"
-            ]
-            all_shapes.extend([{
-                0: tokens
-            }, {
-                0: tokens,
-                1: packed_width
-            }, {
-                0: tokens
-            }, {
-                0: tokens
-            }, {
-                0: sequences
-            }])
-        wrapped = _make_flat_wrapper_mamba_ragged(self, Na, Nm, spec)
+            args += (attention_position_ids, packed_attention_mask)
+            input_names += ["attention_position_ids", "packed_attention_mask"]
+            all_shapes.extend([{0: tokens}, {0: tokens, 1: packed_width}])
+            if tree_state:
+                tree_parent_ids = torch.full((physical_tokens, ),
+                                             -1,
+                                             dtype=torch.int32,
+                                             device=device)
+                tree_depths = torch.zeros(physical_tokens,
+                                          dtype=torch.int32,
+                                          device=device)
+                valid_tree_counts = query_lengths.clone()
+                args += (tree_parent_ids, tree_depths, valid_tree_counts)
+                input_names += [
+                    "tree_parent_ids", "tree_depths", "valid_tree_counts"
+                ]
+                all_shapes.extend([{0: tokens}, {0: tokens}, {0: sequences}])
+        wrapped = _make_flat_wrapper_mamba_ragged(self, Na, Nm, spec,
+                                                  tree_state)
         wrapped.eval()
         return OnnxSpec(wrapped=wrapped,
                         args=args,
