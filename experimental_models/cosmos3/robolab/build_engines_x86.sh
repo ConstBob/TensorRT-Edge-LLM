@@ -82,7 +82,7 @@ echo "=== stage: tensorrt ${EDGELLM_TRT_VERSION} ==="
 # cudaError 35. Unpacked libraries keep SONAME libnvinfer.so.10, so link order
 # alone selects them and the image CUDA 13.1 runtime stays untouched.
 TRT_STAGE="${WORK_ROOT}/tensorrt/${EDGELLM_TRT_VERSION}"
-TRT_PACKAGE_DIR="${TRT_STAGE}/usr"
+TRT_LOCAL="${TRT_LOCAL:-/opt/edgellm-trt/${EDGELLM_TRT_VERSION}}"
 exec 7>"${WORK_ROOT}/tensorrt.lock"
 flock 7
 if [ ! -e "${TRT_STAGE}/READY" ]; then
@@ -99,7 +99,19 @@ if [ ! -e "${TRT_STAGE}/READY" ]; then
     touch "${TRT_STAGE}/READY"
 fi
 flock -u 7
-export LD_LIBRARY_PATH="${TRT_PACKAGE_DIR}/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
+# Compile and link against a node-local copy. Serving the headers off NFS to
+# 128 parallel compiles dropped the C++ build from ~80 to ~4 objects a minute.
+# The static archives are dead weight here; everything links shared.
+if [ ! -e "${TRT_LOCAL}/READY" ]; then
+    rm -rf "${TRT_LOCAL}"
+    mkdir -p "${TRT_LOCAL}"
+    tar -C "${TRT_STAGE}" --exclude='*.a' -cf - . | tar -C "${TRT_LOCAL}" -xf -
+fi
+TRT_PACKAGE_DIR="${TRT_LOCAL}/usr"
+# Keep the NFS copy on the runtime path too: engines built here are loaded by
+# serving replicas that have no /opt copy of their own.
+export LD_LIBRARY_PATH="${TRT_PACKAGE_DIR}/lib/x86_64-linux-gnu:${TRT_STAGE}/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 ls -l "${TRT_PACKAGE_DIR}/lib/x86_64-linux-gnu/libnvinfer.so".* \
       "${TRT_PACKAGE_DIR}/lib/x86_64-linux-gnu/libnvonnxparser.so".*
 
