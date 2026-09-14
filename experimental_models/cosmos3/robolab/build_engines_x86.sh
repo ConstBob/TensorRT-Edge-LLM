@@ -32,12 +32,28 @@ NUM_FRAMES=33
 FPS=15
 
 mkdir -p "${WORK_ROOT}" "${ONNX_DIR}" "${ENGINE_DIR}" "${BUILD_DIR}"
+NATIVE_DIR="${WORK_ROOT}/native"
+
+# The RoboLab policy-server image prepends /workspace/.venv/bin. That
+# interpreter has no pip: Friday's three H200 retries all compiled C++ then
+# died on `python -m pip`. Prefer uv + system python.
+unset VIRTUAL_ENV || true
+PATH="$(printf '%s' "${PATH}" | tr ':' '\n' | grep -v '/.venv/' | paste -sd:)"
+export PATH="/usr/local/bin:/usr/bin:${PATH:-/bin}"
+hash -r
+PY="$(command -v python3)"
+echo "python: ${PY} ($(${PY} -V 2>&1 || true))"
+
+py_install() {
+    uv pip install --python "${PY}" --system --no-cache-dir "$@"
+}
 
 echo "=== stage: toolchain ==="
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends \
-    git ca-certificates build-essential libnvinfer-dev libnvonnxparsers-dev
+    git ca-certificates build-essential cmake ninja-build \
+    libnvinfer-dev libnvonnxparsers-dev
 
 # TensorRT reports capability as "9.0"; artifact tags and nvcc want "90".
 SM="${SM:-$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')}"
@@ -51,9 +67,8 @@ CUTE_MODE=fmha
 CUTE_ARGS=(-DENABLE_CUTE_DSL=fmha "-DCUTE_DSL_ARTIFACT_TAG=sm_${SM}")
 if [ ! -e "${EDGELLM_SRC}/kernelSrcs/cuteDSLPrebuilt/cutedsl_x86_64_sm_${SM}_cuda13.tar.gz" ] \
    && [ ! -d "${EDGELLM_SRC}/cpp/kernels/cuteDSLArtifact/x86_64/sm_${SM}" ]; then
-    if python -m pip install --no-cache-dir \
-        "nvidia-cutlass-dsl[cu13]==4.7.0" cupy-cuda13x cuda-python \
-       && python "${EDGELLM_SRC}/kernelSrcs/build_cutedsl.py" \
+    if py_install "nvidia-cutlass-dsl[cu13]==4.7.0" cupy-cuda13x cuda-python \
+       && "${PY}" "${EDGELLM_SRC}/kernelSrcs/build_cutedsl.py" \
             --kernels fmha --gpu_arch "sm_${SM}" --arch x86_64; then
         echo "generated CuTe DSL fmha artifacts for sm_${SM}"
     else
@@ -63,20 +78,31 @@ if [ ! -e "${EDGELLM_SRC}/kernelSrcs/cuteDSLPrebuilt/cutedsl_x86_64_sm_${SM}_cud
     fi
 fi
 
-echo "=== stage: c++ build (cute_dsl=${CUTE_MODE}) ==="
-cmake -S "${EDGELLM_SRC}" -B "${BUILD_DIR}" -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DTRT_PACKAGE_DIR=/usr \
-    -DCUDA_CTK_VERSION=13.0 \
-    -DCMAKE_CUDA_ARCHITECTURES="${SM}" \
-    -DBUILD_EXPERIMENTAL_MODELS=ON \
-    "${CUTE_ARGS[@]}"
-cmake --build "${BUILD_DIR}" --parallel "$(nproc)" \
-    --target NvInfer_edgellm_plugin cosmos3_policy_build cosmos3_policy_inference
-
-POLICY_BUILD="${BUILD_DIR}/experimental_models/cosmos3/examples/cosmos3_policy_build"
-POLICY_INFER="${BUILD_DIR}/experimental_models/cosmos3/examples/cosmos3_policy_inference"
-export EDGELLM_PLUGIN_PATH="${BUILD_DIR}/libNvInfer_edgellm_plugin.so"
+POLICY_BUILD="${NATIVE_DIR}/cosmos3_policy_build"
+POLICY_INFER="${NATIVE_DIR}/cosmos3_policy_inference"
+PLUGIN_SO="${NATIVE_DIR}/libNvInfer_edgellm_plugin.so"
+if [ -x "${POLICY_BUILD}" ] && [ -x "${POLICY_INFER}" ] && [ -e "${PLUGIN_SO}" ] \
+   && [ "$(cat "${NATIVE_DIR}/SM" 2>/dev/null || true)" = "${SM}" ]; then
+    echo "=== reusing native binaries from ${NATIVE_DIR} ==="
+else
+    echo "=== stage: c++ build (cute_dsl=${CUTE_MODE}) ==="
+    cmake -S "${EDGELLM_SRC}" -B "${BUILD_DIR}" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DTRT_PACKAGE_DIR=/usr \
+        -DCUDA_CTK_VERSION=13.0 \
+        -DCMAKE_CUDA_ARCHITECTURES="${SM}" \
+        -DBUILD_EXPERIMENTAL_MODELS=ON \
+        "${CUTE_ARGS[@]}"
+    cmake --build "${BUILD_DIR}" --parallel "$(nproc)" \
+        --target NvInfer_edgellm_plugin cosmos3_policy_build cosmos3_policy_inference
+    mkdir -p "${NATIVE_DIR}"
+    cp -f "${BUILD_DIR}/experimental_models/cosmos3/examples/cosmos3_policy_build" "${POLICY_BUILD}"
+    cp -f "${BUILD_DIR}/experimental_models/cosmos3/examples/cosmos3_policy_inference" "${POLICY_INFER}"
+    cp -f "${BUILD_DIR}/libNvInfer_edgellm_plugin.so" "${PLUGIN_SO}"
+    printf '%s\n' "${SM}" > "${NATIVE_DIR}/SM"
+    chmod +x "${POLICY_BUILD}" "${POLICY_INFER}"
+fi
+export EDGELLM_PLUGIN_PATH="${PLUGIN_SO}"
 
 if [ -e "${ENGINE_DIR}/READY" ]; then
     echo "=== engines already present, skipping export/build ==="
@@ -91,12 +117,21 @@ else
     flock -u 9
 
     echo "=== stage: python package ==="
-    python -m pip install --no-cache-dir -e "${EDGELLM_SRC}"
+    # Do not `pip install -e`: scikit-build would rebuild C++, and the image
+    # venv has no pip. Export only needs the in-tree package plus extras.
+    if ! "${PY}" -c "import torch, transformers, onnx, onnxscript, safetensors, numpy, onnx_graphsurgeon, PIL"; then
+        py_install \
+            "torch==2.13.0" "transformers==5.14.1" "onnx==1.19.0" \
+            "onnxscript==0.7.1" "safetensors==0.8.0" "numpy==2.2.6" \
+            "onnx-graphsurgeon==0.6.1" pillow
+    fi
+    export PYTHONPATH="${EDGELLM_SRC}${PYTHONPATH:+:${PYTHONPATH}}"
 
     echo "=== stage: onnx export ==="
     exec 8>"${WORK_ROOT}/build.lock"
     flock 8
-    PYTHONNOUSERSITE=1 tensorrt-edgellm-export "${CKPT_LOCAL}" "${ONNX_DIR}" \
+    PYTHONNOUSERSITE=1 "${PY}" -m tensorrt_edgellm.scripts.export \
+        "${CKPT_LOCAL}" "${ONNX_DIR}" \
         --task policy --dtype float16 \
         --action-chunk-size "${ACTION_CHUNK_SIZE}" \
         --num-frames "${NUM_FRAMES}" \
@@ -110,7 +145,7 @@ fi
 
 echo "=== stage: contract check ==="
 CHECK_DIR="$(mktemp -d)"
-python - "${CHECK_DIR}/observation.png" <<'PY'
+"${PY}" - "${CHECK_DIR}/observation.png" <<'PY'
 import sys
 
 import numpy as np
@@ -132,7 +167,7 @@ PY
     --state "0.1,-0.2,0.3,-0.4,0.5,-0.6,0.7,1.0" \
     --output "${CHECK_DIR}/action.json"
 
-python - "${CHECK_DIR}/action.json" <<'PY'
+"${PY}" - "${CHECK_DIR}/action.json" <<'PY'
 import json
 import sys
 
