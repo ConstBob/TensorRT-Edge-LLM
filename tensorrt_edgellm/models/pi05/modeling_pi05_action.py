@@ -213,6 +213,8 @@ class Pi05ActionAttention(nn.Module):
         (rope_cos_sin, attention_pos_id, context_lengths, kvcache_start_index,
          kv_page_table, attention_mask) = attn_io
         bsz, q_len, _ = hidden_states.shape
+        attention_mask = attention_mask.reshape(-1, attention_mask.shape[-1])
+        attention_pos_id = attention_pos_id.reshape(-1)
 
         qkv = torch.cat([
             self.q_proj(hidden_states),
@@ -220,6 +222,7 @@ class Pi05ActionAttention(nn.Module):
             self.v_proj(hidden_states),
         ],
                         dim=-1)
+        qkv = qkv.reshape(-1, qkv.shape[-1])
 
         # Tree decoding with an all-ones mask and relative position ids over a
         # cos/sin table the runtime already sliced to the action span: the query
