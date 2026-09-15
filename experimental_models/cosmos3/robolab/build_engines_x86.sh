@@ -31,6 +31,14 @@ ACTION_CHUNK_SIZE=32
 NUM_FRAMES=33
 FPS=15
 
+# Arithmetic precision of the exported graph. The builder creates a
+# kSTRONGLY_TYPED network (builderUtils.cpp:286) and sets no kFP16/kBF16 flag,
+# so the ONNX dtypes alone decide what the engine computes in. float16 is the
+# shipped configuration; bfloat16/float32 exist to test against the reference,
+# which runs the velocity under fp32/bf16 autocast. Point WORK_ROOT at a
+# separate root when changing this -- artifacts are not tagged by dtype.
+EDGELLM_EXPORT_DTYPE="${EDGELLM_EXPORT_DTYPE:-float16}"
+
 # First TensorRT whose ONNX parser imports trt::RotaryEmbedding natively.
 # Do not call this TRT_VERSION: the NGC images already export that with their
 # own (older) version, which silently won this variable in f9c8.
@@ -206,7 +214,7 @@ else
         echo "=== stage: onnx export ==="
         PYTHONNOUSERSITE=1 "${PY}" -m tensorrt_edgellm.scripts.export \
             "${CKPT_LOCAL}" "${ONNX_DIR}" \
-            --task policy --dtype float16 \
+            --task policy --dtype "${EDGELLM_EXPORT_DTYPE}" \
             --action-chunk-size "${ACTION_CHUNK_SIZE}" \
             --num-frames "${NUM_FRAMES}" \
             --fps "${FPS}"
