@@ -377,6 +377,20 @@ std::string buildPolicyPrompt(std::string const& instruction, std::string const&
     return prompt;
 }
 
+int64_t padCoordinate(int64_t coordinate, int64_t contentSize, int64_t targetSize)
+{
+    int64_t const padding = targetSize - contentSize;
+    if (coordinate < contentSize)
+    {
+        return coordinate;
+    }
+    if (padding >= contentSize)
+    {
+        return contentSize - 1;
+    }
+    return 2 * contentSize - coordinate - 2;
+}
+
 //! Read action_chunk_size and fps from the GEN component contract.
 std::pair<int32_t, float> readActionChunkAndFps(fs::path const& engineDir)
 {
@@ -539,24 +553,41 @@ int main(int argc, char** argv)
                 frames.size(), condFramePath.c_str());
         }
         rt::imageUtils::ImageData const img = rt::imageUtils::loadImageFromFile(condFramePath);
-        LOG_INFO("Loaded conditioning frame %s (%ldx%ld), resizing to %dx%d and normalizing to pixel_values.",
-            condFramePath.c_str(), img.width, img.height, clipW, clipH);
-        rt::imageUtils::ImageData resized(
-            rt::Tensor({1, clipH, clipW, 3}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8, "cosmos3::resized"));
-        rt::imageUtils::ImageData const& frame
-            = rt::imageUtils::resizeImage(img, resized, clipW, clipH, rt::imageUtils::InterpolationMode::kLINEAR);
+        double const scale = std::min(
+            {static_cast<double>(clipW) / static_cast<double>(img.width),
+                static_cast<double>(clipH) / static_cast<double>(img.height), 1.0});
+        int64_t const contentW = static_cast<int64_t>(scale * static_cast<double>(img.width) + 0.5);
+        int64_t const contentH = static_cast<int64_t>(scale * static_cast<double>(img.height) + 0.5);
+        ELLM_CHECK(contentW > 0 && contentH > 0 && contentW <= clipW && contentH <= clipH,
+            "Invalid aspect-preserving resize dimensions");
+        LOG_INFO(
+            "Loaded conditioning frame %s (%ldx%ld), resizing aspect-preservingly to %ldx%ld, "
+            "reflection-padding to %dx%d, and normalizing to pixel_values.",
+            condFramePath.c_str(), img.width, img.height, contentW, contentH, clipW, clipH);
+        rt::imageUtils::ImageData resized(rt::Tensor(
+            {1, contentH, contentW, 3}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8, "cosmos3::resized"));
+        rt::imageUtils::ImageData const& content = rt::imageUtils::resizeImage(
+            img, resized, contentW, contentH, rt::imageUtils::InterpolationMode::kBICUBIC);
 
         // HWC uint8 -> planar CHW float in [-1,1] (preprocessor convention: x / 127.5 - 1), with the
-        // single conditioning frame broadcast across all F clip frames and all B batch elements.
+        // single conditioning frame broadcast across all F clip frames and all B batch elements. Padding is
+        // bottom/right-only, matching ActionTransformPipeline's reference ReflectionPadding transform.
         size_t const clipElems = static_cast<size_t>(3) * pixelFrames * hw;
         std::vector<float> clip(static_cast<size_t>(batch) * clipElems);
-        unsigned char const* srcPixels = frame.data();
+        unsigned char const* srcPixels = content.data();
         for (int32_t c = 0; c < 3; ++c)
         {
             float* frame0 = clip.data() + static_cast<size_t>(c) * pixelFrames * hw;
-            for (size_t i = 0; i < hw; ++i)
+            for (int32_t y = 0; y < clipH; ++y)
             {
-                frame0[i] = static_cast<float>(srcPixels[i * 3 + c]) / 127.5F - 1.0F;
+                int64_t const srcY = padCoordinate(y, contentH, clipH);
+                for (int32_t x = 0; x < clipW; ++x)
+                {
+                    int64_t const srcX = padCoordinate(x, contentW, clipW);
+                    size_t const dstIdx = static_cast<size_t>(y) * clipW + x;
+                    size_t const srcIdx = (static_cast<size_t>(srcY) * contentW + srcX) * 3 + c;
+                    frame0[dstIdx] = static_cast<float>(srcPixels[srcIdx]) / 127.5F - 1.0F;
+                }
             }
             for (int32_t t = 1; t < pixelFrames; ++t)
             {
