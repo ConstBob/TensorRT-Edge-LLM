@@ -772,6 +772,62 @@ def _is_image_blind_calibration(model, quant_cfg: dict) -> bool:
     return quant_cfg.get("algorithm") not in (None, "max")
 
 
+def _is_gemma4_unified_model(model_dir: str) -> bool:
+    from ..chat_template import _get_model_type
+    return _get_model_type(model_dir) in ("gemma4_unified", )
+
+
+def _gemma4_audio_calib_batches(
+        processor,
+        audio_dataset,
+        num_samples: int,
+        prompt: str = "Please transcribe the following audio."):
+    """``BatchFeature`` dicts with raw-PCM ``input_features`` for Gemma4 Unified.
+
+    Streams (audio bytes, transcript) pairs through the model's own processor
+    with the ASR instruction so the language-model quantizers see the audio
+    token activations they will meet at runtime (text-only calibration leaves
+    the first layers' audio ranges 4-7x under-estimated).
+    """
+    import io
+
+    import soundfile as sf
+    batches: list[dict[str, Any]] = []
+    for audio_bytes, _transcript in audio_dataset():
+        wav, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
+        if wav.ndim > 1:
+            wav = wav.mean(axis=1)
+        if sr != 16000:
+            import librosa
+            wav = librosa.resample(wav, orig_sr=sr, target_sr=16000)
+        messages = [{
+            "role":
+            "user",
+            "content": [{
+                "type": "audio",
+                "audio": wav
+            }, {
+                "type": "text",
+                "text": prompt
+            }],
+        }]
+        inputs = processor.apply_chat_template(messages,
+                                               add_generation_prompt=True,
+                                               tokenize=True,
+                                               return_dict=True,
+                                               return_tensors="pt")
+        batches.append({
+            k: v
+            for k, v in inputs.items() if isinstance(v, torch.Tensor)
+        })
+        if len(batches) >= num_samples:
+            break
+    if not batches:
+        raise ValueError(
+            "No usable audio samples for Gemma4 Unified calibration.")
+    return batches
+
+
 def _calibrate_multimodal(model, batches):
     """Forward-loop calibration pass for multimodal ``BatchFeature`` dicts."""
     device = model.device
@@ -1135,6 +1191,27 @@ def quantize_and_export(
                 quant_cfg,
                 forward_loop=lambda m: _calibrate_asr_multimodal(m, batches),
             )
+        elif (visual_quantization is None and audio_dataset is not None
+              and audio_quantization is None
+              and quantization in ("fp8", "nvfp4")
+              and _is_gemma4_unified_model(model_dir)):
+            # Gemma4 Unified feeds raw PCM into the language model, so the
+            # backbone quantizers see audio-token activations that text-only
+            # calibration under-estimates and clips. Calibrate on (audio, ASR
+            # instruction) prompts instead; with --visual_quantization the
+            # visual path below adds these batches to its image batches.
+            audio_ds = resolve_dataset(audio_dataset, "audio")
+            print(f"Audio calibration dataset (Gemma4 Unified): "
+                  f"{dataset_name(audio_ds)}")
+            processor = AutoProcessor.from_pretrained(model_dir,
+                                                      trust_remote_code=True)
+            audio_samples = min(num_samples, 128)
+            batches = _gemma4_audio_calib_batches(processor, audio_ds,
+                                                  audio_samples)
+            mtq.quantize(
+                model,
+                quant_cfg,
+                forward_loop=lambda m: _calibrate_multimodal(m, batches))
         elif (visual_quantization is not None
               or _is_image_blind_calibration(model, quant_cfg)):
             image_ds = resolve_dataset(image_dataset, "image")
@@ -1154,6 +1231,14 @@ def quantize_and_export(
                 is_phi4mm=_is_phi4mm_model(model_dir))
             # Mixing text batches in was tried and reverted: it wins back
             # some text accuracy but costs more on image benchmarks.
+            if (audio_dataset is not None and audio_quantization is None
+                    and quantization in ("fp8", "nvfp4")
+                    and _is_gemma4_unified_model(model_dir)):
+                audio_ds = resolve_dataset(audio_dataset, "audio")
+                print(f"Audio calibration dataset (Gemma4 Unified): "
+                      f"{dataset_name(audio_ds)}")
+                batches = batches + _gemma4_audio_calib_batches(
+                    processor, audio_ds, mm_samples)
             mtq.quantize(
                 model,
                 quant_cfg,
