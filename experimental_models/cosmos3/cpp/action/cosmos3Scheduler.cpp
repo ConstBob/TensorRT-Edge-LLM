@@ -37,12 +37,14 @@ float applyShift(double sigma, double shift)
 }
 
 //! Flow-matching half-log-SNR: lambda = log(alpha) - log(sigma), alpha = 1 - sigma.
-//! Computed in double: at the first UniPC step sigma ~ 0.9998, float32 log(1-sigma)
-//! has only a few bits and poisons the order-2 divided difference.
+//! Kept in float32 to match the reference, which evaluates torch.log on its float32
+//! sigma buffer. At the first UniPC step sigma ~ 0.9998 leaves log(1-sigma) with only
+//! a few significant bits, but that precision loss is part of the reference numerics:
+//! computing it in double here would make this solver disagree with the reference.
 double lambdaOf(double sigma)
 {
-    double const alpha = 1.0 - sigma;
-    return std::log(alpha) - std::log(sigma);
+    float const alpha = 1.0F - static_cast<float>(sigma);
+    return static_cast<double>(std::log(alpha) - std::log(static_cast<float>(sigma)));
 }
 } // namespace
 
