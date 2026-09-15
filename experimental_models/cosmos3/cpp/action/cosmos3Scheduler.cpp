@@ -31,15 +31,17 @@ namespace cosmos3
 namespace
 {
 //! Apply the resolution-dependent flow shift to a raw sigma in (0, 1].
-float applyShift(float sigma, float shift)
+float applyShift(double sigma, double shift)
 {
-    return shift * sigma / (1.0F + (shift - 1.0F) * sigma);
+    return static_cast<float>(shift * sigma / (1.0 + (shift - 1.0) * sigma));
 }
 
 //! Flow-matching half-log-SNR: lambda = log(alpha) - log(sigma), alpha = 1 - sigma.
-float lambdaOf(float sigma)
+//! Computed in double: at the first UniPC step sigma ~ 0.9998, float32 log(1-sigma)
+//! has only a few bits and poisons the order-2 divided difference.
+double lambdaOf(double sigma)
 {
-    float const alpha = 1.0F - sigma;
+    double const alpha = 1.0 - sigma;
     return std::log(alpha) - std::log(sigma);
 }
 } // namespace
@@ -62,18 +64,18 @@ void Cosmos3Scheduler::initialize(int32_t numSteps)
     // (sigma == 1 has lambda = log(1-sigma) - log(sigma) = -inf, which would poison the
     // order-2 divided-difference term rk with inf - inf) and never reaches sigmaMin: the
     // final update jumps from sigmas[numSteps - 1] straight to the terminal sigma.
-    float const sigmaMax
-        = static_cast<float>(mConfig.numTrainTimesteps - 1) / static_cast<float>(mConfig.numTrainTimesteps);
-    float const sigmaMin = 0.0F;
+    double const sigmaMax
+        = static_cast<double>(mConfig.numTrainTimesteps - 1) / static_cast<double>(mConfig.numTrainTimesteps);
+    double const sigmaMin = 0.0;
     for (int32_t i = 0; i < numSteps; ++i)
     {
-        float const frac = static_cast<float>(i) / static_cast<float>(numSteps);
-        float const rawSigma = sigmaMax + frac * (sigmaMin - sigmaMax); // linspace(max, min, N+1)[:-1]
-        float const sigma = applyShift(rawSigma, mConfig.shift);
+        double const frac = static_cast<double>(i) / static_cast<double>(numSteps);
+        double const rawSigma = sigmaMax + frac * (sigmaMin - sigmaMax); // linspace(max, min, N+1)[:-1]
+        float const sigma = applyShift(rawSigma, static_cast<double>(mConfig.shift));
         mSigmas.push_back(sigma);
         // The reference conditions the model on floor(sigma * numTrainTimesteps): integer
         // timesteps [999, 937, 833, 624] at 4 steps.
-        mTimesteps.push_back(std::floor(sigma * static_cast<float>(mConfig.numTrainTimesteps)));
+        mTimesteps.push_back(std::floor(static_cast<double>(sigma) * mConfig.numTrainTimesteps));
     }
     mSigmas.push_back(0.0F);
     reset();
@@ -126,23 +128,23 @@ void Cosmos3Scheduler::reset()
 Cosmos3Scheduler::UniBHCoeffs Cosmos3Scheduler::computeUniBHCoeffs(
     int32_t order, int32_t idxT, int32_t idxS0, int32_t k, bool corrector) const
 {
-    float const sigmaT = mSigmas.at(static_cast<size_t>(idxT));
-    float const sigmaS0 = mSigmas.at(static_cast<size_t>(idxS0));
-    float const alphaT = 1.0F - sigmaT; // use_flow_sigmas: alpha = 1 - sigma
-    float const lambdaS0 = lambdaOf(sigmaS0);
+    double const sigmaT = static_cast<double>(mSigmas.at(static_cast<size_t>(idxT)));
+    double const sigmaS0 = static_cast<double>(mSigmas.at(static_cast<size_t>(idxS0)));
+    double const alphaT = 1.0 - sigmaT; // use_flow_sigmas: alpha = 1 - sigma
+    double const lambdaS0 = lambdaOf(sigmaS0);
 
     // h, hh = -h (predict_x0). The terminal sigma (sigmaT == 0) gives lambda_t -> +inf, hh -> -inf,
     // for which expm1(-inf) = -1 (diffusers' inf-arithmetic limit).
-    float const infF = std::numeric_limits<float>::infinity();
-    float const lambdaT = (sigmaT <= 0.0F) ? infF : lambdaOf(sigmaT);
-    float const h = lambdaT - lambdaS0;
-    float const hh = -h;
-    bool const hhNegInf = (hh == -infF);
-    float const hPhi1 = hhNegInf ? -1.0F : std::expm1(hh);
-    float const bH = hhNegInf ? -1.0F : std::expm1(hh); // bh2 solver: B_h = expm1(hh)
+    double const infD = std::numeric_limits<double>::infinity();
+    double const lambdaT = (sigmaT <= 0.0) ? infD : lambdaOf(sigmaT);
+    double const h = lambdaT - lambdaS0;
+    double const hh = -h;
+    bool const hhNegInf = (hh == -infD);
+    double const hPhi1 = hhNegInf ? -1.0 : std::expm1(hh);
+    double const bH = hhNegInf ? -1.0 : std::expm1(hh); // bh2 solver: B_h = expm1(hh)
 
     // Order-2 divided-difference term: rk and whether the previous x0 prediction participates.
-    float rk = 1.0F;
+    double rk = 1.0;
     bool useMPrev = false;
     if (order >= 2 && mHistCount >= 2)
     {
@@ -150,27 +152,27 @@ Cosmos3Scheduler::UniBHCoeffs Cosmos3Scheduler::computeUniBHCoeffs(
         int32_t const si = corrector ? (k - 2) : (k - 1);
         if (si >= 0)
         {
-            rk = (lambdaOf(mSigmas.at(static_cast<size_t>(si))) - lambdaS0) / h;
+            rk = (lambdaOf(static_cast<double>(mSigmas.at(static_cast<size_t>(si)))) - lambdaS0) / h;
             useMPrev = true;
         }
     }
 
     // Scalar B(h) coefficients. Predictor order 2 uses the simplified rho_p = 0.5; the corrector solves
     // the small R rho = b system (rho_c = 0.5 for order 1; 2x2 solve for order 2).
-    float rhoFirst = 0.5F; // coefficient on the divided difference D1s[0]
-    float rhoLast = 0.5F;  // coefficient on D1_t (corrector only)
+    double rhoFirst = 0.5; // coefficient on the divided difference D1s[0]
+    double rhoLast = 0.5;  // coefficient on D1_t (corrector only)
     if (corrector && order >= 2)
     {
         // R = [[1, 1], [rk, 1]];  b = [hPhiK0/B_h, 2*hPhiK1/B_h]
-        float const hPhiK0 = hhNegInf ? -1.0F : (hPhi1 / hh - 1.0F);
-        float const hPhiK1 = (hhNegInf ? 0.0F : (hPhiK0 / hh)) - 0.5F;
-        float const b0 = hPhiK0 / bH;
-        float const b1 = 2.0F * hPhiK1 / bH;
-        float const det = 1.0F * 1.0F - 1.0F * rk; // det([[1,1],[rk,1]]) = 1 - rk
-        if (std::fabs(det) > std::numeric_limits<float>::epsilon())
+        double const hPhiK0 = hhNegInf ? -1.0 : (hPhi1 / hh - 1.0);
+        double const hPhiK1 = (hhNegInf ? 0.0 : (hPhiK0 / hh)) - 0.5;
+        double const b0 = hPhiK0 / bH;
+        double const b1 = 2.0 * hPhiK1 / bH;
+        double const det = 1.0 - rk; // det([[1,1],[rk,1]]) = 1 - rk
+        if (std::fabs(det) > std::numeric_limits<double>::epsilon())
         {
-            rhoFirst = (b0 * 1.0F - 1.0F * b1) / det;
-            rhoLast = (1.0F * b1 - rk * b0) / det;
+            rhoFirst = (b0 - b1) / det;
+            rhoLast = (b1 - rk * b0) / det;
         }
     }
 
@@ -178,23 +180,23 @@ Cosmos3Scheduler::UniBHCoeffs Cosmos3Scheduler::computeUniBHCoeffs(
     //   out = ratio*x - alphaT*hPhi1*m0 - alphaT*bH*(rhoFirst*(mPrev - m0)/rk + rhoLast*(modelT - m0))
     // into one linear combination out = cX*x + cM0*m0 + cMPrev*mPrev + cMT*modelT.
     UniBHCoeffs c;
-    c.cX = sigmaT / sigmaS0;
+    c.cX = static_cast<float>(sigmaT / sigmaS0);
     c.useMPrev = useMPrev;
     c.useMT = corrector;
-    float m0Coeff = -alphaT * hPhi1;
+    double m0Coeff = -alphaT * hPhi1;
     if (useMPrev)
     {
-        float const dd = -alphaT * bH * rhoFirst / rk;
-        c.cMPrev = dd;
+        double const dd = -alphaT * bH * rhoFirst / rk;
+        c.cMPrev = static_cast<float>(dd);
         m0Coeff -= dd;
     }
     if (corrector)
     {
-        float const dt = -alphaT * bH * rhoLast;
-        c.cMT = dt;
+        double const dt = -alphaT * bH * rhoLast;
+        c.cMT = static_cast<float>(dt);
         m0Coeff -= dt;
     }
-    c.cM0 = m0Coeff;
+    c.cM0 = static_cast<float>(m0Coeff);
     return c;
 }
 

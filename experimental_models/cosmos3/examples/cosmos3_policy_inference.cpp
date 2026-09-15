@@ -346,7 +346,7 @@ std::string aspectRatioString(int32_t width, int32_t height)
 //! Build the structured JSON policy prompt the reference pipeline conditions the
 //! UND tower on. Field order and ": " / ", " spacing must match the reference
 //! Python json serialization exactly so the token stream is identical.
-std::string buildPolicyPrompt(std::string const& instruction, std::string const& viewPoint, int32_t actionChunkSize,
+std::string buildPolicyPrompt(std::string const& instruction, std::string const& viewPoint, int32_t videoNumFrames,
     float fps, int32_t height, int32_t width)
 {
     std::string sentence = instruction;
@@ -358,7 +358,10 @@ std::string buildPolicyPrompt(std::string const& instruction, std::string const&
     {
         sentence += '.';
     }
-    double const endSeconds = static_cast<double>(actionChunkSize) / fps;
+    // ActionPromptJsonFormatter uses video.shape[1] (VAE clip T = chunk+1), not the action
+    // chunk length. At 32/15 and 33/15 both currently round to "0:00-0:02" / "2s"; keep the
+    // reference formula so a fps/chunk change cannot silently drift the token stream.
+    double const endSeconds = static_cast<double>(videoNumFrames) / static_cast<double>(fps);
     int32_t const timeEnd = static_cast<int32_t>(std::lround(endSeconds));
     int32_t const duration = static_cast<int32_t>(endSeconds); // truncated
     char fpsText[32];
@@ -626,7 +629,8 @@ int main(int argc, char** argv)
             message.role = "user";
             std::string const instruction = args.rawPrompt
                 ? prompt
-                : buildPolicyPrompt(prompt, args.viewPoint, actionChunkSize, fps, clipH, clipW);
+                : buildPolicyPrompt(prompt, args.viewPoint, pixelFrames, fps, clipH, clipW);
+            LOG_INFO("Policy UND instruction (%zu chars): %s", instruction.size(), instruction.c_str());
             message.contents.push_back({"text", instruction});
             request.messages.push_back(std::move(message));
             rt::LLMGenerationRequest::FormattedRequest formatted;
