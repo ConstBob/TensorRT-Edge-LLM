@@ -133,10 +133,16 @@ def main() -> None:
     ap.add_argument("--viewpoint", default="concat_view")
     ap.add_argument("--action-chunk-size", type=int, default=32)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no-deterministic-seed",
+                    dest="deterministic_seed",
+                    action="store_false",
+                    help="draw a fresh diffusion seed per request instead of "
+                    "reusing --seed (cosmos-framework reuses it)")
     args = ap.parse_args()
     backend = Cosmos3PolicyBackend(args.binary, args.engine_dir, args.domain,
                                    args.steps, args.guidance, args.viewpoint,
-                                   args.action_chunk_size, args.seed)
+                                   args.action_chunk_size, args.seed,
+                                   args.deterministic_seed)
     OpenPIPolicyServer(EdgeLLMOpenPIPolicy(backend), args.host,
                        args.port).serve_forever()
 

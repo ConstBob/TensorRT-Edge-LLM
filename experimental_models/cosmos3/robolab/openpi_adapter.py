@@ -50,6 +50,8 @@ def openpi_obs_to_request(obs: dict[str, Any],
         (joint.reshape(-1), 1.0 - gripper.reshape(-1))).tolist()
     if obs.get("steps") is not None:
         request["steps"] = obs["steps"]
+    if obs.get("seed") is not None:
+        request["seed"] = int(obs["seed"])
     return request
 
 

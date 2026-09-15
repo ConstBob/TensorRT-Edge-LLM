@@ -70,6 +70,7 @@ class Cosmos3PolicyBackend:
         viewpoint: str = "concat_view",
         action_chunk_size: int = ACTION_CHUNK_SIZE,
         seed: int = 0,
+        deterministic_seed: bool = True,
         extra_env: dict | None = None,
     ) -> None:
         self.binary = binary
@@ -80,6 +81,8 @@ class Cosmos3PolicyBackend:
         self.viewpoint = viewpoint
         self.action_chunk_size = action_chunk_size
         self.extra_env = extra_env or {}
+        self.seed = seed
+        self.deterministic_seed = deterministic_seed
         self._rng = random.Random(seed)
         self._rng_lock = threading.Lock()
         if not os.path.isfile(binary):
@@ -164,8 +167,15 @@ class Cosmos3PolicyBackend:
         state = request.get("state")
         if not isinstance(state, list) or len(state) != RAW_ACTION_DIM:
             raise ValueError("request 'state' must contain 8 values")
-        with self._rng_lock:
-            seed = int(request.get("seed", self._rng.randrange(2**31)))
+        if request.get("seed") is not None:
+            seed = int(request["seed"])
+        elif self.deterministic_seed:
+            # cosmos-framework serving reuses seed 0 on every request; a fresh
+            # draw per step makes the two arms numerically incomparable.
+            seed = self.seed
+        else:
+            with self._rng_lock:
+                seed = self._rng.randrange(2**31)
         with tempfile.TemporaryDirectory() as tmpdir:
             image_path = self._decode_image_to_png(request["image"], tmpdir)
             out_path = os.path.join(tmpdir, "action.json")
@@ -312,11 +322,17 @@ def main() -> None:
     ap.add_argument("--viewpoint", default="concat_view")
     ap.add_argument("--action-chunk-size", type=int, default=ACTION_CHUNK_SIZE)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no-deterministic-seed",
+                    dest="deterministic_seed",
+                    action="store_false",
+                    help="draw a fresh diffusion seed per request instead of "
+                    "reusing --seed (cosmos-framework reuses it)")
     args = ap.parse_args()
 
     backend = Cosmos3PolicyBackend(args.binary, args.engine_dir, args.domain,
                                    args.steps, args.guidance, args.viewpoint,
-                                   args.action_chunk_size, args.seed)
+                                   args.action_chunk_size, args.seed,
+                                   args.deterministic_seed)
     httpd = serve(backend, args.host, args.port)
     try:
         httpd.serve_forever()
