@@ -50,6 +50,10 @@ _MANUAL_BY_MODEL_TYPE = {
 # the same documented contract without loading Python or Transformers.
 _RAW_PROCESSOR_BY_CLASS = {
     "Phi4MMProcessor": "phi4mm",
+    # Nemotron-Omni's tokenizer-owned template renders content as a string and
+    # expects the media sentinels (<image>/<audio>/<video>) already inlined; the
+    # C++ runtime inlines them without loading Python or Transformers.
+    "NemotronH_Nano_Omni_Reasoning_V3Processor": "nemotron_omni",
 }
 _RAW_PROCESSOR_BY_MODEL_TYPE = {
     # Legacy InternVL's model.chat() path inserts these media sentinels before

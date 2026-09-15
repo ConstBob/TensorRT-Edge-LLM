@@ -537,6 +537,20 @@ TEST(ChatTemplateTest, RejectsMediaWithoutProviderOrNativeProcessorContract)
     EXPECT_FALSE(renderer.apply(rt::LLMGenerationRequest::Request{{message}}, formatted, {}));
 }
 
+TEST(ChatTemplateTest, AppliesNemotronOmniProcessorContract)
+{
+    TemporaryTemplate model{
+        {"chat_template.jinja", "{{ messages.0.content }}"}, {"chat_template.processor", "nemotron_omni\n"}};
+    rt::Message message{"user", {{"image", ""}, {"text", "What is in this image?"}}};
+    message.contentIsArray = true;
+
+    chat_template::ChatTemplate renderer;
+    ASSERT_TRUE(renderer.load(model.path));
+    rt::LLMGenerationRequest::FormattedRequest formatted;
+    ASSERT_TRUE(renderer.apply(rt::LLMGenerationRequest::Request{{message}}, formatted, {}));
+    EXPECT_EQ(formatted.formattedCompleteRequest, "<image>What is in this image?");
+}
+
 TEST(ChatTemplateTest, UsesNativeRendererOnlyWhenCheckpointHasNoJinja)
 {
     TemporaryTemplate model{{"chat_template.model", "qwen3_tts\n"}};
