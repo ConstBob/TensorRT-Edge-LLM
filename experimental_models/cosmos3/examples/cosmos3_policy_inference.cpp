@@ -18,8 +18,8 @@
 // End-to-end Cosmos3 policy inference from a raw image + text instruction(s).
 //
 // The pipeline runs entirely in-process:
-//   (a) load + preprocess the image (core imageUtils decode + resize, normalize to
-//       [-1,1] pixel_values, broadcast the conditioning frame to the VAE clip [B,3,F,H,W]),
+//   (a) load + preprocess the image (aspect-preserve + reflection pad, normalize to
+//       [-1,1] pixel_values; only clip frame 0 is the observation, remaining frames -1),
 //   (b) tokenize the prompt(s) with the co-located tokenizer (text_tokenizer/tokenizer.json),
 //   (c) apply embed_tokens with the core embeddingLookup kernel -> inputs_embeds [B,S,hidden],
 //   (d) VAE encode -> UND prefill -> GEN diffusion loop -> action chunk,
@@ -569,11 +569,12 @@ int main(int argc, char** argv)
         rt::imageUtils::ImageData const& content = rt::imageUtils::resizeImage(
             img, resized, contentW, contentH, rt::imageUtils::InterpolationMode::kBICUBIC);
 
-        // HWC uint8 -> planar CHW float in [-1,1] (preprocessor convention: x / 127.5 - 1), with the
-        // single conditioning frame broadcast across all F clip frames and all B batch elements. Padding is
-        // bottom/right-only, matching ActionTransformPipeline's reference ReflectionPadding transform.
+        // HWC uint8 -> planar CHW float in [-1,1] (x / 127.5 - 1). Matches serve_policy._build_data_batch:
+        // only latent/pixel frame 0 is the observation; remaining F-1 frames stay uint8-0, i.e. -1.0.
+        // Do not broadcast the observation across the clip (that was a serving miss vs PyTorch).
+        // Spatial pad is bottom/right-only, matching ActionTransformPipeline ReflectionPadding.
         size_t const clipElems = static_cast<size_t>(3) * pixelFrames * hw;
-        std::vector<float> clip(static_cast<size_t>(batch) * clipElems);
+        std::vector<float> clip(static_cast<size_t>(batch) * clipElems, -1.0F);
         unsigned char const* srcPixels = content.data();
         for (int32_t c = 0; c < 3; ++c)
         {
@@ -588,10 +589,6 @@ int main(int argc, char** argv)
                     size_t const srcIdx = (static_cast<size_t>(srcY) * contentW + srcX) * 3 + c;
                     frame0[dstIdx] = static_cast<float>(srcPixels[srcIdx]) / 127.5F - 1.0F;
                 }
-            }
-            for (int32_t t = 1; t < pixelFrames; ++t)
-            {
-                std::copy_n(frame0, hw, frame0 + static_cast<size_t>(t) * hw);
             }
         }
         for (int32_t b = 1; b < batch; ++b)
