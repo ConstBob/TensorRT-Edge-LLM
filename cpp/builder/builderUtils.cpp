@@ -294,7 +294,7 @@ std::pair<std::unique_ptr<nvinfer1::IBuilder>, std::unique_ptr<nvinfer1::INetwor
     return {std::move(builder), std::move(network)};
 }
 
-std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder* builder)
+std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder* builder, bool enableAliasedPluginIO)
 {
     if (!builder)
     {
@@ -313,7 +313,12 @@ std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder
     config->setFlag(nvinfer1::BuilderFlag::kMONITOR_MEMORY);
 #endif
 #if IS_TRT_RTX || NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 3)
-    config->setPreviewFeature(nvinfer1::PreviewFeature::kALIASED_PLUGIN_IO_10_03, true);
+    // Only DFlash/DSpark draft engines declare a plugin I/O alias. Every other
+    // plugin returns -1 from getAliasedInput, so leave this preview off elsewhere.
+    if (enableAliasedPluginIO)
+    {
+        config->setPreviewFeature(nvinfer1::PreviewFeature::kALIASED_PLUGIN_IO_10_03, true);
+    }
 #endif
 
     return config;

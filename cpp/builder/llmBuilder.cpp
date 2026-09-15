@@ -66,6 +66,14 @@ bool isSpecDecodeDraft(Json const& config, char const* type)
     return specDecodeType(config) == type && engineRole(config) == "draft";
 }
 
+//! DFlash-family draft engines are the only engines that contain a plugin
+//! declaring aliased I/O. No other engine needs the kALIASED_PLUGIN_IO preview.
+bool usesAliasedPluginIO(Json const& config)
+{
+    return isSpecDecodeDraft(config, "dflash") || isSpecDecodeDraft(config, "dflash2")
+        || isSpecDecodeDraft(config, "jetspec") || isSpecDecodeDraft(config, "dspark");
+}
+
 bool isValidSpecDecodeType(std::string const& type)
 {
     return type == "none" || type == "mtp" || type == "eagle3" || type == "dflash" || type == "jetspec"
@@ -352,7 +360,7 @@ bool LLMBuilder::build()
         "ONNX parsing complete. mNbKVCacheInputs=%d, mNumLinearAttnLayers=%d", mNbKVCacheInputs, mNumLinearAttnLayers);
 
     // Create builder config
-    auto config = createBuilderConfig(builder.get());
+    auto config = createBuilderConfig(builder.get(), usesAliasedPluginIO(mModelConfig));
     if (!config)
     {
         return false;
