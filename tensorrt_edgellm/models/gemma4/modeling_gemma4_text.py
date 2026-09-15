@@ -530,13 +530,9 @@ class Gemma4Attention(Attention):
                                   bias=config.attention_bias,
                                   module_name=f"{module_prefix}.k_proj")
         if self.attention_k_eq_v:
-            # K=V: forward uses key_states as value_states, but we still
-            # instantiate v_proj so checkpoint loading can assign its weight.
-            self.v_proj = make_linear(config,
-                                      qkv_in_features,
-                                      self.num_kv_heads * self.head_dim,
-                                      bias=config.attention_bias,
-                                      module_name=f"{module_prefix}.v_proj")
+            # K=V layers use key as value and carry no v_proj weight; leaving it
+            # None avoids a strict-load failure on an unmaterialized tensor.
+            self.v_proj = None
         else:
             self.v_proj = make_linear(config,
                                       qkv_in_features,
