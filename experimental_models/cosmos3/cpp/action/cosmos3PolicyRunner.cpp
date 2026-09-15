@@ -419,6 +419,39 @@ void Cosmos3PolicyRunner::reinjectConditioning(rt::Tensor const& condLatent, cud
     }
 }
 
+void Cosmos3PolicyRunner::maskCleanPredictions(cudaStream_t stream)
+{
+    int32_t const batch = mActiveBatch;
+    int32_t const channel = static_cast<int32_t>(mVideoShape[1]);
+    int32_t const tDim = mActiveT;
+    int32_t const hDim = static_cast<int32_t>(mVideoShape[3]);
+    int32_t const wDim = static_cast<int32_t>(mVideoShape[4]);
+    size_t const planeBytes = static_cast<size_t>(hDim) * wDim * sizeof(float);
+    char* predBase = static_cast<char*>(mPredDevice.rawPointer());
+
+    // video_pred[b, c, 0, :, :] = 0  (frame-0 is the clean VAE plane).
+    CUDA_CHECK(cudaMemset2DAsync(predBase, static_cast<size_t>(tDim) * planeBytes, 0, planeBytes,
+        static_cast<size_t>(batch) * channel, stream));
+
+    size_t const videoBytes = static_cast<size_t>(batch) * activeVideoElems() * sizeof(float);
+    char* actionPred = predBase + videoBytes;
+    size_t const rowPitch = static_cast<size_t>(mConfig.maxActionDim) * sizeof(float);
+    size_t const tailBytes = static_cast<size_t>(mConfig.maxActionDim - mConfig.rawActionDim) * sizeof(float);
+    // v[:, rawActionDim:] = 0 on every action row (PyTorch unpad before UniPC).
+    CUDA_CHECK(cudaMemset2DAsync(actionPred + static_cast<size_t>(mConfig.rawActionDim) * sizeof(float), rowPitch, 0,
+        tailBytes, static_cast<size_t>(batch) * mActiveActionLen, stream));
+    if (mConfig.stateRows > 0)
+    {
+        for (int32_t b = 0; b < batch; ++b)
+        {
+            char* dst = actionPred
+                + static_cast<size_t>(b) * mActiveActionLen * mConfig.maxActionDim * sizeof(float);
+            CUDA_CHECK(cudaMemsetAsync(dst, 0,
+                static_cast<size_t>(mConfig.stateRows) * mConfig.maxActionDim * sizeof(float), stream));
+        }
+    }
+}
+
 void Cosmos3PolicyRunner::setDynamicInputShapes(int32_t batch, int32_t actionLen, int32_t undLen)
 {
     int32_t const channel = static_cast<int32_t>(mVideoShape[1]);
@@ -600,6 +633,7 @@ bool Cosmos3PolicyRunner::runDenoiseStep(int32_t stepIdx, rt::Tensor const& cond
     // Device-resident UniPC update over the packed [video ⧺ action] state, then re-impose the
     // conditioning constraints (frame-0 latent, zero padded action dims) — all on device; the
     // denoising state never visits the host.
+    maskCleanPredictions(stream);
     mScheduler->step(mPredDevice, mStateDevice, stepIdx, stream);
     reinjectConditioning(condLatent, stream);
     return true;

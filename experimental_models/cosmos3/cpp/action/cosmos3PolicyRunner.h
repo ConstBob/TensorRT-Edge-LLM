@@ -187,6 +187,11 @@ private:
     //! \brief Re-inject the clean frame-0 conditioning latent and re-zero the padded action dims
     //! (device-side: one 2D D2D copy + one 2D memset).
     void reinjectConditioning(rt::Tensor const& condLatent, cudaStream_t stream);
+    //! \brief Zero GEN velocity on clean tokens before UniPC, matching PyTorch
+    //! ``pred * (1 - condition_mask)``. Unmasked state-row / frame-0 velocity
+    //! pollutes the x0 history ring even though ``reinjectConditioning`` restores
+    //! the sample itself.
+    void maskCleanPredictions(cudaStream_t stream);
 
     int32_t mNoiseSeed{0};
     std::vector<float> mCurrentState;
