@@ -953,6 +953,15 @@ private:
         OmniNext
     };
     TalkerVariant mTalkerVariant{TalkerVariant::Omni};
+    //! Whether the talker engine emits hidden_states for the last token only rather than
+    //! for the whole sequence. Probed from the engine's declared shape at load time.
+    bool mTalkerHiddenIsGathered{false};
+
+    //! Sequence extent the talker hidden-states buffer needs for a prefill of `seqLen`.
+    int64_t talkerHiddenSeqDim(int64_t seqLen) const
+    {
+        return mTalkerHiddenIsGathered ? 1 : seqLen;
+    }
 
     bool isOmniNext() const noexcept
     {
