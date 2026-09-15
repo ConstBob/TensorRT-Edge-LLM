@@ -144,7 +144,8 @@ fi
 POLICY_BUILD="${NATIVE_DIR}/cosmos3_policy_build"
 POLICY_INFER="${NATIVE_DIR}/cosmos3_policy_inference"
 PLUGIN_SO="${NATIVE_DIR}/libNvInfer_edgellm_plugin.so"
-NATIVE_KEY="sm${SM}-trt${EDGELLM_TRT_VERSION}-cute${CUTE_MODE}"
+SOURCE_REV="$(git -C "${EDGELLM_SRC}" rev-parse HEAD)"
+NATIVE_KEY="sm${SM}-trt${EDGELLM_TRT_VERSION}-cute${CUTE_MODE}-src${SOURCE_REV}"
 if [ -x "${POLICY_BUILD}" ] && [ -x "${POLICY_INFER}" ] && [ -e "${PLUGIN_SO}" ] \
    && [ "$(cat "${NATIVE_DIR}/KEY" 2>/dev/null || true)" = "${NATIVE_KEY}" ]; then
     echo "=== reusing native binaries from ${NATIVE_DIR} ==="
