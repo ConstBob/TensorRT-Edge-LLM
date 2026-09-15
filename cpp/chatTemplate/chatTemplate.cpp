@@ -42,6 +42,7 @@ enum class RawProcessor
     kNone,
     kPhi4MM,
     kInternVL,
+    kNemotronOmni,
 };
 
 struct MediaCounters
@@ -237,6 +238,29 @@ std::string internVLContent(rt::Message const& message)
     return result;
 }
 
+std::string nemotronOmniContent(rt::Message const& message)
+{
+    // Inline each media block as its sentinel token (<image>/<audio>/<video>)
+    // for the runtime media runner to expand; text blocks pass through.
+    std::string result;
+    for (auto const& item : message.contents)
+    {
+        if (item.type == "text")
+        {
+            result += item.content;
+        }
+        else if (item.type == "image" || item.type == "audio" || item.type == "video")
+        {
+            result += "<" + item.type + ">";
+        }
+        else
+        {
+            throw std::runtime_error("NemotronOmni processor does not accept " + item.type + " message content");
+        }
+    }
+    return result;
+}
+
 void replaceNumberedAliases(std::string& value, std::string_view prefix, std::string_view replacement)
 {
     size_t offset = 0;
@@ -287,19 +311,26 @@ Json contentToJson(rt::Message const& message, std::optional<size_t> const& traj
     {
         return internVLContent(message);
     }
+    if (processor == RawProcessor::kNemotronOmni)
+    {
+        return nemotronOmniContent(message);
+    }
 
-    bool const textOnly = std::all_of(message.contents.begin(), message.contents.end(),
-        [](rt::Message::MessageContent const& item) { return item.type == "text"; });
     if (!expectsContentBlocks || message.role == "tool")
     {
-        if (!textOnly)
-        {
-            throw std::runtime_error("provider string-content template requires a model-specific media processor");
-        }
+        // A string-content template renders message.content as a single string.
+        // Media requires a rendering contract the model owns: either a provider
+        // template that iterates content blocks (expectsContentBlocks), or a
+        // raw processor that emits the model's media sentinels. Without one, a
+        // media block has no valid placeholder in the string and is rejected.
         std::string content;
         bool first = true;
         for (auto const& item : message.contents)
         {
+            if (item.type != "text")
+            {
+                throw std::runtime_error("provider string-content template requires a model-specific media processor");
+            }
             if (!first)
             {
                 content += '\n';
@@ -555,6 +586,10 @@ public:
                     else if (processor == "internvl")
                     {
                         mRawProcessor = RawProcessor::kInternVL;
+                    }
+                    else if (processor == "nemotron_omni")
+                    {
+                        mRawProcessor = RawProcessor::kNemotronOmni;
                     }
                     else
                     {
