@@ -196,6 +196,22 @@ class FP16Linear(LinearBase):
         bias = self.bias if self.bias is not None else None
         return F.linear(hidden_states, self.weight, bias)
 
+    def tp_split_dim(self, attr: str) -> Optional[int]:
+        """Shard rule when make_linear tags this layer col/row (tp_size>1).
+
+        weight is [out_features, in_features]: column-parallel shards the
+        output dim 0 (bias, also [out], shards on 0); row-parallel shards the
+        input dim 1 (bias is replicated and added once after the AllReduce).
+        Plain FP16Linear has no scale buffers, so weight/bias are the only
+        shardable attrs.
+        """
+        tp_mode = getattr(self, "tp_mode", TPMode.REPLICATED)
+        if tp_mode == TPMode.COL:
+            return 0 if attr in ("weight", "bias") else None
+        if tp_mode == TPMode.ROW:
+            return 1 if attr == "weight" else None
+        return None
+
 
 # ---------------------------------------------------------------------------
 # FP8Linear
