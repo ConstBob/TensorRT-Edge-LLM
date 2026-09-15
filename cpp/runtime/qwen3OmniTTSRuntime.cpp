@@ -409,6 +409,16 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
         mTalkerLLMConfig = rt::parseEngineConfig(talkerConfigPath);
         mTalkerExec = rt::EngineExecutor::createForLLM(talkerEnginePath, mTalkerLLMConfig);
         rt::validateAgainstEngine(mTalkerLLMConfig, *mTalkerExec, "qwen3_omni_talker");
+
+        // Talker exports differ in what hidden_states carries: some emit the whole sequence,
+        // others gather the last token inside the graph and emit a single row. The prefill
+        // buffer must follow whichever the engine declares, or the last-row read lands on
+        // memory the engine never wrote.
+        {
+            auto const hiddenDims = mTalkerExec->getEngine().getTensorShape(binding_names::kOutputHiddenStates);
+            mTalkerHiddenIsGathered = (hiddenDims.nbDims == 3 && hiddenDims.d[1] == 1);
+            LOG_INFO("Talker hidden_states is %s", mTalkerHiddenIsGathered ? "gathered (one row)" : "full-sequence");
+        }
         std::unordered_map<std::string, std::string> emptyLoraMap;
         mTalkerSharedRes = rt::SharedResources::createForLLM(mTalkerLLMConfig, emptyLoraMap, mStream);
         mTalkerPipelineIO = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForLLM(mTalkerLLMConfig, mStream));
@@ -1918,8 +1928,8 @@ bool Qwen3OmniTTSRuntime::prepareTalkerInput(std::vector<int32_t> const& textTok
 
     // Reshape buffers to 3D [1, seqLen, H] for Talker LLM input
     check::check(mTalkerInputEmbeds.reshape({1, outSeqLen, hiddenSize}), "Tensor reshape failed");
-    check::check(
-        mTalkerHiddenStatesBuffer.reshape({1, outSeqLen, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
+    check::check(mTalkerHiddenStatesBuffer.reshape({1, talkerHiddenSeqDim(outSeqLen), mTalkerConfig.talkerHiddenSize}),
+        "Tensor reshape failed");
     return true;
 }
 
@@ -2152,8 +2162,8 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
 
     // Single batched Talker prefill at bs=activeBatchSize.
     check::check(mTalkerInputEmbeds.reshape({activeBatchSize, maxOutSeqLen, hiddenSize}), "Tensor reshape failed");
-    check::check(
-        mTalkerHiddenStatesBuffer.reshape({activeBatchSize, maxOutSeqLen, hiddenSize}), "Tensor reshape failed");
+    check::check(mTalkerHiddenStatesBuffer.reshape({activeBatchSize, talkerHiddenSeqDim(maxOutSeqLen), hiddenSize}),
+        "Tensor reshape failed");
     {
         TIME_STAGE(metrics::StageNames::kTALKER_PREFILL, stream);
         if (!executeTalkerPrefillStep(
@@ -2397,7 +2407,8 @@ bool Qwen3OmniTTSRuntime::handleAudioGenerationFromThinker(
 
     // Single batched Talker prefill with per-batch context lengths
     check::check(mTalkerInputEmbeds.reshape({activeBatchSize, maxOutSeqLen, hiddenSize}), "Tensor reshape failed");
-    check::check(mTalkerHiddenStatesBuffer.reshape({activeBatchSize, maxOutSeqLen, mTalkerConfig.talkerHiddenSize}),
+    check::check(mTalkerHiddenStatesBuffer.reshape(
+                     {activeBatchSize, talkerHiddenSeqDim(maxOutSeqLen), mTalkerConfig.talkerHiddenSize}),
         "Tensor reshape failed");
 
     {
@@ -4657,7 +4668,8 @@ bool Qwen3OmniTTSRuntime::reprefillQwen3OmniNextChunk(int32_t batchIdx,
 
     // (3) Re-prefill — executeTalkerPrefillStep resets KV cache implicitly.
     check::check(mTalkerInputEmbeds.reshape({1, cs.cumulativeSeqLen, hiddenSize}), "Tensor reshape failed");
-    check::check(mTalkerHiddenStatesBuffer.reshape({1, cs.cumulativeSeqLen, hiddenSize}), "Tensor reshape failed");
+    check::check(mTalkerHiddenStatesBuffer.reshape({1, talkerHiddenSeqDim(cs.cumulativeSeqLen), hiddenSize}),
+        "Tensor reshape failed");
     {
         TIME_STAGE(metrics::StageNames::kTALKER_PREFILL, stream);
         if (!executeTalkerPrefillStep(mTalkerInputEmbeds, mTalkerLogits, mTalkerHiddenStatesBuffer, stream))
@@ -4906,7 +4918,8 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceRuntime& thinker
 
             // Talker prefill
             check::check(mTalkerInputEmbeds.reshape({1, outSeqLen, hiddenSize}), "Tensor reshape failed");
-            check::check(mTalkerHiddenStatesBuffer.reshape({1, outSeqLen, mTalkerConfig.talkerHiddenSize}),
+            check::check(
+                mTalkerHiddenStatesBuffer.reshape({1, talkerHiddenSeqDim(outSeqLen), mTalkerConfig.talkerHiddenSize}),
                 "Tensor reshape failed");
 
             {
