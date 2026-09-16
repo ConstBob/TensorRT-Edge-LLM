@@ -327,6 +327,13 @@ def test_clamp_internvl_block_range():
     # the accumulated total.
     assert vs.clamp_nframes_to_profile(1, "internvl", 640, 360,
                                        _INTERNVL_LIMITS) == (1, 256)
+    # A pixel-shuffle factor of 4 quarters the tokens one tile carries.
+    derived = dict(_INTERNVL_LIMITS,
+                   internvl_image_size=448,
+                   internvl_patch_size=14,
+                   downsample_ratio=0.25)
+    assert vs.clamp_nframes_to_profile(1, "internvl", 640, 360,
+                                       derived) == (1, 64)
 
 
 _QWEN3VL_LIMITS = {

@@ -2272,13 +2272,13 @@ std::tuple<int64_t, int64_t> Gemma4UnifiedTarget(int64_t const height, int64_t c
 // InternVL and Phi-4-MM tile at 448; the token budget is the one the engines are built with.
 std::tuple<int64_t, int64_t> BlockGrid448Target(int64_t const height, int64_t const width)
 {
-    return rt::imageUtils::computeBestBlockGridForResize(height, width, 256, 4096, 448, 448);
+    return rt::imageUtils::computeBestBlockGridForResize(height, width, 256, 4096, 448, 448, 256);
 }
 
 // Nemotron-Omni tiles at its force_image_size of 512.
 std::tuple<int64_t, int64_t> BlockGrid512Target(int64_t const height, int64_t const width)
 {
-    return rt::imageUtils::computeBestBlockGridForResize(height, width, 256, 4096, 512, 512);
+    return rt::imageUtils::computeBestBlockGridForResize(height, width, 256, 4096, 512, 512, 256);
 }
 
 //! One family's preprocessing configuration: the resize target its runner computes for a source, and

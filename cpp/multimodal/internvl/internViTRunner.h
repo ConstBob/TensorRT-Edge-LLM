@@ -39,6 +39,7 @@ struct InternViTConfig
     int64_t patchSizeW{0};                                    //!< Patch width in pixels
     int64_t blockImageSizeH{0};                               //!< Block image height
     int64_t blockImageSizeW{0};                               //!< Block image width
+    int64_t tokensPerBlock{0};                                //!< Tokens one tile contributes after pixel shuffle
     int32_t vocabSize{0};                                     //!< Vocabulary size
     int32_t imageTokenId{0};                                  //!< Token ID for image placeholder
     int32_t imgStartTokenId{151665};                          //!< Token ID for <img> tag
