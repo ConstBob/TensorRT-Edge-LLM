@@ -17,6 +17,7 @@ import math
 
 import onnx
 import pytest
+import torch
 
 from tensorrt_edgellm.config import (LAYER_ATTN, LAYER_MAMBA, LAYER_MOE,
                                      QUANT_NVFP4, MambaConfig, ModelConfig,
@@ -192,12 +193,23 @@ def test_nemotron_h_mtp_draft_exports_token_major_attention(tmp_path):
         "query_lengths"].shape
     assert shapes["context_sequence_count_carrier"][0] != shapes[
         "query_lengths"][0]
+    assert shapes["logits_indices"][0] != shapes["query_lengths"][0]
     outputs = spec.wrapped(*spec.args)
     assert outputs[0].shape == (2, 32)
     assert outputs[1].shape == (2, 16)
 
+    proposal_args = list(spec.args)
+    proposal_args[spec.input_names.index("logits_indices")] = torch.tensor(
+        [0, 1, 0, 1, 0, 1, 0, 1], dtype=torch.int64)
+    proposal_outputs = spec.wrapped(*proposal_args)
+    assert proposal_outputs[0].shape == (8, 32)
+    assert proposal_outputs[1].shape == (8, 16)
+
     _export_model(model, str(output), optimize=False)
     graph = onnx.load(str(output), load_external_data=False).graph
+    inputs = {tensor.name: tensor for tensor in graph.input}
+    assert inputs["logits_indices"].type.tensor_type.shape.dim[
+        0].dim_param == "logits_rows"
     attention = next(node for node in graph.node
                      if node.op_type == "AttentionPlugin")
     assert set(attention.input) >= {
