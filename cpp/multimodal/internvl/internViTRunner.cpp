@@ -22,6 +22,7 @@
 #include "multimodal/common/imageUtils.h"
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -94,6 +95,12 @@ bool InternViTRunner::validateAndFillConfig(std::string const& engineDir)
     mConfig.blockImageSizeH = visionConfig["image_size"][0].get<int64_t>();
     mConfig.blockImageSizeW = visionConfig["image_size"][1].get<int64_t>();
 
+    // Pixel shuffle merges scale x scale patches, matching _pixel_shuffle in the exporter.
+    double const downsampleRatio = jsonConfig.value("downsample_ratio", 0.5);
+    auto const scale = std::max<int64_t>(1, static_cast<int64_t>(1.0 / downsampleRatio));
+    int64_t const tokensPerSide = mConfig.blockImageSizeH / mConfig.patchSizeH / scale;
+    mConfig.tokensPerBlock = tokensPerSide * tokensPerSide;
+
     auto builderConfig = jsonConfig["builder_config"];
     mConfig.minImageTokensPerImage = builderConfig["min_image_tokens"].get<int64_t>();
     mConfig.maxImageTokensPerImage = builderConfig["max_image_tokens_per_image"].get<int64_t>();
@@ -122,9 +129,8 @@ bool InternViTRunner::allocateBuffer(cudaStream_t stream)
             rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "InternViTRunner::mVitInput");
     setTensorAddressStatus &= mVisualContext->setTensorAddress(binding_names::kVisualInput, mVitInput.rawPointer());
     LOG_INFO("MConfig.maxNumBlocks: %d, mConfig.outHiddenSize: %d", mConfig.maxNumBlocks, mConfig.outHiddenSize);
-    // In InternVL3, each block generates 256 tokens, so output size is maxNumBlocks*256
-    mOutputEmbedding = rt::Tensor({mConfig.maxNumBlocks * 256, mConfig.outHiddenSize}, rt::DeviceType::kGPU,
-        nvinfer1::DataType::kHALF, "InternViTRunner::mOutputEmbedding");
+    mOutputEmbedding = rt::Tensor({mConfig.maxNumBlocks * mConfig.tokensPerBlock, mConfig.outHiddenSize},
+        rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "InternViTRunner::mOutputEmbedding");
     setTensorAddressStatus
         &= mVisualContext->setTensorAddress(binding_names::kVisualOutput, mOutputEmbedding.rawPointer());
     if (!setTensorAddressStatus)
@@ -165,7 +171,7 @@ void InternViTRunner::formatPatch(imageUtils::ImageData const& image, std::vecto
         "totalNumBlocks " + std::to_string(totalNumBlocks) + " + curNumBlocks " + std::to_string(curNumBlocks)
             + " exceeds the limitation, max = " + std::to_string(mConfig.maxNumBlocks) + " of VIT engine.");
 
-    int64_t curTokenLength = curNumBlocks * 256;
+    int64_t curTokenLength = curNumBlocks * mConfig.tokensPerBlock;
     if (isThumbnail)
     {
         // Add to the last image token length, instead of considered as a new image
@@ -199,7 +205,7 @@ void InternViTRunner::imagePreprocessTokenLengthsOnly(
         {
             if (image.isVideo)
             {
-                int64_t const videoTokens = image.frames * 256;
+                int64_t const videoTokens = image.frames * mConfig.tokensPerBlock;
                 imageTokenLengths.push_back(videoTokens);
                 ++numImage;
                 totalNumBlocks += image.frames;
@@ -207,14 +213,15 @@ void InternViTRunner::imagePreprocessTokenLengthsOnly(
             }
             auto [resizedHeight, resizedWidth] = image.doResize
                 ? imageUtils::computeBestBlockGridForResize(image.height, image.width, mConfig.minImageTokensPerImage,
-                      mConfig.maxImageTokensPerImage, mConfig.blockImageSizeH, mConfig.blockImageSizeW)
+                      mConfig.maxImageTokensPerImage, mConfig.blockImageSizeH, mConfig.blockImageSizeW,
+                      mConfig.tokensPerBlock)
                 : std::make_tuple(image.height, image.width);
             int64_t const mainBlocks
                 = (resizedHeight / mConfig.blockImageSizeH) * (resizedWidth / mConfig.blockImageSizeW);
-            int64_t tokens = mainBlocks * 256;
+            int64_t tokens = mainBlocks * mConfig.tokensPerBlock;
             if (mainBlocks > 1 || mConfig.minNumBlocks > 1)
             {
-                tokens += 256; // thumbnail
+                tokens += mConfig.tokensPerBlock; // thumbnail
             }
             imageTokenLengths.push_back(tokens);
             ++numImage;
@@ -226,7 +233,7 @@ void InternViTRunner::imagePreprocessTokenLengthsOnly(
     // Reshape output embedding to match expected size (needed for cache memcpy destination).
     if (totalNumBlocks > 0)
     {
-        int64_t const totalImageTokens = totalNumBlocks * 256;
+        int64_t const totalImageTokens = totalNumBlocks * mConfig.tokensPerBlock;
         check::check(mOutputEmbedding.reshape({totalImageTokens, mConfig.outHiddenSize}), "Tensor reshape failed");
     }
 }
@@ -243,8 +250,8 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
         {
             if (image.isVideo)
             {
-                // Video: one 448 tile per frame (InternVL max_num=1). Downstream re-derives the
-                // frame count as tokens/256, so un-resized frames must already be a single block.
+                // Video: one tile per frame (InternVL max_num=1). Downstream re-derives the frame
+                // count as tokens/tokensPerBlock, so un-resized frames must already be a single block.
                 if (!image.doResize)
                 {
                     ELLM_CHECK(image.width == mConfig.blockImageSizeW && image.height == mConfig.blockImageSizeH,
@@ -269,7 +276,7 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
             {
                 auto [resizedHeight, resizedWidth] = imageUtils::computeBestBlockGridForResize(image.height,
                     image.width, mConfig.minImageTokensPerImage, mConfig.maxImageTokensPerImage,
-                    mConfig.blockImageSizeH, mConfig.blockImageSizeW);
+                    mConfig.blockImageSizeH, mConfig.blockImageSizeW, mConfig.tokensPerBlock);
                 rt::imageUtils::resizeAndNormalizeToRgb(image, 0, image.frames, mImageMean, mImageStd,
                     mNormalizedImageDevice, resizedHeight, resizedWidth, stream);
                 formatPatch(image.resizedMeta(resizedHeight, resizedWidth), imageTokenLengths, numImage, totalNumBlocks,
@@ -285,7 +292,7 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
 
             // Add a thumbnail tile when (a) the image has more than 1 main block (matches
             // HuggingFace behavior) or (b) the engine's MIN-profile demands more than 1 block
-            // (engines built with `visual_build --minImageTokens > 256`). Without (b), a
+            // (engines built with `visual_build --minImageTokens` above one tile). Without (b), a
             // single-block image would invoke the engine with totalNumBlocks=1 and the
             // optimization profile would reject it at runtime. The thumbnail is a one-block resize of
             // the ORIGINAL image and is not gated by image.doResize.
@@ -314,8 +321,7 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
             + " exceeds the limitation, max = " + std::to_string(mConfig.maxNumBlocks)
             + ", min = " + std::to_string(mConfig.minNumBlocks) + " of VIT engine.");
 
-    // Calculate total image tokens for profiling (InternVL: each block generates 256 tokens)
-    int64_t totalImageTokens = totalNumBlocks * 256;
+    int64_t totalImageTokens = totalNumBlocks * mConfig.tokensPerBlock;
 
     // Record performance data
     int64_t imageCount = std::accumulate(numImages.begin(), numImages.end(), int64_t(0));
@@ -341,7 +347,7 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
 
     int64_t imageIndex = 0;
     // Video placeholder ("<video>", one per video): expanded the HF way into per-frame
-    // "Frame{i}: <img>{256 IMG_CONTEXT}</img>" groups, newline-separated. getTokenId returns -1
+    // "Frame{i}: <img>{tokensPerBlock IMG_CONTEXT}</img>" groups, newline-separated. getTokenId returns -1
     // when the tokenizer has no such token (non-video models / older InternVL).
     int32_t const videoTokenId = static_cast<int32_t>(tokenizer->getTokenId("<video>"));
 
@@ -382,8 +388,8 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
                 // Video: per-frame groups (format above); IMG_CONTEXT positions across
                 // all frames still total N, matching the ViT output.
                 int64_t const numImageTokens = imageTokenLengths.at(imageIndex);
-                int64_t const numFrames = numImageTokens / 256;
-                if (numFrames >= 1 && numImageTokens % 256 == 0)
+                int64_t const numFrames = numImageTokens / mConfig.tokensPerBlock;
+                if (numFrames >= 1 && numImageTokens % mConfig.tokensPerBlock == 0)
                 {
                     for (int64_t f = 0; f < numFrames; ++f)
                     {
@@ -395,7 +401,7 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
                         std::vector<int32_t> const prefix = tokenizer->encode("Frame" + std::to_string(f + 1) + ": ");
                         newIds.insert(newIds.end(), prefix.begin(), prefix.end());
                         newIds.push_back(mConfig.imgStartTokenId);
-                        for (int64_t k = 0; k < 256; ++k)
+                        for (int64_t k = 0; k < mConfig.tokensPerBlock; ++k)
                         {
                             newIds.push_back(mConfig.imageTokenId);
                         }

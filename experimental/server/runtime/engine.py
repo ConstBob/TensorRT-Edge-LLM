@@ -375,6 +375,14 @@ class _SpecDecodeRuntimeOptions:
     dflash_block_size: int = 0
 
 
+def _internvl_geometry(cfg: dict, key: str) -> int:
+    """InternVL writes vision_config image_size/patch_size as [H, W] and the
+    C++ builder and runtime both read index 0. Other families put a scalar
+    here and never read the result, so they get 0."""
+    value = (cfg.get("vision_config") or {}).get(key)
+    return int(value[0]) if isinstance(value, list) and value else 0
+
+
 def _read_json(path: str) -> dict:
     with open(path, encoding="utf-8") as file:
         return json.load(file)
@@ -1200,6 +1208,11 @@ class LLM:
                 int(cfg.get("video_target_num_patches", 1024)),
                 "downsample_ratio":
                 float(cfg.get("downsample_ratio", 0.5)),
+                # InternVL geometry (visual config.json vision_config).
+                "internvl_image_size":
+                _internvl_geometry(cfg, "image_size"),
+                "internvl_patch_size":
+                _internvl_geometry(cfg, "patch_size"),
             }
         self._video_limits_cache = limits
         return limits

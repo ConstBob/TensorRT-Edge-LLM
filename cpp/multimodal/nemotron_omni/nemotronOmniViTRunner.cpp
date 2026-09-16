@@ -557,7 +557,8 @@ void NemotronOmniViTRunner::imagePreprocessTokenLengthsOnly(
         {
             auto const [h, w] = image.doResize
                 ? imageUtils::computeBestBlockGridForResize(image.height, image.width, mConfig.minImageTokensPerImage,
-                      mConfig.maxImageTokensPerImage, mConfig.blockImageSizeH, mConfig.blockImageSizeW)
+                      mConfig.maxImageTokensPerImage, mConfig.blockImageSizeH, mConfig.blockImageSizeW,
+                      mConfig.tokensPerBlock)
                 : std::make_tuple(image.height, image.width);
             int64_t const mainBlocks = (h / mConfig.blockImageSizeH) * (w / mConfig.blockImageSizeW);
             int64_t tokens = mainBlocks * mConfig.tokensPerBlock;
@@ -615,7 +616,7 @@ void NemotronOmniViTRunner::imagePreprocess(rt::LLMGenerationRequest const& requ
                 // Resize image to the aspect-ratio-matched tile grid within the per-image tile budget
                 auto [resizedHeight, resizedWidth] = imageUtils::computeBestBlockGridForResize(image.height,
                     image.width, mConfig.minImageTokensPerImage, mConfig.maxImageTokensPerImage,
-                    mConfig.blockImageSizeH, mConfig.blockImageSizeW);
+                    mConfig.blockImageSizeH, mConfig.blockImageSizeW, mConfig.tokensPerBlock);
                 rt::imageUtils::resizeAndNormalizeToRgb(image, 0, image.frames, mImageMean, mImageStd,
                     mNormalizedImageDevice, resizedHeight, resizedWidth, stream);
                 formatPatch(image.resizedMeta(resizedHeight, resizedWidth), imageTokenLengths, numImage,

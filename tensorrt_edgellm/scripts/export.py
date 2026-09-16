@@ -2212,6 +2212,8 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
         text_cfg = config.get("text_config") or config.get("llm_config")
         if text_cfg:
             vis_cfg_out["text_config"] = text_cfg
+        # The builder and the runtime derive tokens per tile from this.
+        vis_cfg_out["downsample_ratio"] = config.get("downsample_ratio", 0.5)
         # The C++ visual builder reads vision_config.model_type first.
         # intern_vit_6b (old arch) is not registered; override to "internvl".
         if "vision_config" in vis_cfg_out and "model_type" in vis_cfg_out[

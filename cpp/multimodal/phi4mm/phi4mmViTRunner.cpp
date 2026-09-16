@@ -300,7 +300,8 @@ void Phi4MMViTRunner::imagePreprocessTokenLengthsOnly(
             // Sub-crops
             auto const [h, w] = image.doResize
                 ? imageUtils::computeBestBlockGridForResize(image.height, image.width, mConfig.minImageTokensPerImage,
-                      mConfig.maxImageTokensPerImage, mConfig.blockImageSizeH, mConfig.blockImageSizeW)
+                      mConfig.maxImageTokensPerImage, mConfig.blockImageSizeH, mConfig.blockImageSizeW,
+                      kernel::kTokensPerBlockPhi4)
                 : std::make_tuple(image.height, image.width);
             int64_t const hBlocks = h / mConfig.blockImageSizeH;
             int64_t const wBlocks = w / mConfig.blockImageSizeW;
@@ -347,7 +348,7 @@ void Phi4MMViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
             {
                 auto [resizedHeight, resizedWidth] = imageUtils::computeBestBlockGridForResize(image.height,
                     image.width, mConfig.minImageTokensPerImage, mConfig.maxImageTokensPerImage,
-                    mConfig.blockImageSizeH, mConfig.blockImageSizeW);
+                    mConfig.blockImageSizeH, mConfig.blockImageSizeW, kernel::kTokensPerBlockPhi4);
                 blockGridHWPerBatch.push_back(
                     {resizedHeight / mConfig.blockImageSizeH, resizedWidth / mConfig.blockImageSizeW});
                 rt::imageUtils::resizeAndNormalizeToRgb(image, 0, image.frames, mImageMean, mImageStd,

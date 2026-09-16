@@ -66,6 +66,10 @@ MAX_DECODE_PIXELS = 256 * 1024 * 1024
 MAX_SOURCE_BYTES = 256 * 1024 * 1024  # encoded payload (data: URLs)
 MAX_SOURCE_FRAMES = 54000  # ~30 min @ 30 fps
 
+# Official InternVL3/3.5: 448/14 patches per side, pixel shuffle by 2.
+INTERNVL_DEFAULT_TILE_PIXELS = 448
+INTERNVL_DEFAULT_BLOCK_TOKENS = 256
+
 # Nemotron-Omni video defaults (checkpoint video_io.py / configuration.py).
 NEMOTRON_DEFAULT_FPS = 1.0
 NEMOTRON_TEMPORAL_PATCH = 2  # T frames packed per tubelet
@@ -284,14 +288,15 @@ def _pixel_cap(pixel_budget) -> int:
 def _raw_video_frame_tokens(family: str, count: int, width: int, height: int,
                             limits: dict) -> int:
     """Visual tokens of a do_resize=false video: InternVL frames must be exactly
-    one 448 block (C++ derives frames as tokens/256); Qwen frames must be
+    one tile (C++ derives frames as tokens per block); Qwen frames must be
     factor-aligned, accounted by input size. Nemotron always resizes, so it
     never reaches this path."""
     if family == "internvl":
-        if width != 448 or height != 448:
+        tile = _internvl_tile_pixels(limits)
+        if width != tile or height != tile:
             raise ValueError("do_resize=false InternVL video frames must be "
-                             f"448x448, got {width}x{height}")
-        return count * 256
+                             f"{tile}x{tile}, got {width}x{height}")
+        return count * _internvl_tokens_per_block(limits)
     factor = (limits.get("patch_size", 0) or 1) * \
         (limits.get("merge_size", 0) or 1)
     if factor <= 1:
@@ -393,6 +398,29 @@ def _estimate_qwen2d_frame_tokens(width: int,
     return max(1, (h_bar * w_bar) // (factor * factor))
 
 
+def _internvl_tile_pixels(limits: dict) -> int:
+    """Pixel side of one InternVL tile (``vision_config.image_size``)."""
+    size = limits.get("internvl_image_size", 0)
+    return size if size > 0 else INTERNVL_DEFAULT_TILE_PIXELS
+
+
+def _internvl_tokens_per_block(limits: dict) -> int:
+    """Tokens one InternVL tile produces, mirroring the C++
+    ``imageUtils::computeTokensPerBlock``. Falls back to the official tile
+    size when the engine config lacks the geometry: this layer only pre-checks
+    budgets, the C++ rejects a genuine mismatch."""
+    image_size = limits.get("internvl_image_size", 0)
+    patch = limits.get("internvl_patch_size", 0)
+    ratio = limits.get("downsample_ratio", 0)
+    if image_size <= 0 or patch <= 0 or image_size % patch != 0 or ratio <= 0:
+        return INTERNVL_DEFAULT_BLOCK_TOKENS
+    scale = int(round(1.0 / ratio))
+    patches_per_side = image_size // patch
+    if scale < 1 or patches_per_side % scale != 0:
+        return INTERNVL_DEFAULT_BLOCK_TOKENS
+    return (patches_per_side // scale)**2
+
+
 def _estimate_internvl_image_tokens(width: int, height: int,
                                     limits: dict) -> int:
     """Tokens the C++ InternVL image path produces: mirrors imageUtils
@@ -400,8 +428,10 @@ def _estimate_internvl_image_tokens(width: int, height: int,
     thumbnail block when the grid or the engine minimum exceeds one block)."""
     per_image = limits.get("max_image_tokens_per_image", 0)
     min_per_image = limits.get("min_image_tokens", 0)
-    min_tiles = max(1, min_per_image // 256 - 1)
-    max_tiles = max(1, per_image // 256 - 1)
+    block_tokens = _internvl_tokens_per_block(limits)
+    tile = _internvl_tile_pixels(limits)
+    min_tiles = max(1, min_per_image // block_tokens - 1)
+    max_tiles = max(1, per_image // block_tokens - 1)
     grids = [(cols, rows) for cols in range(1, max_tiles + 1)
              for rows in range(1, max_tiles + 1)
              if min_tiles <= cols * rows <= max_tiles]
@@ -413,12 +443,12 @@ def _estimate_internvl_image_tokens(width: int, height: int,
         diff = abs(aspect - cols / rows)
         if diff < best_diff:
             best_diff, best = diff, (cols, rows)
-        elif diff == best_diff and area > (448 * 448 // 2) * cols * rows:
+        elif diff == best_diff and area > (tile * tile // 2) * cols * rows:
             best = (cols, rows)
     blocks = best[0] * best[1]
-    if blocks > 1 or min_per_image // 256 > 1:
+    if blocks > 1 or min_per_image // block_tokens > 1:
         blocks += 1  # thumbnail block
-    return blocks * 256
+    return blocks * block_tokens
 
 
 def estimate_image_tokens(path: str,
@@ -439,20 +469,23 @@ def estimate_image_tokens(path: str,
         return per_image
     if family == "internvl":
         if not do_resize:
-            # Raw input skips the C++ grid resize: each 448x448 tile is one
-            # block, so the dimensions must be tile-aligned.
-            if width % 448 or height % 448:
+            # Raw input skips the C++ grid resize: each tile is one block, so
+            # the dimensions must be tile-aligned.
+            tile = _internvl_tile_pixels(limits)
+            if width % tile or height % tile:
                 raise ValueError(
-                    "do_resize=false InternVL images must be 448-aligned, "
+                    f"do_resize=false InternVL images must be {tile}-aligned, "
                     f"got {width}x{height}")
-            blocks = (width // 448) * (height // 448)
+            blocks = (width // tile) * (height // tile)
             # C++ appends a thumbnail block when the main image spans more
             # than one block or the engine minimum requires it
             # (internViTRunner formatPatch).
-            min_blocks = max(1, limits.get("min_image_tokens", 0) // 256)
+            block_tokens = _internvl_tokens_per_block(limits)
+            min_blocks = max(1,
+                             limits.get("min_image_tokens", 0) // block_tokens)
             if blocks > 1 or min_blocks > 1:
                 blocks += 1
-            return blocks * 256
+            return blocks * block_tokens
         return _estimate_internvl_image_tokens(width, height, limits)
     if not do_resize:
         # Raw input skips the C++ smart resize: tokens follow the input
@@ -619,10 +652,9 @@ def clamp_nframes_to_profile(
             "the request's other media already consume the engine's visual "
             f"token budget ({max_total}); no room left for this video")
     if family == "internvl":
-        # kBlockLength: an InternVL ViT block is 448x448 = 256 tokens. The
-        # engine minimum is a request-wide bound (all media accumulate), so
-        # it is checked by the caller after all buffers are loaded.
-        block_tokens = 256
+        # The engine minimum is a request-wide bound (all media accumulate),
+        # so it is checked by the caller after all buffers are loaded.
+        block_tokens = _internvl_tokens_per_block(limits)
         max_blocks = max(1, cap // block_tokens)
         n = min(nframes, max_blocks)
         return n, n * block_tokens
@@ -1075,14 +1107,15 @@ def load_video_buffer(rt_module,
                         f"visual tokens but only {cap} remain in the engine "
                         "budget; reduce the frame count or other media")
             elif family == "internvl":
-                max_blocks = cap // 256
+                block_tokens = _internvl_tokens_per_block(limits)
+                max_blocks = cap // block_tokens
                 if len(frame_paths) > max_blocks:
                     raise ValueError(
                         f"{len(frame_paths)} pre-sampled frames exceed the "
                         f"engine's remaining budget of {max_blocks} InternVL "
                         "blocks")
                 _check_cu_budget(len(frame_paths), family, limits, cu_budget)
-                est = len(frame_paths) * 256
+                est = len(frame_paths) * block_tokens
             elif ("qwen3_vl" in limits.get("model_type", "")
                   or "qwen3_5" in limits.get("model_type", "")):
                 # 3D families use the whole-video 3D estimate, not the

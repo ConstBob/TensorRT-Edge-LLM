@@ -473,19 +473,27 @@ bool VisualBuilder::setupInternPhi4ViTProfile(nvinfer1::IOptimizationProfile& pr
 {
     bool result = true;
 
-    // For InternVL and Phi-4MM models, each image block contains 256 tokens (16x16 patch grid)
-    // This is model-specific and comes from the vision encoder's patch size configuration
-    constexpr int64_t kBlockLength = 256;
-
-    if (mBuilderConfig.minImageTokens % kBlockLength != 0 || mBuilderConfig.maxImageTokens % kBlockLength != 0)
+    // Phi-4-MM is fixed at 256 tokens per tile.
+    int64_t tokensPerBlock = 256;
+    if (mModelType == multimodal::ModelType::INTERNVL)
     {
-        LOG_ERROR(
-            "minImageTokens and maxImageTokens must be divisible by %ld for InternVL/Phi4-MM ViT model.", kBlockLength);
+        // Pixel shuffle merges scale x scale patches, matching _pixel_shuffle in the exporter.
+        int64_t const patchSize = mModelConfig[kVisionConfigKey]["patch_size"][0].get<int64_t>();
+        double const downsampleRatio = mModelConfig.value("downsample_ratio", 0.5);
+        auto const scale = std::max<int64_t>(1, static_cast<int64_t>(1.0 / downsampleRatio));
+        int64_t const tokensPerSide = mImageSizeH / patchSize / scale;
+        tokensPerBlock = tokensPerSide * tokensPerSide;
+    }
+
+    if (mBuilderConfig.minImageTokens % tokensPerBlock != 0 || mBuilderConfig.maxImageTokens % tokensPerBlock != 0)
+    {
+        LOG_ERROR("minImageTokens (%ld) and maxImageTokens (%ld) must be divisible by %ld for this model.",
+            mBuilderConfig.minImageTokens, mBuilderConfig.maxImageTokens, tokensPerBlock);
         return false;
     }
 
-    int64_t minNumBlocks = mBuilderConfig.minImageTokens / kBlockLength;
-    int64_t maxNumBlocks = mBuilderConfig.maxImageTokens / kBlockLength;
+    int64_t minNumBlocks = mBuilderConfig.minImageTokens / tokensPerBlock;
+    int64_t maxNumBlocks = mBuilderConfig.maxImageTokens / tokensPerBlock;
     int64_t optNumBlocks = (minNumBlocks + maxNumBlocks) / 2;
 
     result &= setOptimizationProfile(&profile, binding_names::kVisualInput,
