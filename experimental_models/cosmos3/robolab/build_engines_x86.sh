@@ -34,12 +34,14 @@ FPS=15
 # Arithmetic precision of the exported graph. The builder creates a
 # kSTRONGLY_TYPED network (builderUtils.cpp:286) and sets no kFP16/kBF16 flag,
 # so the ONNX dtypes alone decide what the engine computes in. float16 is the
-# shipped configuration. EDGELLM_GEN_DTYPE can override only the denoiser while
-# UND/VAE and their C++ runtime boundaries remain float16; this is the clean
-# experiment against the reference's bf16-autocast velocity model.
-EDGELLM_EXPORT_DTYPE="${EDGELLM_EXPORT_DTYPE:-float16}"
-EDGELLM_GEN_DTYPE="${EDGELLM_GEN_DTYPE:-${EDGELLM_EXPORT_DTYPE}}"
-EXPORT_KEY="base=${EDGELLM_EXPORT_DTYPE};gen=${EDGELLM_GEN_DTYPE};chunk=${ACTION_CHUNK_SIZE};frames=${NUM_FRAMES};fps=${FPS}"
+# shipped configuration. EDGELLM_EXPORT_DTYPE is retained as the denoiser
+# override for compatibility with the first bf16 endpoint spec; the explicit
+# EDGELLM_GEN_DTYPE spelling wins when both are set. UND/VAE and their C++
+# runtime boundaries remain float16 unless EDGELLM_BASE_DTYPE is explicitly
+# changed.
+EDGELLM_BASE_DTYPE="${EDGELLM_BASE_DTYPE:-float16}"
+EDGELLM_GEN_DTYPE="${EDGELLM_GEN_DTYPE:-${EDGELLM_EXPORT_DTYPE:-${EDGELLM_BASE_DTYPE}}}"
+EXPORT_KEY="base=${EDGELLM_BASE_DTYPE};gen=${EDGELLM_GEN_DTYPE};chunk=${ACTION_CHUNK_SIZE};frames=${NUM_FRAMES};fps=${FPS}"
 
 # First TensorRT whose ONNX parser imports trt::RotaryEmbedding natively.
 # Do not call this TRT_VERSION: the NGC images already export that with their
@@ -224,11 +226,11 @@ else
         echo "=== stage: onnx export ==="
         PYTHONNOUSERSITE=1 "${PY}" -m tensorrt_edgellm.scripts.export \
             "${CKPT_LOCAL}" "${ONNX_DIR}" \
-            --task policy --dtype "${EDGELLM_EXPORT_DTYPE}" \
+            --task policy --dtype "${EDGELLM_BASE_DTYPE}" \
             --action-chunk-size "${ACTION_CHUNK_SIZE}" \
             --num-frames "${NUM_FRAMES}" \
             --fps "${FPS}"
-        if [ "${EDGELLM_GEN_DTYPE}" != "${EDGELLM_EXPORT_DTYPE}" ]; then
+        if [ "${EDGELLM_GEN_DTYPE}" != "${EDGELLM_BASE_DTYPE}" ]; then
             echo "=== stage: GEN-only ${EDGELLM_GEN_DTYPE} re-export ==="
             PYTHONNOUSERSITE=1 "${PY}" -m tensorrt_edgellm.scripts.export \
                 "${CKPT_LOCAL}" "${ONNX_DIR}" \
