@@ -4,9 +4,10 @@
 
 | Workflow | Use it when | Data flow |
 |---|---|---|
+| [Published Python wheel](#published-python-wheel) | The target matches a qualified release-wheel configuration. | PyPI wheel → exact native payload selection → Python inference |
 | [C++ source deployment](#source-workflow-c-runtime) | The application uses the supported ONNX export, engine build, and C++ runtime workflow. | Hugging Face checkpoint → optional quantization → ONNX export → C++ engine build → C++ inference |
 | [Python from source](#optional-python-frontend) | The application uses the experimental checkpoint-direct builder or Python server from the same source and build tree. | Hugging Face checkpoint → checkpoint-direct builder → TensorRT engine → Python inference |
-| [Experimental local wheel](#experimental-local-wheel) | A developer needs to evaluate a relocatable Python installation on the current target. | Local source build → target-specific wheel → Python inference |
+| [Local wheel build](#build-a-local-wheel-from-source) | A source user needs a wheel from the current checkout or for a custom target subset. | Local source build → target-specific wheel → Python inference |
 
 ## Source workflow: C++ runtime
 
@@ -463,49 +464,82 @@ tensorrt-edgellm-merge-lora --help
 tensorrt-edgellm-reduce-vocab --help
 ```
 
-**4. Configure HuggingFace Access (Optional)**
+**4. Configure Hugging Face Access (Optional)**
 
-Some models on HuggingFace require you to accept terms before downloading.
-
-**Models that require HuggingFace login:**
-- Llama family (Llama 3.x)
-- Phi-4-Multimodal
-- Alpamayo-R1-10B
-- Other models marked as "gated" on HuggingFace
-
-**To configure access:**
+Some Hugging Face checkpoints require accepting the provider's terms before
+download. After accepting those terms, authenticate with a read token:
 
 ```bash
-# Install HuggingFace CLI and login
 hf auth login
-# Enter your HuggingFace access token when prompted
 ```
 
-> **How to get a token:** Visit [HuggingFace Settings - Tokens](https://huggingface.co/settings/tokens), create a new token (read access is sufficient), and copy it.
+> **How to get a token:** Visit [Hugging Face Settings - Tokens](https://huggingface.co/settings/tokens) and create a read token.
 
-**You're done with export pipeline setup!** You can now quantize and export models with the checkpoint-based workflow. The ONNX files will be transferred to the Edge device for runtime deployment.
+The environment is now ready to quantize or export a supported checkpoint.
 
 ---
 
-## Experimental local wheel
+## Published Python wheel
 
-Wheels are not published or the default installation path in 0.10.1. To
-evaluate a target-specific wheel locally, install the packaging requirements
-and run the local builder:
+TensorRT Edge-LLM 0.11.0 publishes `tensorrt-edgellm` wheels for CPython 3.10,
+3.11, and 3.12 on both `x86_64` and `aarch64`. `pip` selects the wheel matching
+the interpreter ABI and CPU architecture. Each wheel contains every qualified
+native payload for that architecture; at runtime, Edge-LLM selects one exact
+match for the platform release, CUDA and TensorRT SONAMEs, and GPU SM listed in
+the [Wheel Packaging Matrix](support-matrix.md#wheel-packaging-matrix).
+
+Install the CUDA and TensorRT packages specified by the support matrix before
+installing the wheel. The wheel packages Edge-LLM's Python APIs, native runtime,
+plugins, and [checkpoint-direct builder](direct-engine-builder.md), but it does
+not replace the platform CUDA or TensorRT installation.
 
 ```bash
-python -m pip install -r packaging/wheel-toolchain-requirements.txt
-python packaging/wheel_cli.py build-wheel \
-    --local \
-    --trt-package-dir /path/to/TensorRT \
-    --output-dir dist/local
-python -m pip install dist/local/tensorrt_edgellm-*.whl
+python3 -m venv --system-site-packages .venv-edgellm
+source .venv-edgellm/bin/activate
+python -m pip install --upgrade pip
+python -m pip install "tensorrt-edgellm==0.11.0"
+python -c "import tensorrt_edgellm; print(tensorrt_edgellm.__version__)"
+tensorrt-edgellm-build --help
 ```
 
-This experimental path requires a matching unpublished CuTe DSL tarball and
-checksum under `kernelSrcs/cuteDSLPrebuilt/`; see `packaging/README.md` in the
-source checkout. The resulting wheel supports only the detected target and is
-not a general release artifact.
+Install `tensorrt-edgellm[export]` for the PyTorch/ONNX exporter or
+`tensorrt-edgellm[tools]` for export, quantization, LoRA, vocabulary, and audio
+tools. Model-specific C++ executables under `experimental_models/` remain part
+of the source workflow rather than the Python wheel.
+
+## Build a local wheel from source
+
+Use this path to package the current checkout for one detected target. Unlike a
+published architecture wheel, `--local` includes only the exact platform,
+CUDA/TensorRT, and GPU payload detected during the build.
+
+Clone the repository with submodules and generate the matching CuTe DSL archive
+as described in the repository's
+[Wheel Tooling](https://github.com/NVIDIA/TensorRT-Edge-LLM/blob/main/packaging/README.md)
+guide. Then build and install the wheel:
+
+```bash
+python3 -m venv --system-site-packages .venv-wheel
+source .venv-wheel/bin/activate
+python -m pip install -r packaging/wheel-toolchain-requirements.txt
+
+export TRT_PACKAGE_DIR=/usr  # Use the TensorRT SDK root on this target.
+python packaging/wheel_cli.py build-wheel \
+    --local \
+    --trt-package-dir "$TRT_PACKAGE_DIR" \
+    --output-dir dist/local
+
+WHEEL=$(find dist/local -maxdepth 1 -name 'tensorrt_edgellm-*.whl' -print -quit)
+python3 -m venv --system-site-packages .venv-install
+.venv-install/bin/python -m pip install "$WHEEL"
+.venv-install/bin/python -c \
+    "import tensorrt_edgellm; print(tensorrt_edgellm.__version__)"
+.venv-install/bin/tensorrt-edgellm-build --help
+```
+
+The local wheel supports only the detected platform release, CPU architecture,
+CUDA/TensorRT ABI, GPU architecture, and Python ABI. Use a standalone TensorRT
+SDK root instead of `/usr` on an x86 workstation.
 
 ---
 

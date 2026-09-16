@@ -319,9 +319,9 @@ The explicit registry includes Llama, Mistral, Qwen2, Qwen3, Qwen3-MoE,
 Qwen2/2.5/3-VL, Qwen3.5 dense and MoE, Qwen3-ASR, Qwen3-Omni,
 Qwen3-Omni-Next, Qwen3-TTS, InternVL3/3.5, Phi-4 Multimodal,
 Nemotron-H/Omni, Gemma4 and Gemma4 Unified, DiffusionGemma, Cosmos3, and
-Alpamayo. EAGLE3, MTP, DFlash, JetSpec, DSpark, and Gemma4 assistant drafts use
-model-owned speculative definitions. Unsupported `model_type` values fail
-before TensorRT network creation and list the registered choices.
+Alpamayo. EAGLE3, MTP, DFlash/DFlash2, JetSpec, DSpark, and Gemma4 assistant
+drafts use model-owned speculative definitions. Unsupported `model_type`
+values fail before TensorRT network creation and list the registered choices.
 
 The following table distinguishes implementation from automatic direct-builder
 CI coverage. An implemented row can still have model-specific restrictions.

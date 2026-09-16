@@ -1,10 +1,45 @@
 # TensorRT Edge-LLM wheel tooling
 
+Public releases contain six wheels: CPython 3.10, 3.11, and 3.12, each for
+`x86_64` and `aarch64`. The filename identifies the Python ABI and CPU
+architecture; each wheel contains every qualified platform, CUDA/TensorRT, and
+GPU-SM payload for that architecture. The installed runtime detects those
+properties and loads one exact payload. It does not fall back to another SM or
+TensorRT major.
+
+The wheels package the Python APIs and
+[checkpoint-direct builder](../docs/source/user_guide/getting_started/direct-engine-builder.md)
+model families together with the native runtime and plugins. Model-specific
+C++ executables under `experimental_models/` are built separately from source.
+
+## Install a published wheel
+
+Install the supported platform CUDA and TensorRT packages first, then install
+the release from PyPI. Use `--system-site-packages` so a platform-provided
+TensorRT Python package remains visible in the environment.
+
+```bash
+python3 -m venv --system-site-packages .venv-edgellm
+source .venv-edgellm/bin/activate
+python -m pip install --upgrade pip
+python -m pip install "tensorrt-edgellm==0.11.0"
+python -c "import tensorrt_edgellm; print(tensorrt_edgellm.__version__)"
+tensorrt-edgellm-build --help
+```
+
+`pip` selects the matching Python/architecture wheel. Edge-LLM then validates
+the platform release, CUDA and TensorRT SONAMEs, and GPU SM when loading its
+native runtime. See the
+[Wheel Packaging Matrix](../docs/source/user_guide/getting_started/support-matrix.md#wheel-packaging-matrix)
+for the exact payloads included in the release.
+
+## Build wheels from source
+
 The source tree can build a wheel for the current machine, a compatible subset
 of configured GPUs, or every configured payload for one CPU architecture.
 Normal package installation does not install these build-only tools.
 
-## Prerequisites
+### Prerequisites
 
 Clone the repository with submodules and create a build environment using the
 same CPython minor version as the wheel:
@@ -12,7 +47,7 @@ same CPython minor version as the wheel:
 ```bash
 git clone --recurse-submodules https://github.com/NVIDIA/TensorRT-Edge-LLM.git
 cd TensorRT-Edge-LLM
-python3.12 -m venv .venv-wheel
+python3 -m venv --system-site-packages .venv-wheel
 source .venv-wheel/bin/activate
 python -m pip install -r packaging/wheel-toolchain-requirements.txt
 python packaging/wheel_cli.py validate-matrix
@@ -70,7 +105,7 @@ requires an appropriate platform SDK image or environment that supplies the
 target toolchain, sysroot, TensorRT SDK, and Python headers; overriding
 `BASE_IMAGE` alone is not sufficient.
 
-## Build for the current target
+### Build for the current target
 
 Expose one GPU architecture and provide the TensorRT SDK root:
 
@@ -78,7 +113,7 @@ Expose one GPU architecture and provide the TensorRT SDK root:
 export TRT_PACKAGE_DIR=/path/to/TensorRT
 export LD_LIBRARY_PATH="$TRT_PACKAGE_DIR/lib:${LD_LIBRARY_PATH:-}"
 
-CUDA_VISIBLE_DEVICES=GPU-<UUID> \
+CUDA_VISIBLE_DEVICES="$(nvidia-smi --query-gpu=uuid --format=csv,noheader | sed -n '1p')" \
 python packaging/wheel_cli.py build-wheel \
     --local \
     --trt-package-dir "$TRT_PACKAGE_DIR" \
@@ -94,7 +129,23 @@ On IGX Thor, the `igx-thor-cu13-sm110-sm120` row is one native payload with
 SM110 and SM120 device images. Select either physical GPU before `--local`;
 both selections resolve to the same build row and resulting payload.
 
-## Build for selected GPUs
+#### Install the local wheel
+
+Install into a clean environment on the same target configuration:
+
+```bash
+WHEEL=$(find dist/local -maxdepth 1 -name 'tensorrt_edgellm-*.whl' -print -quit)
+python3 -m venv --system-site-packages .venv-install
+.venv-install/bin/python -m pip install "$WHEEL"
+.venv-install/bin/python -c \
+    "import tensorrt_edgellm; print(tensorrt_edgellm.__version__)"
+.venv-install/bin/tensorrt-edgellm-build --help
+```
+
+Build and install with the same CPython minor version. The runtime rejects a
+wheel whose platform, CUDA/TensorRT ABI, or GPU architecture does not match.
+
+### Build for selected GPUs
 
 Repeat `--variant` to combine compatible SM payloads built with the same
 platform, CUDA, TensorRT, and toolchain context:
@@ -129,7 +180,7 @@ This produces one normal AArch64 platform wheel. Its runtime manifest contains
 exact SM110 and SM120 identities that reference the same extension and plugin,
 so the CuTe DSL archive and native targets are compiled and packaged once.
 
-## Build a complete architecture wheel
+### Build a complete architecture wheel
 
 A complete x86_64 or aarch64 wheel combines payloads produced in several
 platform-specific SDK environments. Build and verify each matrix row with the
@@ -156,7 +207,7 @@ installation floor. Payload verification audits ELF architecture, dependencies,
 RPATHs, and target-library resolution before fan-in; release validation rejects
 other platform tags before publication.
 
-## Low-level commands
+### Low-level commands
 
 Every stage remains independently reviewable and usable for custom build
 environments:
