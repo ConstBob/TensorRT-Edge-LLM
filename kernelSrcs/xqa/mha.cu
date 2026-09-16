@@ -529,7 +529,8 @@ __device__ inline void applyContiguousQuerySlidingWindowMask(Warp const& warp, W
 #endif
 
 __device__ inline void applyMaskFromInput(Warp const& warp, WarpAcc& acc, MaskType const* mask, uint32_t rowOffset,
-    uint32_t nbValidCols, uint32_t qSeqLen, uint32_t actualQSeqLen, uint32_t headGrpSize)
+    uint32_t nbValidCols, uint32_t qSeqLen, uint32_t actualQSeqLen, uint32_t paddedQSeqLen,
+    uint32_t headGrpSize)
 {
     uint32_t const idxInQuad = laneId() % 4;
     uint32_t const idxQuad = laneId() / 4;
@@ -548,12 +549,12 @@ __device__ inline void applyMaskFromInput(Warp const& warp, WarpAcc& acc, MaskTy
             {
                 uint32_t const firstCol = instN * mask_n * MMAS_N_PER_MASK + InstAcc::cols * idxInQuad;
                 uint32_t const lastCol = firstCol + instN * (MMAS_N_PER_MASK - 1) + InstAcc::cols - 1;
-                uint32_t const maskPos0 = firstCol + actualQSeqLen < nbValidCols
+                uint32_t const maskPos0 = firstCol + paddedQSeqLen < nbValidCols
                     ? 0u
-                    : min(firstCol + actualQSeqLen - nbValidCols, actualQSeqLen - 1);
-                uint32_t const maskPos1 = lastCol + actualQSeqLen < nbValidCols
+                    : min(firstCol + paddedQSeqLen - nbValidCols, paddedQSeqLen - 1);
+                uint32_t const maskPos1 = lastCol + paddedQSeqLen < nbValidCols
                     ? 0u
-                    : min(lastCol + actualQSeqLen - nbValidCols, actualQSeqLen - 1);
+                    : min(lastCol + paddedQSeqLen - nbValidCols, paddedQSeqLen - 1);
                 uint32_t packedMask = 0u;
                 uint32_t const maskPosStart = (maskPos0 / 16) * 16;
                 reinterpret_cast<uint16_t*>(&packedMask)[0]
@@ -570,9 +571,9 @@ __device__ inline void applyMaskFromInput(Warp const& warp, WarpAcc& acc, MaskTy
                         uint32_t const col = instN * n + InstAcc::cols * idxInQuad + j;
                         // bool const maskFlag = col + qSeqLen < nbValidCols ? true : mask[tokenRow * qSeqLen + (col +
                         // qSeqLen - nbValidCols)];
-                        bool const maskFlag = col + actualQSeqLen < nbValidCols
+                        bool const maskFlag = col + paddedQSeqLen < nbValidCols
                             ? true
-                            : packedMask & (1u << ((col + actualQSeqLen - nbValidCols) - maskPosStart));
+                            : packedMask & (1u << ((col + paddedQSeqLen - nbValidCols) - maskPosStart));
                         acc(m, n)(i, j) = maskFlag && col < nbValidCols ? acc(m, n)(i, j) : -INFINITY;
                     }
                 }
@@ -1626,6 +1627,9 @@ CUBIN_EXPORT __global__
     uint32_t const actualQSeqLen = qSeqLens != nullptr
         ? uint32_t(qSeqLens[idxReq])
         : (variableQSeqLen ? uint32_t(qCuSeqLens[idxReq + 1] - qCuSeqLens[idxReq]) : qSeqLen);
+    // Fixed-width inputs retain padding in KV, while qCuSeqLens describes physically compact input.
+    // TODO: Unify paddedQSeqLen with actualQSeqLen once tree decoding consumes compact ragged Q/KV.
+    uint32_t const paddedQSeqLen = qSeqLens != nullptr ? qSeqLen : actualQSeqLen;
     // Same as idxReq * qSeqLen if all sequences all the same.
     // Take different beams as different requests/sequences currently.
     uint32_t const reqSeqOffset = variableQSeqLen ? uint32_t(qCuSeqLens[idxReq]) : (qSeqLen * idxReq);
@@ -1844,14 +1848,19 @@ CUBIN_EXPORT __global__
     uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
 #if SLIDING_WINDOW
 #if SPEC_DEC && CONTIGUOUS_QUERY_SWA
-    uint32_t const firstQueryPosition = cacheSeqLen - actualQSeqLen;
+    uint32_t const firstQueryPosition = cacheSeqLen - paddedQSeqLen;
     bool const rtIsReallySliding = (cacheSeqLen > slidingWinSize);
     uint32_t const nbTotalSkipTokens
         = firstQueryPosition < slidingWinSize ? 0U : firstQueryPosition - slidingWinSize + 1U;
     uint32_t const maxQueryLeftEdge = rtIsReallySliding ? cacheSeqLen - slidingWinSize : 0U;
 #else
-    bool const rtIsReallySliding = (cacheSeqLen > slidingWinSize);
-    uint32_t const nbTotalSkipTokens = rtIsReallySliding ? cacheSeqLen - slidingWinSize : 0;
+#if SPEC_DEC
+    uint32_t const windowCacheSeqLen = cacheSeqLen - paddedQSeqLen + actualQSeqLen;
+#else
+    uint32_t const windowCacheSeqLen = cacheSeqLen;
+#endif
+    bool const rtIsReallySliding = (windowCacheSeqLen > slidingWinSize);
+    uint32_t const nbTotalSkipTokens = rtIsReallySliding ? windowCacheSeqLen - slidingWinSize : 0;
 #endif
 #else
     constexpr bool rtIsReallySliding = false;
@@ -1869,7 +1878,7 @@ CUBIN_EXPORT __global__
 
     uint32_t const nbSeqIters = useKVCache ? divUp(cacheSeqLen, ctaTile.x) : 0;
 #if SPEC_DEC
-    uint32_t const nbSeqItersWithoutMask = (cacheSeqLen - actualQSeqLen) / ctaTile.x;
+    uint32_t const nbSeqItersWithoutMask = (cacheSeqLen - paddedQSeqLen) / ctaTile.x;
 #endif
 
     uint32_t const seqStrideIters = nbSubSeqPerSeq;
@@ -2346,8 +2355,8 @@ CUBIN_EXPORT __global__
             {
                 // Apply the packed speculative/tree attention mask for tiles that overlap generated query tokens.
                 uint32_t const nbValidCols = (warpTileTokenBeg < cacheSeqLen ? cacheSeqLen - warpTileTokenBeg : 0U);
-                applyMaskFromInput(
-                    warp, acc, mask, idxHeadTokenInGrp, nbValidCols, qSeqLen, actualQSeqLen, headGrpSize);
+                applyMaskFromInput(warp, acc, mask, idxHeadTokenInGrp, nbValidCols, qSeqLen, actualQSeqLen,
+                    paddedQSeqLen, headGrpSize);
             }
 #else
             // Mask the sliding-window left edge and the padded tail of the final cache tile.

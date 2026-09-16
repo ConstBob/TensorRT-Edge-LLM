@@ -2120,7 +2120,7 @@ TEST(XQATreeAttentionDecodingTest, PaddingConsistencyTest)
     TestXQAPaddingConsistency(1, 32, 8, 128, 256, 5, 7);
 }
 
-void runPartialTreeBatchLogicalLengthTest(int32_t slidingWindowSize)
+void runPaddedTreePhysicalKvExtentTest(int32_t slidingWindowSize, bool contiguousQuerySwa = false)
 {
     initializeCudaContextForXQATest();
     constexpr int32_t kBatchSize{2};
@@ -2137,17 +2137,20 @@ void runPartialTreeBatchLogicalLengthTest(int32_t slidingWindowSize)
     ASSERT_TRUE(trt_edgellm::canCompileXQAKernel(
         kNumQHeads, kNumKVHeads, kHeadSize, smVersion, DataType::kHALF, DataType::kHALF));
     ASSERT_TRUE(trt_edgellm::loadXQAJitKernelForTest(smVersion, DataType::kHALF, DataType::kHALF, kHeadSize, kNumQHeads,
-        kNumKVHeads, /*slidingWindow=*/slidingWindowSize > 0, /*specDecode=*/true));
+        kNumKVHeads, /*slidingWindow=*/slidingWindowSize > 0, /*specDecode=*/true, /*tokensPerPage=*/0,
+        contiguousQuerySwa));
 
     size_t const qRowElems = static_cast<size_t>(kNumQHeads) * kHeadSize;
     size_t const kvBatchElems = static_cast<size_t>(2) * kNumKVHeads * kCapacity * kHeadSize;
     std::vector<half> qPadded(static_cast<size_t>(kBatchSize) * kQueryWidth * qRowElems, __float2half(0.F));
     std::vector<half> kvHost(static_cast<size_t>(kBatchSize) * kvBatchElems, __float2half(313.F));
-    std::vector<int32_t> sequenceLengths(kBatchSize);
+    std::vector<int32_t> logicalSequenceLengths(kBatchSize);
+    std::vector<int32_t> physicalSequenceLengths(kBatchSize);
     std::vector<int32_t> paddedMasks(static_cast<size_t>(kBatchSize) * kQueryWidth, 1);
     for (int32_t batchIdx = 0; batchIdx < kBatchSize; ++batchIdx)
     {
-        sequenceLengths[batchIdx] = pastLengths[batchIdx] + validCounts[batchIdx];
+        logicalSequenceLengths[batchIdx] = pastLengths[batchIdx] + validCounts[batchIdx];
+        physicalSequenceLengths[batchIdx] = pastLengths[batchIdx] + kQueryWidth;
         auto qBegin = qPadded.begin() + static_cast<size_t>(batchIdx) * kQueryWidth * qRowElems;
         std::vector<half> qLive(static_cast<size_t>(validCounts[batchIdx]) * qRowElems);
         uniformFloatInitialization(qLive);
@@ -2158,7 +2161,7 @@ void runPartialTreeBatchLogicalLengthTest(int32_t slidingWindowSize)
             auto planeBegin = kvBegin + static_cast<size_t>(plane) * kNumKVHeads * kCapacity * kHeadSize;
             for (int32_t head = 0; head < kNumKVHeads; ++head)
             {
-                std::vector<half> kvLive(static_cast<size_t>(sequenceLengths[batchIdx]) * kHeadSize);
+                std::vector<half> kvLive(static_cast<size_t>(physicalSequenceLengths[batchIdx]) * kHeadSize);
                 uniformFloatInitialization(kvLive);
                 std::copy(kvLive.begin(), kvLive.end(), planeBegin + static_cast<size_t>(head) * kCapacity * kHeadSize);
             }
@@ -2173,7 +2176,8 @@ void runPartialTreeBatchLogicalLengthTest(int32_t slidingWindowSize)
     thrust::device_vector<half> kvDevice(kvHost);
     thrust::device_vector<half> paddedOutput(
         static_cast<size_t>(kBatchSize) * kQueryWidth * qRowElems, __float2half(0.F));
-    thrust::device_vector<int32_t> sequenceLengthsDevice(sequenceLengths);
+    thrust::device_vector<int32_t> logicalSequenceLengthsDevice(logicalSequenceLengths);
+    thrust::device_vector<int32_t> physicalSequenceLengthsDevice(physicalSequenceLengths);
     thrust::device_vector<int32_t> validCountsDevice(validCounts.begin(), validCounts.end());
     thrust::device_vector<int32_t> paddedMasksDevice(paddedMasks);
 
@@ -2187,12 +2191,13 @@ void runPartialTreeBatchLogicalLengthTest(int32_t slidingWindowSize)
     paddedParams.qSeqLen = kQueryWidth;
     paddedParams.qInputPtr = thrust::raw_pointer_cast(qPaddedDevice.data());
     paddedParams.kvCache.data = thrust::raw_pointer_cast(kvDevice.data());
-    paddedParams.kvCache.sequence_lengths = thrust::raw_pointer_cast(sequenceLengthsDevice.data());
+    paddedParams.kvCache.sequence_lengths = thrust::raw_pointer_cast(physicalSequenceLengthsDevice.data());
     paddedParams.kvCache.capacity = kCapacity;
     paddedParams.output = thrust::raw_pointer_cast(paddedOutput.data());
     paddedParams.treeAttnMask = thrust::raw_pointer_cast(paddedMasksDevice.data());
     paddedParams.qSeqLens = thrust::raw_pointer_cast(validCountsDevice.data());
     paddedParams.slidingWinSize = slidingWindowSize;
+    paddedParams.contiguousQuerySwa = contiguousQuerySwa;
     paddedParams.attentionScale = 1.F / std::sqrt(static_cast<float>(kHeadSize));
     paddedRunner.dispatchSpecDecodeXQAKernel(paddedParams, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -2225,10 +2230,12 @@ void runPartialTreeBatchLogicalLengthTest(int32_t slidingWindowSize)
     compactParams.qSeqLen = kQueryWidth;
     compactParams.qInputPtr = thrust::raw_pointer_cast(qCompactDevice.data());
     compactParams.kvCache = paddedParams.kvCache;
+    compactParams.kvCache.sequence_lengths = thrust::raw_pointer_cast(logicalSequenceLengthsDevice.data());
     compactParams.output = thrust::raw_pointer_cast(compactOutput.data());
     compactParams.treeAttnMask = thrust::raw_pointer_cast(compactMasksDevice.data());
     compactParams.qCuSeqLen = thrust::raw_pointer_cast(qCuSeqLensDevice.data());
     compactParams.slidingWinSize = slidingWindowSize;
+    compactParams.contiguousQuerySwa = contiguousQuerySwa;
     compactParams.attentionScale = paddedParams.attentionScale;
     paddedRunner.dispatchSpecDecodeXQAKernel(compactParams, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -2251,7 +2258,7 @@ void runPartialTreeBatchLogicalLengthTest(int32_t slidingWindowSize)
         thrust::device_vector<half> qReferenceDevice(qReference);
         thrust::device_vector<half> kvReferenceDevice(kvReference);
         thrust::device_vector<half> referenceOutput(qReference.size(), __float2half(0.F));
-        thrust::device_vector<int32_t> referenceLengthDevice(1, sequenceLengths[batchIdx]);
+        thrust::device_vector<int32_t> referenceLengthDevice(1, logicalSequenceLengths[batchIdx]);
         thrust::device_vector<int32_t> referenceMasksDevice(referenceMasks);
 
         trt_edgellm::DecoderXQARunner referenceRunner(
@@ -2265,6 +2272,7 @@ void runPartialTreeBatchLogicalLengthTest(int32_t slidingWindowSize)
         referenceParams.output = thrust::raw_pointer_cast(referenceOutput.data());
         referenceParams.treeAttnMask = thrust::raw_pointer_cast(referenceMasksDevice.data());
         referenceParams.slidingWinSize = slidingWindowSize;
+        referenceParams.contiguousQuerySwa = contiguousQuerySwa;
         referenceParams.attentionScale = paddedParams.attentionScale;
         referenceRunner.dispatchSpecDecodeXQAKernel(referenceParams, stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -2283,12 +2291,17 @@ void runPartialTreeBatchLogicalLengthTest(int32_t slidingWindowSize)
     }
 }
 
-TEST(XQATreeAttentionDecodingTest, PartialTreeBatchUsesLogicalLengthsWithoutKvMutation)
+TEST(XQATreeAttentionDecodingTest, PaddedTreeUsesPhysicalKvExtentWithoutKvMutation)
 {
-    runPartialTreeBatchLogicalLengthTest(/*slidingWindowSize=*/0);
+    runPaddedTreePhysicalKvExtentTest(/*slidingWindowSize=*/0);
 }
 
-TEST(XQATreeAttentionDecodingTest, PartialTreeBatchUsesLogicalLengthsWithSlidingWindow)
+TEST(XQATreeAttentionDecodingTest, PaddedTreeUsesPhysicalKvExtentWithSlidingWindow)
 {
-    runPartialTreeBatchLogicalLengthTest(/*slidingWindowSize=*/8);
+    runPaddedTreePhysicalKvExtentTest(/*slidingWindowSize=*/8);
+}
+
+TEST(XQATreeAttentionDecodingTest, PaddedTreeUsesPhysicalKvExtentWithContiguousQuerySlidingWindow)
+{
+    runPaddedTreePhysicalKvExtentTest(/*slidingWindowSize=*/8, /*contiguousQuerySwa=*/true);
 }
