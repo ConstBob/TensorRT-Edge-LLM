@@ -1,5 +1,6 @@
 tests:
   - tests/defs/test_common.py::test_build_project
+  - tests/defs/test_pi05.py::test_cpp_build_and_unit_tests
   - tests/defs/test_vlm_pipeline.py::test_engine_build[Qwen3.5-0.8B-FP8-FP8-KV-fp8-fp8kv-mxsl2048-mxbs1-mxil1024-mnit128-mxit1024-mxpiit512]
   - tests/defs/test_vlm_pipeline.py::test_inference[Qwen3.5-0.8B-FP8-FP8-KV-fp8-fp8kv-mxsl2048-mxbs1-mxil1024-mnit128-mxit1024-mxpiit512-vlm_basic]
   - tests/defs/test_server_pipeline.py::test_build_pybind

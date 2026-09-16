@@ -52,10 +52,11 @@ rt::Tensor readPixelValues(
 //! trajectory is replicated so every batch entry denoises the same one.
 std::vector<float> readNoise(std::string const& path, size_t chunkElems, int32_t batch);
 
-//! \brief Read an observation from a JSON request: ``task``, ``state`` and a
-//! ``cameras`` object keyed by the contract's camera names. Naming the slots is what
-//! keeps a request independent of argument order.
-//! \throws std::runtime_error On a missing file, malformed JSON, or a missing field.
+//! \brief Read an observation from a JSON request: ``task``, a ``cameras`` object keyed by
+//! contract name, and the state as either ``state`` or DROID's
+//! ``joint_position`` / ``gripper_position`` pair.
+//! \throws std::runtime_error On a missing file, malformed JSON, a missing field, or a
+//!         request that spells the state both ways.
 Pi05Observation readObservation(std::string const& path);
 
 //! \brief True when \p path names the safetensors form writeActionChunk() writes.

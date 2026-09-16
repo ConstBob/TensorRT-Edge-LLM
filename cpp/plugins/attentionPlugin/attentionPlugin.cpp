@@ -208,8 +208,11 @@ constexpr AttentionExecutionMode resolveAttentionExecutionMode(rt::ExecutionPhas
     switch (phase)
     {
     case rt::ExecutionPhase::kContextPrefill:
-    case rt::ExecutionPhase::kDiffusionDenoise:
     case rt::ExecutionPhase::kDiffusionCommit: return AttentionExecutionMode::kNORMAL_PREFILL;
+    // A denoise step attends over its whole chunk at once, which is the tree kernel's shape
+    // even though nothing about it is speculative.
+    case rt::ExecutionPhase::kDiffusionDenoise:
+        return enableTreeAttention ? AttentionExecutionMode::kTREE_DECODING : AttentionExecutionMode::kNORMAL_PREFILL;
     case rt::ExecutionPhase::kContextChunk: return AttentionExecutionMode::kCHUNKED_PREFILL;
     case rt::ExecutionPhase::kAutoregressiveDecode: return AttentionExecutionMode::kVANILLA_DECODING;
     case rt::ExecutionPhase::kSpecDraftProposal:
@@ -229,6 +232,10 @@ static_assert(attentionModeUsesQueryLengths(
     resolveAttentionExecutionMode(rt::ExecutionPhase::kSpecDraftProposal, /*enableTreeAttention=*/false)));
 static_assert(!attentionModeUsesQueryLengths(
     resolveAttentionExecutionMode(rt::ExecutionPhase::kSpecDraftProposal, /*enableTreeAttention=*/true)));
+static_assert(attentionModeUsesQueryLengths(
+    resolveAttentionExecutionMode(rt::ExecutionPhase::kDiffusionDenoise, /*enableTreeAttention=*/false)));
+static_assert(!attentionModeUsesQueryLengths(
+    resolveAttentionExecutionMode(rt::ExecutionPhase::kDiffusionDenoise, /*enableTreeAttention=*/true)));
 
 enum class RuntimeContextMaskMode
 {

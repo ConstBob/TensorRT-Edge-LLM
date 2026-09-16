@@ -292,7 +292,10 @@ are listed under [Speculative Draft Checkpoints](#speculative-draft-checkpoints)
   [nvidia/Cosmos3-Edge](https://huggingface.co/nvidia/Cosmos3-Edge)
 - **pi0.5** (model-specific exporter/runtime): camera observations and an
   instruction to a robot action chunk.
-  [lerobot/pi05_libero_base](https://huggingface.co/lerobot/pi05_libero_base)
+  [lerobot/pi05_libero_base](https://huggingface.co/lerobot/pi05_libero_base),
+  [lerobot/pi05_droid](https://huggingface.co/lerobot/pi05_droid),
+  [lerobot/pi05_base](https://huggingface.co/lerobot/pi05_base) (served under the
+  `pi05_aloha` contract)
 
 ## Speculative Draft Checkpoints
 

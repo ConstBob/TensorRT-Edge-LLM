@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "common/bindingNames.h"
+
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -52,8 +54,13 @@ inline constexpr char const* kNoiseTrajectory = "noise_trajectory";
 inline constexpr char const* kTimestep = "timestep";
 inline constexpr char const* kActionPred = "action_pred";
 
-//! Cache lengths of an XQA export; absent from every other action graph.
-inline constexpr char const* kKVSeqLens = "kv_seq_lens";
+//! Token-major AttentionPlugin metadata the action graph binds; the shared
+//! contract owns the names, so they are pulled in rather than restated.
+using trt_edgellm::binding_names::kAttentionSequenceLengths;
+using trt_edgellm::binding_names::kContextSequenceCountCarrier;
+using trt_edgellm::binding_names::kExecutionPhaseMarker;
+using trt_edgellm::binding_names::kQueryLengths;
+using trt_edgellm::binding_names::kQueryStartOffsets;
 
 //! Paged-pool inputs; see cpp/common/bindingNames.h for the shared
 //! AttentionPlugin's contract these follow.

@@ -473,6 +473,45 @@ bool Pi05Builder::validateProfileNames(nvinfer1::INetworkDefinition const& netwo
             ok = false;
         }
     }
+    // The batch maps are consulted by name when the profile is widened, so a key that
+    // names nothing in the profile would be silently ignored and leave that input at
+    // its exported bound while the rest of the engine grew.
+    nlohmann::json const batchAxis = mModelConfig.value("batch_axis", nlohmann::json::object());
+    nlohmann::json const batchStride = mModelConfig.value("batch_stride", nlohmann::json::object());
+    nlohmann::json const batchBias = mModelConfig.value("batch_bias", nlohmann::json::object());
+    // Bound to named locals: items() holds a reference into its json, so iterating the
+    // temporary that value() returns would read it after the init-statement destroys it.
+    std::pair<char const*, nlohmann::json const&> const maps[]{
+        {"batch_axis", batchAxis}, {"batch_stride", batchStride}, {"batch_bias", batchBias}};
+    for (auto const& [map, entries] : maps)
+    {
+        for (auto const& item : entries.items())
+        {
+            if (!profileJson.contains(item.key()))
+            {
+                LOG_ERROR("pi0.5 %s %s names %s, which the optimization profile does not declare", mComponent.c_str(),
+                    map, item.key().c_str());
+                ok = false;
+                continue;
+            }
+            // Stride and bias scale an axis; without one declared they are read and discarded.
+            if (std::string(map) != "batch_axis" && !batchAxis.contains(item.key()))
+            {
+                LOG_ERROR(
+                    "pi0.5 %s %s names %s, which declares no batch_axis", mComponent.c_str(), map, item.key().c_str());
+                ok = false;
+            }
+        }
+    }
+    for (auto const& item : batchStride.items())
+    {
+        if (item.value().is_number_integer() && item.value().get<int64_t>() <= 0)
+        {
+            LOG_ERROR("pi0.5 %s batch_stride for %s is %ld; a request occupies at least one slot", mComponent.c_str(),
+                item.key().c_str(), item.value().get<int64_t>());
+            ok = false;
+        }
+    }
     return ok;
 }
 
@@ -490,6 +529,9 @@ bool Pi05Builder::setupOptimizationProfile(
     // How many slots along the batch axis one request occupies. Only the paged K/V
     // pool needs more than one: it grows by a whole sequence's pages per request.
     nlohmann::json const batchStride = mModelConfig.value("batch_stride", nlohmann::json::object());
+    // Constant slots the batch axis carries on top of the per-request ones, for a
+    // prefix-sum input whose length is one past the request count.
+    nlohmann::json const batchBias = mModelConfig.value("batch_bias", nlohmann::json::object());
 
     auto* profile = builder.createOptimizationProfile();
     bool ok = true;
@@ -518,7 +560,8 @@ bool Pi05Builder::setupOptimizationProfile(
                 return false;
             }
             int64_t const stride = batchStride.value(name, 1);
-            maxDims.d[axis] = std::max(maxDims.d[axis], static_cast<int64_t>(mMaxBatchSize) * stride);
+            int64_t const bias = batchBias.value(name, 0);
+            maxDims.d[axis] = std::max(maxDims.d[axis], static_cast<int64_t>(mMaxBatchSize) * stride + bias);
         }
         ok &= builder::setOptimizationProfile(profile, name.c_str(), minDims, optDims, maxDims);
     }

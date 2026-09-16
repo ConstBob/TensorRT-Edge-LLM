@@ -135,7 +135,7 @@ Pi05Observation readObservation(std::string const& path)
     {
         throw std::runtime_error("pi0.5 request " + path + " is not valid JSON: " + e.what());
     }
-    for (char const* key : {"task", "state", "cameras"})
+    for (char const* key : {"task", "cameras"})
     {
         if (!request.contains(key))
         {
@@ -144,7 +144,32 @@ Pi05Observation readObservation(std::string const& path)
     }
     Pi05Observation observation;
     observation.task = request.at("task").get<std::string>();
-    observation.state = request.at("state").get<std::vector<float>>();
+    // A DROID client holds the two halves openpi concatenates rather than the joined
+    // vector, so either spelling is read -- but a request carrying both has said the
+    // state twice and there is no reason to prefer one.
+    bool const hasJoint = request.contains("joint_position");
+    bool const hasGripper = request.contains("gripper_position");
+    bool const split = hasJoint && hasGripper;
+    if (request.contains("state") == (hasJoint || hasGripper))
+    {
+        throw std::runtime_error("pi0.5 request " + path
+            + " must carry either \"state\" or both \"joint_position\" and \"gripper_position\"");
+    }
+    if (hasJoint != hasGripper)
+    {
+        throw std::runtime_error("pi0.5 request " + path + " carries only \""
+            + (hasJoint ? "joint_position" : "gripper_position") + "\"; the split spelling needs both");
+    }
+    if (split)
+    {
+        observation.state = request.at("joint_position").get<std::vector<float>>();
+        std::vector<float> const gripper = request.at("gripper_position").get<std::vector<float>>();
+        observation.state.insert(observation.state.end(), gripper.begin(), gripper.end());
+    }
+    else
+    {
+        observation.state = request.at("state").get<std::vector<float>>();
+    }
     // Object rather than array: the contract places a view by name, so a request that
     // names its slots cannot be reordered into a different one.
     for (auto const& [name, imagePath] : request.at("cameras").items())
@@ -250,8 +275,13 @@ void writeActionChunk(std::string const& path, Pi05ActionChunk const& chunk, int
         doc["prompt"] = chunk.prompt;
         doc["token_ids"] = chunk.tokenIds;
     }
-    doc["robot_action_dim"] = robotDim;
-    doc["robot_actions"] = actionRows(chunk.robotActions, chunk.horizon, robotDim);
+    if (!chunk.robotActions.empty())
+    {
+        // Absent from a canonical-tensor run: converting to robot units needs the
+        // request's own state, which those tensors do not carry.
+        doc["robot_action_dim"] = robotDim;
+        doc["robot_actions"] = actionRows(chunk.robotActions, chunk.horizon, robotDim);
+    }
     if (path.empty())
     {
         std::cout << doc.dump(2) << "\n";
