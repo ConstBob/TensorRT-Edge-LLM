@@ -191,6 +191,15 @@ else
 fi
 export EDGELLM_PLUGIN_PATH="${PLUGIN_SO}"
 
+# Engine sets built before EXPORT_KEY existed are the shipped fp16 contract at
+# the constants above. Adopt that stamp rather than wiping a working engine
+# directory the first time a serving replica restarts onto this script. A
+# non-default precision request still mismatches and rebuilds.
+if [ -e "${ENGINE_DIR}/READY" ] && [ ! -e "${ONNX_DIR}/EXPORT_KEY" ] \
+   && [ "${EDGELLM_BASE_DTYPE}" = "float16" ] && [ "${EDGELLM_GEN_DTYPE}" = "float16" ]; then
+    printf '%s\n' "${EXPORT_KEY}" > "${ONNX_DIR}/EXPORT_KEY"
+fi
+
 if [ -e "${ENGINE_DIR}/READY" ] \
    && [ "$(cat "${ONNX_DIR}/EXPORT_KEY" 2>/dev/null || true)" = "${EXPORT_KEY}" ]; then
     echo "=== engines already present, skipping export/build ==="
