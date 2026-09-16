@@ -1545,8 +1545,11 @@ class NemotronHCausalLM(nn.Module):
             getattr(config, "mtp_base", False)
             or getattr(config, "dflash_base", False)
             or getattr(config, "dspark_base", False))
-        tree_state = not (getattr(config, "dspark_base", False)
-                          and not getattr(config, "dspark_tree_base", False))
+        tree_state = bool(
+            getattr(config, "dflash_base", False)
+            or getattr(config, "mtp_tree_base", False)
+            or getattr(config, "dflash_tree_base", False)
+            or getattr(config, "dspark_tree_base", False))
         inputs_embeds = torch.zeros(physical_tokens,
                                     config.hidden_size,
                                     dtype=torch.float16,

@@ -207,8 +207,8 @@ def test_nemotron_h_mtp_draft_exports_token_major_attention(tmp_path):
     }
 
 
-@pytest.mark.parametrize("mode",
-                         ["vanilla", "dspark", "dspark_tree", "dflash", "mtp"])
+@pytest.mark.parametrize(
+    "mode", ["vanilla", "dspark", "dspark_tree", "dflash", "mtp", "mtp_tree"])
 def test_nemotron_spec_state_metadata_matches_decoder_mode(tmp_path, mode):
     config = _config()
     if mode != "vanilla":
@@ -218,11 +218,13 @@ def test_nemotron_spec_state_metadata_matches_decoder_mode(tmp_path, mode):
         config.dspark_tree_base = mode == "dspark_tree"
     if mode == "dflash":
         config.dflash_target_layer_ids = [0]
+    if mode.startswith("mtp"):
+        config.mtp_tree_base = mode == "mtp_tree"
     model = NemotronHCausalLM(config)
     spec = model.onnx_export_spec()
     assert len(spec.input_names) == len(spec.args) == len(spec.dynamic_shapes)
     state_names = {"tree_parent_ids", "tree_depths", "valid_tree_counts"}
-    has_tree_state = mode in {"dspark_tree", "dflash", "mtp"}
+    has_tree_state = mode in {"dspark_tree", "dflash", "mtp_tree"}
     assert state_names.issubset(spec.input_names) == has_tree_state
     if not has_tree_state:
         assert state_names.isdisjoint(spec.input_names)
