@@ -187,11 +187,16 @@ class Cosmos3UndPrefill(nn.Module):
                              ) -> Tuple[tuple, list, list, tuple]:
         cfg = self.cfg
         n, hkv, d = self.n, cfg["num_key_value_heads"], self.head_dim
+        # Match the graph input to the model weights. A hard-coded fp16 input
+        # combined with bf16 RMSNorm weights promotes the normalized activation
+        # to fp32, leaving the first projection as an invalid Float x BFloat16
+        # MatMul in a strongly-typed TensorRT network.
+        model_dtype = self.model.layers[0].self_attn.q_proj.weight.dtype
         b, s = 1, 13
         inputs_embeds = torch.zeros(b,
                                     s,
                                     cfg["hidden_size"],
-                                    dtype=torch.float16,
+                                    dtype=model_dtype,
                                     device=device)
         rope = torch.zeros(b, s, d, dtype=torch.float32, device=device)
         pos = torch.arange(s, dtype=torch.int32, device=device).unsqueeze(0)

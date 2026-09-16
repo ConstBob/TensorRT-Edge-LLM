@@ -34,10 +34,12 @@ FPS=15
 # Arithmetic precision of the exported graph. The builder creates a
 # kSTRONGLY_TYPED network (builderUtils.cpp:286) and sets no kFP16/kBF16 flag,
 # so the ONNX dtypes alone decide what the engine computes in. float16 is the
-# shipped configuration; bfloat16/float32 exist to test against the reference,
-# which runs the velocity under fp32/bf16 autocast. Point WORK_ROOT at a
-# separate root when changing this -- artifacts are not tagged by dtype.
+# shipped configuration. EDGELLM_GEN_DTYPE can override only the denoiser while
+# UND/VAE and their C++ runtime boundaries remain float16; this is the clean
+# experiment against the reference's bf16-autocast velocity model.
 EDGELLM_EXPORT_DTYPE="${EDGELLM_EXPORT_DTYPE:-float16}"
+EDGELLM_GEN_DTYPE="${EDGELLM_GEN_DTYPE:-${EDGELLM_EXPORT_DTYPE}}"
+EXPORT_KEY="base=${EDGELLM_EXPORT_DTYPE};gen=${EDGELLM_GEN_DTYPE};chunk=${ACTION_CHUNK_SIZE};frames=${NUM_FRAMES};fps=${FPS}"
 
 # First TensorRT whose ONNX parser imports trt::RotaryEmbedding natively.
 # Do not call this TRT_VERSION: the NGC images already export that with their
@@ -187,7 +189,8 @@ else
 fi
 export EDGELLM_PLUGIN_PATH="${PLUGIN_SO}"
 
-if [ -e "${ENGINE_DIR}/READY" ]; then
+if [ -e "${ENGINE_DIR}/READY" ] \
+   && [ "$(cat "${ONNX_DIR}/EXPORT_KEY" 2>/dev/null || true)" = "${EXPORT_KEY}" ]; then
     echo "=== engines already present, skipping export/build ==="
 else
     echo "=== stage: checkpoint ==="
@@ -200,6 +203,13 @@ else
 
     exec 8>"${WORK_ROOT}/build.lock"
     flock 8
+    # EXPORT_OK alone is unsafe: changing precision or the served shape would
+    # otherwise silently reuse an incompatible graph and partial engines.
+    if [ "$(cat "${ONNX_DIR}/EXPORT_KEY" 2>/dev/null || true)" != "${EXPORT_KEY}" ]; then
+        echo "=== export contract changed; clearing stale ONNX/engines ==="
+        rm -rf "${ONNX_DIR}" "${ENGINE_DIR}"
+        mkdir -p "${ONNX_DIR}" "${ENGINE_DIR}"
+    fi
     if [ -e "${ONNX_DIR}/EXPORT_OK" ]; then
         echo "=== onnx already present, skipping export ==="
     else
@@ -218,10 +228,22 @@ else
             --action-chunk-size "${ACTION_CHUNK_SIZE}" \
             --num-frames "${NUM_FRAMES}" \
             --fps "${FPS}"
+        if [ "${EDGELLM_GEN_DTYPE}" != "${EDGELLM_EXPORT_DTYPE}" ]; then
+            echo "=== stage: GEN-only ${EDGELLM_GEN_DTYPE} re-export ==="
+            PYTHONNOUSERSITE=1 "${PY}" -m tensorrt_edgellm.scripts.export \
+                "${CKPT_LOCAL}" "${ONNX_DIR}" \
+                --task policy --components gen --dtype "${EDGELLM_GEN_DTYPE}" \
+                --action-chunk-size "${ACTION_CHUNK_SIZE}" \
+                --num-frames "${NUM_FRAMES}" \
+                --fps "${FPS}"
+        fi
+        printf '%s\n' "${EXPORT_KEY}" > "${ONNX_DIR}/EXPORT_KEY"
         touch "${ONNX_DIR}/EXPORT_OK"
     fi
 
     echo "=== stage: engine build ==="
+    rm -rf "${ENGINE_DIR}"
+    mkdir -p "${ENGINE_DIR}"
     ldd "${POLICY_BUILD}" | grep -E "nvinfer|nvonnx|cudart|cuda" || true
     ldd "${PLUGIN_SO}" | grep -E "nvinfer|nvonnx|cudart|cuda" || true
     "${POLICY_BUILD}" --onnxDir "${ONNX_DIR}" --engineDir "${ENGINE_DIR}"
