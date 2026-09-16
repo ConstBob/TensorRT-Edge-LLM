@@ -25,7 +25,7 @@ endif()
 
 project(
   tensorrt_edgellm_sdk
-  VERSION 0.10.1
+  VERSION 0.11.0
   LANGUAGES ${_EDGELLM_PROJECT_LANGUAGES})
 
 if(EDGELLM_PYTHON_ONLY_WHEEL)

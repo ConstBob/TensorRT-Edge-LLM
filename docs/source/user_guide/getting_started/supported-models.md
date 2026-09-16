@@ -10,7 +10,7 @@ TensorRT Edge-LLM supports the checkpoint IDs listed below. Dense LLM families i
 
 The model coverage list is not comprehensive, and not every listed checkpoint has been fully verified on every supported platform and precision. If a listed model does not export, build, or run correctly, please report an issue with the checkpoint ID, precision, platform, and command line used.
 
-The model class names were checked against the upstream [Transformers model source tree](https://github.com/huggingface/transformers/tree/main/src/transformers/models). Checkpoint IDs are linked to their Hugging Face pages and grouped into original checkpoints and quantized checkpoints.
+The model class names were checked against the upstream [Transformers model source tree](https://github.com/huggingface/transformers/tree/main/src/transformers/models). Checkpoint IDs are linked to their Hugging Face pages and grouped into original checkpoints and quantized checkpoints. All links below are public or gated; run `hf auth login` after accepting the provider's terms for a gated checkpoint.
 
 ## Precision Notes
 
@@ -28,6 +28,8 @@ The model class names were checked against the upstream [Transformers model sour
 <details>
 <summary><b>Llama 3.x</b></summary>
 
+`model_type: llama`; text input to text output.
+
 **Original:**
 
 - [meta-llama/Meta-Llama-3-8B-Instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct)
@@ -44,6 +46,8 @@ The model class names were checked against the upstream [Transformers model sour
 
 <details>
 <summary><b>Qwen2 / Qwen2.5</b></summary>
+
+`model_type: qwen2`; text input to text output.
 
 **Original:**
 
@@ -87,6 +91,8 @@ The model class names were checked against the upstream [Transformers model sour
 <details>
 <summary><b>Qwen3</b></summary>
 
+`model_type: qwen3` or `qwen3_moe`; text input to text output.
+
 **Original:**
 
 - [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B), [Qwen/Qwen3-0.6B-Base](https://huggingface.co/Qwen/Qwen3-0.6B-Base)
@@ -108,9 +114,10 @@ The model class names were checked against the upstream [Transformers model sour
 <details>
 <summary><b>HunYuan V1 Dense</b></summary>
 
-HunYuan V1 dense checkpoints (`hunyuan_v1_dense`) apply the per-head QK RMSNorm after RoPE and
-use the DynamicNTKAlpha RoPE variant (`rope_scaling.type == "dynamic"` with `alpha`); both are
-handled automatically by export and runtime.
+`model_type: hunyuan_v1_dense`; text input to text output. These checkpoints
+apply per-head QK RMSNorm after RoPE and use the
+DynamicNTKAlpha RoPE variant (`rope_scaling.type == "dynamic"` with `alpha`);
+both are handled automatically by export and runtime.
 
 **Original:**
 
@@ -121,6 +128,9 @@ handled automatically by export and runtime.
 
 <details>
 <summary><b>Qwen vision-language families</b></summary>
+
+`model_type: qwen2_5_vl` or `qwen3_vl`; text and image/video input to text
+output.
 
 **Qwen2.5-VL:**
 
@@ -140,6 +150,9 @@ handled automatically by export and runtime.
 <details>
 <summary><b>Qwen3.5 / Qwen3.6 / Qwen3.8</b></summary>
 
+`model_type: qwen3_5` or `qwen3_5_moe`; text-only checkpoints accept text,
+while multimodal checkpoints accept text and image/video. Both produce text.
+
 - [Qwen/Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B), [Qwen/Qwen3.5-0.8B-Base](https://huggingface.co/Qwen/Qwen3.5-0.8B-Base)
 - [Qwen/Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B), [Qwen/Qwen3.5-2B-Base](https://huggingface.co/Qwen/Qwen3.5-2B-Base)
 - [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B), [Qwen/Qwen3.5-4B-Base](https://huggingface.co/Qwen/Qwen3.5-4B-Base)
@@ -148,13 +161,18 @@ handled automatically by export and runtime.
 - [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B)
 - [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)
 - [RadixArk/Qwen3.8-27B-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4)
-- [Qwen/Qwen3.5-35B-A3B-GPTQ-Int4](https://huggingface.co/Qwen/Qwen3.5-35B-A3B-GPTQ-Int4), [nvidia/Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4)
+- [Qwen/Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B), [Qwen/Qwen3.5-35B-A3B-GPTQ-Int4](https://huggingface.co/Qwen/Qwen3.5-35B-A3B-GPTQ-Int4)
+- [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B), [nvidia/Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4)
 - [Qwen/Qwen3.5-122B-A10B](https://huggingface.co/Qwen/Qwen3.5-122B-A10B), [nvidia/Qwen3.5-122B-A10B-NVFP4](https://huggingface.co/nvidia/Qwen3.5-122B-A10B-NVFP4)
 
 </details>
 
 <details>
 <summary><b>InternVL and Phi-4</b></summary>
+
+InternVL uses `model_type: internvl_chat` or `internvl`; Phi-4 Multimodal uses
+`phi4mm` or `phi4_multimodal`. Both accept text and image input and produce
+text; Phi-4 also accepts audio.
 
 **InternVL:**
 
@@ -165,7 +183,7 @@ handled automatically by export and runtime.
 - [OpenGVLab/InternVL3_5-8B-HF](https://huggingface.co/OpenGVLab/InternVL3_5-8B-HF), [OpenGVLab/InternVL3_5-14B-HF](https://huggingface.co/OpenGVLab/InternVL3_5-14B-HF)
 - [OpenGVLab/InternVL3-1B-AWQ](https://huggingface.co/OpenGVLab/InternVL3-1B-AWQ), [OpenGVLab/InternVL3-2B-AWQ](https://huggingface.co/OpenGVLab/InternVL3-2B-AWQ), [OpenGVLab/InternVL3-8B-AWQ](https://huggingface.co/OpenGVLab/InternVL3-8B-AWQ), [OpenGVLab/InternVL3-14B-AWQ](https://huggingface.co/OpenGVLab/InternVL3-14B-AWQ)
 
-**Phi-4:**
+**Phi-4 Multimodal:**
 
 - [microsoft/Phi-4-multimodal-instruct](https://huggingface.co/microsoft/Phi-4-multimodal-instruct)
 
@@ -174,6 +192,12 @@ handled automatically by export and runtime.
 <details>
 <summary><b>Nemotron-3 / 3.5</b></summary>
 
+Nemotron-H language checkpoints use `model_type: nemotron_h` and accept text
+input. Nemotron Omni uses `NemotronH_Nano_Omni_Reasoning_V3` and accepts text,
+image/video, and audio. Both produce text.
+
+**Nemotron-H:**
+
 - [nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16)
 - [nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8)
 - [nvidia/NVIDIA-Nemotron-Nano-9B-v2](https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2)
@@ -181,12 +205,19 @@ handled automatically by export and runtime.
 - [nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4)
 - [nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4)
 - [nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4)
+
+**Nemotron Omni:**
+
 - [nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4)
 
 </details>
 
 <details>
 <summary><b>Gemma4</b></summary>
+
+`model_type: gemma4` or `gemma4_unified`; accepted modalities depend on the
+checkpoint and all variants produce text. Paired `gemma4_assistant` or
+`gemma4_unified_assistant` checkpoints provide MTP.
 
 **Text, image, and audio input:**
 
@@ -196,7 +227,7 @@ handled automatically by export and runtime.
 **Text and image input:**
 
 - [google/gemma-4-31B-it](https://huggingface.co/google/gemma-4-31B-it), [nvidia/Gemma-4-31B-IT-NVFP4](https://huggingface.co/nvidia/Gemma-4-31B-IT-NVFP4)
-- [google/gemma-4-26B-A4B-it-qat-q4_0-unquantized](https://huggingface.co/google/gemma-4-26B-A4B-it-qat-q4_0-unquantized)
+- [google/gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it), [google/gemma-4-26B-A4B-it-qat-q4_0-unquantized](https://huggingface.co/google/gemma-4-26B-A4B-it-qat-q4_0-unquantized)
 - [nvidia/Gemma-4-26B-A4B-NVFP4](https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4)
 
 **MTP assistants:**
@@ -210,12 +241,17 @@ handled automatically by export and runtime.
 <details>
 <summary><b>DiffusionGemma</b></summary>
 
+`model_type: diffusion_gemma` or `diffusiongemma`; text and image input to text
+output through block-diffusion decoding.
+
 - [nvidia/diffusiongemma-26B-A4B-it-NVFP4](https://huggingface.co/nvidia/diffusiongemma-26B-A4B-it-NVFP4)
 
 </details>
 
 <details>
 <summary><b>Muse-Glimmer</b></summary>
+
+`model_type: muse_glimmer`; text, image, or video input to text output.
 
 The FP16 checkpoint supports text, image, and video
 input; the NVFP4 checkpoint is text-only. Compatible DFlash and DFlash2 drafts
@@ -228,19 +264,35 @@ are listed under [Speculative Draft Checkpoints](#speculative-draft-checkpoints)
 
 ## Speech Recognition
 
-- **Qwen3-ASR:** [Qwen/Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B), [Qwen/Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B)
-- **Nemotron-3.5-ASR:** [nvidia/nemotron-3.5-asr-streaming-0.6b](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)
+- **Qwen3-ASR** (`qwen3_asr`): audio to transcript text.
+  [Qwen/Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B),
+  [Qwen/Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B)
+- **Nemotron-3.5-ASR** (`nemotron3_5_asr`): streaming audio to transcript
+  text through its model-specific RNN-T runtime.
+  [nvidia/nemotron-3.5-asr-streaming-0.6b](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)
 
 ## Speech Generation
 
-- **Qwen3-TTS:** [Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice), [Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice), [Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign), [Qwen/Qwen3-TTS-12Hz-0.6B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base), [Qwen/Qwen3-TTS-12Hz-1.7B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base)
-- **Qwen3-Omni:** [Qwen/Qwen3-Omni-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct)
+- **Qwen3-TTS** (`qwen3_tts`): text, language, style, or reference-speech
+  conditioning to speech.
+  [Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice),
+  [Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice),
+  [Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign),
+  [Qwen/Qwen3-TTS-12Hz-0.6B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base),
+  [Qwen/Qwen3-TTS-12Hz-1.7B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base)
+- **Qwen3-Omni** (`qwen3_omni_moe`): text, image/video, and audio to text
+  and optional speech.
+  [Qwen/Qwen3-Omni-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct)
 
 ## Action and Multimodal Reasoning
 
-- **Alpamayo:** [nvidia/Alpamayo-R1-10B](https://huggingface.co/nvidia/Alpamayo-R1-10B)
-- **Cosmos3-Edge:** [nvidia/Cosmos3-Edge](https://huggingface.co/nvidia/Cosmos3-Edge), [nvidia/Cosmos3-Edge-Policy-DROID](https://huggingface.co/nvidia/Cosmos3-Edge-Policy-DROID)
-- **pi0.5:** [lerobot/pi05_libero_base](https://huggingface.co/lerobot/pi05_libero_base)
+- **Alpamayo** (`alpamayo_r1`): text and image/video to reasoning and a
+  trajectory. [nvidia/Alpamayo-R1-10B](https://huggingface.co/nvidia/Alpamayo-R1-10B)
+- **Cosmos3-Edge** (`cosmos3_edge`): text and image/video to reasoning.
+  [nvidia/Cosmos3-Edge](https://huggingface.co/nvidia/Cosmos3-Edge)
+- **pi0.5** (model-specific exporter/runtime): camera observations and an
+  instruction to a robot action chunk.
+  [lerobot/pi05_libero_base](https://huggingface.co/lerobot/pi05_libero_base)
 
 ## Speculative Draft Checkpoints
 
@@ -253,6 +305,7 @@ are listed under [Speculative Draft Checkpoints](#speculative-draft-checkpoints)
 | [AngelSlim/Qwen3-4B_eagle3](https://huggingface.co/AngelSlim/Qwen3-4B_eagle3) | [Qwen/Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) |
 | [Tengyunw/qwen3_8b_eagle3](https://huggingface.co/Tengyunw/qwen3_8b_eagle3) or [AngelSlim/Qwen3-8B_eagle3](https://huggingface.co/AngelSlim/Qwen3-8B_eagle3) | [Qwen/Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) |
 | [Rayzl/qwen2.5-vl-7b-eagle3-sgl](https://huggingface.co/Rayzl/qwen2.5-vl-7b-eagle3-sgl) | [Qwen/Qwen2.5-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct) |
+| [deepseek-ai/eagle3_gemma4_12b_ttt7](https://huggingface.co/deepseek-ai/eagle3_gemma4_12b_ttt7) | [google/gemma-4-12B-it](https://huggingface.co/google/gemma-4-12B-it) |
 
 ### DFlash Draft Models
 
@@ -265,6 +318,10 @@ are listed under [Speculative Draft Checkpoints](#speculative-draft-checkpoints)
 | [z-lab/Qwen3.5-9B-DFlash](https://huggingface.co/z-lab/Qwen3.5-9B-DFlash) | [Qwen/Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B) |
 | [z-lab/Qwen3.5-27B-DFlash](https://huggingface.co/z-lab/Qwen3.5-27B-DFlash) | [Qwen/Qwen3.5-27B](https://huggingface.co/Qwen/Qwen3.5-27B) |
 | [z-lab/Qwen3.5-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.5-35B-A3B-DFlash) | [Qwen/Qwen3.5-35B-A3B-GPTQ-Int4](https://huggingface.co/Qwen/Qwen3.5-35B-A3B-GPTQ-Int4) |
+| [z-lab/Qwen3.6-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash) | [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) or [nvidia/Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4) |
+| [deepseek-ai/dflash_gemma4_12b_block7](https://huggingface.co/deepseek-ai/dflash_gemma4_12b_block7) or [z-lab/gemma4-12B-it-DFlash](https://huggingface.co/z-lab/gemma4-12B-it-DFlash) | [google/gemma-4-12B-it](https://huggingface.co/google/gemma-4-12B-it) |
+| [z-lab/gemma-4-26B-A4B-it-DFlash](https://huggingface.co/z-lab/gemma-4-26B-A4B-it-DFlash) | [google/gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it) |
+| [z-lab/gemma-4-31B-it-DFlash](https://huggingface.co/z-lab/gemma-4-31B-it-DFlash) | [google/gemma-4-31B-it](https://huggingface.co/google/gemma-4-31B-it) |
 | [nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash) | [nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4) |
 | [meta-models/Muse-Glimmer-30B-assistant](https://huggingface.co/meta-models/Muse-Glimmer-30B-assistant) | [meta-models/Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B) or [RadixArk/Muse-Glimmer-NVFP4](https://huggingface.co/RadixArk/Muse-Glimmer-NVFP4) |
 

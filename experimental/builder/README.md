@@ -354,9 +354,10 @@ The explicit registry currently includes Llama, Mistral, Qwen2, Qwen3,
 Qwen3-MoE, Qwen2/2.5/3-VL, Qwen3.5 dense and MoE, Qwen3-ASR, Qwen3-Omni,
 Qwen3-Omni-Next, Qwen3-TTS, InternVL3/3.5, Phi-4 Multimodal,
 Nemotron-H/Omni, Gemma4 and Gemma4 Unified, DiffusionGemma, Cosmos3, and
-Alpamayo. EAGLE3, MTP, DFlash, dSpark, and Gemma4 assistant drafts use
-model-owned speculative definitions. Unsupported `model_type` values fail
-before a TensorRT network is created and report the registered choices.
+Alpamayo. EAGLE3, MTP, DFlash/DFlash2, JetSpec, DSpark, and Gemma4 assistant
+drafts use model-owned speculative definitions. Unsupported `model_type`
+values fail before a TensorRT network is created and report the registered
+choices.
 
 The user guide contains an explicit
 [implementation, CI, and known-gap matrix](../../docs/source/user_guide/getting_started/direct-engine-builder.md#support-and-validation-status).
