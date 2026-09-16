@@ -4016,6 +4016,22 @@ def main() -> None:
         help=("pi0.5 only: keep the modulation inside the per-step action "
               "graph and export no ``cond`` component."),
     )
+    # Deferred like every other pi0.5 import here, so the module does not pull the
+    # model package in at load time; the names come from the contract table so the
+    # accepted set and the error text cannot drift apart.
+    from ..models.pi05.policy_assets import OPENPI_POLICY_CONTRACTS
+    p.add_argument(
+        "--pi05-policy-config",
+        default=None,
+        choices=sorted(OPENPI_POLICY_CONTRACTS),
+        help=
+        ("pi0.5 only: the openpi configuration this bundle serves. It fixes "
+         "the action horizon, the camera slots and the prompt, which the "
+         "converted checkpoints do not name. pi05_aloha is an inference "
+         "contract over the generalist pi05_base weights, not a checkpoint "
+         "of its own. The checkpoint's own horizon is cross-checked. Required "
+         "unless the feature contract names one on its own."),
+    )
     p.add_argument(
         "--pi05-denoise-steps",
         type=int,
@@ -4499,9 +4515,9 @@ def main() -> None:
                     model_config=load_model_config(model_dir))
         return
 
-    # pi0.5 checkpoints carry no ``model_type``, share their variant fields with pi0, and
-    # lack the standard LLM config fields, so the architecture is resolved from the weight
-    # signature and dispatched here rather than through ModelConfig.
+    # pi0.5 lacks the standard LLM config fields and shares its variant fields with pi0, so
+    # it is dispatched here rather than through ModelConfig; a converted checkpoint that
+    # names nothing in ``type`` falls back to the weight signature.
     if _is_pi05_checkpoint(model_dir):
         from ..models.pi05.export import export_pi05_components
         requested = [c for c in args.components.split(",") if c] or None
@@ -4509,6 +4525,7 @@ def main() -> None:
                                args.output_dir,
                                components=requested,
                                dtype=dtype,
+                               policy_config=args.pi05_policy_config,
                                num_denoise_steps=args.pi05_denoise_steps,
                                hoist_adarms_cond=args.pi05_hoist_adarms_cond)
         return

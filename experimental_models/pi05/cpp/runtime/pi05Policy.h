@@ -36,11 +36,40 @@ namespace pi05
 
 //! \brief Per-key normalization statistics from openpi's ``norm_stats.json``. Only the
 //! quantiles are read: openpi derives ``use_quantile_norm`` from the model type, so every
-//! pi0.5 configuration normalizes as ``x_norm = 2 * (x - q01) / (q99 - q01) - 1``.
+//! pi0.5 configuration normalizes as
+//! ``x_norm = 2 * (x - q01) / (q99 - q01 + kQuantileEpsilon) - 1``.
 struct NormStats
 {
     std::vector<float> q01;
     std::vector<float> q99;
+};
+
+//! openpi's divisor floor, applied to every quantile map whatever the spread.
+constexpr float kQuantileEpsilon = 1e-6F;
+
+//! Image slots the architecture carries: one base view and two wrist views.
+constexpr int32_t kMaxCameraSlots = 3;
+
+//! openpi's PaligemmaTokenizer bins the state over [-1, 1) with exactly this many
+//! buckets; any other count yields a prompt no pi0.5 checkpoint was trained on.
+constexpr int32_t kStateBins = 256;
+
+//! \brief Which embodiment's observation and action math a bundle asks for. Every
+//! step that differs between openpi's policy configurations keys off this.
+enum class Pi05Adapter
+{
+    kLibero,
+    kDroid,
+    kAloha
+};
+
+//! \brief One image slot, as the prefix consumes it.
+struct Pi05CameraSlot
+{
+    std::string name;
+    //! An optional slot a request omits is left out of the prefix rather than sent as a
+    //! masked black frame, so omitting it shifts every language position after it.
+    bool required{true};
 };
 
 //! \brief Everything the exported ``policy.json`` declares about one embodiment.
@@ -58,11 +87,13 @@ struct Pi05Contract
     //! same stamp, and nothing else ties the two together.
     std::string exportId;
 
-    std::vector<std::string> cameraNames;
-    //! Views the checkpoint declares but never feeds. They are masked out of attention,
-    //! so a compact prefix omits them; an export that records only a count leaves the
-    //! names blank, and the size still carries how many there are.
-    std::vector<std::string> emptyCameras;
+    Pi05Adapter adapter{Pi05Adapter::kLibero};
+
+    std::vector<Pi05CameraSlot> cameras;
+    //! Names the configuration accepts and drops, matching its openpi input transform.
+    //! A name in neither list is rejected, since two swapped views produce plausible
+    //! actions rather than an error.
+    std::vector<std::string> ignoredCameras;
 
     int32_t stateDim{0};
     int32_t actionHorizon{0};  //!< steps per chunk; checked against the action engine
@@ -72,13 +103,12 @@ struct Pi05Contract
     int32_t imageHeight{0};
     int32_t imageWidth{0};
     int32_t maxTokenLen{0};
+    int32_t tokenizerVocabSize{0};
     int32_t numBins{256};
     //! Whether the discretized state goes into the prompt. openpi's pi05_libero says no,
     //! and pi0.5 has no state projection, so there the state reaches the model through
     //! neither path.
     bool discreteStateInput{false};
-    //! Divisor floor for a dimension whose q99 does not exceed its q01.
-    float stateEps{1e-8F};
 };
 
 //! \brief One camera of an observation.
@@ -100,9 +130,10 @@ struct Pi05CameraView
 //! \brief What one policy call sees, in the robot's own units.
 struct Pi05Observation
 {
-    //! One entry per camera the checkpoint actually feeds. The empty cameras are
-    //! masked out in the reference and take no image here.
+    //! One entry per slot the request fills. Required slots must all be here; an
+    //! optional one may be left out, and a name the contract ignores is dropped.
     std::vector<Pi05CameraView> cameras;
+    //! Robot units, the embodiment's own width. The adapter converts it.
     std::vector<float> state;
     std::string task;
     //! Replicate the request across the batch axis; needs engines built for it.
@@ -144,10 +175,9 @@ struct Pi05ActionChunk
     //! Row-major [batch, horizon, modelActionDim], normalized and zero-padded as
     //! the action engine emits it.
     std::vector<float> normalizedActions;
-    //! Row-major [horizon, robotActionDim] in robot units, batch entry 0 only.
-    //! batch > 1 exists to exercise the engine layer -- entry-vs-entry equality and
-    //! throughput -- not to serve several robots, so only the first is converted.
-    //! Compare entries in normalizedActions above; widening this is a scope change.
+    //! Row-major [horizon, robotActionDim], batch entry 0 only, and empty from
+    //! inferTensors(): the ALOHA conversion reads the request's own state, which canonical
+    //! tensors do not carry. Compare batch entries in normalizedActions above.
     std::vector<float> robotActions;
     //! What the towers were conditioned on, so a chunk can be reproduced without
     //! re-deriving the prompt.
@@ -194,7 +224,8 @@ public:
     Pi05ActionChunk infer(Pi05Observation const& observation);
 
     //! \brief Run already-canonical tensors, skipping the observation adapters.
-    //! For accuracy comparison and profiling: the chunk carries no prompt. \p pixelValues
+    //! For accuracy comparison and profiling: the chunk carries the normalized actions
+    //! alone, with no prompt and no robot-unit conversion. \p pixelValues
     //! may also carry the declared empty slots, which is the shape a full-prefix reference
     //! dumps -- but this runtime masks nothing, so those views attend and shift the language
     //! positions after them. Use that shape for shape-level benchmarks, not for parity.
@@ -212,26 +243,27 @@ public:
         return mContract;
     }
 
-    //! \brief Camera views in the order the prefix expects them.
-    std::vector<std::string> const& cameraNames() const noexcept
+    //! \brief Image slots in the order the prefix expects them.
+    std::vector<Pi05CameraSlot> const& cameras() const noexcept
     {
-        return mContract.cameraNames;
+        return mContract.cameras;
     }
 
     //! The adapter API above is infer(), inferTensors(), runtime() and contract(). What
     //! follows are the contract steps, public because each is checked directly against an
-    //! openpi or LeRobot golden: a wrong prompt, tokenization or unnormalization produces a
+    //! openpi golden: a wrong prompt, tokenization or unnormalization produces a
     //! plausible robot command rather than an error, so they are tested in isolation and
     //! not only through infer(). Callers should not need them.
 
-    //! \brief Reject a count of supplied camera images the contract cannot place.
-    //! Real images fill the real cameras only, one per name, in order.
-    //! \throws std::invalid_argument When \p images differs from the camera count.
-    void validateImageCount(int32_t images) const;
+    //! \brief Place the supplied views into the contract's slots, in prefix order, keeping
+    //! the active ones alone. Unnamed views fill the leading slots by position instead.
+    //! \throws std::invalid_argument On an unknown or repeated name, a partly named
+    //!         request, or a required slot no view fills.
+    std::vector<Pi05CameraView const*> resolveActiveViews(std::vector<Pi05CameraView> const& views) const;
 
     //! \brief Reject a view count the contract cannot explain: a pixel tensor either
-    //! carries the real cameras alone, which is the policy path, or every declared slot
-    //! including the empty ones, which only a shape-level benchmark should use.
+    //! carries as many views as a request can activate, which is the policy path, or
+    //! every image slot, which only a shape-level benchmark should use.
     //! \throws std::invalid_argument When \p views is neither.
     void validateViewCount(int32_t views) const;
 
@@ -241,12 +273,17 @@ public:
     //! \throws std::invalid_argument When it is not device FLOAT16 [views, 3, H, W].
     void validatePixelValues(rt::Tensor const& pixelValues) const;
 
-    //! \brief Assemble the pi0.5 prompt from a task string and a robot-unit state.
+    //! \brief Convert a robot-unit state into the space the checkpoint was trained in.
+    //! Identity except under ALOHA, which flips joint signs and un-linearizes both grippers.
+    //! \throws std::invalid_argument When \p state is not the contract's width.
+    std::vector<float> adaptInputState(std::vector<float> const& state) const;
+
+    //! \brief Assemble the pi0.5 prompt from a task string and an adapted state.
     //!
     //! Only a ``discrete_state_input`` contract puts the state in: normalized,
     //! discretized into ``num_bins`` bins over [-1, 1) and written in as decimal
     //! text. pi05_libero does not, so there the state is validated and dropped.
-    std::string buildPrompt(std::string const& task, std::vector<float> const& state) const;
+    std::string buildPrompt(std::string const& task, std::vector<float> const& adapted) const;
 
     //! \brief Encode \p prompt with the PaliGemma tokenizer staged beside the engines,
     //! appending the separately encoded start-of-answer newline unless the contract
@@ -261,23 +298,27 @@ public:
     std::vector<float> unnormalizeActions(
         std::vector<float> const& normalized, int32_t horizon, int32_t actionDim) const;
 
+    //! \brief Unnormalize, then the embodiment's own conversion. ALOHA adds openpi's
+    //! absolute-action step and the inverse input conversion; the others stop at the slice.
+    //! \param adapted The same state adaptInputState() produced for this request.
+    std::vector<float> postprocessActions(std::vector<float> const& normalized, int32_t horizon, int32_t actionDim,
+        std::vector<float> const& adapted) const;
+
     int32_t robotActionDim() const noexcept
     {
         return mContract.robotActionDim;
     }
 
-    //! \brief Views the checkpoint declares a real camera for.
+    //! \brief Slots the contract names, which is the most views a request can activate.
     int32_t numCameras() const noexcept
     {
-        return static_cast<int32_t>(mContract.cameraNames.size());
+        return static_cast<int32_t>(mContract.cameras.size());
     }
 
 private:
     void loadContract(std::string const& engineDir);
     //! Decode and preprocess the ordered views into the bound pixel tensor.
     //! \param times Accumulates the decode and preprocess halves across the views.
-    //! For each contract camera slot, the index into \p views that fills it.
-    std::vector<size_t> orderCameraSlots(std::vector<Pi05CameraView> const& views) const;
     void stagePixelValues(std::vector<Pi05CameraView const*> const& ordered, Pi05ObservationTimes& times);
     //! Resize-with-pad \p rgb into view slot \p viewIdx of the pinned staging. Returns its ms.
     double stageOneView(unsigned char const* rgb, int32_t srcH, int32_t srcW, size_t viewIdx);
@@ -290,14 +331,14 @@ private:
     std::unique_ptr<Pi05Runtime> mRuntime;
     std::unique_ptr<tokenizer::Tokenizer> mTokenizer;
     cudaStream_t mStream{nullptr};
-    //! Sized from the contract once: a request's view count never varies.
+    //! Sized once for every slot the contract declares; a request using fewer reshapes it down.
     rt::Tensor mPixelValues;
     rt::Tensor mPixelValuesHost;    //!< pinned staging for mPixelValues
     std::vector<float> mPlanarView; //!< one view's resized CHW float buffer, reused per request
 };
 
 //! \brief The contract's camera order on one line, for help text and diagnostics.
-std::string cameraOrderSummary(std::vector<std::string> const& names);
+std::string cameraOrderSummary(std::vector<Pi05CameraSlot> const& slots);
 
 //! \brief Preprocess one decoded RGB8 frame the way PaliGemma expects.
 //!

@@ -35,16 +35,17 @@ import torch
 from ..._version import __version__
 from ...onnx.export import _strip_attention_plugin_optional_inputs
 from ...onnx.export_encoder import _run_dynamo_export
-from .modeling_pi05_action import (KV_TOKENS_PER_PAGE, Pi05Action,
-                                   Pi05ActionConfig, build_pi05_action,
-                                   build_pi05_cond, kv_pages_per_seq,
-                                   num_adarms_sites, packed_mask_words,
-                                   xqa_cache_capacity)
+from .modeling_pi05_action import (DIFFUSION_DENOISE_PHASE, KV_TOKENS_PER_PAGE,
+                                   Pi05Action, Pi05ActionConfig,
+                                   build_pi05_action, build_pi05_cond,
+                                   kv_pages_per_seq, num_adarms_sites,
+                                   packed_mask_words, xqa_cache_capacity)
 from .modeling_pi05_prefix import (Pi05Prefix, Pi05PrefixConfig,
                                    build_pi05_prefix)
 from .modeling_pi05_visual import (Pi05Visual, Pi05VisualConfig,
                                    build_pi05_visual)
-from .policy_assets import (OPENPI_POLICY_CONTRACT, POLICY_CONTRACT_FILENAME,
+from .policy_assets import (MAX_CAMERA_SLOTS, MAX_TOKEN_LEN,
+                            OPENPI_POLICY_CONTRACTS, POLICY_CONTRACT_FILENAME,
                             TEXT_TOKENIZER_DIRNAME, build_policy_contract,
                             checkpoint_fingerprint, load_json_if_present,
                             policy_config_name, policy_semantics, sha256_file,
@@ -82,10 +83,9 @@ _GEMMA_VARIANTS = {
     },
 }
 
-# pi0.5 tokenizes to ``max_token_len=200`` (openpi Pi0Config.__post_init__);
-# the reference engine build rounds up to a multiple of 16.
-DEFAULT_MAX_TOKEN_LEN = 208
-DEFAULT_NUM_VIEWS = 3
+# Prompt capacity the prefix is built for: openpi's ``max_token_len`` rounded up to a
+# multiple of 16, as the reference engine build does.
+DEFAULT_MAX_TOKEN_LEN = -(-MAX_TOKEN_LEN // 16) * 16
 _TOKENS_PER_VIEW = 256
 
 # Ceiling on the runtime-selectable denoise step count in a hoisted-cond export:
@@ -116,9 +116,13 @@ def _variant(name: str) -> dict:
     return _GEMMA_VARIANTS[name]
 
 
-def default_max_prefix_len(num_views: int = DEFAULT_NUM_VIEWS,
-                           max_token_len: int = DEFAULT_MAX_TOKEN_LEN) -> int:
-    return num_views * _TOKENS_PER_VIEW + max_token_len
+def default_max_prefix_len(max_token_len: int = DEFAULT_MAX_TOKEN_LEN) -> int:
+    """Prefix capacity for every configuration: all image slots plus the prompt.
+
+    Sized for ``MAX_CAMERA_SLOTS`` whatever the configuration feeds, so the canonical
+    full-slot shape the accuracy and profiling harnesses use always fits.
+    """
+    return MAX_CAMERA_SLOTS * _TOKENS_PER_VIEW + max_token_len
 
 
 def _write_component_config(out_dir: str, config: dict,
@@ -377,9 +381,9 @@ def make_action_config(
         "timestep":
         _shape([1], [1], [max_batch_size]),
         "rope_rotary_cos_sin":
-        _shape([1, horizon, d], [1, horizon, d], [max_batch_size, horizon, d]),
+        _shape([horizon, d], [horizon, d], [max_batch_size * horizon, d]),
         "attention_pos_id":
-        _shape([1, horizon], [1, horizon], [max_batch_size, horizon]),
+        _shape([horizon], [horizon], [max_batch_size * horizon]),
     }
     cond_contract = {
         "timestep": {
@@ -400,21 +404,39 @@ def make_action_config(
             },
         }
     batch_axis = {name: 0 for name in profile}
-    batch_stride: dict = {}
+    # One request occupies a whole action horizon of the token-major axis.
+    batch_stride: dict = {
+        "rope_rotary_cos_sin": horizon,
+        "attention_pos_id": horizon
+    }
+    batch_bias: dict = {}
     capacity = xqa_cache_capacity(max_prefix_len, horizon)
-    profile["kv_seq_lens"] = _shape([1], [1], [max_batch_size])
-    batch_axis["kv_seq_lens"] = 0
     pages = kv_pages_per_seq(max_prefix_len, horizon)
     words = packed_mask_words(horizon)
+    profile["query_lengths"] = _shape([1], [1], [max_batch_size])
+    batch_axis["query_lengths"] = 0
+    profile["attention_sequence_lengths"] = _shape([1], [1], [max_batch_size])
+    batch_axis["attention_sequence_lengths"] = 0
+    profile["query_start_offsets"] = _shape([2], [2], [max_batch_size + 1])
+    batch_axis["query_start_offsets"] = 0
+    batch_bias["query_start_offsets"] = 1
+    # Shape-only carriers: the extent IS the value, so all three bounds are the
+    # one the runtime binds -- tree decoding, and no context sequence.
+    profile["execution_phase_marker"] = _shape([DIFFUSION_DENOISE_PHASE],
+                                               [DIFFUSION_DENOISE_PHASE],
+                                               [DIFFUSION_DENOISE_PHASE])
+    batch_axis["execution_phase_marker"] = None
+    profile["context_sequence_count_carrier"] = _shape([0], [0], [0])
+    batch_axis["context_sequence_count_carrier"] = None
     profile["kvcache_start_index"] = _shape([1], [1], [max_batch_size])
     batch_axis["kvcache_start_index"] = 0
     profile["kv_page_table"] = _shape([1, 2, pages], [1, 2, pages],
                                       [max_batch_size, 2, pages])
     batch_axis["kv_page_table"] = 0
-    profile["attention_mask"] = _shape([1, horizon, words],
-                                       [1, horizon, words],
-                                       [max_batch_size, horizon, words])
+    profile["attention_mask"] = _shape([horizon, words], [horizon, words],
+                                       [max_batch_size * horizon, words])
     batch_axis["attention_mask"] = 0
+    batch_stride["attention_mask"] = horizon
     pool = _shape([2, pages, KV_TOKENS_PER_PAGE, hkv, d],
                   [2, max_batch_size * pages, KV_TOKENS_PER_PAGE, hkv, d],
                   [2, max_batch_size * pages, KV_TOKENS_PER_PAGE, hkv, d])
@@ -425,10 +447,30 @@ def make_action_config(
         batch_stride[f"kv_cache_layer{i:02d}"] = pages
     pool_axes = ["k_then_v", "num_pages", "page", "kv_heads", "head_dim"]
     kv_contract = {
-        "kv_seq_lens": {
+        "query_lengths": {
             "dtype": "int32",
             "rank": 1,
             "axes": ["batch"],
+        },
+        "attention_sequence_lengths": {
+            "dtype": "int32",
+            "rank": 1,
+            "axes": ["batch"],
+        },
+        "query_start_offsets": {
+            "dtype": "int32",
+            "rank": 1,
+            "axes": ["batch_plus_one"],
+        },
+        "execution_phase_marker": {
+            "dtype": "int32",
+            "rank": 1,
+            "axes": ["execution_phase"],
+        },
+        "context_sequence_count_carrier": {
+            "dtype": "int32",
+            "rank": 1,
+            "axes": ["context_sequences"],
         },
         "kvcache_start_index": {
             "dtype": "int32",
@@ -442,8 +484,8 @@ def make_action_config(
         },
         "attention_mask": {
             "dtype": "int32",
-            "rank": 3,
-            "axes": ["batch", "action_horizon", "packed_mask_words"],
+            "rank": 2,
+            "axes": ["execution_tokens", "packed_mask_words"],
         },
         "kv_cache_layerNN": {
             "dtype": "fp16",
@@ -457,6 +499,7 @@ def make_action_config(
         "engine_filename": "action.engine",
         "batch_axis": batch_axis,
         "batch_stride": batch_stride,
+        "batch_bias": batch_bias,
         "optimization_profile": profile,
         "tensor_contract": {
             "inputs": {
@@ -468,13 +511,13 @@ def make_action_config(
                 **cond_contract,
                 "rope_rotary_cos_sin": {
                     "dtype": "fp32",
-                    "rank": 3,
-                    "axes": ["batch", "action_horizon", "head_dim"],
+                    "rank": 2,
+                    "axes": ["execution_tokens", "head_dim"],
                 },
                 "attention_pos_id": {
                     "dtype": "int32",
-                    "rank": 2,
-                    "axes": ["batch", "action_horizon"],
+                    "rank": 1,
+                    "axes": ["execution_tokens"],
                 },
                 **kv_contract,
             },
@@ -718,8 +761,9 @@ def export_pi05_components(
     output_dir: str,
     components: "list[str] | None" = None,
     dtype: torch.dtype = torch.float16,
-    num_views: int = DEFAULT_NUM_VIEWS,
-    max_views: int = 8,
+    policy_config: "str | None" = None,
+    num_views: "int | None" = None,
+    max_views: int = MAX_CAMERA_SLOTS,
     max_token_len: int = DEFAULT_MAX_TOKEN_LEN,
     max_prefix_len: "int | None" = None,
     max_batch_size: int = 1,
@@ -750,8 +794,11 @@ def export_pi05_components(
     # From the openpi configuration, not the checkpoint: a Hugging Face mirror ships
     # LeRobot's own horizon (chunk_size 50, n_action_steps 10) and the graph must be
     # built at the same H the manifest declares.
-    action_horizon = int(OPENPI_POLICY_CONTRACT[policy_config_name(
-        checkpoint, config)]["action_horizon"])
+    config_name = policy_config_name(checkpoint, config, policy_config)
+    policy = OPENPI_POLICY_CONTRACTS[config_name]
+    action_horizon = int(policy["action_horizon"])
+    if num_views is None:
+        num_views = int(policy["opt_views"])
     num_denoise_steps = resolve_num_denoise_steps(config, num_denoise_steps)
     paligemma_variant = _config_field(config, ("paligemma_variant", ),
                                       "paligemma variant")
@@ -759,7 +806,7 @@ def export_pi05_components(
                                    "action expert variant")
 
     if max_prefix_len is None:
-        max_prefix_len = default_max_prefix_len(num_views, max_token_len)
+        max_prefix_len = default_max_prefix_len(max_token_len)
 
     options = {
         "dtype": "float16",
@@ -770,6 +817,7 @@ def export_pi05_components(
         "max_batch_size": max_batch_size,
         "num_denoise_steps": num_denoise_steps,
         "hoist_adarms_cond": hoist_adarms_cond,
+        "policy_config": config_name,
         # Shapes and variants the weights do not pin: the same checkpoint under a
         # changed config must not reuse a partial export built from the old one.
         "action_dim": action_dim,
@@ -781,9 +829,9 @@ def export_pi05_components(
     export_id = _export_id(fingerprint, options)
     _validate_existing_export(output_dir, fingerprint, export_id)
     logger.info(
-        "pi0.5 export %s: action_dim=%d action_horizon=%d max_prefix_len=%d "
-        "num_denoise_steps=%d", export_id, action_dim, action_horizon,
-        max_prefix_len, num_denoise_steps)
+        "pi0.5 export %s (%s): action_dim=%d action_horizon=%d "
+        "max_prefix_len=%d num_denoise_steps=%d", export_id, config_name,
+        action_dim, action_horizon, max_prefix_len, num_denoise_steps)
 
     os.makedirs(output_dir, exist_ok=True)
     manifest_path = os.path.join(output_dir, POLICY_CONTRACT_FILENAME)
@@ -811,8 +859,7 @@ def export_pi05_components(
                     "checkpoint_fingerprint": fingerprint,
                     "export_id": export_id,
                     "components": [],
-                    "action_horizon": action_horizon,
-                })
+                }, config_name)
             _validate_policy_semantics(manifest_path, contract)
 
             assets_existed = os.path.isdir(assets_dir)

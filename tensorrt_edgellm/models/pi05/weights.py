@@ -15,8 +15,8 @@
 """pi0.5 checkpoint detection and weight splitting.
 
 The supported input is a PyTorch pi0.5 checkpoint: ``model.safetensors`` plus a
-``config.json``. Two schemas ship the same weights -- the LeRobot release, which
-is the validated one and writes ``max_action_dim`` / ``n_action_steps`` and no
+``config.json``. Two schemas ship the same weights -- the LeRobot releases, which
+are the validated ones and write ``max_action_dim`` / ``n_action_steps`` and no
 normalization assets, and openpi's ``convert_jax_model_to_pytorch.py`` output,
 which writes ``action_dim`` / ``action_horizon`` and an ``assets/`` directory.
 """
@@ -29,6 +29,7 @@ import logging
 import os
 from typing import Dict, Tuple
 
+import safetensors
 import torch
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,9 @@ _PI05_EXPERT_NORM_MARKER = ".input_layernorm.dense."
 # never has it (state is either discretized into the prompt or unused).
 _PI0_STATE_PROJ_KEY = "state_proj.weight"
 
+# Uniform prefix of a checkpoint saved from the LeRobot policy wrapper.
+_WRAPPER_PREFIX = "model."
+
 
 def load_checkpoint_weights(model_dir: str) -> Dict[str, torch.Tensor]:
     """Load and merge every safetensors shard in a pi0.5 checkpoint directory."""
@@ -80,6 +84,10 @@ def load_checkpoint_weights(model_dir: str) -> Dict[str, torch.Tensor]:
     merged: Dict[str, torch.Tensor] = {}
     for shard in shards:
         merged.update(_load_safetensors(shard))
+    # Some LeRobot releases save the policy wrapper rather than the model, which puts
+    # every tensor one level down. Stripping it here keeps one naming below.
+    if merged and all(k.startswith(_WRAPPER_PREFIX) for k in merged):
+        merged = {k[len(_WRAPPER_PREFIX):]: v for k, v in merged.items()}
     logger.info("Loaded %d tensors from %d shard(s) in %s", len(merged),
                 len(shards), model_dir)
     return merged
@@ -111,20 +119,43 @@ def is_pi05_weights(weights: Dict[str, torch.Tensor]) -> bool:
 def is_pi05_checkpoint(model_dir: str) -> bool:
     """Whether ``model_dir`` holds a pi0.5 checkpoint.
 
-    Prefers an explicit ``model_type`` in config.json and falls back to the
-    weight signature for checkpoints converted before that field existed.
+    Prefers the name config.json gives itself -- the LeRobot releases write
+    ``type``, and ``model_type`` is accepted too -- and falls back to the weight
+    signature, read from the safetensors headers, for checkpoints converted
+    before either field existed.
     """
     config_path = os.path.join(model_dir, "config.json")
     if not os.path.isfile(config_path):
         return False
     with open(config_path) as f:
         config = json.load(f)
-    declared = str(config.get("model_type", "")).lower()
+    declared = str(config.get("model_type", config.get("type", ""))).lower()
     if declared:
         return declared == "pi05"
     if "paligemma_variant" not in config:
         return False
-    return is_pi05_weights(load_checkpoint_weights(model_dir))
+    # Key names alone decide this, so read the safetensors headers rather than
+    # materializing every tensor: the caller loads them again straight after.
+    return is_pi05_weights(_checkpoint_key_set(model_dir))
+
+
+def _checkpoint_key_set(model_dir: str) -> Dict[str, None]:
+    """Every tensor name in the checkpoint, without reading tensor data.
+
+    Strips the LeRobot policy-wrapper prefix exactly as the full loader does, so
+    the two paths see the same names and cannot disagree about the architecture.
+    """
+    keys: Dict[str, None] = {}
+    for name in sorted(os.listdir(model_dir)):
+        if not name.endswith(".safetensors"):
+            continue
+        with safetensors.safe_open(os.path.join(model_dir, name),
+                                   framework="pt") as handle:
+            for key in handle.keys():
+                keys[key] = None
+    if keys and all(k.startswith(_WRAPPER_PREFIX) for k in keys):
+        keys = {k[len(_WRAPPER_PREFIX):]: None for k in keys}
+    return keys
 
 
 def split_pi05_weights(

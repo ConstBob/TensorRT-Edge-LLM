@@ -17,6 +17,7 @@
 
 #include "action/pi05ActionRunner.h"
 
+#include "common/executionPhase.h"
 #include "common/logger.h"
 #include "common/pi05Bindings.h"
 #include "kernels/pi05Kernels.h"
@@ -34,6 +35,12 @@ namespace trt_edgellm
 {
 namespace pi05
 {
+namespace
+{
+//! The extent that puts the AttentionPlugin in tree decoding: a denoise step attends a
+//! fixed query chunk over the prefix cache plus its same-step appended K/V.
+constexpr int64_t kTreeDecodingPhaseExtent = static_cast<int64_t>(rt::ExecutionPhase::kDiffusionDenoise);
+} // namespace
 
 Pi05ActionRunner::Pi05ActionRunner(std::string const& engineDir, Pi05PolicyConfig const& config, cudaStream_t stream)
     : mConfig(config)
@@ -132,15 +139,42 @@ void Pi05ActionRunner::allocateTensors()
 void Pi05ActionRunner::allocatePagedInputs(int32_t maxBatch)
 {
     int32_t const pages = pagesPerSeq(mConfig);
-    int32_t const words = (mConfig.actionHorizon + 31) / 32;
+    int32_t const horizon = mConfig.actionHorizon;
+    int32_t const words = (horizon + 31) / 32;
 
     mKVPageTable = rt::Tensor({maxBatch, 2, pages}, rt::DeviceType::kGPU, DataType::kINT32, "pi05::kvPageTable");
     mKVPageTableHost
         = rt::Tensor({maxBatch, 2, pages}, rt::DeviceType::kCPU, DataType::kINT32, "pi05::kvPageTableHost");
-    mAttentionMask = rt::Tensor(
-        {maxBatch, mConfig.actionHorizon, words}, rt::DeviceType::kGPU, DataType::kINT32, "pi05::attentionMask");
+    mAttentionMask
+        = rt::Tensor({maxBatch * horizon, words}, rt::DeviceType::kGPU, DataType::kINT32, "pi05::attentionMask");
     mKVCacheStartIdx
         = rt::Tensor(std::vector<int64_t>{maxBatch}, rt::DeviceType::kGPU, DataType::kINT32, "pi05::kvCacheStartIdx");
+
+    mQueryLengths
+        = rt::Tensor(std::vector<int64_t>{maxBatch}, rt::DeviceType::kGPU, DataType::kINT32, "pi05::queryLengths");
+    mQueryLengthsHost
+        = rt::Tensor(std::vector<int64_t>{maxBatch}, rt::DeviceType::kCPU, DataType::kINT32, "pi05::queryLengthsHost");
+    mQueryStartOffsets = rt::Tensor(
+        std::vector<int64_t>{maxBatch + 1}, rt::DeviceType::kGPU, DataType::kINT32, "pi05::queryStartOffsets");
+    mQueryStartOffsetsHost = rt::Tensor(
+        std::vector<int64_t>{maxBatch + 1}, rt::DeviceType::kCPU, DataType::kINT32, "pi05::queryStartOffsetsHost");
+    std::fill_n(mQueryLengthsHost.dataPointer<int32_t>(), maxBatch, horizon);
+    int32_t* const offsets = mQueryStartOffsetsHost.dataPointer<int32_t>();
+    for (int32_t slot = 0; slot <= maxBatch; ++slot)
+    {
+        offsets[slot] = slot * horizon;
+    }
+    // Pinned members, written here and never again, so the copies below stay valid
+    // without a host-side sync.
+    CUDA_CHECK(cudaMemcpyAsync(mQueryLengths.rawPointer(), mQueryLengthsHost.rawPointer(),
+        mQueryLengthsHost.getMemoryCapacity(), cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(cudaMemcpyAsync(mQueryStartOffsets.rawPointer(), mQueryStartOffsetsHost.rawPointer(),
+        mQueryStartOffsetsHost.getMemoryCapacity(), cudaMemcpyHostToDevice, mStream));
+
+    // Both carriers select through their extent and neither is read, so one allocation
+    // serves both: the context-count carrier binds this address at extent 0.
+    mPhaseMarker = rt::Tensor(
+        std::vector<int64_t>{kTreeDecodingPhaseExtent}, rt::DeviceType::kGPU, DataType::kINT32, "pi05::phaseMarker");
 
     // Every query token attends to every other; the bits past the horizon are unread.
     CUDA_CHECK(cudaMemsetAsync(mAttentionMask.rawPointer(), 0xFF, mAttentionMask.getMemoryCapacity(), mStream));
@@ -301,11 +335,10 @@ void Pi05ActionRunner::initializeNoise(int32_t batch)
     }
     size_t const chunk = static_cast<size_t>(mConfig.actionHorizon) * static_cast<size_t>(mConfig.actionDim);
     float* data = mNoiseHost.dataPointer<float>();
-    std::mt19937 gen(static_cast<std::mt19937::result_type>(mNoiseSeed));
     std::normal_distribution<float> dist(0.0F, 1.0F);
     for (size_t i = 0; i < chunk; ++i)
     {
-        data[i] = dist(gen);
+        data[i] = dist(mNoiseGen);
     }
     // A seeded batch is one request replicated, so every entry starts from the same x_0.
     // Drawing per entry instead makes the spread the caller measures track the noise.
@@ -385,10 +418,12 @@ std::vector<float> Pi05ActionRunner::generate(std::vector<rt::Tensor>& kvCache, 
     stageRopeInputs(mRopeCache, mConfig.headDim, activeBatch, horizon, mPrefixLen, mActionRopeCosSin, mActionPosIds,
         mActionPosIdsHost, mStream);
 
+    // Token-major bindings: one row per query token, requests concatenated.
+    int64_t const execTokens = static_cast<int64_t>(activeBatch) * horizon;
     bool ok
         = mAction.context->setInputShape(binding_names::kNoiseTrajectory, Dims{3, {activeBatch, horizon, actionDim}});
-    ok &= mAction.context->setInputShape(binding_names::kRopeCosSin, Dims{3, {activeBatch, horizon, mConfig.headDim}});
-    ok &= mAction.context->setInputShape(binding_names::kAttentionPosId, Dims{2, {activeBatch, horizon}});
+    ok &= mAction.context->setInputShape(binding_names::kRopeCosSin, Dims{2, {execTokens, mConfig.headDim}});
+    ok &= mAction.context->setInputShape(binding_names::kAttentionPosId, Dims{1, {execTokens}});
     ok &= mAction.context->setTensorAddress(binding_names::kNoiseTrajectory, mNoiseDevice.rawPointer());
     ok &= mAction.context->setTensorAddress(binding_names::kAttentionPosId, mActionPosIds.rawPointer());
     ok &= mAction.context->setTensorAddress(binding_names::kActionPred, mPredDevice.rawPointer());
@@ -436,13 +471,22 @@ std::vector<float> Pi05ActionRunner::generate(std::vector<rt::Tensor>& kvCache, 
     Dims const cacheShape{5, {2, numPages, rt::kTOKENS_PER_PAGE, mConfig.numKVHeads, mConfig.headDim}};
     ok &= mAction.context->setInputShape(binding_names::kKVCacheStartIndex, Dims{1, {activeBatch}});
     ok &= mAction.context->setInputShape(binding_names::kKVPageTable, Dims{3, {activeBatch, 2, pages}});
-    ok &= mAction.context->setInputShape(
-        binding_names::kAttentionMask, Dims{3, {activeBatch, horizon, (horizon + 31) / 32}});
+    ok &= mAction.context->setInputShape(binding_names::kAttentionMask, Dims{2, {execTokens, (horizon + 31) / 32}});
     ok &= mAction.context->setTensorAddress(binding_names::kKVCacheStartIndex, mKVCacheStartIdx.rawPointer());
     ok &= mAction.context->setTensorAddress(binding_names::kKVPageTable, mKVPageTable.rawPointer());
     ok &= mAction.context->setTensorAddress(binding_names::kAttentionMask, mAttentionMask.rawPointer());
-    ok &= mAction.context->setInputShape(binding_names::kKVSeqLens, Dims{1, {activeBatch}});
-    ok &= mAction.context->setTensorAddress(binding_names::kKVSeqLens, mKVSeqLens.rawPointer());
+    // The two length inputs are not interchangeable: query_lengths counts the rows
+    // this request contributes, attention_sequence_lengths the cache behind them.
+    ok &= mAction.context->setInputShape(binding_names::kQueryLengths, Dims{1, {activeBatch}});
+    ok &= mAction.context->setTensorAddress(binding_names::kQueryLengths, mQueryLengths.rawPointer());
+    ok &= mAction.context->setInputShape(binding_names::kQueryStartOffsets, Dims{1, {activeBatch + 1}});
+    ok &= mAction.context->setTensorAddress(binding_names::kQueryStartOffsets, mQueryStartOffsets.rawPointer());
+    ok &= mAction.context->setInputShape(binding_names::kAttentionSequenceLengths, Dims{1, {activeBatch}});
+    ok &= mAction.context->setTensorAddress(binding_names::kAttentionSequenceLengths, mKVSeqLens.rawPointer());
+    ok &= mAction.context->setInputShape(binding_names::kExecutionPhaseMarker, Dims{1, {kTreeDecodingPhaseExtent}});
+    ok &= mAction.context->setTensorAddress(binding_names::kExecutionPhaseMarker, mPhaseMarker.rawPointer());
+    ok &= mAction.context->setInputShape(binding_names::kContextSequenceCountCarrier, Dims{1, {0}});
+    ok &= mAction.context->setTensorAddress(binding_names::kContextSequenceCountCarrier, mPhaseMarker.rawPointer());
     for (int32_t i = 0; i < mConfig.numHiddenLayers; ++i)
     {
         ok &= mAction.context->setInputShape(binding_names::formatActionKVCacheName(i).c_str(), cacheShape);
@@ -532,15 +576,29 @@ std::vector<float> Pi05ActionRunner::generate(std::vector<rt::Tensor>& kvCache, 
             }
             else
             {
-                mGraph = capturedGraph;
-                CUDA_CHECK(cudaGraphInstantiate(&mGraphExec, mGraph, nullptr, nullptr, 0));
-                mGraphKVCache.resize(static_cast<size_t>(mConfig.numHiddenLayers));
-                for (int32_t i = 0; i < mConfig.numHiddenLayers; ++i)
+                // Instantiate into locals first: handing the graph to the members before
+                // this succeeds would leak the previous one when a retry re-captures.
+                cudaGraphExec_t exec{nullptr};
+                cudaError_t const status = cudaGraphInstantiate(&exec, capturedGraph, nullptr, nullptr, 0);
+                if (status != cudaSuccess)
                 {
-                    mGraphKVCache[i] = kvCache[i].rawPointer();
+                    LOG_WARNING("pi0.5 denoise-loop graph instantiate failed (%s); using plain enqueues",
+                        cudaGetErrorString(status));
+                    cudaGraphDestroy(capturedGraph);
+                    mUseCudaGraph = false;
                 }
-                mGraphReady = true;
-                LOG_INFO("Captured the pi0.5 denoise loop (%d steps) into one CUDA graph", mNumDenoiseSteps);
+                else
+                {
+                    mGraph = capturedGraph;
+                    mGraphExec = exec;
+                    mGraphKVCache.resize(static_cast<size_t>(mConfig.numHiddenLayers));
+                    for (int32_t i = 0; i < mConfig.numHiddenLayers; ++i)
+                    {
+                        mGraphKVCache[i] = kvCache[i].rawPointer();
+                    }
+                    mGraphReady = true;
+                    LOG_INFO("Captured the pi0.5 denoise loop (%d steps) into one CUDA graph", mNumDenoiseSteps);
+                }
             }
             // The warmup ran the loop for real; whichever path follows starts from x_0 and t = 1.
             resetLoopState();

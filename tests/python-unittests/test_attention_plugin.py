@@ -2218,8 +2218,12 @@ def test_batch_permutation_invariance_decode():
 # --------------------------------------------------------------------------- #
 def _tree_attention_rounds(q_norm_gamma=None,
                            k_norm_gamma=None,
-                           shuffle_pages=False):
-    p = AttentionParams(batch_size=4, seq_len=4, **BASE)
+                           shuffle_pages=False,
+                           seq_len=4,
+                           execution_phase=None):
+    # max_seq_len has to admit the widest round, and the cache the rounds it commits.
+    base = dict(BASE, max_seq_len=max(BASE["max_seq_len"], seq_len))
+    p = AttentionParams(batch_size=4, seq_len=seq_len, **base)
     num_rounds = 5
     gen = torch.Generator().manual_seed(42)
     runner = AttentionPluginRunner(p,
@@ -2235,7 +2239,14 @@ def _tree_attention_rounds(q_norm_gamma=None,
     tree_mask = tree_mask.to(DEV)
 
     pos = 0
+    # get_tree_attention_mask gives every token past the four-node base tree the root
+    # plus itself, so they all sit one level under the root. Without the tail the ids
+    # would be shorter than the query, which silently stops testing the wide case.
     base_depth = torch.tensor([0, 1, 1, 2], dtype=torch.int32)
+    base_depth = torch.cat([
+        base_depth,
+        torch.ones(max(0, seq_len - base_depth.numel()), dtype=torch.int32)
+    ])
     for r in range(num_rounds):
         qkv = torch.randn((p.batch_size, p.seq_len, p.qkv_hidden_size),
                           generator=gen,
@@ -2270,9 +2281,14 @@ def _tree_attention_rounds(q_norm_gamma=None,
             k_norm_gamma=k_norm_gamma,
             rms_norm_eps=p.rms_norm_eps)
 
-        attn_out, plugin_kv = runner.run(qkv.to(torch.float16), plugin_kv,
-                                         ctx_len, combined, cache_idx, packed,
-                                         pos_ids)
+        attn_out, plugin_kv = runner.run(qkv.to(torch.float16),
+                                         plugin_kv,
+                                         ctx_len,
+                                         combined,
+                                         cache_idx,
+                                         packed,
+                                         pos_ids,
+                                         execution_phase=execution_phase)
         pk, pv = _plugin_kv_to_ref(plugin_kv, p)
 
         assert_close(f"tree-attn[r{r}]", ref_out, attn_out, 1e-2, 1e-2)
@@ -2298,8 +2314,17 @@ def _tree_attention_rounds(q_norm_gamma=None,
         pos += int(len(accepted))
 
 
-def test_tree_attention():
-    _tree_attention_rounds()
+# 50 is the pi0.5 ALOHA action horizon: the widest chunk any model sends through this
+# path, and the first that needs two words of packed mask per query token.
+@pytest.mark.parametrize("seq_len", [4, 50])
+def test_tree_attention(seq_len):
+    _tree_attention_rounds(seq_len=seq_len)
+
+
+# The cases above reach the tree kernel through a spec-decode phase. pi0.5 reaches it
+# through kDiffusionDenoise, which the plugin resolves on a separate branch.
+def test_tree_attention_diffusion_phase():
+    _tree_attention_rounds(seq_len=50, execution_phase=6)
 
 
 def test_tree_attention_shuffled_page_table():

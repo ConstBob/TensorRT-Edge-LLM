@@ -22,6 +22,7 @@
 
 #include <cerrno>
 #include <cstdlib>
+#include <exception>
 #include <getopt.h>
 #include <iostream>
 #include <limits>
@@ -81,7 +82,7 @@ bool isSupportedComponent(std::string const& component)
 }
 
 //! A numeric option, or false. Reported through the usage path rather than thrown:
-//! argument parsing runs before main's try block.
+//! argument parsing runs before the try block below.
 bool parseInt(char const* text, int32_t& out)
 {
     if (text == nullptr)
@@ -147,10 +148,20 @@ int main(int argc, char** argv)
     }
     gLogger.setLevel(args.debug ? nvinfer1::ILogger::Severity::kVERBOSE : nvinfer1::ILogger::Severity::kINFO);
 
-    std::vector<std::string> const components
-        = args.component == "all" ? pi05::policyComponents(args.onnxDir) : std::vector<std::string>{args.component};
-    if (!pi05::buildPi05Policy(args.onnxDir, args.engineDir, components, args.maxBatchSize))
+    // A manifest that parses but carries a wrong field type reaches the JSON accessors
+    // as an exception, not a parse error, so it needs a boundary here to be reported.
+    try
     {
+        std::vector<std::string> const components
+            = args.component == "all" ? pi05::policyComponents(args.onnxDir) : std::vector<std::string>{args.component};
+        if (!pi05::buildPi05Policy(args.onnxDir, args.engineDir, components, args.maxBatchSize))
+        {
+            return EXIT_FAILURE;
+        }
+    }
+    catch (std::exception const& error)
+    {
+        LOG_ERROR("pi0.5 policy build failed: %s", error.what());
         return EXIT_FAILURE;
     }
     LOG_INFO("pi0.5 policy build complete: %s", args.engineDir.c_str());

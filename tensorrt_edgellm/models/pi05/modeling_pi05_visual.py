@@ -102,16 +102,18 @@ class Pi05VisionAttention(nn.Module):
             return x.view(bsz, seq_len, self.num_heads,
                           self.head_dim).transpose(1, 2)
 
-        q = _heads(self.q_proj(hidden_states)) * self.qk_scale
+        q = _heads(self.q_proj(hidden_states))
         k = _heads(self.k_proj(hidden_states))
         v = _heads(self.v_proj(hidden_states))
 
+        # Scaled inside the attention, as openpi does. head_dim is 72 here, so the
+        # factor is not a power of two and pre-scaling would round every query element.
         attn_output = attention_onnx(q.to(io_type),
                                      k.to(io_type),
                                      v.to(io_type),
                                      attn_mask=None,
                                      is_causal=False,
-                                     scale=1.0)
+                                     scale=self.qk_scale)
         attn_output = attn_output.transpose(1, 2).reshape(bsz, seq_len, -1)
         return self.out_proj(attn_output)
 

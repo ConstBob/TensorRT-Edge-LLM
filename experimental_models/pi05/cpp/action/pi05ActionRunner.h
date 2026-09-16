@@ -21,6 +21,7 @@
 #include "common/tensor.h"
 
 #include <cuda_runtime.h>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -57,10 +58,12 @@ public:
         return mMaxBatch;
     }
 
-    //! \brief Set the random seed for the initial noise trajectory.
+    //! \brief Reseed the generator that draws the initial noise trajectory.
+    //! It advances across requests, as openpi draws a fresh x_0 per inference;
+    //! reseeding is what makes a run reproducible.
     void setNoiseSeed(int32_t seed) noexcept
     {
-        mNoiseSeed = seed;
+        mNoiseGen.seed(static_cast<std::mt19937::result_type>(seed));
     }
 
     //! \brief Use an externally supplied x_0 instead of seeding one locally.
@@ -93,7 +96,7 @@ public:
 private:
     void allocateTensors();
     //! Build the request-invariant paged-attention inputs (identity page table,
-    //! all-ones mask, tree-decoding discriminator).
+    //! all-ones mask, uniform query geometry, tree-decoding phase carrier).
     void allocatePagedInputs(int32_t maxBatch);
     //! Fill the identity page table for a pool of \p numPages pages per plane.
     //! The V plane's ids are the K ids offset by that count.
@@ -120,7 +123,7 @@ private:
     int32_t mMaxBatch{1};
     int32_t mActiveBatch{1};
     int32_t mPrefixLen{0};
-    int32_t mNoiseSeed{0};
+    std::mt19937 mNoiseGen{0};
     std::vector<float> mExternalNoise;
     bool mUseCudaGraph{false};
     bool mGraphReady{false};
@@ -138,12 +141,22 @@ private:
     rt::Tensor mKVPageTableHost; //!< pinned staging for mKVPageTable
 
     //! Paged-pool exports only. Request-invariant once built: an identity page table,
-    //! an all-ones mask making the action tokens mutually visible, and the shape-only
-    //! tensor whose non-empty length selects tree decoding over prefill.
+    //! an all-ones mask making the action tokens mutually visible, and the start index
+    //! the tree-decoding path leaves unread.
     rt::Tensor mKVPageTable;
     rt::Tensor mAttentionMask;
     rt::Tensor mKVCacheStartIdx;
     int64_t mPageTableNumPages{-1};
+
+    //! Token-major query geometry. Every request contributes exactly one action
+    //! horizon of rows, so both are staged once and never restaged.
+    rt::Tensor mQueryLengths;          //!< [B] int32, actionHorizon
+    rt::Tensor mQueryLengthsHost;      //!< pinned staging for mQueryLengths
+    rt::Tensor mQueryStartOffsets;     //!< [B + 1] int32, slot * actionHorizon
+    rt::Tensor mQueryStartOffsetsHost; //!< pinned staging for mQueryStartOffsets
+
+    //! Shape-only carriers: the plugin reads the bound extent, never the payload.
+    rt::Tensor mPhaseMarker; //!< extent = rt::ExecutionPhase::kDiffusionDenoise
 
     //! [maxPrefixLen + actionHorizon, headDim] packed (cos|sin) for every position; the
     //! expert reads the rows the prefix did not.

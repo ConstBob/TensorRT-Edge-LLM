@@ -91,7 +91,7 @@ void printUsage(char const* programName, pi05::Pi05Contract const* contract)
                  "\n  Raw policy mode -- a real observation in, robot actions out:\n"
                  "  --inputFile  JSON request: task, state, and cameras keyed by contract name.\n";
     std::cerr << (contract != nullptr
-            ? "               Cameras: " + pi05::cameraOrderSummary(contract->cameraNames) + "\n"
+            ? "               Cameras: " + pi05::cameraOrderSummary(contract->cameras) + "\n"
             : std::string("               Pass --engineDir with --help to list the camera names.\n"));
     std::cerr << "\n  Canonical tensor mode -- preprocessed tensors in, normalized [B, H, 32] out:\n"
                  "  --pixelValues  fp16 [views, 3, S, S] views, as a raw dump of the tensor's bytes.\n"
@@ -256,7 +256,7 @@ int main(int argc, char** argv)
         {
             observation = pi05::readObservation(args.inputFile);
             observation.batch = args.batch;
-            LOG_INFO("pi0.5 camera order: %s", pi05::cameraOrderSummary(policy.cameraNames()).c_str());
+            LOG_INFO("pi0.5 camera order: %s", pi05::cameraOrderSummary(policy.cameras()).c_str());
         }
         else
         {
@@ -289,7 +289,11 @@ int main(int argc, char** argv)
         }
         pi05::Pi05ActionChunk const& chunk = *last;
 
-        LOG_INFO("pi0.5 request: %d view(s) + %zu language tokens -> prefix %d", views, chunk.tokenIds.size(),
+        // Derived, not the slot count: a request that omits an optional camera runs fewer
+        // views than the contract names, and the prefix is what says how many.
+        int32_t const activeViews
+            = (runtime.getPrefixLen() - static_cast<int32_t>(chunk.tokenIds.size())) / cfg.numImageTokens;
+        LOG_INFO("pi0.5 request: %d view(s) + %zu language tokens -> prefix %d", activeViews, chunk.tokenIds.size(),
             runtime.getPrefixLen());
         if (!chunk.prompt.empty())
         {

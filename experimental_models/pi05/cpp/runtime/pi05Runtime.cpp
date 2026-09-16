@@ -194,11 +194,15 @@ rt::Tensor const& Pi05Runtime::assemblePrefix(
                 + std::to_string(i) + " is outside the embedding table's " + std::to_string(vocabSize) + " rows");
         }
     }
-    // Against the allocation, not the current shape: mTokenIds is reshaped per request.
-    if (numTokens > mConfig.maxPrefixLen)
+    // The engine bound is on the assembled prefix, not on the language tokens alone, and
+    // against the allocation rather than the current shape: mInputsEmbeds is reshaped per
+    // request. Checked here so the cause is named instead of surfacing as a failed prefill.
+    if (prefixLen > mConfig.maxPrefixLen)
     {
-        throw std::runtime_error("pi0.5 prompt has " + std::to_string(numTokens)
-            + " tokens, more than the prefix capacity " + std::to_string(mConfig.maxPrefixLen));
+        throw std::runtime_error("pi0.5 prefix is " + std::to_string(imageTokens) + " image + "
+            + std::to_string(numTokens) + " language = " + std::to_string(prefixLen)
+            + " tokens, more than the capacity " + std::to_string(mConfig.maxPrefixLen)
+            + " the engines were built for");
     }
     if (!mInputsEmbeds.reshape({batch, prefixLen, mConfig.hiddenSize}))
     {
@@ -498,9 +502,39 @@ bool Pi05Runtime::prefill(rt::Tensor const& inputsEmbeds)
     return true;
 }
 
+//! Drains the stream on the failure and exception paths only. The success path already
+//! ends in a synchronizing D2H, so a retry after an early return is the one case where
+//! the caller could otherwise rewrite a pinned staging buffer still being read.
+class StreamDrainOnFailure
+{
+public:
+    StreamDrainOnFailure(cudaStream_t stream) noexcept
+        : mStream(stream)
+    {
+    }
+
+    ~StreamDrainOnFailure()
+    {
+        if (!mSucceeded)
+        {
+            cudaStreamSynchronize(mStream);
+        }
+    }
+
+    void succeeded() noexcept
+    {
+        mSucceeded = true;
+    }
+
+private:
+    cudaStream_t mStream;
+    bool mSucceeded{false};
+};
+
 std::vector<float> Pi05Runtime::generate(
     rt::Tensor const& pixelValues, std::vector<int32_t> const& tokenIds, int32_t batch)
 {
+    StreamDrainOnFailure drain(mStream);
     rt::Tensor const& imageFeatures = mVisualRunner->encode(pixelValues);
     markStage(0);
     rt::Tensor const& inputsEmbeds = assemblePrefix(imageFeatures, tokenIds, batch);
@@ -511,11 +545,13 @@ std::vector<float> Pi05Runtime::generate(
     }
     markStage(2);
     std::vector<float> actions = mActionRunner->generate(mKVCache, mActiveBatch, mPrefixLen);
-    if (!actions.empty())
+    if (actions.empty())
     {
-        collectStageTimes();
-        logBatchSpread(actions, batch);
+        return actions;
     }
+    collectStageTimes();
+    logBatchSpread(actions, batch);
+    drain.succeeded();
     return actions;
 }
 

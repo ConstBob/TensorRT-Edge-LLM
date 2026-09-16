@@ -68,6 +68,7 @@ tests:
   - tests/python-unittests/test_attention_plugin.py::test_ragged_prefill_batch_invariance
   - tests/python-unittests/test_attention_plugin.py::test_batch_permutation_invariance_decode
   - tests/python-unittests/test_attention_plugin.py::test_tree_attention
+  - tests/python-unittests/test_attention_plugin.py::test_tree_attention_diffusion_phase
   - tests/python-unittests/test_attention_plugin.py::test_tree_attention_head512_prefill_then_decode
   - tests/python-unittests/test_attention_plugin.py::test_tree_attention_topology
   - tests/python-unittests/test_attention_plugin.py::test_prefill_decode_handoff
@@ -323,3 +324,8 @@ tests:
   - tests/python-unittests/test_pipeline_context_reuse.py::test_context_reuse_fixture_has_strict_prefix_seed
   - tests/python-unittests/test_pipeline_context_reuse.py::test_context_reuse_cold_and_hit_outputs_are_token_identical
   - tests/python-unittests/test_pipeline_context_reuse.py::test_spec_prefill_evict_fixture_and_survivor_equivalence
+
+  # pi0.5 action comparator tests
+  - tests/python-unittests/test_pi05_action_comparator.py::test_a_bad_second_entry_is_not_diluted_by_a_good_first
+  - tests/python-unittests/test_pi05_action_comparator.py::test_a_single_entry_passes
+  - tests/python-unittests/test_pi05_action_comparator.py::test_every_entry_must_clear_the_ceiling
