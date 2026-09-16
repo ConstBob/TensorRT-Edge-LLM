@@ -568,6 +568,7 @@ class NemotronHMtpDraftModel(nn.Module):
                         [f"present_key_values_{i}" for i in range(na)])
 
         tokens = torch.export.Dim("physical_tokens", min=1, max=8_388_608)
+        logits_rows = torch.export.Dim("logits_rows", min=1, max=8_388_608)
         sequences = torch.export.Dim("num_sequences", min=1, max=256)
         context_sequences = torch.export.Dim("num_context_sequences",
                                              min=0,
@@ -601,7 +602,7 @@ class NemotronHMtpDraftModel(nn.Module):
             0: sequences,
             2: max_pages
         }, {
-            0: sequences
+            0: logits_rows
         }, {
             0: tokens
         }, {
