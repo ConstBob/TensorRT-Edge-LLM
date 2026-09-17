@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # Bring up Cosmos3-Edge Reasoner OpenAI server on a Lepton GPU node.
 # Expects a source checkout at EDGELLM_SRC (cloned by the endpoint command).
-set -euxo pipefail
+# Keep the Lepton GPU if a step fails. Bare `set -e` + exit releases the replica.
+set -euo pipefail
+hold_gpu() {
+  echo "REASONER_HOLDING_GPU status=${1:-unknown}"
+  sleep infinity
+}
+trap 'hold_gpu ERR' ERR
 
 EDGELLM_SRC="${EDGELLM_SRC:-/tmp/edgellm}"
 WORK_ROOT="${WORK_ROOT:-/mnt/cosmos-eval/edgellm-reasoner-1643}"
@@ -102,10 +108,15 @@ export EDGELLM_PLUGIN_PATH="$(find "${BUILD_DIR}" -name 'libNvInfer_edgellm_plug
 echo REASONER_PYBIND_OK
 
 echo OPENAI_SERVE_STARTING
-exec "${PY}" -m experimental.server.cli \
+while true; do
+  "${PY}" -m experimental.server.cli \
     "${REASONING_CHECKPOINT}" \
     --host 0.0.0.0 \
     --port 8000 \
     --cache-dir "${CACHE_DIR}" \
     --max-image-tokens 4096 \
-    --max-image-tokens-per-image 4096
+    --max-image-tokens-per-image 4096 \
+    && echo REASONER_SERVE_EXIT_0
+  echo REASONER_SERVE_DIED_HOLDING_GPU
+  sleep 30
+done
