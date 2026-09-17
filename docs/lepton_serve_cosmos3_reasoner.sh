@@ -239,16 +239,28 @@ else
   PLUGIN_SO="$(find "${NATIVE_DIR}" -name 'libNvInfer_edgellm_plugin.so' -print -quit)"
 fi
 SO_DIR="$(dirname "${RUNTIME_SO}")"
+# experimental.server._import_runtime does not honor top-level
+# ``import _edgellm_runtime`` from PYTHONPATH. It looks for
+# EDGELLM_PYBIND_DIR, BUILD_DIR/pybind, then repo build/pybind.
+export EDGELLM_PYBIND_DIR="${SO_DIR}"
+mkdir -p "${EDGELLM_SRC}/build/pybind"
+ln -sfn "${RUNTIME_SO}" "${EDGELLM_SRC}/build/pybind/$(basename "${RUNTIME_SO}")"
+ln -sfn "${PLUGIN_SO}" "${EDGELLM_SRC}/build/pybind/$(basename "${PLUGIN_SO}")"
 export PYTHONPATH="${SO_DIR}:${EDGELLM_SRC}${PYTHONPATH:+:${PYTHONPATH}}"
 export EDGELLM_PLUGIN_PATH="${PLUGIN_SO}"
 "${PY}" -c "import _edgellm_runtime, experimental.server.cli; print('PYBIND_OK', _edgellm_runtime.__file__)"
+cd "${EDGELLM_SRC}"
+"${PY}" -c "from experimental.server.runtime.engine import _import_runtime; m=_import_runtime(); print('RUNTIME_IMPORT_OK', getattr(m, '__file__', m))"
 echo REASONER_PYBIND_OK
 
 echo OPENAI_SERVE_STARTING
 # ``python -m experimental.server.cli`` only imports the module (no
 # ``if __name__``) and exits 0 in ~400ms. The package entry is
 # ``python -m experimental.server`` / ``experimental.server.cli:main``.
+# Disable ERR trap around serve: a non-zero python exit must retry,
+# not sleep-infinity the GPU.
 while true; do
+  trap - ERR
   set +e
   "${PY}" -m experimental.server \
     "${REASONING_CHECKPOINT}" \
@@ -259,6 +271,7 @@ while true; do
     --max-image-tokens-per-image 4096
   serve_rc=$?
   set -e
+  trap 'hold_gpu ERR' ERR
   echo "REASONER_SERVE_EXIT_${serve_rc}"
   echo "REASONER_SERVE_DIED_HOLDING_GPU"
   sleep 30
