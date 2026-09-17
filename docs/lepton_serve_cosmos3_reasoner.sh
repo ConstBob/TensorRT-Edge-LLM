@@ -200,19 +200,29 @@ if [ ! -f "${EDGELLM_SRC}/3rdParty/xgrammar/include/xgrammar/xgrammar.h" ]; then
   hold_gpu NO_XGRAMMAR
 fi
 
+CUTE_ROOT="${WORK_ROOT}/cutedsl"
+CUTE_ARTIFACT="${CUTE_ROOT}/x86_64/sm_${SM}"
+mkdir -p "${CUTE_ROOT}" "$(dirname "${EDGELLM_SRC}/cpp/kernels/cuteDSLArtifact")"
+rm -rf "${EDGELLM_SRC}/cpp/kernels/cuteDSLArtifact"
+ln -s "${CUTE_ROOT}" "${EDGELLM_SRC}/cpp/kernels/cuteDSLArtifact"
 CUTE_ARGS=(-DENABLE_CUTE_DSL=fmha "-DCUTE_DSL_ARTIFACT_TAG=sm_${SM}")
-if [ ! -d "${EDGELLM_SRC}/cpp/kernels/cuteDSLArtifact/x86_64/sm_${SM}" ] \
-   && [ ! -e "${EDGELLM_SRC}/kernelSrcs/cuteDSLPrebuilt/cutedsl_x86_64_sm_${SM}_cuda13.tar.gz" ]; then
-  if (uv pip install --python "${PY}" --no-cache-dir 'nvidia-cutlass-dsl[cu13]==4.7.0' cupy-cuda13x cuda-python \
-        || uv pip install --python "${PY}" --no-cache-dir --break-system-packages \
-             'nvidia-cutlass-dsl[cu13]==4.7.0' cupy-cuda13x cuda-python) \
-     && "${PY}" "${EDGELLM_SRC}/kernelSrcs/build_cutedsl.py" --kernels fmha --gpu_arch "sm_${SM}" --arch x86_64; then
-    echo "generated CuTe DSL fmha artifacts for sm_${SM}"
-  else
-    echo "WARNING: CuTe generate failed; ENABLE_CUTE_DSL=OFF"
-    CUTE_ARGS=(-DENABLE_CUTE_DSL=OFF)
-  fi
+if [ ! -e "${CUTE_ARTIFACT}/metadata.json" ]; then
+  echo "CUTE_FMHA_GENERATE sm_${SM}"
+  # build_cutedsl.py pins CuPy exactly. An unpinned install selected 14.2.0,
+  # failed its dependency check (requires 13.6.0), and silently disabled the
+  # only ViTAttentionPlugin backend that supports Cosmos3's head size 72.
+  uv pip install --python "${PY}" --no-cache-dir --break-system-packages \
+      'nvidia-cutlass-dsl[cu13]==4.7.0' 'cupy-cuda13x==13.6.0' cuda-python
+  "${PY}" "${EDGELLM_SRC}/kernelSrcs/build_cutedsl.py" \
+      --kernels fmha --gpu_arch "sm_${SM}" --arch x86_64 \
+      --output_dir "${CUTE_ROOT}" --clean
 fi
+if [ ! -s "${CUTE_ARTIFACT}/libcutedsl_x86_64.a" ] \
+   || [ ! -s "${CUTE_ARTIFACT}/metadata.json" ]; then
+  echo "FATAL: CuTe FMHA artifact missing for sm_${SM}"
+  hold_gpu NO_CUTE_FMHA
+fi
+echo "CUTE_FMHA_READY ${CUTE_ARTIFACT}"
 
 CUDA_DIR="$(readlink -f /usr/local/cuda 2>/dev/null || true)"
 if [ -z "${CUDA_DIR}" ] || [ ! -e "${CUDA_DIR}/include/cuda_runtime_api.h" ]; then
@@ -224,8 +234,11 @@ PYBIND_DIR="$("${PY}" -m pybind11 --cmakedir)"
 
 echo "CUDA_DIR=${CUDA_DIR} CUDA_CTK_VERSION=${CUDA_CTK_VERSION} TRT_PACKAGE_DIR=${TRT_PACKAGE_DIR}"
 NATIVE_DIR="${WORK_ROOT}/native"
-SOURCE_REV="$(git -C "${EDGELLM_SRC}" rev-parse HEAD)"
-PYBIND_KEY="sm${SM}-src${SOURCE_REV}"
+# Key only native build inputs. Serve-script/doc-only commits should not force
+# another 368-object rebuild, while any C++/kernel/CMake change still does.
+NATIVE_SOURCE_KEY="$(git -C "${EDGELLM_SRC}" ls-files -s \
+    CMakeLists.txt cmake cpp kernelSrcs pybind | sha256sum | cut -d' ' -f1)"
+PYBIND_KEY="sm${SM}-cutefmha-native${NATIVE_SOURCE_KEY}"
 mkdir -p "${NATIVE_DIR}"
 RUNTIME_SO="$(find "${NATIVE_DIR}" -name '*_edgellm_runtime*.so' -print -quit || true)"
 PLUGIN_SO="$(find "${NATIVE_DIR}" -name 'libNvInfer_edgellm_plugin.so' -print -quit || true)"
