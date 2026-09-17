@@ -26,9 +26,12 @@ sh .gitlab/ci/scripts/wheel_ci.sh ci-precheck
 
 The generated `wheel-generated.yml` contains the concrete build and integration
 matrices; do not edit it directly. For each enabled x86_64 and aarch64 variant,
-integration installs the assembled wheel in a fresh target environment, imports
-it, builds an engine, and runs inference. `wheel_integration_gate` records the
-exact qualified filename and SHA-256 digest for every selected Python ABI.
+integration first installs the base wheel in a fresh target environment with
+CUDA/TensorRT, rejects optional workflow packages, and runs the documented
+direct-build/native-inference example. Only after that succeeds does it install
+`[server]` and repeat build/inference through the high-level API. Both phases
+must report generated text and tokens; a successful import is not sufficient.
+`wheel_integration_gate` records the exact qualified filename and SHA-256 digest for every selected Python ABI.
 
 ## Public wheel release
 

@@ -32,6 +32,11 @@ TensorRT Edge-LLM is NVIDIA's C++ inference runtime for text, vision, audio, spe
 
 Check the [**Official Support Matrix**](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/support-matrix.html), then follow the [**Quick Start Guide**](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/quick-start-guide.html). Checkpoint IDs are listed in [**Supported Models**](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/supported-models.html).
 
+For a supported target, install a [published Python wheel](docs/source/user_guide/getting_started/installation.md#published-python-wheel)
+without compiling Edge-LLM. Use `tensorrt-edgellm[server]` for the high-level
+Python API and HTTP serving; see the [extras guide](docs/source/user_guide/getting_started/installation.md#optional-python-dependencies)
+for export/tools dependencies and the minimal base workflow.
+
 ---
 
 ## Documentation

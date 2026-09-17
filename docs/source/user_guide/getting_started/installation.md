@@ -488,24 +488,126 @@ native payload for that architecture; at runtime, Edge-LLM selects one exact
 match for the platform release, CUDA and TensorRT SONAMEs, and GPU SM listed in
 the [Wheel Packaging Matrix](support-matrix.md#wheel-packaging-matrix).
 
-Install the CUDA and TensorRT packages specified by the support matrix before
-installing the wheel. The wheel packages Edge-LLM's Python APIs, native runtime,
-plugins, and [checkpoint-direct builder](direct-engine-builder.md), but it does
-not replace the platform CUDA or TensorRT installation.
+Release wheels are published on PyPI and NVIDIA's Python package index. Install
+on the target machine; no Edge-LLM checkout, CMake build, or CuTe DSL download is
+needed. Install a compatible NVIDIA driver and the CUDA/TensorRT versions
+listed in the support matrix, including the matching TensorRT Python package.
+For a standalone TensorRT SDK, install its Python wheel for your interpreter
+and expose its shared libraries before starting Python:
+
+```bash
+export TRT_PACKAGE_DIR=/path/to/TensorRT
+export LD_LIBRARY_PATH="$TRT_PACKAGE_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+```
+
+`LD_LIBRARY_PATH` is needed only when the libraries are not already on the
+system loader search path. `TRT_PACKAGE_DIR` is a convenience in this example
+and a source-build setting; setting it alone does not configure wheel loading.
+No TensorRT-specific `PATH` or `PYTHONPATH` change is needed when its Python
+bindings are installed in the active environment.
+
+### Recommended: Python API and server
+
+Use the `server` extra for the high-level Python API, model downloads, and HTTP
+serving. It does not install the PyTorch/ONNX export toolchain.
+Use CPython 3.10, 3.11, or 3.12 below. `--system-site-packages` exposes a
+platform-provided TensorRT Python package; it does not install TensorRT.
 
 ```bash
 python3 -m venv --system-site-packages .venv-edgellm
 source .venv-edgellm/bin/activate
 python -m pip install --upgrade pip
-python -m pip install "tensorrt-edgellm==0.11.0"
-python -c "import tensorrt_edgellm; print(tensorrt_edgellm.__version__)"
-tensorrt-edgellm-build --help
+python -m pip install --only-binary=tensorrt-edgellm \
+  --extra-index-url https://pypi.nvidia.com "tensorrt-edgellm[server]==0.11.0"
+python -c "import tensorrt; from tensorrt_edgellm import runtime; runtime.load()"
 ```
 
-Install `tensorrt-edgellm[export]` for the PyTorch/ONNX exporter or
-`tensorrt-edgellm[tools]` for export, quantization, LoRA, vocabulary, and audio
-tools. Model-specific C++ executables under `experimental_models/` remain part
-of the source workflow rather than the Python wheel.
+Run the check outside a source checkout so it imports the installed wheel.
+Unlike an import or `--help` alone, `runtime.load()` validates native payload
+selection. A matching wheel filename does not guarantee a matching runtime
+stack; if selection fails, use a listed configuration or build from source.
+
+To serve a model, run outside a source checkout:
+
+```bash
+tensorrt-edgellm-serve Qwen/Qwen3.5-0.8B
+```
+
+The first launch downloads the checkpoint and builds its engines. For gated
+models, accept the provider's terms and run `hf auth login` first.
+
+### Optional Python dependencies
+
+All extras use the same wheel and native payloads; they select additional pip
+dependencies, not separate builds. Commands may be present without their
+dependencies: installing the base package does not enable every workflow.
+
+| Install selection | Use case | Main additional dependencies |
+|---|---|---|
+| No extra | Low-level native runtime; direct builds from local Safetensors checkpoints | Base dependencies: NumPy and CUDA Python |
+| `[server]` (recommended for inference) | High-level `LLM` API, Hub downloads, and HTTP serving | Hugging Face Hub, FastAPI, Uvicorn, PyAV |
+| `[export]` | Checkpoint-to-ONNX export | PyTorch, Transformers, ONNX, ONNX Script, Safetensors |
+| `[tools]` | Export plus quantization, LoRA, vocabulary, and audio tools | Export dependencies plus ModelOpt, PEFT, datasets, and audio tooling |
+| `[server-tools]` | Optional Transformers-based reference/tooling environment | Transformers; combine with `[server]` for serving |
+| `[native-build]` | Building Python bindings from source, not using published wheels | pybind11 |
+
+`[tools]` includes the export dependencies, but not the complete server stack.
+For serving and all export/tools workflows, install
+`"tensorrt-edgellm[server,tools]==0.11.0"` using the pip command above. Extras can
+also be added later in the same environment. `[builder]` is an empty
+compatibility alias (the direct builder is in the base package); `[dev]`
+currently adds no dependencies. No extra installs the platform CUDA/TensorRT
+stack. Do not install `.` or use `-e .` over a published wheel unless switching
+to the source workflow.
+
+### Minimal installation (advanced)
+
+Use the base wheel for low-level native integration without the server/export
+dependencies. Keep the same CUDA/TensorRT prerequisites, but use a fresh venv
+without system site-packages for the base-only check. Replace the TensorRT
+wheel path below with the matching SDK wheel:
+
+```bash
+python3 -m venv .venv-edgellm-base
+source .venv-edgellm-base/bin/activate
+python -m pip install "/path/to/TensorRT/python/tensorrt-<version>-<python-abi>-none-linux_<arch>.whl"
+python -m pip install --only-binary=tensorrt-edgellm \
+  --extra-index-url https://pypi.nvidia.com "tensorrt-edgellm==0.11.0"
+```
+
+For a concrete base-only workflow,
+{download}`save the build-and-infer example <../../../../examples/python/installed_wheel_build_and_infer.py>`
+as a standalone file outside the checkout. Provide a local, complete
+`Qwen2.5-0.5B-Instruct` Safetensors checkpoint and a disposable output directory:
+
+```bash
+python -I /path/to/installed_wheel_build_and_infer.py \
+  /path/to/Qwen2.5-0.5B-Instruct /tmp/edgellm-base-engines \
+  --workflow base --require-base-only
+```
+
+This builds a text engine directly, then runs a prompt through
+`tensorrt_edgellm.runtime.LLMRuntime` and checks for generated text and tokens.
+The output directory is replaced. `--require-base-only` rejects common optional
+workflow packages so they cannot hide missing base dependencies.
+The native inference portion also works with an existing compatible text
+engine directory (this example's output directory):
+
+Save the function below with `from pathlib import Path` and
+`from typing import Tuple`, then call
+`_infer_base(Path("/path/to/checkpoint"), Path("/path/to/engines"), "Hello", 32)`:
+
+```{literalinclude} ../../../../examples/python/installed_wheel_build_and_infer.py
+:language: python
+:pyobject: _infer_base
+```
+
+The base path does not download checkpoints. PyTorch `.bin` checkpoints need
+PyTorch from `[export]` or `[tools]`; high-level serving uses `[server]`.
+
+C++ example executables, including those under `experimental_models/`, remain
+part of the source workflow. See the [Python server quick start](quick-start-guide.md#option-2-one-line-python-server)
+or [direct builder guide](direct-engine-builder.md) for wheel-based inference.
 
 ## Build a local wheel from source
 

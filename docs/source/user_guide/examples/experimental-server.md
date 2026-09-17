@@ -9,19 +9,18 @@ Anthropic HTTP APIs. ONNX is not used by this path.
 
 ## Install
 
-Build TensorRT Edge-LLM with Python bindings, then install the package and
-server dependencies in the same environment:
+For a supported target, follow [published-wheel installation](../getting_started/installation.md#published-python-wheel)
+and select `tensorrt-edgellm[server]==0.11.0`. The wheel includes the runtime
+bindings, builder, and plugin; no checkout, `native-build` extra, or CMake build
+is needed. Run the examples in that environment outside a source checkout.
 
-```bash
-cd /path/to/TensorRT-Edge-LLM
-pip install -e ".[server,builder,native-build]"
-```
+Alternatively, complete the [source build and server setup](../getting_started/installation.md#install-and-launch-the-python-server).
+Do not reinstall the source package over a published wheel.
 
-For a prebuilt TensorRT Edge-LLM package that already contains the Python
-runtime extension, omit `native-build`. A cache miss uses the builder extra to
-copy the model-provided Jinja into the runtime bundle. Pantor Inja loads that
-file directly in C++; serving a built bundle does not require Jinja2 or the
-PyTorch/ONNX exporter.
+For gated checkpoints, accept the provider's terms and run `hf auth login`.
+The server extra supplies `huggingface-hub` for downloads. Model-provided Jinja
+templates run natively through Pantor Inja; serving does not require Jinja2 or
+the PyTorch/ONNX exporter.
 
 ## Python API
 
