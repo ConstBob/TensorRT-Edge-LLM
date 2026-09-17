@@ -43,11 +43,11 @@ fi
 uv pip install --python "${PY}" --no-cache-dir \
     pybind11==3.0.4 fastapi==0.139.2 uvicorn==0.51.0 \
     'huggingface-hub>=1.5.0,<2.0' av==17.1.0 python-multipart==0.0.32 \
-    'numpy==2.2.6' || \
+    'numpy==2.2.6' cuda-python || \
 uv pip install --python "${PY}" --no-cache-dir --break-system-packages \
     pybind11==3.0.4 fastapi==0.139.2 uvicorn==0.51.0 \
     'huggingface-hub>=1.5.0,<2.0' av==17.1.0 python-multipart==0.0.32 \
-    'numpy==2.2.6'
+    'numpy==2.2.6' cuda-python
 
 SM="${SM:-$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')}"
 echo "target SM: ${SM}"
