@@ -1118,7 +1118,7 @@ class LLM:
         config = self._visual_config()
         model_type = config.get("model_type", "")
         qwen_video_types = ("qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_5",
-                            "qwen3_omni")
+                            "qwen3_omni", "cosmos3_edge_vision")
         # Audio-side model types have no video path (qwen3_omni_audio_encoder,
         # qwen3_omni_code2wav, qwen3_asr*); the omni ones share the qwen3_omni
         # prefix, so exclude before the prefix match.
@@ -1143,7 +1143,8 @@ class LLM:
             raise ValueError(
                 f"video input is not supported for model_type={model_type!r}"
                 " in this runtime bundle; supported families: Qwen-VL "
-                "(qwen2_vl/qwen2_5_vl/qwen3_vl/qwen3_5/qwen3_omni), InternVL, "
+                "(qwen2_vl/qwen2_5_vl/qwen3_vl/qwen3_5/qwen3_omni), "
+                "Cosmos3-Edge, InternVL, "
                 "Nemotron-Omni, and Muse-Glimmer")
         self._video_family_cache = family
         return family

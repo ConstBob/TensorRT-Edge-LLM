@@ -209,6 +209,54 @@ def test_video_model_family_muse(tmp_path):
     assert llm._video_model_family() == "muse"
 
 
+def test_cosmos3_reasoner_routes_native_video_file(monkeypatch, tmp_path):
+    # Cosmos3 uses the Qwen-compatible native video decoder and visual runner.
+    eng = _engine()
+    root = tmp_path / "cosmos3"
+    (root / "visual").mkdir(parents=True)
+    (root / "visual" /
+     "config.json").write_text('{"model_type": "cosmos3_edge_vision"}')
+    (root / "visual" / "visual.engine").touch()
+    llm = eng.LLM.__new__(eng.LLM)
+    llm._media_dir = str(root)
+    assert llm._video_model_family() == "qwen"
+    captured = {}
+
+    def fake_load_video_buffer(rt,
+                               item,
+                               family,
+                               frame_limits=None,
+                               budget=None,
+                               pixel_budget=None,
+                               cu_budget=None):
+        captured.update(item=item, family=family)
+        return _FakeVideoBuffer(item["video_url"]["url"], frames=8), 0, 0, 0
+
+    import experimental.server.media.video_sampling as vs_mod
+    monkeypatch.setattr(vs_mod, "load_video_buffer", fake_load_video_buffer)
+    buffers = eng._load_image_buffers(None, [{
+        "role":
+        "user",
+        "content": [{
+            "type": "video_url",
+            "video_url": {
+                "url": "example.mp4"
+            }
+        }],
+    }], llm._video_model_family, lambda: {})
+
+    assert captured == {
+        "item": {
+            "type": "video_url",
+            "video_url": {
+                "url": "example.mp4"
+            }
+        },
+        "family": "qwen",
+    }
+    assert [buffer.video for buffer in buffers] == ["example.mp4"]
+
+
 def test_load_image_buffers_nemotron_minimum():
     # A Nemotron video buffer is built and its EVS token estimate is honored
     # against the request-wide engine minimum (no cu_seqlens binding).
