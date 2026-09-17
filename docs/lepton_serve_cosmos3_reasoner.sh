@@ -87,11 +87,24 @@ unpack_trt_debs() {
   for pkg in libnvinfer-headers-dev libnvinfer-headers-plugin-dev \
              libnvinfer-dev libnvinfer10 \
              libnvinfer-plugin-dev libnvinfer-plugin10 \
-             libnvinfer-vc-plugin-dev libnvinfer-vc-plugin10 \
-             libnvonnxparsers-dev libnvonnxparsers10 \
-             python3-libnvinfer; do
+             libnvonnxparsers-dev libnvonnxparsers10; do
     deb="${pkg}_${ver}_amd64.deb"
     echo "TRT_DEB fetching ${deb}"
+    curl -fsSL -o "${BUILD_DIR}/${deb}" "${EDGELLM_TRT_REPO}/${deb}"
+    dpkg-deb -x "${BUILD_DIR}/${deb}" "${dest}"
+  done
+  touch "${dest}/READY"
+}
+
+unpack_trt_python_debs() {
+  local ver="$1" dest="$2"
+  local pkg deb
+  # The existing Policy stage already has the 2.4 GB libnvinfer-dev package.
+  # Only these small packages are missing for the checkpoint-direct Python
+  # builder (roughly 1 MB total).
+  for pkg in libnvinfer-vc-plugin10 python3-libnvinfer; do
+    deb="${pkg}_${ver}_amd64.deb"
+    echo "TRT_PY_DEB fetching ${deb}"
     curl -fsSL -o "${BUILD_DIR}/${deb}" "${EDGELLM_TRT_REPO}/${deb}"
     dpkg-deb -x "${BUILD_DIR}/${deb}" "${dest}"
   done
@@ -115,14 +128,16 @@ mkdir -p "${WORK_ROOT}/tensorrt"
 exec 7>"${WORK_ROOT}/tensorrt.lock"
 flock 7
 if [ ! -e "${STAGED}/READY_FULL" ]; then
-  rm -rf "${STAGED}"
   mkdir -p "${STAGED}"
   POLICY_STAGE="/mnt/cosmos-eval/edgellm-b/tensorrt/${EDGELLM_TRT_FALLBACK}"
-  if [ -e "${POLICY_STAGE}/READY" ]; then
+  if [ ! -e "${STAGED}/READY" ] && [ -e "${POLICY_STAGE}/READY" ]; then
     echo "TRT_SEED_FROM_POLICY_STAGE ${POLICY_STAGE}"
     tar -C "${POLICY_STAGE}" --exclude='*.a' -cf - . | tar -C "${STAGED}" -xf -
   fi
-  unpack_trt_debs "${EDGELLM_TRT_FALLBACK}" "${STAGED}"
+  if [ ! -e "${STAGED}/READY" ]; then
+    unpack_trt_debs "${EDGELLM_TRT_FALLBACK}" "${STAGED}"
+  fi
+  unpack_trt_python_debs "${EDGELLM_TRT_FALLBACK}" "${STAGED}"
 fi
 flock -u 7
 
