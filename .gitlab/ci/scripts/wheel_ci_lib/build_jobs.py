@@ -112,7 +112,7 @@ def _prepare_cutedsl(python_bin: str, variant: str,
         "--variant",
         variant,
         "--artifact-dir",
-        str(config.REPO_ROOT / "kernelSrcs" / "cuteDSLPrebuilt"),
+        str(config.REPO_ROOT / "kernelSrcs" / "cuteDSLOssPrebuilt"),
     ],
                        cwd=config.REPO_ROOT,
                        env=common.build_environment(trt_dir))

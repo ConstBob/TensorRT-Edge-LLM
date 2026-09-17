@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
-from . import assemble, base, cutedsl, payload, verify
+from . import assemble, base, cutedsl, oss, payload, verify
 from .config import CONTRACT, REPO_ROOT, load_matrix
 
 
@@ -60,7 +60,8 @@ def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--artifact-dir",
         type=Path,
-        default=REPO_ROOT / "kernelSrcs" / "cuteDSLPrebuilt",
+        default=REPO_ROOT / "kernelSrcs" /
+        ("cuteDSLOssPrebuilt" if oss.enabled() else "cuteDSLPrebuilt"),
         help="Directory containing CuTe DSL archives and checksum files.")
     parser.add_argument(
         "--payload-root",

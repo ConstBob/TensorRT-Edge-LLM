@@ -129,3 +129,21 @@ build_cutedsl_docker_matrix:
       - kernelSrcs/cuteDSLPrebuilt/*.tar.gz
       - kernelSrcs/cuteDSLPrebuilt/*.tar.gz.sha256
       - .ci-telemetry-artifact/
+
+# Wheel kernels use a distinct output namespace; internal test kernels are unchanged.
+build_oss_cutedsl_docker_matrix:
+  extends: [build_cutedsl_docker_matrix, .wheel_rules]
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends git
+  script:
+    - >-
+      sh "$CI_PROJECT_DIR/.gitlab/ci/scripts/ci_run.sh" 0
+      "Build OSS wheel CuTeDSL kernels" --
+      python3 "$CI_PROJECT_DIR/packaging/wheel_cli.py" build-oss-cutedsl
+      --output-dir "$CI_PROJECT_DIR/kernelSrcs/cuteDSLOssPrebuilt"
+  artifacts:
+    name: "cutedsl-oss-matrix-${CI_COMMIT_SHORT_SHA}"
+    expire_in: 30 days
+    paths:
+      - kernelSrcs/cuteDSLOssPrebuilt/
+      - .ci-telemetry-artifact/

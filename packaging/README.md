@@ -237,3 +237,32 @@ The build commands require clean output directories and a clean tracked source
 checkout by default. Use distinct `--work-dir` and `--output-dir` paths for a
 new run. `--allow-dirty-source` and `--no-device-image-check` are explicit
 development overrides and must not be used for release artifacts.
+
+## OSS release builds (internal checkout)
+
+Wheel tooling stages a tracked-source copy, including pinned submodules, and
+applies the repository OSS policy before packaging Python or compiling native
+code. It does not sanitize the developer's checkout. Public source exports
+retain the source-build workflow above without the internal release policy.
+
+Internal wheel builds require separate OSS CuTe archives; ordinary internal
+test archives are not accepted. In the CuTe builder environment, generate them
+from the same checkout before building wheels (Git must also be installed):
+
+```bash
+python3 packaging/wheel_cli.py build-oss-cutedsl \
+    --output-dir kernelSrcs/cuteDSLOssPrebuilt
+```
+
+The internal `build-wheel` default uses this directory. Each archive has a
+checksum and an OSS provenance receipt binding the policy, sanitized kernel
+sources, and extracted files. Policy or kernel changes require regeneration.
+CI generates these separately from internal-test kernels.
+
+Base packaging, native payload verification, final assembly, and publication
+enforce the OSS checks. Final wheel checks scan all members, including metadata
+and native library bytes; internal CI paths, nested build archives, and loose
+kernels are rejected. Wheel builds omit CUDA device line information, which can
+embed private build paths even after host debug-symbol stripping. Normal source
+builds retain CUDA line information for profiling.
+Legacy unstamped artifacts must be rebuilt, not relabeled.

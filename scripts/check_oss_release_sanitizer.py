@@ -83,26 +83,34 @@ def _copy_tracked_worktree(repo_root: Path, export_root: Path,
             "scripts/check_oss_release_sanitizer.py",
             "scripts/strip_internal_release.py",
             "scripts/README.md",
+            "packaging/wheellib/oss.py",
+            "packaging/wheellib/oss_cutedsl.py",
     ]:
         src = repo_root / rel_path
         if src.exists():
             _copy_file(src, export_root / rel_path)
 
 
+def stage_oss_source(repo_root: Path, export_root: Path,
+                     include_submodules: bool) -> None:
+    """Populate a fresh staging tree and apply the repository release policy."""
+    _copy_tracked_worktree(repo_root, export_root, include_submodules)
+    subprocess.run([
+        sys.executable,
+        str(repo_root / "scripts/strip_internal_release.py"),
+        "--root",
+        str(export_root),
+        "--manifest",
+        str(repo_root / "oss_release_manifest.json"),
+    ],
+                   check=True)
+
+
 def check_oss_release_sanitizer(repo_root: Path, keep_temp: bool,
                                 include_submodules: bool) -> Path | None:
     temp_dir = Path(tempfile.mkdtemp(prefix="edgellm-oss-release-check."))
     try:
-        _copy_tracked_worktree(repo_root, temp_dir, include_submodules)
-        subprocess.run([
-            sys.executable,
-            str(repo_root / "scripts/strip_internal_release.py"),
-            "--root",
-            str(temp_dir),
-            "--manifest",
-            str(repo_root / "oss_release_manifest.json"),
-        ],
-                       check=True)
+        stage_oss_source(repo_root, temp_dir, include_submodules)
     except Exception:
         if keep_temp:
             print(f"Temporary export tree preserved: {temp_dir}",

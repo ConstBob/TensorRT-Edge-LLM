@@ -17,8 +17,13 @@ set(CMAKE_CXX_FLAGS
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -t 0 -fPIC")
 set(CUDA_PTXAS_FLAGS "-warn-lmem-usage -warn-double-usage -warn-spills")
 set(CMAKE_CUDA_FLAGS_RELEASE
-    "${CMAKE_CUDA_FLAGS_RELEASE} -lineinfo -res-usage --use_fast_math -Xptxas='${CUDA_PTXAS_FLAGS}'"
+    "${CMAKE_CUDA_FLAGS_RELEASE} -res-usage --use_fast_math -Xptxas='${CUDA_PTXAS_FLAGS}'"
 )
+
+# Device line tables expose build paths that host prefix maps cannot rewrite.
+if(NOT DEFINED EDGELLM_WHEEL_PAYLOAD_DIR)
+  set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} -lineinfo")
+endif()
 
 set(CMAKE_CUDA_FLAGS_DEBUG "-g")
 

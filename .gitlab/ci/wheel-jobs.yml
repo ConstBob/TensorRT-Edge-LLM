@@ -16,6 +16,11 @@
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       changes: &wheel_changes
         - .gitmodules
+        - DO_NOT_RELEASE
+        - oss_release_manifest.json
+        - scripts/strip_internal_release.py
+        - scripts/check_oss_release_sanitizer.py
+        - .gitlab/ci/cutedsl-jobs.yml
         - .gitlab/ci/wheel-jobs.yml
         - .gitlab/ci/wheel-generated.yml
         - .gitlab/ci/wheel-qualification.toml
@@ -91,7 +96,7 @@ wheel_python_base:
     - job: wheel_packaging_precheck
       artifacts: true
     - job: build_ci_dependency_images
-    - job: build_cutedsl_docker_matrix
+    - job: build_oss_cutedsl_docker_matrix
       artifacts: true
   cache:
     policy: pull-push
