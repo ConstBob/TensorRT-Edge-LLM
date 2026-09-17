@@ -191,10 +191,21 @@ if [ -z "${NVIH}" ]; then
 fi
 echo "using NvInfer.h=${NVIH} TRT_PACKAGE_DIR=${TRT_PACKAGE_DIR}"
 
+if [ ! -f "${EDGELLM_SRC}/3rdParty/xgrammar/include/xgrammar/xgrammar.h" ]; then
+  echo "INIT_SUBMODULES xgrammar (shallow clone has no gitlinks)"
+  git -C "${EDGELLM_SRC}" submodule update --init --recursive --depth 1
+fi
+if [ ! -f "${EDGELLM_SRC}/3rdParty/xgrammar/include/xgrammar/xgrammar.h" ]; then
+  echo "FATAL: 3rdParty/xgrammar header still missing"
+  hold_gpu NO_XGRAMMAR
+fi
+
 CUTE_ARGS=(-DENABLE_CUTE_DSL=fmha "-DCUTE_DSL_ARTIFACT_TAG=sm_${SM}")
 if [ ! -d "${EDGELLM_SRC}/cpp/kernels/cuteDSLArtifact/x86_64/sm_${SM}" ] \
    && [ ! -e "${EDGELLM_SRC}/kernelSrcs/cuteDSLPrebuilt/cutedsl_x86_64_sm_${SM}_cuda13.tar.gz" ]; then
-  if uv pip install --python "${PY}" --no-cache-dir 'nvidia-cutlass-dsl[cu13]==4.7.0' cupy-cuda13x cuda-python \
+  if (uv pip install --python "${PY}" --no-cache-dir 'nvidia-cutlass-dsl[cu13]==4.7.0' cupy-cuda13x cuda-python \
+        || uv pip install --python "${PY}" --no-cache-dir --break-system-packages \
+             'nvidia-cutlass-dsl[cu13]==4.7.0' cupy-cuda13x cuda-python) \
      && "${PY}" "${EDGELLM_SRC}/kernelSrcs/build_cutedsl.py" --kernels fmha --gpu_arch "sm_${SM}" --arch x86_64; then
     echo "generated CuTe DSL fmha artifacts for sm_${SM}"
   else
