@@ -223,22 +223,36 @@ CUDA_CTK_VERSION="${CUDA_CTK_VERSION:-13.1}"
 PYBIND_DIR="$("${PY}" -m pybind11 --cmakedir)"
 
 echo "CUDA_DIR=${CUDA_DIR} CUDA_CTK_VERSION=${CUDA_CTK_VERSION} TRT_PACKAGE_DIR=${TRT_PACKAGE_DIR}"
-cmake -S "${EDGELLM_SRC}" -B "${BUILD_DIR}" -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DTRT_PACKAGE_DIR="${TRT_PACKAGE_DIR}" \
-    -DCUDA_DIR="${CUDA_DIR}" \
-    -DCUDA_CTK_VERSION="${CUDA_CTK_VERSION}" \
-    -DCMAKE_CUDA_ARCHITECTURES="${SM}" \
-    -DBUILD_PYTHON_BINDINGS=ON \
-    -Dpybind11_DIR="${PYBIND_DIR}" \
-    "${CUTE_ARGS[@]}"
-cmake --build "${BUILD_DIR}" --parallel 16 --target _edgellm_runtime NvInfer_edgellm_plugin
-
-RUNTIME_SO="$(find "${BUILD_DIR}" -name '*_edgellm_runtime*.so' -print -quit)"
-PLUGIN_SO="$(find "${BUILD_DIR}" -name 'libNvInfer_edgellm_plugin.so' -print -quit)"
-if [ -z "${RUNTIME_SO}" ] || [ -z "${PLUGIN_SO}" ]; then
-  echo "FATAL: missing pybind or plugin so runtime=${RUNTIME_SO:-none} plugin=${PLUGIN_SO:-none}"
-  hold_gpu NO_PYBIND_SO
+NATIVE_DIR="${WORK_ROOT}/native"
+SOURCE_REV="$(git -C "${EDGELLM_SRC}" rev-parse HEAD)"
+PYBIND_KEY="sm${SM}-src${SOURCE_REV}"
+mkdir -p "${NATIVE_DIR}"
+RUNTIME_SO="$(find "${NATIVE_DIR}" -name '*_edgellm_runtime*.so' -print -quit || true)"
+PLUGIN_SO="$(find "${NATIVE_DIR}" -name 'libNvInfer_edgellm_plugin.so' -print -quit || true)"
+if [ -n "${RUNTIME_SO}" ] && [ -n "${PLUGIN_SO}" ] \
+   && [ "$(cat "${NATIVE_DIR}/PYBIND_KEY" 2>/dev/null || true)" = "${PYBIND_KEY}" ]; then
+  echo "REUSING_PYBIND ${PYBIND_KEY}"
+else
+  cmake -S "${EDGELLM_SRC}" -B "${BUILD_DIR}" -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DTRT_PACKAGE_DIR="${TRT_PACKAGE_DIR}" \
+      -DCUDA_DIR="${CUDA_DIR}" \
+      -DCUDA_CTK_VERSION="${CUDA_CTK_VERSION}" \
+      -DCMAKE_CUDA_ARCHITECTURES="${SM}" \
+      -DBUILD_PYTHON_BINDINGS=ON \
+      -Dpybind11_DIR="${PYBIND_DIR}" \
+      "${CUTE_ARGS[@]}"
+  cmake --build "${BUILD_DIR}" --parallel 16 --target _edgellm_runtime NvInfer_edgellm_plugin
+  RUNTIME_SO="$(find "${BUILD_DIR}" -name '*_edgellm_runtime*.so' -print -quit)"
+  PLUGIN_SO="$(find "${BUILD_DIR}" -name 'libNvInfer_edgellm_plugin.so' -print -quit)"
+  if [ -z "${RUNTIME_SO}" ] || [ -z "${PLUGIN_SO}" ]; then
+    echo "FATAL: missing pybind or plugin so runtime=${RUNTIME_SO:-none} plugin=${PLUGIN_SO:-none}"
+    hold_gpu NO_PYBIND_SO
+  fi
+  cp -f "${RUNTIME_SO}" "${PLUGIN_SO}" "${NATIVE_DIR}/"
+  printf '%s\n' "${PYBIND_KEY}" > "${NATIVE_DIR}/PYBIND_KEY"
+  RUNTIME_SO="$(find "${NATIVE_DIR}" -name '*_edgellm_runtime*.so' -print -quit)"
+  PLUGIN_SO="$(find "${NATIVE_DIR}" -name 'libNvInfer_edgellm_plugin.so' -print -quit)"
 fi
 SO_DIR="$(dirname "${RUNTIME_SO}")"
 export PYTHONPATH="${SO_DIR}:${EDGELLM_SRC}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -247,15 +261,21 @@ export EDGELLM_PLUGIN_PATH="${PLUGIN_SO}"
 echo REASONER_PYBIND_OK
 
 echo OPENAI_SERVE_STARTING
+# ``python -m experimental.server.cli`` only imports the module (no
+# ``if __name__``) and exits 0 in ~400ms. The package entry is
+# ``python -m experimental.server`` / ``experimental.server.cli:main``.
 while true; do
-  "${PY}" -m experimental.server.cli \
+  set +e
+  "${PY}" -m experimental.server \
     "${REASONING_CHECKPOINT}" \
     --host 0.0.0.0 \
     --port 8000 \
     --cache-dir "${CACHE_DIR}" \
     --max-image-tokens 4096 \
-    --max-image-tokens-per-image 4096 \
-    && echo REASONER_SERVE_EXIT_0
-  echo REASONER_SERVE_DIED_HOLDING_GPU
+    --max-image-tokens-per-image 4096
+  serve_rc=$?
+  set -e
+  echo "REASONER_SERVE_EXIT_${serve_rc}"
+  echo "REASONER_SERVE_DIED_HOLDING_GPU"
   sleep 30
 done
