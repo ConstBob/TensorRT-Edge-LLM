@@ -87,13 +87,15 @@ unpack_trt_debs() {
   for pkg in libnvinfer-headers-dev libnvinfer-headers-plugin-dev \
              libnvinfer-dev libnvinfer10 \
              libnvinfer-plugin-dev libnvinfer-plugin10 \
-             libnvonnxparsers-dev libnvonnxparsers10; do
+             libnvinfer-vc-plugin-dev libnvinfer-vc-plugin10 \
+             libnvonnxparsers-dev libnvonnxparsers10 \
+             python3-libnvinfer; do
     deb="${pkg}_${ver}_amd64.deb"
     echo "TRT_DEB fetching ${deb}"
     curl -fsSL -o "${BUILD_DIR}/${deb}" "${EDGELLM_TRT_REPO}/${deb}"
     dpkg-deb -x "${BUILD_DIR}/${deb}" "${dest}"
   done
-  touch "${dest}/READY"
+  touch "${dest}/READY_FULL"
 }
 
 sync_trt_local() {
@@ -103,93 +105,47 @@ sync_trt_local() {
   touch "${dest}/READY"
 }
 
-NVIH="$(locate_nvinfer_h || true)"
 TRT_LOCAL="${TRT_LOCAL:-/opt/edgellm-trt-reasoner}"
-TRT_PACKAGE_DIR=""
-
-if [ -n "${NVIH}" ]; then
-  echo "TRT_HEADERS_IN_IMAGE ${NVIH}"
-  TRT_PACKAGE_DIR=/usr
-else
-  echo "TRT_HEADERS_MISSING_IN_IMAGE"
-  NFS_CANDIDATES=()
-  if [ -n "${TRT_STAGE:-}" ]; then
-    NFS_CANDIDATES+=("${TRT_STAGE}")
+# The checkpoint-direct builder uses INetworkDefinition.add_rotary_embedding,
+# introduced in TensorRT 10.16. The image's 10.14 Python binding cannot expose
+# that method even though its C++ headers are present. Stage both native libs
+# and python3-libnvinfer 10.16 side-by-side in this Reasoner-owned WORK_ROOT.
+STAGED="${WORK_ROOT}/tensorrt/${EDGELLM_TRT_FALLBACK}"
+mkdir -p "${WORK_ROOT}/tensorrt"
+exec 7>"${WORK_ROOT}/tensorrt.lock"
+flock 7
+if [ ! -e "${STAGED}/READY_FULL" ]; then
+  rm -rf "${STAGED}"
+  mkdir -p "${STAGED}"
+  POLICY_STAGE="/mnt/cosmos-eval/edgellm-b/tensorrt/${EDGELLM_TRT_FALLBACK}"
+  if [ -e "${POLICY_STAGE}/READY" ]; then
+    echo "TRT_SEED_FROM_POLICY_STAGE ${POLICY_STAGE}"
+    tar -C "${POLICY_STAGE}" --exclude='*.a' -cf - . | tar -C "${STAGED}" -xf -
   fi
-  NFS_CANDIDATES+=(
-    /mnt/cosmos-eval/edgellm-b/tensorrt/10.16.1.11-1+cuda12.9
-  )
-  for d in /mnt/cosmos-eval/edgellm-b/tensorrt/*; do
-    if [ -d "${d}" ]; then
-      NFS_CANDIDATES+=("${d}")
-    fi
-  done
-  STAGED=""
-  for d in "${NFS_CANDIDATES[@]}"; do
-    if [ -e "${d}/READY" ] && locate_nvinfer_h "${d}" >/dev/null; then
-      STAGED="${d}"
-      echo "TRT_NFS_STAGE ${STAGED}"
-      break
-    fi
-  done
-
-  if [ -z "${STAGED}" ]; then
-    IMG_TRT_VER="$(dpkg-query -W -f='${Version}' libnvinfer10 2>/dev/null || true)"
-    echo "IMAGE_LIBNVINFER10_VERSION=${IMG_TRT_VER:-none}"
-    STAGE_DIR="${WORK_ROOT}/tensorrt/${IMG_TRT_VER:-unknown}"
-    mkdir -p "${WORK_ROOT}/tensorrt"
-    exec 7>"${WORK_ROOT}/tensorrt.lock"
-    flock 7
-    trap - ERR
-    set +e
-    unpack_rc=1
-    if [ -n "${IMG_TRT_VER}" ] && [ ! -e "${STAGE_DIR}/READY" ]; then
-      echo "TRT_UNPACK_IMAGE_MATCH ${IMG_TRT_VER}"
-      unpack_trt_debs "${IMG_TRT_VER}" "${STAGE_DIR}"
-      unpack_rc=$?
-      if [ "${unpack_rc}" -ne 0 ]; then
-        echo "WARNING: image-match TRT debs failed; trying ${EDGELLM_TRT_FALLBACK}"
-        rm -rf "${STAGE_DIR}"
-        STAGE_DIR="${WORK_ROOT}/tensorrt/${EDGELLM_TRT_FALLBACK}"
-        unpack_trt_debs "${EDGELLM_TRT_FALLBACK}" "${STAGE_DIR}"
-        unpack_rc=$?
-      fi
-    elif [ -z "${IMG_TRT_VER}" ]; then
-      STAGE_DIR="${WORK_ROOT}/tensorrt/${EDGELLM_TRT_FALLBACK}"
-      if [ ! -e "${STAGE_DIR}/READY" ]; then
-        echo "TRT_UNPACK_FALLBACK ${EDGELLM_TRT_FALLBACK}"
-        unpack_trt_debs "${EDGELLM_TRT_FALLBACK}" "${STAGE_DIR}"
-        unpack_rc=$?
-      else
-        unpack_rc=0
-      fi
-    else
-      unpack_rc=0
-    fi
-    set -e
-    trap 'hold_gpu ERR' ERR
-    flock -u 7
-    if [ "${unpack_rc}" -ne 0 ]; then
-      echo "FATAL: TensorRT deb unpack failed"
-      hold_gpu TRT_DEB_UNPACK
-    fi
-    STAGED="${STAGE_DIR}"
-  fi
-
-  if [ ! -e "${TRT_LOCAL}/READY" ]; then
-    echo "TRT_COPY_LOCAL ${STAGED} -> ${TRT_LOCAL}"
-    sync_trt_local "${STAGED}" "${TRT_LOCAL}"
-  fi
-  TRT_PACKAGE_DIR="${TRT_LOCAL}/usr"
-  export LD_LIBRARY_PATH="${TRT_PACKAGE_DIR}/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
-  NVIH="$(locate_nvinfer_h "${TRT_PACKAGE_DIR}" || locate_nvinfer_h "${TRT_LOCAL}" || true)"
+  unpack_trt_debs "${EDGELLM_TRT_FALLBACK}" "${STAGED}"
 fi
+flock -u 7
+
+rm -rf "${TRT_LOCAL}"
+echo "TRT_COPY_LOCAL ${STAGED} -> ${TRT_LOCAL}"
+sync_trt_local "${STAGED}" "${TRT_LOCAL}"
+TRT_PACKAGE_DIR="${TRT_LOCAL}/usr"
+export LD_LIBRARY_PATH="${TRT_PACKAGE_DIR}/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+export PYTHONPATH="${TRT_PACKAGE_DIR}/lib/python3.12/dist-packages${PYTHONPATH:+:${PYTHONPATH}}"
+NVIH="$(locate_nvinfer_h "${TRT_PACKAGE_DIR}" || locate_nvinfer_h "${TRT_LOCAL}" || true)"
 
 if [ -z "${NVIH}" ]; then
   echo "FATAL: NvInfer.h still missing after staging"
   hold_gpu NO_NVINFER_H
 fi
 echo "using NvInfer.h=${NVIH} TRT_PACKAGE_DIR=${TRT_PACKAGE_DIR}"
+"${PY}" - <<'PY'
+import tensorrt as trt
+print("TENSORRT_PYTHON", trt.__version__, trt.__file__)
+assert hasattr(trt.INetworkDefinition, "add_rotary_embedding"), (
+    "TensorRT Python binding lacks add_rotary_embedding"
+)
+PY
 
 if [ ! -f "${EDGELLM_SRC}/3rdParty/xgrammar/include/xgrammar/xgrammar.h" ]; then
   echo "INIT_SUBMODULES xgrammar (shallow clone has no gitlinks)"
@@ -238,7 +194,7 @@ NATIVE_DIR="${WORK_ROOT}/native"
 # another 368-object rebuild, while any C++/kernel/CMake change still does.
 NATIVE_SOURCE_KEY="$(git -C "${EDGELLM_SRC}" ls-files -s \
     CMakeLists.txt cmake cpp kernelSrcs pybind | sha256sum | cut -d' ' -f1)"
-PYBIND_KEY="sm${SM}-cutefmha-native${NATIVE_SOURCE_KEY}"
+PYBIND_KEY="sm${SM}-trt${EDGELLM_TRT_FALLBACK}-cutefmha-native${NATIVE_SOURCE_KEY}"
 mkdir -p "${NATIVE_DIR}"
 RUNTIME_SO="$(find "${NATIVE_DIR}" -name '*_edgellm_runtime*.so' -print -quit || true)"
 PLUGIN_SO="$(find "${NATIVE_DIR}" -name 'libNvInfer_edgellm_plugin.so' -print -quit || true)"
