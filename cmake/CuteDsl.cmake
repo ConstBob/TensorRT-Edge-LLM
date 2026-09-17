@@ -554,13 +554,22 @@ function(cute_dsl_setup)
     )
   endif()
 
-  # Per-family definitions for the FP16 MoE grouped-GEMM modules. Each
-  # target-specific artifact pack contains exactly one of these variants.
+  # Per-family and per-SM definitions for the FP16 MoE grouped-GEMM modules.
   if("f16_moe" IN_LIST _active_groups)
     foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
       if(_cute_dsl_multi_arch)
         target_compile_definitions(
           ${_tgt} PRIVATE "CUTE_DSL_F16_MOE_MULTI_ARCH_ENABLED")
+        foreach(_f16_moe_gpu_arch ${_meta_gpu_archs})
+          if(NOT _f16_moe_gpu_arch MATCHES "^sm_([0-9]+)$")
+            message(
+              FATAL_ERROR
+                "Invalid FP16 MoE multi-SM metadata entry '${_f16_moe_gpu_arch}' in ${_metadata}."
+            )
+          endif()
+          target_compile_definitions(
+            ${_tgt} PRIVATE "CUTE_DSL_F16_MOE_ARTIFACT_SM_${CMAKE_MATCH_1}=1")
+        endforeach()
       else()
         target_compile_definitions(
           ${_tgt} PRIVATE "CUTE_DSL_F16_MOE_ARTIFACT_SM=${_meta_sm}")

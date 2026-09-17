@@ -66,6 +66,52 @@ constexpr size_t kPROBLEM_SHAPE_VALUES_PER_EXPERT{4};
 constexpr size_t kSTRIDE_VALUES_PER_EXPERT{6};
 constexpr size_t kADDRESS_VALUES_PER_EXPERT{3};
 
+bool isArtifactSm(int32_t smVersion) noexcept
+{
+#if defined(CUTE_DSL_F16_MOE_ARTIFACT_SM)
+    return smVersion == kARTIFACT_SM;
+#else
+    bool artifactAvailable{false};
+    switch (smVersion)
+    {
+#if defined(CUTE_DSL_F16_MOE_ARTIFACT_SM_80)
+    case 80:
+#endif
+#if defined(CUTE_DSL_F16_MOE_ARTIFACT_SM_86)
+    case 86:
+#endif
+#if defined(CUTE_DSL_F16_MOE_ARTIFACT_SM_87)
+    case 87:
+#endif
+#if defined(CUTE_DSL_F16_MOE_ARTIFACT_SM_89)
+    case 89:
+#endif
+#if defined(CUTE_DSL_F16_MOE_ARTIFACT_SM_100)
+    case 100:
+#endif
+#if defined(CUTE_DSL_F16_MOE_ARTIFACT_SM_101)
+    case 101:
+#endif
+#if defined(CUTE_DSL_F16_MOE_ARTIFACT_SM_103)
+    case 103:
+#endif
+#if defined(CUTE_DSL_F16_MOE_ARTIFACT_SM_110)
+    case 110:
+#endif
+#if defined(CUTE_DSL_F16_MOE_ARTIFACT_SM_120)
+    case 120:
+#endif
+#if defined(CUTE_DSL_F16_MOE_ARTIFACT_SM_121)
+    case 121:
+#endif
+        artifactAvailable = true;
+        break;
+    default: break;
+    }
+    return artifactAvailable;
+#endif
+}
+
 size_t alignUp(size_t value, size_t alignment)
 {
     if (alignment == 0 || value > std::numeric_limits<size_t>::max() - (alignment - 1))
@@ -218,11 +264,7 @@ bool CuteDslF16MoeRunner::canImplement(int32_t hiddenSize, int32_t moeInterSize,
 #if defined(CUTE_DSL_F16_MOE_BLACKWELL_GEFORCE_ENABLED)
     architectureAvailable = architectureAvailable || isBlackwellGeforceSm(smVersion);
 #endif
-    bool artifactAvailable{true};
-#if defined(CUTE_DSL_F16_MOE_ARTIFACT_SM)
-    artifactAvailable = smVersion == kARTIFACT_SM;
-#endif
-    return architectureAvailable && artifactAvailable && isSupportedNumExperts(numExperts) && topK > 0
+    return architectureAvailable && isArtifactSm(smVersion) && isSupportedNumExperts(numExperts) && topK > 0
         && topK <= kMaxTopK && hiddenSize > 0 && hiddenSize % kHiddenSizeAlignment == 0 && moeInterSize > 0
         && moeInterSize % kInterSizeAlignment == 0 && fc1N <= std::numeric_limits<int32_t>::max()
         && fc1N % kFc1NAlignment == 0 && (activationType == kACT_SWIGLU || activationType == kACT_RELU2);
@@ -253,13 +295,11 @@ CuteDslF16MoeRunner::Variant CuteDslF16MoeRunner::selectVariant(int32_t smVersio
 
 bool CuteDslF16MoeRunner::ensureKernelModules(int32_t smVersion, cudaStream_t stream) noexcept
 {
-#if defined(CUTE_DSL_F16_MOE_ARTIFACT_SM)
-    if (smVersion != kARTIFACT_SM)
+    if (!isArtifactSm(smVersion))
     {
-        LOG_ERROR("CuteDslF16MoeRunner: linked SM%d artifact cannot execute on SM%d", kARTIFACT_SM, smVersion);
+        LOG_ERROR("CuteDslF16MoeRunner: linked artifact cannot execute on SM%d", smVersion);
         return false;
     }
-#endif
     switch (selectVariant(smVersion))
     {
     case Variant::kAmpere:
