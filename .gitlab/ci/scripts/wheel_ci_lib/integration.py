@@ -108,6 +108,27 @@ def _integration_environment(
     return environment
 
 
+def _example_command(interpreter: pathlib.PurePath, script: pathlib.PurePath,
+                     model_dir: pathlib.PurePath, root: pathlib.PurePath,
+                     workflow: str, variant: str) -> typing.List[str]:
+    command = [
+        str(interpreter),
+        "-I",
+        str(script),
+        str(model_dir),
+        str(root / f"{workflow}-engines"),
+        "--workflow",
+        workflow,
+        "--expected-variant",
+        variant,
+        "--result",
+        str(root / f"{workflow}.json"),
+    ]
+    if workflow == "base":
+        command.append("--require-base-only")
+    return command
+
+
 def _local_integration(row: typing.Mapping[str, object], python_abi: str,
                        wheel: pathlib.Path, result: pathlib.Path) -> None:
     variant = str(row["variant_id"])
@@ -157,22 +178,21 @@ def _local_integration(row: typing.Mapping[str, object], python_abi: str,
             str(wheel),
         ]
         config.run_checked(install, env=environment)
-        raw_result = root / "result.json"
-        config.run_checked([
-            str(interpreter),
-            "-I",
-            str(config.REPO_ROOT / "examples" / "python" /
-                "installed_wheel_build_and_infer.py"),
-            str(model_dir),
-            str(root / "engine"),
-            "--expected-variant",
-            variant,
-            "--result",
-            str(raw_result),
-        ],
-                           cwd=root,
-                           env=environment)
-        evidence = json.loads(raw_result.read_text(encoding="utf-8"))
+        script = (config.REPO_ROOT / "examples" / "python" /
+                  "installed_wheel_build_and_infer.py")
+        results = {}
+        for workflow in ("base", "server"):
+            if workflow == "server":
+                config.run_checked([*install[:-1], f"{wheel}[server]"],
+                                   env=environment)
+            config.run_checked(_example_command(interpreter, script, model_dir,
+                                                root, workflow, variant),
+                               cwd=root,
+                               env=environment)
+            results[workflow] = json.loads(
+                (root / f"{workflow}.json").read_text(encoding="utf-8"))
+        evidence = results["server"]
+        evidence["base"] = results["base"]
     evidence.update({
         "variant_id": variant,
         "python_abi": python_abi,
@@ -266,27 +286,44 @@ def _remote_integration(variant: str, python_abi: str, wheel: pathlib.Path,
             )
         target_model = _copy_remote_model(scp, target, remote, model_dir,
                                           ssh_environment)
-        command = " && ".join([
+        remote_path = pathlib.PurePosixPath(remote)
+        interpreter = remote_path / "venv" / "bin" / "python"
+        install = (
+            f"{shlex.quote(str(interpreter))} -m pip install "
+            f"--extra-index-url {shlex.quote(os.environ.get('WHEEL_EXTRA_INDEX_URL', 'https://pypi.nvidia.com'))} "
+        )
+        commands = [
             f"{python_bin} -m venv --without-pip {shlex.quote(remote + '/venv')}",
             (f"{python_bin} -m pip install --ignore-installed "
              f"--prefix {shlex.quote(remote + '/venv')} pip"),
-            f"{shlex.quote(remote + '/venv/bin/python')} -m pip install {shlex.quote(target_trt)}",
-            (f"{shlex.quote(remote + '/venv/bin/python')} -m pip install "
-             f"--extra-index-url {shlex.quote(os.environ.get('WHEEL_EXTRA_INDEX_URL', 'https://pypi.nvidia.com'))} "
-             f"{shlex.quote(remote + '/' + wheel.name)}"),
-            (f"cd {shlex.quote(remote)} && "
-             f"{shlex.quote(remote + '/venv/bin/python')} -I "
-             f"{shlex.quote(remote + '/' + script.name)} "
-             f"{shlex.quote(target_model)} {shlex.quote(remote + '/engine')} "
-             f"--expected-variant {shlex.quote(variant)} "
-             f"--result {shlex.quote(remote + '/result.json')}"),
-        ])
+            f"{shlex.quote(str(interpreter))} -m pip install {shlex.quote(target_trt)}",
+            install + shlex.quote(remote + '/' + wheel.name),
+            f"cd {shlex.quote(remote)}",
+        ]
+        for workflow in ("base", "server"):
+            if workflow == "server":
+                commands.append(install + shlex.quote(remote + '/' +
+                                                      wheel.name + '[server]'))
+            commands.append(
+                shlex.join(
+                    _example_command(interpreter, remote_path / script.name,
+                                     pathlib.PurePosixPath(target_model),
+                                     remote_path, workflow, variant)))
+        command = " && ".join(commands)
         config.run_checked([*ssh, target, command], env=ssh_environment)
         result.parent.mkdir(parents=True, exist_ok=True)
         config.run_checked(
-            [*scp, f"{target}:{remote}/result.json",
+            [*scp, f"{target}:{remote}/server.json",
              str(result)],
             env=ssh_environment)
+        with tempfile.TemporaryDirectory(
+                prefix="edgellm-base-evidence-") as temporary:
+            base_result = pathlib.Path(temporary) / "base.json"
+            config.run_checked(
+                [*scp, f"{target}:{remote}/base.json",
+                 str(base_result)],
+                env=ssh_environment)
+            base_evidence = json.loads(base_result.read_text(encoding="utf-8"))
     finally:
         subprocess.run(
             [*ssh, target, f"rm -rf {shlex.quote(remote)}"],
@@ -294,6 +331,7 @@ def _remote_integration(variant: str, python_abi: str, wheel: pathlib.Path,
             env=ssh_environment,
         )
     evidence = json.loads(result.read_text(encoding="utf-8"))
+    evidence["base"] = base_evidence
     evidence.update({
         "variant_id": variant,
         "python_abi": python_abi,
@@ -343,13 +381,25 @@ def _validate_integration_result(key: typing.Tuple[str, str],
             "wheel_sha256") != config.sha256(wheel):
         raise RuntimeError(
             f"Integration evidence for {key} references another wheel.")
-    output_count = value.get("output_token_count")
-    if not isinstance(output_count, int) or output_count < 1:
-        raise RuntimeError(f"Integration evidence for {key} has no output.")
-    output_text = value.get("output_text")
-    if not isinstance(output_text, str) or not output_text.strip():
+    base = value.get("base")
+    if (not isinstance(base, dict) or base.get("workflow") != "base"
+            or base.get("base_only") is not True
+            or base.get("variant_id") != key[0]):
         raise RuntimeError(
-            f"Integration evidence for {key} has no generated text.")
+            f"Integration evidence for {key} lacks base-only qualification.")
+    if value.get("workflow") != "server":
+        raise RuntimeError(
+            f"Integration evidence for {key} lacks server qualification.")
+    for workflow, evidence in (("base", base), ("server", value)):
+        output_count = evidence.get("output_token_count")
+        if type(output_count) is not int or output_count < 1:
+            raise RuntimeError(
+                f"Integration evidence for {key}/{workflow} has no output.")
+        output_text = evidence.get("output_text")
+        if not isinstance(output_text, str) or not output_text.strip():
+            raise RuntimeError(
+                f"Integration evidence for {key}/{workflow} has no generated text."
+            )
 
 
 def integration_gate() -> None:

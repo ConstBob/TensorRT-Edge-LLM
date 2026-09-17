@@ -16,16 +16,24 @@ see the [ONNX-less Builder Design](../../developer_guide/software-design/onnxles
 
 ## Prerequisites
 
+For a supported target, use a [base wheel](installation.md#minimal-installation-advanced).
+It includes the builder and selects its bundled plugin automatically; skip
+the source-build steps below. Run commands in the activated wheel environment
+outside a source checkout.
+
+### From source
+
 Install the repository package in a virtual environment. The TensorRT Python
 wheel must match the TensorRT headers and libraries used to build Edge-LLM:
 
 ```bash
 cd /path/to/TensorRT-Edge-LLM
 python3 -m venv --system-site-packages .venv
-.venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install \
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install \
   /path/to/TensorRT/python/tensorrt-<version>-cp312-none-linux_x86_64.whl
-.venv/bin/python -m pip install ".[builder]"
+python -m pip install ".[builder]"
 ```
 
 Build Edge-LLM and its plugin library before compiling an engine:
@@ -42,14 +50,18 @@ extension includes `cutedsl_all.h`.
 
 ## Build All Components
 
+The following commands work with either installation. A source install defaults
+to `build/libNvInfer_edgellm_plugin.so`; use `--plugin-path` only for a different
+source-build location. A published wheel resolves its packaged plugin without
+that option.
+
 The default `--components all` selection discovers the checkpoint family and
 builds all of its components in runtime order:
 
 ```bash
-.venv/bin/tensorrt-edgellm-build \
+tensorrt-edgellm-build \
   --model-dir /path/to/checkpoint \
   --engine-dir /path/to/engines \
-  --plugin-path /path/to/build/libNvInfer_edgellm_plugin.so \
   --max-input-len 2048 \
   --max-kv-cache-capacity 4096 \
   --max-batch-size 1
@@ -68,11 +80,10 @@ quantized projections.
 Use `--components` only for an intentional partial rebuild:
 
 ```bash
-.venv/bin/tensorrt-edgellm-build \
+tensorrt-edgellm-build \
   --model-dir /path/to/checkpoint \
   --engine-dir /path/to/engines \
-  --components visual,audio \
-  --plugin-path /path/to/build/libNvInfer_edgellm_plugin.so
+  --components visual,audio
 ```
 
 The component set and output layout are model-specific:
@@ -125,6 +136,12 @@ This preserves the TensorRT-native lowering used by the single-device NVFP4
 path while avoiding full copies of the shardable fused-plugin tensors.
 
 ## Run The Engines
+
+Wheel users can run the [native Python inference example](installation.md#minimal-installation-advanced)
+with an existing compatible text engine, or use the
+[Python server](../examples/experimental-server.md). The C++ commands below,
+including speculative inference, require a source build; wheels do not install
+these executables.
 
 Use the same C++ runtime and request JSON used by the ONNX workflow. A
 text-only engine runs directly from the output directory:
@@ -219,12 +236,11 @@ target checkpoint's non-LLM components.
 EAGLE3, DFlash, JetSpec, DSpark, and Gemma4 MTP use paired checkpoints:
 
 ```bash
-.venv/bin/tensorrt-edgellm-build \
+tensorrt-edgellm-build \
   --model-dir /path/to/target \
   --draft-model-dir /path/to/draft \
   --spec-type eagle3 \
-  --engine-dir /path/to/engines \
-  --plugin-path /path/to/build/libNvInfer_edgellm_plugin.so
+  --engine-dir /path/to/engines
 ```
 
 Replace `eagle3` with `dflash`, `jetspec`, `dspark`, or `gemma4_mtp` as
@@ -245,11 +261,10 @@ greedy-only.
 Qwen3.5 native MTP reads draft layers from the target checkpoint:
 
 ```bash
-.venv/bin/tensorrt-edgellm-build \
+tensorrt-edgellm-build \
   --model-dir /path/to/qwen3.5-checkpoint \
   --spec-type mtp \
-  --engine-dir /path/to/engines \
-  --plugin-path /path/to/build/libNvInfer_edgellm_plugin.so
+  --engine-dir /path/to/engines
 ```
 
 The integrated Qwen draft uses the target embedding and falls back to the

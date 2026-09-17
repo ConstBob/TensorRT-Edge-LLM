@@ -14,18 +14,20 @@ C++ executables under `experimental_models/` are built separately from source.
 
 ## Install a published wheel
 
-Install the supported platform CUDA and TensorRT packages first, then install
-the release from PyPI. Use `--system-site-packages` so a platform-provided
-TensorRT Python package remains visible in the environment.
+Published wheels do not require a checkout or the build tools below. Follow
+the [installation guide](../docs/source/user_guide/getting_started/installation.md#published-python-wheel)
+to prepare CUDA, TensorRT, and a compatible Python environment, then install:
 
 ```bash
-python3 -m venv --system-site-packages .venv-edgellm
-source .venv-edgellm/bin/activate
-python -m pip install --upgrade pip
-python -m pip install "tensorrt-edgellm==0.11.0"
-python -c "import tensorrt_edgellm; print(tensorrt_edgellm.__version__)"
-tensorrt-edgellm-build --help
+python -m pip install --only-binary=tensorrt-edgellm \
+  --extra-index-url https://pypi.nvidia.com "tensorrt-edgellm[server]==0.11.0"
 ```
+
+`[server]` is recommended for high-level inference. See the
+[extras guide](../docs/source/user_guide/getting_started/installation.md#optional-python-dependencies)
+for export/tools workflows, or the [minimal base example](../docs/source/user_guide/getting_started/installation.md#minimal-installation-advanced)
+for low-level runtime use without extras. Do not install the repository package
+over the published wheel.
 
 `pip` selects the matching Python/architecture wheel. Edge-LLM then validates
 the platform release, CUDA and TensorRT SONAMEs, and GPU SM when loading its
