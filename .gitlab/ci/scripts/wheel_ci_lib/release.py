@@ -34,7 +34,7 @@ import urllib.parse
 import zipfile
 
 from wheel_ci_lib import common
-from wheellib import config, wheel_artifact
+from wheellib import config, oss, wheel_artifact
 
 PACKAGE_NAME = wheel_artifact.PACKAGE_NAME
 WheelIdentity = wheel_artifact.WheelIdentity
@@ -51,26 +51,6 @@ ARTIFACTORY_PYPI_URL = ("https://artifactory.nvidia.com/artifactory/api/pypi/"
 NVIDIA_PYPI_SIMPLE_URL = "https://pypi.nvidia.com/simple/tensorrt-edgellm/"
 PYPI_ORG_SIMPLE_URL = "https://pypi.org/simple/tensorrt-edgellm/"
 PUBLIC_INDEX_URLS = (NVIDIA_PYPI_SIMPLE_URL, PYPI_ORG_SIMPLE_URL)
-FORBIDDEN_PUBLIC_MARKERS = (
-    b"gitlab-master.nvidia.com",
-    b"nv-shared-pypi-local",
-    b"urm.nvidia.com",
-    b"/home/scratch.",
-    b"/scratch.edge_llm",
-)
-TEXT_ARCHIVE_SUFFIXES = frozenset({
-    ".cfg",
-    ".ini",
-    ".json",
-    ".md",
-    ".py",
-    ".rst",
-    ".toml",
-    ".txt",
-    ".yaml",
-    ".yml",
-})
-MAX_TEXT_AUDIT_BYTES = 16 * 1024 * 1024
 MAX_HTTP_RESPONSE_BYTES = 8 * 1024 * 1024
 REDACTED = "<redacted>"
 
@@ -218,27 +198,6 @@ def parse_wheel_identity(filename: str,
     return identity
 
 
-def _audit_text_members(archive: zipfile.ZipFile, wheel: pathlib.Path) -> None:
-    for info in archive.infolist():
-        path = pathlib.PurePosixPath(info.filename)
-        if path.is_absolute() or ".." in path.parts:
-            raise RuntimeError(
-                f"Wheel contains an unsafe member path: {info.filename!r}.")
-        suffix = path.suffix.lower()
-        is_metadata = ".dist-info" in path.parts
-        if (info.file_size > MAX_TEXT_AUDIT_BYTES
-                or (suffix not in TEXT_ARCHIVE_SUFFIXES and not is_metadata)):
-            continue
-        content = archive.read(info)
-        marker = next(
-            (value for value in FORBIDDEN_PUBLIC_MARKERS if value in content),
-            None)
-        if marker is not None:
-            raise RuntimeError(
-                f"{wheel.name}:{info.filename} contains internal marker "
-                f"{marker.decode(errors='replace')!r}.")
-
-
 def _audit_release_provenance(wheel: pathlib.Path, identity: WheelIdentity,
                               source_revision: str) -> None:
     """Confirm the tested wheel belongs to this source release."""
@@ -266,7 +225,8 @@ def _audit_release_provenance(wheel: pathlib.Path, identity: WheelIdentity,
         if variants.get("source_revision") != source_revision:
             raise RuntimeError(
                 f"{wheel.name} was not built from {source_revision}.")
-        _audit_text_members(archive, wheel)
+        oss.require_policy(variants)
+        oss.audit_archive(archive)
 
 
 def _qualified_wheel_digests(path: pathlib.Path,

@@ -29,7 +29,7 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Set, Tuple
 
-from . import wheel_artifact
+from . import oss, wheel_artifact
 from .config import (CONTRACT, REPO_ROOT, load_matrix, load_toml, run_checked,
                      sha256, write_json)
 from .verify import verify
@@ -87,6 +87,7 @@ def _read_json(path: Path) -> Dict[str, Any]:
 def _base_metadata(base_wheel: Path) -> Dict[str, Any]:
     metadata_path = base_wheel.parent / "base-wheel.json"
     metadata = _read_json(metadata_path)
+    oss.require_policy(metadata)
     required = {
         "schema_version", "package_version", "source_revision", "wheel",
         "wheel_sha256"
@@ -292,6 +293,7 @@ def _audit_final_wheel(wheel: Path, cpu_arch: str, python_abi: str,
         raise RuntimeError(
             f"Final wheel identity does not match {python_abi}/{cpu_arch}.")
     with zipfile.ZipFile(wheel) as archive:
+        oss.audit_archive(archive)
         names, wheel_file, record_file = _wheel_members(archive)
         _audit_wheel_metadata(archive, wheel_file, cpu_arch, python_abi)
         manifest = _load_runtime_manifest(archive, names)
@@ -438,6 +440,7 @@ def main(argv=None) -> None:
         write_json(
             root / "tensorrt_edgellm" / "_native" / "variants.json", {
                 "schema_version": 1,
+                "oss_policy_sha256": base["oss_policy_sha256"],
                 "package_version": base["package_version"],
                 "source_revision": base["source_revision"],
                 "source_provenance_sha256": base["source_provenance_sha256"],

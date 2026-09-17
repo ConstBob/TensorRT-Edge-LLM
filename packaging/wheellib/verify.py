@@ -28,6 +28,7 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, Mapping, Sequence, Set, Tuple
 
+from . import oss
 from .config import (CONTRACT, REPO_ROOT, cuda_driver_stub, load_matrix,
                      load_toml, require_variant, sha256)
 
@@ -37,6 +38,7 @@ _REQUIRED = set(CONTRACT.RUNTIME_VARIANT_FIELDS) | {
     "cutedsl_groups",
     "evidence_sha256",
     "source_provenance_sha256",
+    "oss_policy_sha256",
     "submodule_revisions",
 }
 _GLIBC_BASELINES = {
@@ -572,7 +574,10 @@ def verify(stage: Path,
     """Validate metadata, content, dependencies, architecture, and size."""
     stage = stage.resolve(strict=True)
     payload, row = _validate_payload_metadata(stage, matrix_path)
+    oss.require_policy(payload)
     package_stage, extension, plugin = _payload_binaries(stage, payload)
+    oss.audit_file(extension)
+    oss.audit_file(plugin)
     cutedsl_metadata = _validate_cutedsl_metadata(stage, payload, row)
     evidence_dir, evidence = _load_evidence(stage, payload)
     license_file = _audit_stage_inventory(stage, extension, plugin,

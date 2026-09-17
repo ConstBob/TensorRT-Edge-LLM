@@ -47,7 +47,8 @@
       "tests/defs/utils/command_execution.py",
       "tests/defs/utils/command_generation.py",
       "tests/test_lists/l0_e2e_super_thor.yml",
-      "unittests/cpp/runtime/multiDevice/parallelConfigTest.cpp"
+      "unittests/cpp/runtime/multiDevice/parallelConfigTest.cpp",
+      "packaging/wheellib/oss.py"
     ],
     "forbidden_patterns": [
       "edge-llm-internal-release",
@@ -70,6 +71,14 @@
       "cpu-general-k8s",
       "local-spark",
       "-nvks"
+    ],
+    "wheel_forbidden_patterns": [
+      "nv-shared-pypi-local",
+      "/home/scratch.",
+      "/scratch.edge_llm",
+      "/builds/",
+      "/gitlab-runner/",
+      "/build/wheel-ci/"
     ]
   }
 }
