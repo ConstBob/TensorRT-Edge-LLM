@@ -114,6 +114,12 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
     auto const& subConfig = (jsonConfig.contains("text_config") && jsonConfig["text_config"].is_object())
         ? jsonConfig["text_config"]
         : jsonConfig;
+    // Cosmos3-Edge stores RoPE fields under text_config.rope_parameters.
+    auto const& ropeParams = (subConfig.contains("rope_scaling") && subConfig["rope_scaling"].is_object())
+        ? subConfig["rope_scaling"]
+        : (subConfig.contains("rope_parameters") && subConfig["rope_parameters"].is_object())
+        ? subConfig["rope_parameters"]
+        : subConfig;
     if (isMuseGlimmer)
     {
         mConfig.vocabSize = subConfig.value("vocab_size", int32_t{0});
@@ -122,11 +128,22 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
     else
     {
         mConfig.vocabSize = subConfig["vocab_size"].get<int32_t>();
-        mConfig.mropeTheta = subConfig["rope_theta"].get<float>();
+        if (subConfig.contains("rope_theta") && subConfig["rope_theta"].is_number())
+        {
+            mConfig.mropeTheta = subConfig["rope_theta"].get<float>();
+        }
+        else if (ropeParams.contains("rope_theta") && ropeParams["rope_theta"].is_number())
+        {
+            mConfig.mropeTheta = ropeParams["rope_theta"].get<float>();
+        }
+        else
+        {
+            LOG_ERROR("Failed to parse rope_theta in text_config");
+            return false;
+        }
     }
 
-    // Read mrope_section from rope_parameters or rope_scaling
-    auto const& ropeParams = subConfig.contains("rope_scaling") ? subConfig["rope_scaling"] : subConfig;
+    // Read mrope_section from rope_parameters or rope_scaling.
     if (ropeParams.contains("mrope_section"))
     {
         auto section = ropeParams["mrope_section"].get<std::vector<int32_t>>();

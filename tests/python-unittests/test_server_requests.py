@@ -209,6 +209,80 @@ def test_video_model_family_muse(tmp_path):
     assert llm._video_model_family() == "muse"
 
 
+def test_cosmos3_reasoner_routes_native_video_file(monkeypatch, tmp_path):
+    # Cosmos3 uses the Qwen-compatible native video decoder and visual runner.
+    eng = _engine()
+    root = tmp_path / "cosmos3"
+    (root / "visual").mkdir(parents=True)
+    (root / "visual" /
+     "config.json").write_text('{"model_type": "cosmos3_edge_vision"}')
+    (root / "visual" / "visual.engine").touch()
+    llm = eng.LLM.__new__(eng.LLM)
+    llm._media_dir = str(root)
+    assert llm._video_model_family() == "qwen"
+    captured = {}
+
+    def fake_load_video_buffer(rt,
+                               item,
+                               family,
+                               frame_limits=None,
+                               budget=None,
+                               pixel_budget=None,
+                               cu_budget=None):
+        captured.update(item=item, family=family)
+        return _FakeVideoBuffer(item["video_url"]["url"], frames=8), 0, 0, 0
+
+    import experimental.server.media.video_sampling as vs_mod
+    monkeypatch.setattr(vs_mod, "load_video_buffer", fake_load_video_buffer)
+    buffers = eng._load_image_buffers(None, [{
+        "role":
+        "user",
+        "content": [{
+            "type": "video_url",
+            "video_url": {
+                "url": "example.mp4"
+            }
+        }],
+    }], llm._video_model_family, lambda: {})
+
+    assert captured == {
+        "item": {
+            "type": "video_url",
+            "video_url": {
+                "url": "example.mp4"
+            }
+        },
+        "family": "qwen",
+    }
+    assert [buffer.video for buffer in buffers] == ["example.mp4"]
+
+
+def test_cosmos3_reasoner_uses_per_frame_video_budget(tmp_path):
+    eng = _engine()
+    visual = tmp_path / "cosmos3" / "visual"
+    visual.mkdir(parents=True)
+    (visual / "config.json").write_text(
+        json.dumps({
+            "model_type": "cosmos3_edge_vision",
+            "builder_config": {
+                "min_image_tokens": 4,
+                "max_image_tokens": 1024,
+                "max_image_tokens_per_image": 512,
+            },
+        }))
+    # Cosmos3's processor intentionally omits temporal_patch_size. The C++
+    # runner defaults it to one, so server-side accounting must do the same.
+    (visual / "preprocessor_config.json").write_text(
+        json.dumps({
+            "patch_size": 16,
+            "merge_size": 2,
+        }))
+    llm = eng.LLM.__new__(eng.LLM)
+    llm._media_dir = str(tmp_path / "cosmos3")
+
+    assert llm._video_frame_limits()["temporal_patch_size"] == 1
+
+
 def test_load_image_buffers_nemotron_minimum():
     # A Nemotron video buffer is built and its EVS token estimate is honored
     # against the request-wide engine minimum (no cu_seqlens binding).

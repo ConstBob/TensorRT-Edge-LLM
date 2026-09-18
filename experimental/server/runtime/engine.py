@@ -1118,7 +1118,7 @@ class LLM:
         config = self._visual_config()
         model_type = config.get("model_type", "")
         qwen_video_types = ("qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_5",
-                            "qwen3_omni")
+                            "qwen3_omni", "cosmos3_edge_vision")
         # Audio-side model types have no video path (qwen3_omni_audio_encoder,
         # qwen3_omni_code2wav, qwen3_asr*); the omni ones share the qwen3_omni
         # prefix, so exclude before the prefix match.
@@ -1143,7 +1143,8 @@ class LLM:
             raise ValueError(
                 f"video input is not supported for model_type={model_type!r}"
                 " in this runtime bundle; supported families: Qwen-VL "
-                "(qwen2_vl/qwen2_5_vl/qwen3_vl/qwen3_5/qwen3_omni), InternVL, "
+                "(qwen2_vl/qwen2_5_vl/qwen3_vl/qwen3_5/qwen3_omni), "
+                "Cosmos3-Edge, InternVL, "
                 "Nemotron-Omni, and Muse-Glimmer")
         self._video_family_cache = family
         return family
@@ -1178,6 +1179,13 @@ class LLM:
                 processor = {}
         video_processor = processor.get("video_processor") or {}
         if builder.get("max_image_tokens"):
+            # Cosmos3 processes every sampled frame. Its processor omits the
+            # Qwen temporal-patching field, so match the compiled runner's
+            # default instead of applying Qwen's two-frame grouping.
+            temporal_patch_size = pre.get("temporal_patch_size")
+            if temporal_patch_size is None:
+                temporal_patch_size = (1 if cfg.get("model_type")
+                                       == "cosmos3_edge_vision" else 2)
             limits = {
                 "model_type":
                 cfg.get("model_type", ""),
@@ -1194,7 +1202,7 @@ class LLM:
                 "merge_size":
                 int(pre.get("merge_size", 0)),
                 "temporal_patch_size":
-                int(pre.get("temporal_patch_size", 2)),
+                int(temporal_patch_size),
                 "max_image_tokens_checkpoint":
                 int(pre.get("max_image_tokens", 0)),
                 "max_video_frame_tokens":
