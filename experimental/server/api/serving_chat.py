@@ -167,8 +167,13 @@ class OpenAIServingChat:
             raise UnsupportedFeatureError(
                 "this runtime only supports /v1/audio/speech")
         if request.model and request.model != self._client.model_name:
-            raise ModelNotFoundError(
-                f"model {request.model!r} is not served by this process")
+            # vLLM-style eval clients send the BenchService endpoint name
+            # (or any alias) as `model`. OpenAI-compatible servers accept it.
+            logger.info(
+                "Ignoring chat model alias %r (served as %r)",
+                request.model,
+                self._client.model_name,
+            )
         from ..media.media_source import (enforce_local_media_policy,
                                           message_media_modalities)
 
