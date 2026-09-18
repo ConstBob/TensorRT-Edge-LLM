@@ -199,8 +199,9 @@ class OpenAIServingChat:
                 "presence_penalty is not supported by the Edge-LLM runtime",
                 param="presence_penalty")
         if request.seed is not None:
-            raise UnsupportedFeatureError(
-                "seed is not supported by the Edge-LLM runtime", param="seed")
+            # vLLM eval clients (BenchService / CosmosReason2) send seed=1.
+            # The engine has no RNG hook; greedy temp=0 is deterministic anyway.
+            logger.info("Ignoring unsupported chat seed=%s", request.seed)
 
         try:
             tool_config = validate_tool_request(request.messages,
