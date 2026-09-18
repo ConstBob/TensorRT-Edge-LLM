@@ -65,7 +65,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
     stream_options: Optional[StreamOptions] = None
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     top_p: float = Field(default=0.9, gt=0.0, le=1.0)
-    top_k: int = Field(default=50, ge=1)
+    top_k: int = 50
+    # Accepted for vLLM-client compatibility; the engine has no equivalent
+    # knob, so these are validated and then ignored.
+    min_p: float = Field(default=0.0, ge=0.0, le=1.0)
+    repetition_penalty: float = Field(default=1.0, gt=0.0)
     tools: Optional[List[Dict[str, Any]]] = None
     tool_choice: Optional[Union[str, Dict[str, Any]]] = None
     parallel_tool_calls: bool = True
@@ -81,6 +85,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
     disable_spec_decode: bool = False
     reuse_context: StrictBool = True
     cache_generated_tokens: StrictBool = True
+
+    @field_validator("top_k")
+    @classmethod
+    def _normalize_top_k(cls, value):
+        # vLLM-style clients send top_k <= 0 to mean "no top-k filtering"; the
+        # engine only accepts a positive k, so fall back to the server default.
+        return value if value > 0 else 50
 
     @field_validator("stop")
     @classmethod

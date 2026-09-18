@@ -106,6 +106,8 @@ def _register_exception_handlers(app: FastAPI) -> None:
         location = first.get("loc", ())
         param = ".".join(str(item) for item in location[1:]) or None
         message = first.get("msg", "invalid request")
+        logger.warning("Rejected request to %s (param=%s): %s",
+                       request.url.path, param, message)
         error = ServerError(str(message), param=param)
         return _error_response(request, error)
 
