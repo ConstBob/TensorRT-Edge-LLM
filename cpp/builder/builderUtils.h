@@ -91,8 +91,12 @@ std::pair<std::unique_ptr<nvinfer1::IBuilder>, std::unique_ptr<nvinfer1::INetwor
 
 //! Create TensorRT builder config with optimized settings.
 //! @param builder TensorRT builder object
+//! @param enableAliasedPluginIO Enable the kALIASED_PLUGIN_IO preview. Only the
+//!        DFlash/DSpark draft engines declare aliased plugin I/O; every other
+//!        plugin returns -1 from getAliasedInput, so leave this off elsewhere.
 //! @return Builder config with monitor memory flag enabled (TRT >= 10.6)
-std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder* builder);
+std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(
+    nvinfer1::IBuilder* builder, bool enableAliasedPluginIO = false);
 
 //! Parse ONNX model and create parser.
 //! @param network TensorRT network definition to populate
