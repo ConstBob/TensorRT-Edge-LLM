@@ -69,6 +69,16 @@ bool isSpecDecodeDraft(Json const& config, char const* type)
     return specDecodeType(config) == type && engineRole(config) == "draft";
 }
 
+//! DFlash-family draft engines (dflash/dflash2/jetspec share the DFlashDraftModel
+//! ONNX; dspark uses the DSpark draft) are the only engines that contain a plugin
+//! declaring aliased I/O: DFlashTargetKVCacheUpdatePlugin's present KV pool aliases
+//! its past KV pool. No other engine needs the kALIASED_PLUGIN_IO preview.
+bool usesAliasedPluginIO(Json const& config)
+{
+    return isSpecDecodeDraft(config, "dflash") || isSpecDecodeDraft(config, "dflash2")
+        || isSpecDecodeDraft(config, "jetspec") || isSpecDecodeDraft(config, "dspark");
+}
+
 //! The CodePredictor exports one model name per Qwen3-Omni variant, all sharing this suffix.
 bool isCodePredictor(Json const& config)
 {
@@ -382,7 +392,7 @@ bool LLMBuilder::build()
         "LLMBuilder: inputs_embeds must be rank-2 [physical_tokens, hidden_size]. Re-export the model.");
 
     // Create builder config
-    auto config = createBuilderConfig(builder.get());
+    auto config = createBuilderConfig(builder.get(), usesAliasedPluginIO(mModelConfig));
     if (!config)
     {
         return false;
