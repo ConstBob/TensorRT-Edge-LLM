@@ -49,10 +49,13 @@ class ChatAudioConfig(AudioGenerationConfig):
 
 
 class ChatCompletionRequest(OpenAIBaseModel):
+    # vLLM / BenchService send extra and null sampling fields. Forbidding them
+    # 400s every eval request before the engine runs.
+    model_config = ConfigDict(extra="ignore")
     messages: List[Dict[str, Any]]
     model: Optional[str] = None
-    frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
-    presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
+    frequency_penalty: Optional[float] = Field(default=0.0, ge=-2.0, le=2.0)
+    presence_penalty: Optional[float] = Field(default=0.0, ge=-2.0, le=2.0)
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: bool = False
     top_logprobs: Optional[int] = Field(default=None, ge=0, le=50)
@@ -86,11 +89,28 @@ class ChatCompletionRequest(OpenAIBaseModel):
     reuse_context: StrictBool = True
     cache_generated_tokens: StrictBool = True
 
+    @field_validator("frequency_penalty", "presence_penalty", mode="before")
+    @classmethod
+    def _null_penalty(cls, value):
+        return 0.0 if value is None else value
+
+    @field_validator("repetition_penalty", mode="before")
+    @classmethod
+    def _null_repetition_penalty(cls, value):
+        return 1.0 if value is None else value
+
+    @field_validator("min_p", mode="before")
+    @classmethod
+    def _null_min_p(cls, value):
+        return 0.0 if value is None else value
+
     @field_validator("top_k")
     @classmethod
     def _normalize_top_k(cls, value):
         # vLLM-style clients send top_k <= 0 to mean "no top-k filtering"; the
         # engine only accepts a positive k, so fall back to the server default.
+        if value is None:
+            return 50
         return value if value > 0 else 50
 
     @field_validator("stop")
