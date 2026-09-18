@@ -73,6 +73,35 @@ def _materialize_checkpoint_defaults(model: nn.Module, device: str) -> None:
         materialize(device)
 
 
+# Quantization-scale buffers that model classes register with a safe ``ones``
+# default but that not every checkpoint variant carries: official
+# ``nvidia/*-FP8`` / ``*-NVFP4`` checkpoints omit the attention ``q_scale``
+# (ModelOpt keeps the legacy ``qScale=1.0`` convention), and INT4-AWQ exports
+# omit ``pre_quant_scale`` on the resmoothed q/k/v/gate/up projections. The
+# normal (non-meta) load path simply keeps the registered ``ones`` default when
+# the tensor is absent; under ``low_cpu_mem_usage`` that default lands on the
+# meta device, so restore it explicitly before the strict materialization scan.
+_OPTIONAL_SCALE_DEFAULT_BUFFERS = frozenset(
+    ("q_scale", "k_scale", "v_scale", "pre_quant_scale"))
+
+
+def _materialize_optional_scale_buffers(model: nn.Module, device: str) -> None:
+    """Fill in optional ``ones``-default scale buffers left on the meta device.
+
+    Mirrors the non-``low_cpu_mem_usage`` load path, where a checkpoint that
+    omits one of these buffers keeps the module's registered ``ones`` default.
+    Restricted to the known-optional scale buffer names so a genuinely missing
+    required tensor (e.g. a weight) still trips the strict meta-tensor scan.
+    """
+    for module in model.modules():
+        for name, buf in module.named_buffers(recurse=False):
+            if (name in _OPTIONAL_SCALE_DEFAULT_BUFFERS and buf is not None
+                    and buf.device.type == "meta"):
+                module.register_buffer(
+                    name, torch.ones(buf.shape, dtype=buf.dtype,
+                                     device=device))
+
+
 def standard_attention_scale(head_dim: int) -> float:
     return 1.0 / (float(head_dim)**0.5)
 
@@ -744,6 +773,7 @@ class AutoModel:
                      mapping=config.mapping)
         if low_cpu_mem_usage:
             _materialize_checkpoint_defaults(model, device)
+            _materialize_optional_scale_buffers(model, device)
             meta_tensors = [
                 name for name, tensor in (*model.named_parameters(),
                                           *model.named_buffers())
