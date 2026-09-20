@@ -181,7 +181,7 @@ l0_e2e_a30_trtrtx:
       artifacts: true
   variables:
     CUDA_VERSION: "13.2"
-    TRT_RTX_VERSION: "1.7.0.28"
+    TRT_RTX_VERSION: "1.7.1.80"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     PRIORITY: l0_e2e_a30_trtrtx
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/TensorRT-RTX/$TRT_RTX_VERSION/TensorRT-RTX-$TRT_RTX_VERSION-x86_64_rocky8_cuda13.4"

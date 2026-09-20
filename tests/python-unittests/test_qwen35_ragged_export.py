@@ -319,7 +319,8 @@ def test_qwen35_awq_v1_decoder_linears_are_token_major(tmp_path):
         node.name: 2
         for node in linear_nodes
     }
-    qkv_concat = next(node for node in graph.node if node.name == "node_cat")
+    qkv_concat = next(node for node in graph.node
+                      if node.op_type == "QkvConcatPlugin")
     assert len(values[qkv_concat.output[0]].type.tensor_type.shape.dim) == 2
 
 
