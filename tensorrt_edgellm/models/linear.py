@@ -79,6 +79,7 @@ __all__ = [
     "RowParallelLinear",
     "is_nvfp4_linear",
     "is_int4_linear",
+    "is_nvfp4_a16_linear",
     "FP16Linear",
     "FP8Linear",
     "MXFP8Linear",
@@ -867,6 +868,11 @@ def is_int4_linear(module: nn.Module) -> bool:
     """Return whether *module* emits an INT4 groupwise GEMM plugin."""
     return isinstance(module,
                       (AWQLinear, ModelOptAWQPrepackedLinear, GPTQLinear))
+
+
+def is_nvfp4_a16_linear(module: nn.Module) -> bool:
+    """Return whether *module* is an NVFP4 W4A16 dense GEMM linear."""
+    return isinstance(module, NVFP4A16Linear)
 
 
 def make_linear(

@@ -62,10 +62,11 @@ from ...dflash import DFlashVersion
 from ..default.modeling_default import (MLP, OnnxSpec, RMSNorm,
                                         _concat_hidden_in_provider_order)
 from ..linear import (ColumnParallelLinear, FP16Linear, NVFP4LinearMethod,
-                      ReplicatedLinear, TPMode, is_nvfp4_linear, make_linear)
+                      ReplicatedLinear, TPMode, is_int4_linear,
+                      is_nvfp4_a16_linear, is_nvfp4_linear, make_linear)
 from ..ops import (KV_PAGE_SIZE, attention_plugin, causal_conv1d,
                    causal_conv1d_with_intermediate, gated_delta_net,
-                   gated_delta_net_with_intermediate)
+                   gated_delta_net_with_intermediate, qkv_concat)
 
 __all__ = ["Qwen3_5CausalLM"]
 
@@ -509,6 +510,11 @@ class GatedAttention(nn.Module):
                                   bias=config.attention_bias,
                                   module_name=f"{module_prefix}.v_proj",
                                   tp_mode=TPMode.COL)
+        # INT4 / NVFP4-A16 QKV packs through qkv_concat to keep the Concat from
+        # being elided on SM>=100 (which corrupts the strided V write).
+        self._uses_qkv_concat = any(
+            is_int4_linear(proj) or is_nvfp4_a16_linear(proj)
+            for proj in (self.q_proj, self.k_proj, self.v_proj))
         if self.enable_fp8_kv_cache:
             self.q_proj.register_buffer("q_scale", torch.ones(1))
             self.k_proj.register_buffer("k_scale", torch.ones(1))
@@ -582,10 +588,12 @@ class GatedAttention(nn.Module):
         kwargs["qkv_scales"] = getattr(self, "_qkv_scales_float",
                                        [1.0, 1.0, 1.0])
 
+        qkv = (qkv_concat(query_states, key_states, value_states)
+               if self._uses_qkv_concat else torch.cat(
+                   [query_states, key_states, value_states], dim=-1))
         attn_output, present_key_value = attention_plugin(
-            torch.cat([query_states, key_states, value_states],
-                      dim=-1), past_key_value, context_lengths,
-            rope_rotary_cos_sin, kvcache_start_index, kv_page_table, **kwargs)
+            qkv, past_key_value, context_lengths, rope_rotary_cos_sin,
+            kvcache_start_index, kv_page_table, **kwargs)
 
         # attn_output: [batch, seq, num_heads, head_dim]
         # Apply gating: sigmoid(gate) * attn_output
@@ -630,8 +638,11 @@ class GatedAttention(nn.Module):
                                self.head_dim)).reshape(
                                    num_tokens,
                                    self.num_kv_heads * self.head_dim)
+        qkv = (qkv_concat(query_states, key_states, value_states)
+               if self._uses_qkv_concat else torch.cat(
+                   [query_states, key_states, value_states], dim=-1))
         attn_output, present_key_value = attention_plugin(
-            torch.cat([query_states, key_states, value_states], dim=-1),
+            qkv,
             past_key_value,
             query_lengths,
             rope_rotary_cos_sin,
