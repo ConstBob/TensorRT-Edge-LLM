@@ -80,6 +80,7 @@ class SamplingParams:
     temperature: float = 0.7
     top_p: float = 0.9
     top_k: int = 50
+    seed: Optional[int] = None
     max_tokens: int = 2048
     enable_thinking: bool = False
     reasoning_effort: str = ""
@@ -1270,6 +1271,7 @@ class LLM:
         req.image_buffers = image_buffers
         req.audio_buffers = audio_buffers
         req.stop_strings = params.stop
+        req.sampling_seed = params.seed
         req.logit_bias = normalized_logit_bias
         if params.guided_decoding is not None:
             guide_type, guide = params.guided_decoding

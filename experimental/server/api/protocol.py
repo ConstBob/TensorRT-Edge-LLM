@@ -14,12 +14,20 @@
 # limitations under the License.
 """Typed OpenAI protocol models supported by the Edge-LLM server."""
 
+import logging
 import time
 import uuid
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import (BaseModel, ConfigDict, Field, StrictBool,
+from pydantic import (BaseModel, ConfigDict, Field, StrictBool, ValidationInfo,
                       field_validator, model_validator)
+
+logger = logging.getLogger("edgellm.server.protocol")
+
+_UNSUPPORTED_SAMPLING_DEFAULTS = {
+    "min_p": 0.0,
+    "repetition_penalty": 1.0,
+}
 
 
 class OpenAIBaseModel(BaseModel):
@@ -59,13 +67,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
     max_tokens: Optional[int] = Field(default=None, ge=1)
     max_completion_tokens: Optional[int] = Field(default=None, ge=1)
     n: int = Field(default=1, ge=1, le=1)
-    seed: Optional[int] = None
+    seed: Optional[int] = Field(default=None, ge=0, le=(1 << 64) - 1)
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     top_p: float = Field(default=0.9, gt=0.0, le=1.0)
-    top_k: int = Field(default=50, ge=1)
+    top_k: int = Field(default=50, ge=-1)
+    min_p: float = Field(default=0.0, ge=0.0, le=1.0)
+    repetition_penalty: float = Field(default=1.0, gt=0.0)
     tools: Optional[List[Dict[str, Any]]] = None
     tool_choice: Optional[Union[str, Dict[str, Any]]] = None
     parallel_tool_calls: bool = True
@@ -91,6 +101,18 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 isinstance(item, str) for item in value):
             return value
         raise ValueError("stop must be a string or an array of strings")
+
+    @field_validator("min_p", "repetition_penalty")
+    @classmethod
+    def _normalize_unsupported_sampling_fields(
+            cls, value: Union[int, float],
+            info: ValidationInfo) -> Union[int, float]:
+        default = _UNSUPPORTED_SAMPLING_DEFAULTS[info.field_name]
+        if value == default:
+            return value
+        logger.warning("%s=%s is unsupported; using default %s",
+                       info.field_name, value, default)
+        return default
 
     @model_validator(mode="after")
     def _validate_request(self):

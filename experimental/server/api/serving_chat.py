@@ -198,10 +198,6 @@ class OpenAIServingChat:
             raise UnsupportedFeatureError(
                 "presence_penalty is not supported by the Edge-LLM runtime",
                 param="presence_penalty")
-        if request.seed is not None:
-            raise UnsupportedFeatureError(
-                "seed is not supported by the Edge-LLM runtime", param="seed")
-
         try:
             tool_config = validate_tool_request(request.messages,
                                                 request.tools,
@@ -274,6 +270,7 @@ class OpenAIServingChat:
             temperature=request.temperature,
             top_p=1.0 if greedy else request.top_p,
             top_k=1 if greedy else request.top_k,
+            seed=request.seed,
             max_tokens=request.effective_max_tokens,
             enable_thinking=request.enable_thinking,
             reasoning_effort=request.reasoning_effort or "",

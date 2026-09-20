@@ -658,6 +658,34 @@ def test_chat_forwards_context_cache_request_policies(client_and_llm):
     assert not llm.last_sampling_params.cache_generated_tokens
 
 
+def test_chat_normalizes_unsupported_sampling_fields_and_forwards_seed(
+        client_and_llm, caplog):
+    client, llm = client_and_llm
+    seed = (1 << 64) - 1
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Describe the video",
+                               }],
+                               "seed":
+                               seed,
+                               "top_k":
+                               -1,
+                               "min_p":
+                               0.2,
+                               "repetition_penalty":
+                               1.2,
+                           })
+
+    assert response.status_code == 200, response.text
+    assert llm.last_sampling_params.seed == seed
+    assert llm.last_sampling_params.top_k == -1
+    assert "min_p=0.2 is unsupported; using default 0.0" in caplog.text
+    assert ("repetition_penalty=1.2 is unsupported; using default 1.0"
+            in caplog.text)
+
+
 def test_chat_template_is_default_on_and_request_configurable(client_and_llm):
     client, llm = client_and_llm
     body = {"messages": [{"role": "user", "content": "Hello"}]}
@@ -1770,6 +1798,8 @@ def test_native_errors_map_to_protocol_status(client_and_llm, marker, status):
     ("max_tokens", 2.5),
     ("temperature", "hot"),
     ("top_p", 2.0),
+    ("min_p", 1.1),
+    ("repetition_penalty", 0),
 ])
 def test_sampling_schema_rejects_invalid_values(client_and_llm, field, value):
     client, _ = client_and_llm
@@ -1783,6 +1813,22 @@ def test_sampling_schema_rejects_invalid_values(client_and_llm, field, value):
                            })
     assert response.status_code == 400
     assert field in response.text
+
+
+@pytest.mark.parametrize("seed", [-1, 1 << 64],
+                         ids=["negative", "exceeds-uint64"])
+def test_sampling_schema_rejects_seed_outside_uint64(client_and_llm, seed):
+    client, _ = client_and_llm
+    response = client.post("/v1/chat/completions",
+                           json={
+                               "messages": [{
+                                   "role": "user",
+                                   "content": "Hello"
+                               }],
+                               "seed": seed,
+                           })
+    assert response.status_code == 400
+    assert "seed" in response.text
 
 
 def test_stream_include_usage_requires_boolean(client_and_llm):
