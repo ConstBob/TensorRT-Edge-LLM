@@ -372,6 +372,38 @@ TEST(ChatTemplateTest, AppliesQwen38ReasoningEffortContract)
     EXPECT_FALSE(renderer.apply(request, formatted, options));
 }
 
+TEST(ChatTemplateTest, LeavesEnableThinkingUndefinedForQwen3Omni)
+{
+    // Generation-prompt tail of the Qwen3-Omni provider template, verbatim.
+    constexpr char kTail[] = R"JINJA({%- if add_generation_prompt -%}{{- '<|im_start|>assistant\n' -}}
+{%- if enable_thinking is defined and enable_thinking is false -%}{{- '<think>\n\n</think>\n\n' -}}{%- endif -%}
+{%- endif -%})JINJA";
+    rt::LLMGenerationRequest::Request request{{rt::Message{"user", {{"text", "hello"}}}}};
+    rt::LLMGenerationRequest::FormattedRequest formatted;
+
+    {
+        TemporaryTemplate model{{"chat_template.jinja", kTail}, {"config.json", R"({"model":"qwen3_omni_moe_text"})"}};
+        chat_template::ChatTemplate renderer;
+        ASSERT_TRUE(renderer.load(model.path));
+        ASSERT_TRUE(renderer.apply(request, formatted, {}));
+        EXPECT_EQ(formatted.formattedCompleteRequest, "<|im_start|>assistant\n");
+    }
+    {
+        TemporaryTemplate model{{"chat_template.jinja", kTail}, {"config.json", R"({"model":"qwen3_moe"})"}};
+        chat_template::ChatTemplate renderer;
+        ASSERT_TRUE(renderer.load(model.path));
+        ASSERT_TRUE(renderer.apply(request, formatted, {}));
+        EXPECT_EQ(formatted.formattedCompleteRequest, "<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    }
+    {
+        TemporaryTemplate model{{"chat_template.jinja", kTail}};
+        chat_template::ChatTemplate renderer;
+        ASSERT_TRUE(renderer.load(model.path));
+        ASSERT_TRUE(renderer.apply(request, formatted, {}));
+        EXPECT_EQ(formatted.formattedCompleteRequest, "<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    }
+}
+
 TEST(ChatTemplateTest, ExposesReasoningUnderCurrentAndLegacyProviderKeys)
 {
     TemporaryTemplate model{{"chat_template.jinja", "{{ messages[0].reasoning }}|{{ messages[0].reasoning_content }}"}};

@@ -65,6 +65,32 @@ Json parseJsonOrString(std::string const& value)
     return parsed.is_discarded() ? Json(value) : preserveJsonOrder(parsed);
 }
 
+//! Qwen3-Omni Instruct checkpoints are trained never to emit reasoning tokens. Binding
+//! ``enable_thinking`` makes their provider template prepend an inert
+//! ``<think>\n\n</think>\n\n``, which also shifts the Talker prefill slices off the first
+//! spoken token. Leaving the flag undefined selects the no-injection branch, as the
+//! provider's own ``apply_chat_template`` does when the caller passes no kwarg.
+bool omitsEnableThinking(std::filesystem::path const& modelDir)
+{
+    auto const configPath = modelDir / "config.json";
+    std::ifstream stream(configPath);
+    if (!stream)
+    {
+        return false;
+    }
+    try
+    {
+        auto const config = Json::parse(stream);
+        auto const model = config.value("model", config.value("model_type", std::string{}));
+        return model.rfind("qwen3_omni", 0) == 0;
+    }
+    catch (std::exception const& error)
+    {
+        LOG_WARNING("Ignoring unparsable %s: %s", configPath.c_str(), error.what());
+        return false;
+    }
+}
+
 std::string readTextFile(std::filesystem::path const& path)
 {
     if (!std::filesystem::is_regular_file(path))
@@ -548,6 +574,7 @@ public:
         mProviderTemplate.reset();
         mManualFamily.clear();
         mRawProcessor = RawProcessor::kNone;
+        mOmitEnableThinking = omitsEnableThinking(modelDir);
         mBosToken = std::move(bosToken);
         mEosToken = std::move(eosToken);
 
@@ -682,7 +709,10 @@ public:
                 setInjaObjectField(inputs, "bos_token", mBosToken);
                 setInjaObjectField(inputs, "eos_token", mEosToken);
                 setInjaObjectField(inputs, "strftime_now", true);
-                setInjaObjectField(inputs, "enable_thinking", options.enableThinking);
+                if (!mOmitEnableThinking)
+                {
+                    setInjaObjectField(inputs, "enable_thinking", options.enableThinking);
+                }
                 if (!options.reasoningEffort.empty())
                 {
                     setInjaObjectField(inputs, "reasoning_effort", options.reasoningEffort);
@@ -745,6 +775,7 @@ private:
     std::string mBosToken;
     std::string mEosToken;
     RawProcessor mRawProcessor{RawProcessor::kNone};
+    bool mOmitEnableThinking{false};
     Mode mMode{Mode::kUninitialized};
 };
 
