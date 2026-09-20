@@ -48,6 +48,8 @@ void transposeToPatchGemma4ViT(rt::Tensor const& originalImage, rt::Tensor& inpu
 //!     temporalPatchSize: Temporal patch size for the vision transformer
 //!     patchSize: Patch size for the vision transformer
 //!     mergeSize: Merge size for the vision transformer
+//!     temporalFirst: Flatten patches as [T,C,H,W] instead of [C,T,H,W]
+//!     channelLast: Flatten patches as [H,W,C,T]; mutually exclusive with temporalFirst
 //!     stream: CUDA stream for execution
 //! Outputs:
 //!     inputPatches [GPU, Half]: Total VIT input tensor of all images [totalSeqLength, inputDim]
@@ -57,7 +59,7 @@ void transposeToPatchGemma4ViT(rt::Tensor const& originalImage, rt::Tensor& inpu
 //! \throws std::runtime_error if image has invalid shape, data type or location
 void transposeToPatchQwenViT(rt::Tensor const& originalImage, rt::Tensor& inputPatches, int64_t const inputOffset,
     int64_t const temporalPatchSize, int64_t const patchSize, int64_t const mergeSize, bool temporalFirst,
-    cudaStream_t stream);
+    bool channelLast, cudaStream_t stream);
 
 //! The kernel will initialize the rotary position embeddings for Qwen2.5-VL VIT
 //! Inputs:
@@ -160,6 +162,14 @@ void transposeToPatchInternVLPhi4MM(
 //!     fastPosEmbedWeight [GPU, Half]: Fast position embeddings weight tensor [4, totalSeqLength]
 //! \throws std::runtime_error if image has invalid shape, data type or location
 void initFastPosEmbedQwenViT(rt::Tensor& fastPosEmbedIdx, rt::Tensor& fastPosEmbedWeight,
+    std::vector<int64_t> const& gridTHW, int64_t const mergeSize, int64_t const numGridPerSide, int64_t const startIdx,
+    cudaStream_t stream);
+
+//! Initialize learned-position interpolation metadata for Cosmos3-Edge VIT.
+//! Cosmos3 uses PyTorch bilinear interpolation with align_corners=false, unlike Qwen3-VL's
+//! align_corners=true coordinate mapping. Tensor layout and merge-group ordering match
+//! initFastPosEmbedQwenViT.
+void initFastPosEmbedCosmos3ViT(rt::Tensor& fastPosEmbedIdx, rt::Tensor& fastPosEmbedWeight,
     std::vector<int64_t> const& gridTHW, int64_t const mergeSize, int64_t const numGridPerSide, int64_t const startIdx,
     cudaStream_t stream);
 

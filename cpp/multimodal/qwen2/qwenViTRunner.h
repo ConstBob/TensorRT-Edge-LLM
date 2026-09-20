@@ -195,6 +195,9 @@ protected:
     //! \brief Whether flattened patch elements use temporal-major rather than channel-major order.
     virtual bool vitPatchTemporalFirst() const;
 
+    //! \brief Whether flattened patch elements use [H,W,C,T] order.
+    virtual bool vitPatchChannelLast() const;
+
     //! \brief Fill mRotaryPosEmb for the given spans. Base = Qwen 2D rotary (concat(freq_h, freq_w) over
     //!        2x2-merge-grouped tokens, no position offset). Subclasses with a different per-token rotary layout
     //!        (e.g. Muse-Glimmer's concat(freq_w, freq_h) + 1 raster layout) override this. Called only when

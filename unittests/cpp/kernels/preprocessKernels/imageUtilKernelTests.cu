@@ -191,7 +191,7 @@ static void BuildPhi4mmBatchedInputs(std::vector<std::pair<int32_t, int32_t>> co
 
 void TestTransposeToPatchQwenViT(int32_t const height, int32_t const width, int32_t const channels = 3,
     int32_t const T = 2, int32_t const temporalPatchSize = 2, int32_t const patchSize = 14, int32_t const mergeSize = 2,
-    bool const temporalFirst = false)
+    bool const temporalFirst = false, bool const channelLast = false)
 {
     cudaStream_t stream{nullptr};
 
@@ -201,7 +201,7 @@ void TestTransposeToPatchQwenViT(int32_t const height, int32_t const width, int3
     uniformFloatInitialization<half>(originalImage, 0, 1);
 
     transposeToPatchQwenReference(originalImage, inputPatchesRef, 0, T, height, width, channels, temporalPatchSize,
-        patchSize, mergeSize, temporalFirst);
+        patchSize, mergeSize, temporalFirst, channelLast);
 
     // GPU tensors
     rt::Tensor originalImageDevice({T, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
@@ -215,8 +215,8 @@ void TestTransposeToPatchQwenViT(int32_t const height, int32_t const width, int3
     int32_t const inputDim = channels * temporalPatchSize * patchSize * patchSize;
     rt::Tensor inputPatchesDevice({totalSeqLength, inputDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
-    kernel::transposeToPatchQwenViT(
-        originalImageDevice, inputPatchesDevice, 0, temporalPatchSize, patchSize, mergeSize, temporalFirst, stream);
+    kernel::transposeToPatchQwenViT(originalImageDevice, inputPatchesDevice, 0, temporalPatchSize, patchSize, mergeSize,
+        temporalFirst, channelLast, stream);
 
     std::vector<half> inputPatches(T * height * width * channels);
     CUDA_CHECK(cudaMemcpyAsync(inputPatches.data(), inputPatchesDevice.rawPointer(), inputPatches.size() * sizeof(half),
@@ -250,6 +250,13 @@ TEST(TransposeToPatchQwen, AccuracyTemporalFirst)
         /*mergeSize*/ 1, /*temporalFirst*/ true);
 }
 
+TEST(TransposeToPatchQwen, AccuracyChannelLast)
+{
+    TestTransposeToPatchQwenViT(
+        /*height*/ 224, /*width*/ 224, /*channels*/ 3, /*T*/ 4, /*temporalPatchSize*/ 2, /*patchSize*/ 14,
+        /*mergeSize*/ 2, /*temporalFirst*/ false, /*channelLast*/ true);
+}
+
 void BenchmarkTransposeToPatchQwenViT(int32_t const height, int32_t const width, int32_t const channels = 3,
     int32_t const T = 2, int32_t const temporalPatchSize = 2, int32_t const patchSize = 14, int32_t const mergeSize = 2)
 {
@@ -271,7 +278,7 @@ void BenchmarkTransposeToPatchQwenViT(int32_t const height, int32_t const width,
 
     auto launch = [&]() {
         kernel::transposeToPatchQwenViT(
-            originalImageDevice, inputPatchesDevice, 0, temporalPatchSize, patchSize, mergeSize, false, stream);
+            originalImageDevice, inputPatchesDevice, 0, temporalPatchSize, patchSize, mergeSize, false, false, stream);
     };
 
     constexpr int32_t numWarmup = 10;
@@ -552,6 +559,91 @@ void TestInitFastPosEmbedQwenViT(int64_t const mergeSize = 2, int64_t const numG
 TEST(InitFastPosEmbedQwenViT, Accuracy)
 {
     TestInitFastPosEmbedQwenViT();
+}
+
+TEST(InitFastPosEmbedCosmos3ViT, AlignCornersFalseAccuracy)
+{
+    cudaStream_t stream{nullptr};
+    int64_t constexpr mergeSize = 2;
+    int64_t constexpr numGridPerSide = 16;
+    std::vector<std::vector<int64_t>> const grids{{2, 80, 128}, {1, 24, 32}};
+    std::vector<int64_t> offsets{0};
+    for (auto const& grid : grids)
+    {
+        offsets.push_back(offsets.back() + grid[0] * grid[1] * grid[2]);
+    }
+    int64_t const totalSeqLength = offsets.back();
+    std::vector<int64_t> expectedIdx(4 * totalSeqLength);
+    std::vector<half> expectedWeight(4 * totalSeqLength);
+
+    for (size_t image = 0; image < grids.size(); ++image)
+    {
+        auto const& grid = grids[image];
+        int64_t const T = grid[0];
+        int64_t const H = grid[1];
+        int64_t const W = grid[2];
+        int64_t const llmGridH = H / mergeSize;
+        int64_t const llmGridW = W / mergeSize;
+        for (int64_t t = 0; t < T; ++t)
+        {
+            for (int64_t h = 0; h < llmGridH; ++h)
+            {
+                for (int64_t w = 0; w < llmGridW; ++w)
+                {
+                    for (int64_t mh = 0; mh < mergeSize; ++mh)
+                    {
+                        for (int64_t mw = 0; mw < mergeSize; ++mw)
+                        {
+                            int64_t const grouped = ((h * llmGridW + w) * mergeSize + mh) * mergeSize + mw;
+                            int64_t const targetIdx = offsets[image] + t * H * W + grouped;
+                            float const sourceH = std::clamp(
+                                (static_cast<float>(h * mergeSize + mh) + 0.5F) * numGridPerSide / H - 0.5F, 0.0F,
+                                static_cast<float>(numGridPerSide - 1));
+                            float const sourceW = std::clamp(
+                                (static_cast<float>(w * mergeSize + mw) + 0.5F) * numGridPerSide / W - 0.5F, 0.0F,
+                                static_cast<float>(numGridPerSide - 1));
+                            int64_t const h0 = static_cast<int64_t>(std::floor(sourceH));
+                            int64_t const w0 = static_cast<int64_t>(std::floor(sourceW));
+                            int64_t const h1 = std::min(h0 + 1, numGridPerSide - 1);
+                            int64_t const w1 = std::min(w0 + 1, numGridPerSide - 1);
+                            float const dh = sourceH - h0;
+                            float const dw = sourceW - w0;
+                            std::array<int64_t, 4> const indices{h0 * numGridPerSide + w0, h0 * numGridPerSide + w1,
+                                h1 * numGridPerSide + w0, h1 * numGridPerSide + w1};
+                            std::array<float, 4> const weights{
+                                (1.0F - dh) * (1.0F - dw), (1.0F - dh) * dw, dh * (1.0F - dw), dh * dw};
+                            for (int64_t corner = 0; corner < 4; ++corner)
+                            {
+                                expectedIdx[corner * totalSeqLength + targetIdx] = indices[corner];
+                                expectedWeight[corner * totalSeqLength + targetIdx] = __float2half(weights[corner]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    rt::Tensor actualIdx({4, totalSeqLength}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
+    rt::Tensor actualWeight({4, totalSeqLength}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    for (size_t image = 0; image < grids.size(); ++image)
+    {
+        kernel::initFastPosEmbedCosmos3ViT(
+            actualIdx, actualWeight, grids[image], mergeSize, numGridPerSide, offsets[image], stream);
+    }
+
+    std::vector<int64_t> hostIdx(expectedIdx.size());
+    std::vector<half> hostWeight(expectedWeight.size());
+    CUDA_CHECK(cudaMemcpyAsync(
+        hostIdx.data(), actualIdx.rawPointer(), hostIdx.size() * sizeof(int64_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(hostWeight.data(), actualWeight.rawPointer(), hostWeight.size() * sizeof(half),
+        cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    EXPECT_EQ(hostIdx, expectedIdx);
+    for (size_t i = 0; i < expectedWeight.size(); ++i)
+    {
+        EXPECT_EQ(__half2float(hostWeight[i]), __half2float(expectedWeight[i])) << "Mismatch at weight " << i;
+    }
 }
 TEST(phi4mmPostprocessVisionTokens, Accuracy)
 {

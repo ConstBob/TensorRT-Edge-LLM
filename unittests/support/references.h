@@ -114,7 +114,8 @@ EagleAcceptResult eagleAcceptRef(std::vector<float> const& logits, std::vector<i
 // Image utility reference functions
 void transposeToPatchQwenReference(std::vector<half> const& originalImage, std::vector<half>& patch,
     int32_t const inputOffset, int32_t const T, int32_t const height, int32_t const width, int32_t const channels,
-    int32_t const temporalPatchSize, int32_t const patchSize, int32_t const mergeSize, bool temporalFirst = false);
+    int32_t const temporalPatchSize, int32_t const patchSize, int32_t const mergeSize, bool temporalFirst = false,
+    bool channelLast = false);
 
 void transposeToPatchInternVLReference(std::vector<half> const& originalImage, std::vector<half>& patch,
     int32_t const inputOffset, int32_t const height, int32_t const width, int32_t const channels,
