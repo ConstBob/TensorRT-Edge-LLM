@@ -258,11 +258,14 @@ class MuseGlimmerForCausalLM(NetworkModule):
         hidden_states = self.norm(hidden_states)
         selected = F.gather_token_rows(hidden_states, ragged.logits_indices)
         logits = F.cast(self.lm_head(selected), trt.float32)
-        if self.output_multiplier != 1.0:
-            logits = logits * np.float32(self.output_multiplier)
         if cfg.final_logit_softcapping is not None:
+            # Fold output_multiplier into the softcap pre-tanh scale to emit a
+            # single pre-tanh multiply, matching Gemma3/Gemma4.
             cap = float(cfg.final_logit_softcapping)
-            logits = (logits / np.float32(cap)).tanh() * np.float32(cap)
+            pre_scale = np.float32(self.output_multiplier / cap)
+            logits = (logits * pre_scale).tanh() * np.float32(cap)
+        elif self.output_multiplier != 1.0:
+            logits = logits * np.float32(self.output_multiplier)
         outputs["logits"] = logits
         if cfg.engine_role == "base" and cfg.spec_decode_type == "dflash":
             outputs["hidden_states"] = F.hidden_state_feedback(
