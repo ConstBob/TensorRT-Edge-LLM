@@ -89,6 +89,9 @@ def _apply_compile_workarounds(max_batch_size: int) -> str:
     if trt_major >= 11:
         if sm_version >= 100:
             flags = _append_lunowud_flag(flags, "-peep:match_dual_gemm=off")
+    if (trt_major, trt_minor) > (11, 0):
+        # CUDA Tile MXFP8 quantization produces NaNs for zero blocks.
+        flags = _append_lunowud_flag(flags, "-kgen:codegen:cuda_tile=0")
     if trt_major >= 11 or (trt_major == 10 and trt_minor >= 15):
         flags = _append_lunowud_flag(flags, "-mlir:autotune:num_threads=1")
         flags = _append_lunowud_flag(flags, "-mlir:collective:fp4=off")

@@ -67,6 +67,10 @@ std::string applyCompileWorkarounds([[maybe_unused]] int32_t maxBatchSize)
         appendLunowudFlag(lunowudFlags, "-peep:match_dual_gemm=off");
     }
 #endif
+#if NV_TENSORRT_MAJOR > 11 || (NV_TENSORRT_MAJOR == 11 && NV_TENSORRT_MINOR > 0)
+    // CUDA Tile MXFP8 quantization produces NaNs for zero blocks.
+    appendLunowudFlag(lunowudFlags, "-kgen:codegen:cuda_tile=0");
+#endif
 #if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 15)
     appendLunowudFlag(lunowudFlags, "-mlir:autotune:num_threads=1");
     appendLunowudFlag(lunowudFlags, "-mlir:collective:fp4=off");
