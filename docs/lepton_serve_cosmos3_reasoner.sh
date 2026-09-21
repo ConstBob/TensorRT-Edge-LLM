@@ -262,11 +262,17 @@ echo OPENAI_SERVE_STARTING
 while true; do
   trap - ERR
   set +e
+  # Visual profile can emit 4096 image tokens. Default max_input_len=4096 then
+  # 400s EDGELLM_INPUT_TOO_LONG on any HD eval image plus the text prompt
+  # (BlinkDepth 2048px: prefill 4118). KV 16384 leaves room for eval
+  # max_tokens=8192 after a full visual prefill.
   "${PY}" -m experimental.server \
     "${REASONING_CHECKPOINT}" \
     --host 0.0.0.0 \
     --port 8000 \
     --cache-dir "${CACHE_DIR}" \
+    --max-input-len 8192 \
+    --max-kv-cache-capacity 16384 \
     --max-image-tokens 4096 \
     --max-image-tokens-per-image 4096
   serve_rc=$?
