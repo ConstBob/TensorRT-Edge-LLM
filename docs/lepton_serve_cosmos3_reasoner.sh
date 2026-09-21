@@ -264,15 +264,24 @@ while true; do
   set +e
   # Visual profile can emit 4096 image tokens. Default max_input_len=4096 then
   # 400s EDGELLM_INPUT_TOO_LONG on any HD eval image plus the text prompt
-  # (BlinkDepth 2048px: prefill 4118). KV 16384 leaves room for eval
-  # max_tokens=8192 after a full visual prefill.
+  # (BlinkDepth 2048px: prefill 4118).
+  #
+  # Without --enable-in-flight-batching the server serves one request at a
+  # time, so the eval harness's dozens of concurrent streams overflow the
+  # 16-deep queue and every sample comes back 429 "server request queue is
+  # full" (a whole 64-cell run scored 0 with 100% http_error). Batch 8 x
+  # KV 131072 covers 8 concurrent sequences at the worst case of a full
+  # 8192 prefill plus the harness's max_tokens=8192.
   "${PY}" -m experimental.server \
     "${REASONING_CHECKPOINT}" \
     --host 0.0.0.0 \
     --port 8000 \
     --cache-dir "${CACHE_DIR}" \
     --max-input-len 8192 \
-    --max-kv-cache-capacity 16384 \
+    --enable-in-flight-batching \
+    --max-batch-size 8 \
+    --max-kv-cache-capacity 131072 \
+    --max-queued-requests 128 \
     --max-image-tokens 4096 \
     --max-image-tokens-per-image 4096
   serve_rc=$?
