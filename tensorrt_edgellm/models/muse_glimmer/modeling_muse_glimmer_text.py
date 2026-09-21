@@ -472,10 +472,13 @@ class MuseGlimmerForCausalLM(nn.Module):
 
         selected = torch.index_select(hidden_states, 0, logits_indices)
         logits = self.lm_head(selected).to(torch.float32)
-        logits = logits * self.output_multiplier
         if self.final_logit_softcapping is not None:
+            # Fold output_multiplier into the softcap pre-tanh scale to emit a
+            # single pre-tanh multiply, matching Gemma3/Gemma4.
             cap = float(self.final_logit_softcapping)
-            logits = torch.tanh(logits / cap) * cap
+            logits = torch.tanh(logits * (self.output_multiplier / cap)) * cap
+        elif self.output_multiplier != 1.0:
+            logits = logits * self.output_multiplier
 
         emitted_hidden = (self.model.target_hidden_concat
                           if dflash_base else None)
