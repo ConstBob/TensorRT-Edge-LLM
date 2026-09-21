@@ -48,6 +48,17 @@ class ChatAudioConfig(AudioGenerationConfig):
     format: Literal["pcm16"] = "pcm16"
 
 
+#: Scalar sampling knobs an OpenAI client may send explicitly as ``null`` to
+#: mean "unset". Their declared types are not optional, so pydantic rejects the
+#: null outright unless each falls back to its own declared default. Covering
+#: the whole set at once matters: patching them one at a time as each is
+#: reported just moves the 400 to the next field (``presence_penalty`` was
+#: fixed while ``top_p`` still 400'd every eval request).
+_NULLABLE_SAMPLING_FIELDS = ("temperature", "top_p", "min_p",
+                             "frequency_penalty", "presence_penalty",
+                             "repetition_penalty")
+
+
 class ChatCompletionRequest(OpenAIBaseModel):
     # vLLM / BenchService send extra and null sampling fields. Forbidding them
     # 400s every eval request before the engine runs.
@@ -89,22 +100,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
     reuse_context: StrictBool = True
     cache_generated_tokens: StrictBool = True
 
-    @field_validator("frequency_penalty", "presence_penalty", mode="before")
+    @field_validator(*_NULLABLE_SAMPLING_FIELDS, mode="before")
     @classmethod
-    def _null_penalty(cls, value):
-        return 0.0 if value is None else value
+    def _null_sampling_field(cls, value, info):
+        if value is None:
+            return cls.model_fields[info.field_name].get_default()
+        return value
 
-    @field_validator("repetition_penalty", mode="before")
-    @classmethod
-    def _null_repetition_penalty(cls, value):
-        return 1.0 if value is None else value
-
-    @field_validator("min_p", mode="before")
-    @classmethod
-    def _null_min_p(cls, value):
-        return 0.0 if value is None else value
-
-    @field_validator("top_k")
+    @field_validator("top_k", mode="before")
     @classmethod
     def _normalize_top_k(cls, value):
         # vLLM-style clients send top_k <= 0 to mean "no top-k filtering"; the
