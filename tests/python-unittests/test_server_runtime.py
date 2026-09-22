@@ -698,11 +698,12 @@ def test_native_chat_template_derives_hybrid_mtp_replay_tail(monkeypatch):
             "role": "user",
             "content": "hello"
         }],
-        SamplingParams(cache_generated_tokens=False),
+        SamplingParams(cache_generated_tokens=False, seed=7),
     )
     assert request.apply_chat_template is True
     assert request.add_generation_prompt is True
     assert request.context_cache_replay_tail_length == -1
+    assert request.requests[0].sampling_seed == 7
 
     raw_request = llm._make_generation_request(
         [{
