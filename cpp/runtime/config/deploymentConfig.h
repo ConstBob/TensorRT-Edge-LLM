@@ -158,7 +158,8 @@ struct DeploymentConfig
 //!     - `specConfig->verifySize <= specConfig->maxVerifySize`
 //!     - non-DFlash/JetSpec: `specConfig->draftingStep * specConfig->draftingTopK <= specConfig->maxDraftProposalSize`
 //!     - MTP: `draftingStep + 1 <= 16` (EAGLE utility kernel depth limit);
-//!       `draftingTopK == 1` selects the linear chain and requires `verifySize == draftingStep + 1`,
+//!       `draftingTopK == 1` selects the linear chain and requires the active
+//!       `verifySize == draftingStep + 1` (the engine's `maxVerifySize` profile may be larger),
 //!       while `draftingTopK > 1` selects tree drafting and requires
 //!       `draftingTopK < verifySize`, `draftingTopK <= 8`, and `verifySize <= 128`
 //!       (MTP tree utility limit; unfillable verify nodes become padding)

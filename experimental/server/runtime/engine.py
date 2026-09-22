@@ -376,6 +376,29 @@ class _SpecDecodeRuntimeOptions:
     dflash_block_size: int = 0
 
 
+def _resolve_tree_size(method: str, top_k: int, requested_size: Optional[int],
+                       max_size: int, linear_size: int) -> int:
+    """Resolve an active tree node budget within the compiled profile.
+
+    ``top_k == 1`` is the degenerate linear tree, whose node count is fixed by
+    the proposal path. Branching trees may use any node budget large enough to
+    hold the root and its first fanout, up to the engine profile maximum.
+    """
+    minimum_size = linear_size if top_k == 1 else top_k + 1
+    default_size = linear_size if top_k == 1 else max_size
+    size = requested_size or default_size
+    if top_k == 1 and size != linear_size:
+        raise ValueError(
+            f"{method} linear decoding requires verify_tree_size="
+            f"{linear_size}; use max_verify_tree_size to set a larger engine "
+            "profile")
+    if not minimum_size <= size <= max_size:
+        raise ValueError(
+            f"{method} verify_tree_size must be within the active topology "
+            f"and compiled capacity [{minimum_size}, {max_size}]")
+    return size
+
+
 def _internvl_geometry(cfg: dict, key: str) -> int:
     """InternVL writes vision_config image_size/patch_size as [H, W] and the
     C++ builder and runtime both read index 0. Other families put a scalar
@@ -418,6 +441,8 @@ def _resolve_spec_decode_runtime_options(
     max_verify_size = int(
         base.get("builder_config", {}).get("max_verify_tree_size",
                                            _DEFAULT_VERIFY_TREE_SIZE))
+    max_draft_size = int(
+        draft.get("builder_config", {}).get("max_draft_tree_size", 0))
 
     if engine_method == "eagle3":
         return _SpecDecodeRuntimeOptions(
@@ -429,12 +454,14 @@ def _resolve_spec_decode_runtime_options(
     if engine_method in {"mtp", "gemma4_mtp"}:
         top_k = draft_top_k or 1
         step = num_speculative_tokens or draft_step or _DEFAULT_DRAFT_STEP
-        verify_size = (verify_tree_size
-                       or (step + 1 if top_k == 1 else max_verify_size))
+        verify_size = _resolve_tree_size(engine_method, top_k,
+                                         verify_tree_size, max_verify_size,
+                                         step + 1)
+        if max_draft_size > 0 and step > max_draft_size:
+            raise ValueError(
+                f"{engine_method} draft_step={step} exceeds the compiled "
+                f"proposal capacity {max_draft_size}")
         return _SpecDecodeRuntimeOptions(top_k, step, verify_size)
-
-    max_draft_size = int(
-        draft.get("builder_config", {}).get("max_draft_tree_size", 0))
 
     if engine_method in {"dflash", "jetspec"}:
         if draft_step not in (None, 1):
@@ -457,12 +484,9 @@ def _resolve_spec_decode_runtime_options(
                 f"{engine_method} num_speculative_tokens must be within the "
                 f"compiled proposal capacity [2, {compiled_block_size}]")
         top_k = draft_top_k or 1
-        verify_size = (verify_tree_size
-                       or (block_size if top_k == 1 else max_verify_size))
-        if not 1 <= verify_size <= max_verify_size:
-            raise ValueError(
-                f"{engine_method} verify_tree_size must be within the "
-                f"compiled verification capacity [1, {max_verify_size}]")
+        verify_size = _resolve_tree_size(engine_method, top_k,
+                                         verify_tree_size, max_verify_size,
+                                         block_size)
         return _SpecDecodeRuntimeOptions(top_k, 1, verify_size, block_size)
 
     if engine_method == "dspark":
@@ -473,18 +497,18 @@ def _resolve_spec_decode_runtime_options(
         mode_config = draft.get("dspark_config") or {}
         block_size = int(
             mode_config.get("block_size", draft.get("block_size", 0)))
-        slot_offset = 0 if mode_config.get("sample_from_anchor", True) else 1
         if max_draft_size <= 0:
-            max_draft_size = block_size + slot_offset
+            max_draft_size = block_size
         top_k = draft_top_k or 1
         if top_k > 1:
             if num_speculative_tokens is not None:
                 raise ValueError(
                     "dspark tree uses verify_tree_size as its node budget; "
                     "omit num_speculative_tokens")
-            verify_size = verify_tree_size or max_verify_size
+            verify_size = _resolve_tree_size("dspark", top_k, verify_tree_size,
+                                             max_verify_size, 2)
         else:
-            proposal_capacity = min(block_size, max_draft_size - slot_offset)
+            proposal_capacity = min(block_size, max_draft_size)
             if proposal_capacity < 1:
                 raise ValueError(
                     "compiled dspark draft has no proposal capacity")
@@ -493,11 +517,9 @@ def _resolve_spec_decode_runtime_options(
                 raise ValueError(
                     "dspark num_speculative_tokens must be within the "
                     f"compiled proposal capacity [1, {proposal_capacity}]")
-            verify_size = verify_tree_size or proposal_size + 1
-        if not 2 <= verify_size <= max_verify_size:
-            raise ValueError(
-                "dspark verify_tree_size must be within the compiled "
-                f"verification capacity [2, {max_verify_size}]")
+            verify_size = _resolve_tree_size("dspark", top_k, verify_tree_size,
+                                             max_verify_size,
+                                             proposal_size + 1)
         if (top_k > 1 and int(base.get("num_linear_attn_layers", 0)) > 0
                 and base.get("recurrent_spec_verify_mode") == "replay"
                 and verify_size != max_verify_size):
@@ -838,6 +860,8 @@ class LLM:
         draft_top_k: Optional[int] = None,
         draft_step: Optional[int] = None,
         verify_tree_size: Optional[int] = None,
+        max_verify_tree_size: Optional[int] = None,
+        max_draft_tree_size: Optional[int] = None,
         build_options: Optional["BuildOptions"] = None,
         speculative_config: Optional[Any] = None,
         context_cache_config: Optional[Union[ContextCacheConfig,
@@ -850,9 +874,13 @@ class LLM:
                 or not math.isfinite(engine_cache_max_size_gb)
                 or engine_cache_max_size_gb <= 0):
             raise ValueError("engine_cache_max_size_gb must be positive")
-        for name, value in (("draft_top_k", draft_top_k),
-                            ("draft_step", draft_step), ("verify_tree_size",
-                                                         verify_tree_size)):
+        for name, value in (
+            ("draft_top_k", draft_top_k),
+            ("draft_step", draft_step),
+            ("verify_tree_size", verify_tree_size),
+            ("max_verify_tree_size", max_verify_tree_size),
+            ("max_draft_tree_size", max_draft_tree_size),
+        ):
             if value is None:
                 continue
             if (isinstance(value, bool) or not isinstance(value, int)
@@ -892,6 +920,8 @@ class LLM:
             max_input_len=max_input_len,
             max_batch_size=max_batch_size,
             max_kv_cache_capacity=max_kv_cache_capacity,
+            max_verify_tree_size=max_verify_tree_size,
+            max_draft_tree_size=max_draft_tree_size,
             max_image_tokens=max_image_tokens,
             max_image_tokens_per_image=max_image_tokens_per_image,
         )
@@ -911,7 +941,19 @@ class LLM:
         tree_base = (resolved_top_k > 1 and options.builder_spec_type
                      in {"mtp", "dflash", "jetspec", "dspark"})
         if options.spec_type != "none":
-            options = replace(options, tree_base=tree_base)
+            profile_options = {"tree_base": tree_base}
+            profile_verify_size = max_verify_tree_size or verify_tree_size
+            if (profile_verify_size is not None
+                    and options.max_verify_tree_size is None):
+                profile_options["max_verify_tree_size"] = profile_verify_size
+            profile_draft_size = max_draft_tree_size
+            if (profile_draft_size is None
+                    and options.builder_spec_type == "dflash"):
+                profile_draft_size = profile_verify_size
+            if (profile_draft_size is not None
+                    and options.max_draft_tree_size is None):
+                profile_options["max_draft_tree_size"] = profile_draft_size
+            options = replace(options, **profile_options)
 
         prepared = prepare_model(
             model,
@@ -2130,7 +2172,8 @@ def load_model(**kwargs):
         model_type = json.load(file).get("model_type")
     if model_type == "qwen3_tts":
         runtime_class = TTS
-        for name in ("draft_top_k", "draft_step", "verify_tree_size"):
+        for name in ("draft_top_k", "draft_step", "verify_tree_size",
+                     "max_verify_tree_size", "max_draft_tree_size"):
             if kwargs.pop(name, None) is not None:
                 raise ValueError(
                     f"standalone TTS models do not support {name}")

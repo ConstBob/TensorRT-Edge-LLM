@@ -666,11 +666,11 @@ def test_dspark_sample_without_anchor_uses_resolved_physical_capacity():
     _setup_llm_profiles(_ProfileBuilder(), config, network, cfg, args)
 
     for profile in config.profiles:
-        assert profile.shapes["inputs_embeds"] == ((7, 16), (21, 16), (21, 16))
-        assert profile.shapes["positions"] == ((7, ), (21, ), (21, ))
-        assert profile.shapes["rope_rotary_cos_sin"] == ((7, 4), (21, 4), (21,
+        assert profile.shapes["inputs_embeds"] == ((1, 16), (21, 16), (21, 16))
+        assert profile.shapes["positions"] == ((1, ), (21, ), (21, ))
+        assert profile.shapes["rope_rotary_cos_sin"] == ((1, 4), (21, 4), (21,
                                                                            4))
-        assert profile.shapes["packed_attention_mask"] == ((7, 1), (21, 1),
+        assert profile.shapes["packed_attention_mask"] == ((1, 1), (21, 1),
                                                            (21, 1))
 
 
@@ -689,17 +689,19 @@ def test_dspark_runtime_config_preserves_execution_contract():
     assert dspark["sample_from_anchor"] is False
 
 
-def test_experimental_dspark_rejects_unimplemented_attention_semantics():
+def test_experimental_dspark_accepts_shared_kv_and_value_norm():
     args = _build_args(resolved_spec_role=contracts.SpecRole.DRAFT,
                        spec_type="dspark")
     target = _dense_config()
+    cfg = _dense_config(dspark_target_layer_ids=[0],
+                        dspark_markov_rank=1,
+                        attention_k_eq_v=True,
+                        has_value_norm=True)
 
-    for field in ("attention_k_eq_v", "has_value_norm"):
-        cfg = _dense_config(dspark_target_layer_ids=[0],
-                            dspark_markov_rank=1,
-                            **{field: True})
-        with pytest.raises(ValueError, match=field):
-            configure_dspark_draft(cfg, paired_target=target, build_args=args)
+    configure_dspark_draft(cfg, paired_target=target, build_args=args)
+
+    assert cfg.attention_k_eq_v is True
+    assert cfg.has_value_norm is True
 
 
 def test_ordinary_draft_profiles_use_context_prefill_then_proposal():

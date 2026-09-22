@@ -26,6 +26,8 @@ from .ragged import RaggedDecoderInputs
 class GatedDeltaNet(Module):
     """Linear-attention block composed from projections and recurrent ops."""
 
+    replicated_controls = True
+
     def __init__(self, ctx, prefix: str) -> None:
         super().__init__(ctx, prefix)
         gdn = ctx.cfg.gdn_cfg
@@ -34,17 +36,25 @@ class GatedDeltaNet(Module):
             gdn.key_dim * ctx.cfg.tp_size,
             gdn.value_dim * ctx.cfg.tp_size,
         )
-        self.in_proj_qkv = Linear(ctx,
+        self._init_input_projections()
+        self.out_proj = Linear(ctx, self.key("out_proj"))
+
+    def _init_input_projections(self) -> None:
+        """Create the split projection layout used by Qwen3.5 checkpoints."""
+        self.in_proj_qkv = Linear(self.ctx,
                                   self.key("in_proj_qkv"),
                                   tp_output_segments=self.tp_qkv_segments)
-        self.in_proj_z = Linear(ctx, self.key("in_proj_z"))
-        self.in_proj_b = Linear(ctx,
+        self.in_proj_z = Linear(self.ctx, self.key("in_proj_z"))
+        self.in_proj_b = Linear(self.ctx,
                                 self.key("in_proj_b"),
                                 tensor_parallel=False)
-        self.in_proj_a = Linear(ctx,
+        self.in_proj_a = Linear(self.ctx,
                                 self.key("in_proj_a"),
                                 tensor_parallel=False)
-        self.out_proj = Linear(ctx, self.key("out_proj"))
+
+    def _project_inputs(self, hidden_states):
+        return (self.in_proj_qkv(hidden_states), self.in_proj_z(hidden_states),
+                self.in_proj_b(hidden_states), self.in_proj_a(hidden_states))
 
     def _constant_weight(self, suffix: str, shape, dtype, tp_segments=()):
         key = self.key(suffix)
@@ -69,11 +79,8 @@ class GatedDeltaNet(Module):
                 collect_intermediate=False):
         cfg = self.cfg
         gdn = cfg.gdn_cfg
-        mixed = self.in_proj_qkv(hidden_states)
-        gate = self.in_proj_z(hidden_states)
-        beta = self.in_proj_b(hidden_states)
-        alpha = self.in_proj_a(hidden_states)
-        if cfg.tp_size > 1:
+        mixed, gate, beta, alpha = self._project_inputs(hidden_states)
+        if cfg.tp_size > 1 and self.replicated_controls:
             # Keep the small alpha and beta projections replicated because a
             # rank-local shard is narrower than the supported NVFP4 GEMM tile.
             start = cfg.tp_rank * gdn.num_value_heads

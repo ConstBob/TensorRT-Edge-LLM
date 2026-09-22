@@ -181,6 +181,8 @@ class ModelConfig:
     draft_top_k: Optional[int] = None
     draft_step: Optional[int] = None
     verify_tree_size: Optional[int] = None
+    max_verify_tree_size: Optional[int] = None
+    max_draft_tree_size: Optional[int] = None
     speculative_config: Optional[SpeculativeConfig] = None
     context_cache_config: ContextCacheConfig = field(
         default_factory=ContextCacheConfig)
@@ -207,6 +209,8 @@ class ModelConfig:
             "draft_top_k": self.draft_top_k,
             "draft_step": self.draft_step,
             "verify_tree_size": self.verify_tree_size,
+            "max_verify_tree_size": self.max_verify_tree_size,
+            "max_draft_tree_size": self.max_draft_tree_size,
             "speculative_config": self.speculative_config,
             "context_cache_config": self.context_cache_config,
             "enable_in_flight_batching": self.enable_in_flight_batching,
@@ -339,6 +343,8 @@ def create_argument_parser() -> argparse.ArgumentParser:
     model.add_argument("--draft-top-k", type=_positive_int)
     model.add_argument("--draft-step", type=_positive_int)
     model.add_argument("--verify-tree-size", type=_positive_int)
+    model.add_argument("--max-verify-tree-size", type=_positive_int)
+    model.add_argument("--max-draft-tree-size", type=_positive_int)
     model.add_argument("--speculative-config", default="")
     model.add_argument(
         "--enable-context-reuse",
@@ -402,6 +408,8 @@ def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
         draft_top_k=args.draft_top_k,
         draft_step=draft_step,
         verify_tree_size=args.verify_tree_size,
+        max_verify_tree_size=args.max_verify_tree_size,
+        max_draft_tree_size=args.max_draft_tree_size,
         speculative_config=speculative,
         context_cache_config=context_cache,
         enable_in_flight_batching=args.enable_in_flight_batching,

@@ -17,6 +17,7 @@
 from ...core import contracts
 from ...core.bundle import BundleConfig
 from ...core.dspark_config import resolve_dspark_config
+from ..gemma4.configuration import normalize_block_draft_config
 
 
 def resolve_build_profile(draft: dict, max_draft_tree_size,
@@ -41,17 +42,6 @@ def _validate_dimensions(draft, target) -> None:
     if target.vocab_size != draft.vocab_size:
         raise ValueError("DSpark base/draft vocab sizes must match: "
                          f"{target.vocab_size} != {draft.vocab_size}")
-
-
-def _validate_model_contract(config) -> None:
-    unsupported = [
-        name for name in ("attention_k_eq_v", "has_value_norm")
-        if getattr(config, name)
-    ]
-    if unsupported:
-        raise ValueError(
-            "experimental DSpark does not implement checkpoint semantics: " +
-            ", ".join(unsupported))
 
 
 def _validate_runtime_contract(config, build_args,
@@ -144,5 +134,5 @@ def configure_draft(config,
         raise ValueError("DSpark draft config must provide target_layer_ids")
     if config.dspark_markov_rank <= 0:
         raise ValueError("DSpark draft requires markov_rank > 0")
-    _validate_model_contract(config)
+    normalize_block_draft_config(config)
     _validate_runtime_contract(config, build_args, contracts.SpecRole.DRAFT)

@@ -106,9 +106,8 @@ class Qwen3MoeSparseMoeBlock(Module):
         elif cfg.quant_type == quantization.QUANT_INT4_GPTQ:
 
             def materialize_int4():
-                load_projection = partial(
-                    weight_conversion.load_gptq_expert_projection,
-                    self.weights, self.experts.prefix)
+                load_projection = partial(self.weights.gptq_expert_projection,
+                                          self.experts.prefix)
                 return prepare_gated_int4_weights(self.ctx, load_projection)
 
             moe_weights = self.weights.parameter_value(

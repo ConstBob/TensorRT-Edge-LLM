@@ -49,6 +49,16 @@ QUANT_TYPES = frozenset((
 ))
 
 
+def _module_setting(values: dict, module_name: str):
+    """Return the nearest setting inherited from a module or its parents."""
+    candidate = module_name
+    while candidate:
+        if candidate in values:
+            return values[candidate]
+        candidate = candidate.rpartition(".")[0]
+    return None
+
+
 @dataclass(frozen=True)
 class QuantConfig:
     """Effective quantization for checkpoint-backed linear layers."""
@@ -75,13 +85,15 @@ class QuantConfig:
             return QUANT_FP16
         if self.layer_overrides:
             fallback = QUANT_FP16 if self.is_mixed_precision else self.quant_type
-            return self.layer_overrides.get(normalized, fallback)
+            override = _module_setting(self.layer_overrides, normalized)
+            return fallback if override is None else override
         return self.quant_type
 
     def module_group_size(self, module_name: str) -> int:
         """Return the checkpoint group size used by one linear module."""
         normalized = normalize_module_name(module_name)
-        return int(self.layer_group_sizes.get(normalized, self.group_size))
+        group_size = _module_setting(self.layer_group_sizes, normalized)
+        return int(self.group_size if group_size is None else group_size)
 
     @property
     def is_quantized(self) -> bool:
@@ -368,9 +380,20 @@ def _detect_plain_weights(model_dir: str,
         key.rsplit(".", 1)[0]
         for key in keys if key.endswith(".weight_scale")
     }
+    quantized_names = {
+        _normalize_checkpoint_name(name, conversion)
+        for name in scales
+    }
     excluded = set()
     for name in weights - scales:
         normalized = _normalize_checkpoint_name(name, conversion)
+        # Multi-component checkpoints can contain a plain Talker projection
+        # and a quantized Thinker projection with the same frontend name.
+        # Keep the shared name quantized here; module_quant_type() verifies
+        # the concrete checkpoint namespace and restores FP16 for the plain
+        # component.
+        if normalized in quantized_names:
+            continue
         excluded.update(_expand_quantized_module(normalized, conversion))
     return _finalize_exclusions(list(excluded), conversion)
 

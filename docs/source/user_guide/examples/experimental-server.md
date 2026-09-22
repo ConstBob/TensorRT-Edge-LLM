@@ -78,8 +78,9 @@ requests at once; see [Runtime Concurrency](#runtime-concurrency).
 The cache contains downloaded checkpoints and complete, profile-specific
 runtime bundles. A launch reuses a bundle only when the base checkpoint,
 optional draft checkpoint, and build profile all match. A cache miss runs
-`tensorrt-edgellm-build --components all --externalize-weights all` internally
-and publishes the completed bundle atomically. Direct engine and ONNX paths are
+`tensorrt-edgellm-build --components all` internally and publishes the
+completed bundle atomically. The builder's default policy externalizes the
+weight kinds supported by each component. Direct engine and ONNX paths are
 rejected so the server cannot lose the checkpoint-to-runtime association.
 
 Compiled bundles use a 50 GiB least-recently-used cache by default. Set
@@ -159,7 +160,12 @@ Gemma MTP instead supplies its separate assistant checkpoint as `model`. The
 server defaults MTP, DFlash, JetSpec, and dSpark to their linear contracts.
 Where the method supports branching, setting `--draft-top-k` above 1 selects
 its tree contract and causes the direct builder to compile matching tree-base
-inputs automatically. The
+inputs automatically. `--max-verify-tree-size` and
+`--max-draft-tree-size` set engine profile capacities, while
+`--verify-tree-size` optionally selects a smaller active verification topology.
+For linear MTP (`--draft-top-k 1`), omit `--verify-tree-size`; the server
+derives the active size as `--draft-step + 1`, independently of the larger
+build profile. The
 `disable_spec_decode` request field can disable drafting for one request,
 except with a Gemma MTP verification engine; use a standalone target bundle
 for target-only Gemma inference.

@@ -44,9 +44,11 @@ class Linear(Module):
         "gate_up_proj",
         "in_proj",
         "in_proj_qkv",
+        "in_proj_qkvz",
         "in_proj_z",
         "in_proj_b",
         "in_proj_a",
+        "in_proj_ba",
     ))
 
     def __init__(

@@ -35,6 +35,48 @@ __all__ = [
 ]
 
 
+class Qwen3OmniNextGatedDeltaNet(GatedDeltaNet):
+    """Provider-fused Qwen3-Next linear-attention projections."""
+
+    replicated_controls = False
+
+    def _init_input_projections(self) -> None:
+        self.in_proj_qkvz = Linear(self.ctx, self.key("in_proj_qkvz"))
+        self.in_proj_ba = Linear(self.ctx, self.key("in_proj_ba"))
+
+    def _project_inputs(self, hidden_states):
+        gdn = self.cfg.gdn_cfg
+        if gdn.num_value_heads % gdn.num_key_heads:
+            raise ValueError(
+                "Qwen3-Omni-Next value heads must divide into key heads")
+        values_per_key = gdn.num_value_heads // gdn.num_key_heads
+        value_group = values_per_key * gdn.value_head_dim
+        qkvz_group = 2 * gdn.key_head_dim + 2 * value_group
+
+        qkvz = self.in_proj_qkvz(hidden_states).reshape(
+            (0, gdn.num_key_heads, qkvz_group))
+        ba = self.in_proj_ba(hidden_states).reshape(
+            (0, gdn.num_key_heads, 2 * values_per_key))
+
+        offset = 0
+        query = qkvz[:, :, offset:offset + gdn.key_head_dim]
+        offset += gdn.key_head_dim
+        key = qkvz[:, :, offset:offset + gdn.key_head_dim]
+        offset += gdn.key_head_dim
+        value = qkvz[:, :, offset:offset + value_group]
+        offset += value_group
+        gate = qkvz[:, :, offset:offset + value_group]
+        beta = ba[:, :, :values_per_key]
+        alpha = ba[:, :, values_per_key:]
+
+        mixed = F.concatenate((query.reshape(
+            (0, gdn.key_dim)), key.reshape(
+                (0, gdn.key_dim)), value.reshape((0, gdn.value_dim))), 1)
+        return (mixed, gate.reshape(
+            (0, gdn.value_dim)), beta.reshape((0, gdn.num_value_heads)),
+                alpha.reshape((0, gdn.num_value_heads)))
+
+
 class Qwen3OmniNextAttention(GatedDecoderAttention):
     """Next gated full attention with unit-offset Q/K normalization."""
 
@@ -60,7 +102,8 @@ class Qwen3OmniNextDecoderLayer(Module):
             unit_offset=True)
         self.mlp = self.mlp_class(ctx, self.key("mlp"))
         if layer_type == config.LAYER_GDN:
-            self.mixer = GatedDeltaNet(ctx, self.key("linear_attn"))
+            self.mixer = Qwen3OmniNextGatedDeltaNet(ctx,
+                                                    self.key("linear_attn"))
         elif layer_type == config.LAYER_ATTN:
             self.mixer = Qwen3OmniNextAttention(ctx, self.key("self_attn"))
         else:

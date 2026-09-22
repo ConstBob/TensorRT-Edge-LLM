@@ -94,13 +94,18 @@ def test_spec_bundle_layout(tmp_path):
     assert inspect_bundle(str(tmp_path)).engine_type == EngineType.SPEC_DECODE
 
 
-def test_builder_argv_builds_every_component_and_externalizes_weights():
-    options = BuildOptions(spec_type="mtp", draft_model_dir="assistant")
+def test_builder_argv_builds_every_component():
+    options = BuildOptions(spec_type="mtp",
+                           draft_model_dir="assistant",
+                           max_verify_tree_size=16,
+                           max_draft_tree_size=8)
     argv = options.to_argv("base", "bundle")
     assert argv[argv.index("--components") + 1] == "all"
     assert argv[argv.index("--spec-type") + 1] == "gemma4_mtp"
     assert argv[argv.index("--draft-model-dir") + 1] == "assistant"
-    assert argv[argv.index("--externalize-weights") + 1] == "all"
+    assert argv[argv.index("--max-verify-tree-size") + 1] == "16"
+    assert argv[argv.index("--max-draft-tree-size") + 1] == "8"
+    assert "--externalize-weights" not in argv
 
 
 def test_cache_path_binds_checkpoint_and_profile(tmp_path):
@@ -349,6 +354,7 @@ def test_muse_glimmer_dflash2_server_loads_paired_runtime(
             "method": "dflash",
             "model": "incoai/Muse-Glimmer-30B-DFlash2",
         },
+        verify_tree_size=16,
     )
 
     assert prepared_options[0].spec_type == "dflash"
@@ -356,6 +362,8 @@ def test_muse_glimmer_dflash2_server_loads_paired_runtime(
         "incoai/Muse-Glimmer-30B-DFlash2"
     assert prepared_options[0].max_image_tokens == 4096
     assert prepared_options[0].max_image_tokens_per_image == 4096
+    assert prepared_options[0].max_verify_tree_size == 16
+    assert prepared_options[0].max_draft_tree_size == 16
     assert llm.has_draft_model
     assert llm._runtime.args[3:6] == (1, 1, 16)
     assert llm._runtime.args[-4:-2] == (str(base), str(draft))

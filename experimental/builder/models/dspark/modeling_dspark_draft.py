@@ -21,19 +21,23 @@ import tensorrt as trt
 
 from ...core import config as core_config
 from ...core import quantization
-from ...ops import (GatedMLP, Linear, Module, NetworkModule, RMSNorm,
-                    TreeAttention)
+from ...ops import Linear, Module, NetworkModule, RMSNorm
 from ...ops import functional as F
-from ...ops import pack_qkv
 from ...ops.ragged import RaggedDecoderInputs, add_ragged_decoder_inputs
 from .. import registry as model_registry
+from ..dflash.modeling_dflash_draft import (DFlashDecoderLayer,
+                                            DFlashProposalAttention,
+                                            _draft_rotary_dim)
+from ..gemma4.modeling_gemma4_text import Gemma4RMSNorm
 
 
-class DSparkProposalAttention(TreeAttention):
+class DSparkProposalAttention(DFlashProposalAttention):
     """Proposal attention over persistent target-derived and proposal K/V."""
 
-    def __init__(self, ctx, prefix: str) -> None:
-        super().__init__(ctx, prefix)
+    def __init__(self, ctx, prefix: str, layer_index: int) -> None:
+        super().__init__(ctx, prefix, layer_index)
+        if not str(ctx.cfg.model_type).startswith("gemma4"):
+            self.sliding_window_size = ctx.cfg.sliding_window_size
         self.attention_sinks = None
         if ctx.cfg.attention_sink_bias:
             name = self.key("attention_sink_bias")
@@ -51,72 +55,42 @@ class DSparkProposalAttention(TreeAttention):
                 delta_positions, delta_token_to_sequence, attention_mask,
                 attention_pos_id):
         cfg = self.cfg
-        key_delta = self.k_proj(hidden_delta).reshape(
-            (0, cfg.num_key_value_heads, cfg.head_dim))
-        key_delta = self.k_norm(key_delta, 3)
-        value_delta = self.v_proj(hidden_delta).reshape(
-            (0, cfg.num_key_value_heads, cfg.head_dim))
+        key_delta, value_delta = self.project_delta_kv(hidden_delta)
         updated = F.update_dflash_target_cache(key_delta, value_delta, past,
                                                delta_rope, delta_positions,
                                                delta_token_to_sequence,
                                                ragged.kv_page_table)
 
-        query = self.q_proj(hidden).reshape(
-            (0, cfg.num_attention_heads, cfg.head_dim))
-        query = self.q_norm(query, 3).reshape(
-            (0, cfg.num_attention_heads * cfg.head_dim))
-        key = self.k_proj(hidden).reshape(
-            (0, cfg.num_key_value_heads, cfg.head_dim))
-        key = self.k_norm(key, 3).reshape(
-            (0, cfg.num_key_value_heads * cfg.head_dim))
-        value = self.v_proj(hidden)
-        qkv = pack_qkv(query, key, value, self.v_proj)
+        qkv, qkv_scales = self.project_qkv(hidden)
         attention, present = F.attention(
             qkv,
             updated,
             rope,
             ragged,
             num_q_heads=cfg.num_attention_heads,
-            num_kv_heads=cfg.num_key_value_heads,
-            head_size=cfg.head_dim,
-            sliding_window_size=cfg.sliding_window_size,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_dim,
+            sliding_window_size=self.sliding_window_size,
             attention_scale=cfg.attention_scaling,
             enable_fp8_kv_cache=False,
+            qkv_scales=qkv_scales,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
             attention_sinks=(F.constant(self.attention_sinks,
                                         "attention_sinks")
                              if self.attention_sinks is not None else None),
-            enable_contiguous_query_swa=cfg.dspark_contiguous_query_swa,
+            enable_contiguous_query_swa=(cfg.dspark_contiguous_query_swa
+                                         and self.sliding_window_size > 0),
         )
         attention = attention.reshape(
-            (0, cfg.num_attention_heads * cfg.head_dim))
+            (0, cfg.num_attention_heads * self.head_dim))
         return self.o_proj(attention), present
 
 
-class DSparkDecoderLayer(Module):
+class DSparkDecoderLayer(DFlashDecoderLayer):
     """One DSpark cached proposal decoder layer."""
 
-    def __init__(self, ctx, prefix: str) -> None:
-        super().__init__(ctx, prefix)
-        self.input_norm = RMSNorm(ctx, self.key("input_layernorm"),
-                                  ctx.cfg.rms_norm_eps)
-        self.attention = DSparkProposalAttention(ctx, self.key("self_attn"))
-        self.post_norm = RMSNorm(ctx, self.key("post_attention_layernorm"),
-                                 ctx.cfg.rms_norm_eps)
-        self.mlp = GatedMLP(ctx, self.key("mlp"))
-
-    def forward(self, hidden, hidden_delta, past, rope, ragged, delta_rope,
-                delta_positions, delta_token_to_sequence, attention_mask,
-                attention_pos_id):
-        attention, present = self.attention(self.input_norm(hidden),
-                                            hidden_delta, past, rope, ragged,
-                                            delta_rope, delta_positions,
-                                            delta_token_to_sequence,
-                                            attention_mask, attention_pos_id)
-        hidden = hidden + attention
-        feed_forward = self.mlp(self.post_norm(hidden))
-        return hidden + feed_forward, present
+    attention_class = DSparkProposalAttention
 
 
 class DSparkTargetProjection(Module):
@@ -169,13 +143,15 @@ class DSparkDraftModel(NetworkModule):
     def __init__(self, ctx, lm_head=None) -> None:
         super().__init__(ctx)
         self._target_weights = None
+        norm_class = (Gemma4RMSNorm if str(
+            ctx.cfg.model_type).startswith("gemma4") else RMSNorm)
         self.fc = DSparkTargetProjection(ctx, "fc")
-        self.hidden_norm = RMSNorm(ctx, "hidden_norm", ctx.cfg.rms_norm_eps)
+        self.hidden_norm = norm_class(ctx, "hidden_norm", ctx.cfg.rms_norm_eps)
         self.layers = [
-            DSparkDecoderLayer(ctx, f"layers.{index}")
+            DSparkDecoderLayer(ctx, f"layers.{index}", index)
             for index in range(ctx.cfg.num_hidden_layers)
         ]
-        self.norm = RMSNorm(ctx, "norm", ctx.cfg.rms_norm_eps)
+        self.norm = norm_class(ctx, "norm", ctx.cfg.rms_norm_eps)
         self.lm_head = lm_head or Linear(ctx, "lm_head")
 
     def input_tensors(self) -> Dict[str, object]:
@@ -188,14 +164,15 @@ class DSparkDraftModel(NetworkModule):
             self.add_input("inputs_embeds", trt.float16,
                            (-1, cfg.hidden_size)),
             "past_key_values": [
-                self.add_input(f"past_key_values_{index}", kv_dtype,
-                               (2, -1, F.KV_PAGE_SIZE, cfg.num_key_value_heads,
-                                cfg.head_dim))
+                self.add_input(
+                    f"past_key_values_{index}", kv_dtype,
+                    (2, -1, F.KV_PAGE_SIZE, cfg.layer_num_kv_heads(index),
+                     cfg.layer_head_dim(index)))
                 for index in range(cfg.num_hidden_layers)
             ],
             "rope":
             self.add_input("rope_rotary_cos_sin", trt.float32,
-                           (-1, cfg.rotary_dim)),
+                           (-1, _draft_rotary_dim(cfg))),
             "base_hidden":
             self.add_input("dflash_target_hidden_concat", trt.float16,
                            (-1, len(target_layers) * cfg.hidden_size)),
@@ -205,7 +182,7 @@ class DSparkDraftModel(NetworkModule):
             self.add_input("packed_attention_mask", trt.int32, (-1, -1)),
             "delta_rope":
             self.add_input("dflash_delta_rope_cos_sin", trt.float32,
-                           (-1, cfg.rotary_dim)),
+                           (-1, _draft_rotary_dim(cfg))),
             "delta_positions":
             self.add_input("dflash_delta_positions", trt.int32, (-1, )),
             "delta_token_to_sequence":
@@ -230,8 +207,12 @@ class DSparkDraftModel(NetworkModule):
                                   io["attention_mask"], io["attention_pos_id"])
             present.append(cache)
         hidden = self.norm(hidden)
+        logits = F.cast(self.lm_head(hidden), trt.float32)
+        if self.cfg.final_logit_softcapping is not None:
+            cap = np.float32(self.cfg.final_logit_softcapping)
+            logits = (logits / cap).tanh() * cap
         outputs = {
-            "logits": F.cast(self.lm_head(hidden), trt.float32),
+            "logits": logits,
             "dspark_hidden_states": F.cast(hidden, trt.float16),
         }
         for index, tensor in enumerate(present):

@@ -16,6 +16,7 @@
 
 from ...core import contracts
 from ...core.bundle import BundleConfig
+from ..gemma4.configuration import normalize_block_draft_config
 
 
 def _validate_dimensions(draft, target) -> None:
@@ -38,7 +39,11 @@ def configure_base(config,
         raise ValueError("DFlash base requires a paired draft checkpoint")
     bundle = BundleConfig.from_pretrained(paired_draft_dir)
     draft = bundle.component_dict(contracts.Component.LLM)
-    dflash = draft.get("dflash_config") or {}
+    dflash = dict(draft.get("dflash_config") or {})
+    for key in ("target_layer_ids", "block_size", "mask_token_id",
+                "causal_head"):
+        if key not in dflash and draft.get(key) is not None:
+            dflash[key] = draft[key]
     target_layers = [
         int(index) for index in dflash.get("target_layer_ids", ())
     ]
@@ -74,3 +79,4 @@ def configure_draft(config, *, paired_target=None, **kwargs) -> None:
     if paired_target is None:
         raise ValueError("DFlash draft requires a target config")
     _validate_dimensions(config, paired_target)
+    normalize_block_draft_config(config)

@@ -83,7 +83,7 @@ def test_dflash_runtime_defaults_clamp_to_compiled_draft_profile(tmp_path):
                                              None, None)
 
 
-def test_dspark_runtime_defaults_reserve_non_anchor_mask_slot(tmp_path):
+def test_dspark_runtime_defaults_add_non_anchor_mask_slot(tmp_path):
     _write_cached_draft_bundle(tmp_path, "dspark", 9, 8, {
         "block_size": 8,
         "sample_from_anchor": False
@@ -92,10 +92,11 @@ def test_dspark_runtime_defaults_reserve_non_anchor_mask_slot(tmp_path):
     options = _resolve_spec_decode_runtime_options(str(tmp_path), "dspark",
                                                    None, 1, None, None)
 
-    assert options.verify_size == 8
-    with pytest.raises(ValueError, match="compiled proposal capacity"):
-        _resolve_spec_decode_runtime_options(str(tmp_path), "dspark", 8, 1,
-                                             None, None)
+    assert options.verify_size == 9
+    assert _resolve_spec_decode_runtime_options(str(tmp_path), "dspark", 8, 1,
+                                                None, None).verify_size == 9
+    assert _resolve_spec_decode_runtime_options(str(tmp_path), "dspark", 7, 1,
+                                                None, None).verify_size == 8
 
 
 def test_dspark_tree_runtime_defaults_to_compiled_verify_budget(tmp_path):
