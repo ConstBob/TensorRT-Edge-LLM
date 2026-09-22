@@ -392,6 +392,25 @@ def test_sample_video_cosmos3_preserves_odd_frame_count(tmp_path):
     assert frames.shape[0] == 5
 
 
+def test_sample_video_preserves_client_presampled_frames(tmp_path):
+    pytest.importorskip("av")
+    pytest.importorskip("numpy")
+    clip = tmp_path / "presampled.mp4"
+    _write_synthetic_clip(clip, n_frames=5, size=64, fps=4)
+
+    frames, fps, timestamps, _, _ = vs.sample_video(
+        str(clip),
+        target_fps=2,
+        do_sample_frames=False,
+        max_frames=5,
+        frame_limits=_COSMOS3_LIMITS,
+    )
+
+    assert frames.shape[0] == 5
+    assert len(timestamps) == 5
+    assert fps == pytest.approx(4.0)
+
+
 def test_frames_path_qwen3d_uses_3d_estimate(tmp_path):
     # Pre-sampled frames for a 3D-family model must use the whole-video 3D
     # estimate (100 frames of 256x256 fit a 4096-token per-media budget after

@@ -33,7 +33,7 @@ from ..parsing.tool_calling import (StreamingAssistantOutputParser, ToolConfig,
 from ..runtime.engine import (OMNI_AUDIO_SAMPLE_RATE, AudioParams,
                               SamplingParams)
 from ..runtime.engine_client import EngineClient, PreparedRequest
-from .errors import (InvalidRequestError, ModelNotFoundError, ServerError,
+from .errors import (InvalidRequestError, ServerError,
                      UnsupportedFeatureError)
 from .protocol import (ChatCompletionChoice, ChatCompletionMessage,
                        ChatCompletionRequest, ChatCompletionResponse,
@@ -167,8 +167,11 @@ class OpenAIServingChat:
             raise UnsupportedFeatureError(
                 "this runtime only supports /v1/audio/speech")
         if request.model and request.model != self._client.model_name:
-            raise ModelNotFoundError(
-                f"model {request.model!r} is not served by this process")
+            # BYO evaluation clients identify the deployment rather than the
+            # checkpoint in `model`. This process serves exactly one model, so
+            # the alias is unambiguous.
+            logger.info("Ignoring chat model alias %r (served as %r)",
+                        request.model, self._client.model_name)
         from ..media.media_source import (enforce_local_media_policy,
                                           message_media_modalities)
 

@@ -751,6 +751,7 @@ def sample_video(source: str,
                  *,
                  target_fps: float = DEFAULT_FPS,
                  nframes: Optional[int] = None,
+                 do_sample_frames: bool = True,
                  min_frames: int = FPS_MIN_FRAMES,
                  max_frames: Optional[int] = None,
                  family: str = "qwen",
@@ -831,7 +832,13 @@ def sample_video(source: str,
                     "other media in the request")
             return est
 
-        if family == "internvl":
+        if not do_sample_frames:
+            if max_frames is not None and total > max_frames:
+                raise ValueError(
+                    f"pre-sampled video has {total} frames, over "
+                    f"max_frames={max_frames}")
+            n = total
+        elif family == "internvl":
             n = internvl_nframes(total,
                                  video_fps,
                                  target_fps=target_fps,
@@ -867,13 +874,14 @@ def sample_video(source: str,
                                                      or 0, stream.height or 0,
                                                      frame_limits or {},
                                                      budget, cu_budget)
-            if nframes is not None and n < planned:
+            if (nframes is not None or not do_sample_frames) and n < planned:
                 # Explicit nframes is exact-or-reject: the profile clamp only
-                # auto-shrinks fps-derived counts.
+                # auto-shrinks fps-derived counts. A client-preprocessed clip
+                # must likewise remain intact.
                 raise ValueError(
-                    f"nframes={nframes} needs more visual tokens than the "
-                    "engine profile allows; lower nframes or rebuild the "
-                    "visual engine with a larger --maxImageTokens")
+                    f"requested {planned} exact video frames need more visual "
+                    "tokens than the engine profile allows; lower nframes or "
+                    "rebuild the visual engine with a larger --maxImageTokens")
         else:
             est_tokens = _raw_video_tokens(n, stream.width or 0, stream.height
                                            or 0)
@@ -1207,10 +1215,14 @@ def load_video_buffer(rt_module,
         raise ValueError(
             f"nframes/min_frames/max_frames must be integers: {exc}") from exc
     default_fps = NEMOTRON_DEFAULT_FPS if family == "nemotron" else DEFAULT_FPS
+    do_sample_frames = item.get("do_sample_frames", True)
+    if not isinstance(do_sample_frames, bool):
+        raise ValueError("do_sample_frames must be a boolean")
     frames, fps, timestamps, est, decoded_px = sample_video(
         _extract_video_source(item),
         target_fps=_positive_float(item.get("fps", default_fps), "fps"),
         nframes=nframes,
+        do_sample_frames=do_sample_frames,
         min_frames=min_frames,
         max_frames=max_frames,
         family=family,

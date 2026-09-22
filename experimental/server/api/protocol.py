@@ -57,6 +57,11 @@ class ChatAudioConfig(AudioGenerationConfig):
 
 
 class ChatCompletionRequest(OpenAIBaseModel):
+    # Evaluation clients commonly include provider-specific fields. Keep the
+    # strict base model for every other API surface, but tolerate those fields
+    # at the OpenAI chat boundary.
+    model_config = ConfigDict(extra="ignore")
+
     messages: List[Dict[str, Any]]
     model: Optional[str] = None
     frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
@@ -88,9 +93,22 @@ class ChatCompletionRequest(OpenAIBaseModel):
     enable_thinking: bool = False
     reasoning_effort: Optional[str] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
+    mm_processor_kwargs: Optional[Dict[str, Any]] = None
     disable_spec_decode: bool = False
     reuse_context: StrictBool = True
     cache_generated_tokens: StrictBool = True
+
+    @field_validator("frequency_penalty", "presence_penalty", "temperature",
+                     "top_p", "top_k", "min_p", "repetition_penalty",
+                     mode="before")
+    @classmethod
+    def _default_null_sampling_fields(cls, value, info: ValidationInfo):
+        # vLLM-style clients use explicit null to mean "not configured".
+        # Pydantic otherwise rejects these non-Optional fields before their
+        # declared defaults can apply.
+        if value is None:
+            return cls.model_fields[info.field_name].get_default()
+        return value
 
     @field_validator("stop")
     @classmethod
@@ -145,6 +163,26 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     "chat_template_kwargs.reasoning_effort must be a string")
             if effort is not None:
                 self.reasoning_effort = effort
+        if self.mm_processor_kwargs:
+            media_keys = {
+                "fps", "nframes", "min_frames", "max_frames", "do_resize",
+                "do_sample_frames"
+            }
+            defaults = {
+                key: value
+                for key, value in self.mm_processor_kwargs.items()
+                if key in media_keys and value is not None
+            }
+            for message in self.messages:
+                content = message.get("content")
+                if not isinstance(content, list):
+                    continue
+                for item in content:
+                    if not isinstance(item, dict) or item.get(
+                            "type") not in ("video", "video_url"):
+                        continue
+                    for key, value in defaults.items():
+                        item.setdefault(key, value)
         wants_audio = bool(self.modalities and "audio" in self.modalities)
         if wants_audio != (self.audio is not None):
             raise ValueError(

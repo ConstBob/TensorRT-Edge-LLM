@@ -283,6 +283,61 @@ def test_cosmos3_reasoner_uses_single_frame_temporal_patches(tmp_path):
     assert llm._video_frame_limits()["temporal_patch_size"] == 1
 
 
+def test_eval_mm_processor_kwargs_reach_native_video_item():
+    from experimental.server.api.protocol import ChatCompletionRequest
+
+    request = ChatCompletionRequest(
+        messages=[{
+            "role":
+            "user",
+            "content": [{
+                "type": "video_url",
+                "video_url": {
+                    "url": "data:video/mp4;base64,AAAA"
+                },
+            }],
+        }],
+        mm_processor_kwargs={
+            "fps": 4.0,
+            "max_frames": 128,
+            "total_pixels": 8 * 1024 * 1024,
+            "do_sample_frames": False,
+        },
+    )
+
+    item = request.messages[0]["content"][0]
+    assert item["fps"] == 4.0
+    assert item["max_frames"] == 128
+    assert item["do_sample_frames"] is False
+    assert "total_pixels" not in item
+
+
+def test_eval_mm_processor_kwargs_do_not_override_item_values():
+    from experimental.server.api.protocol import ChatCompletionRequest
+
+    request = ChatCompletionRequest(
+        messages=[{
+            "role":
+            "user",
+            "content": [{
+                "type": "video_url",
+                "video_url": {
+                    "url": "example.mp4"
+                },
+                "fps": 8.0,
+            }],
+        }],
+        mm_processor_kwargs={
+            "fps": 4.0,
+            "max_frames": 128,
+        },
+    )
+
+    item = request.messages[0]["content"][0]
+    assert item["fps"] == 8.0
+    assert item["max_frames"] == 128
+
+
 def test_load_image_buffers_nemotron_minimum():
     # A Nemotron video buffer is built and its EVS token estimate is honored
     # against the request-wide engine minimum (no cu_seqlens binding).
@@ -684,6 +739,35 @@ def test_chat_normalizes_unsupported_sampling_fields_and_forwards_seed(
     assert "min_p=0.2 is unsupported; using default 0.0" in caplog.text
     assert ("repetition_penalty=1.2 is unsupported; using default 1.0"
             in caplog.text)
+
+
+def test_chat_accepts_benchservice_alias_nulls_and_extra_fields(client_and_llm):
+    client, llm = client_and_llm
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "trt-edge-reasoner-yz-0917",
+            "messages": [{
+                "role": "user",
+                "content": "Hello",
+            }],
+            "n": 1,
+            "temperature": 0,
+            "top_p": None,
+            "top_k": None,
+            "repetition_penalty": None,
+            "presence_penalty": None,
+            "seed": 1,
+            "max_tokens": 8,
+            "benchservice_metadata": {
+                "probe": True
+            },
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert llm.last_sampling_params.temperature == 0
+    assert llm.last_sampling_params.seed == 1
 
 
 def test_chat_template_is_default_on_and_request_configurable(client_and_llm):
