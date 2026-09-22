@@ -72,6 +72,8 @@ tools = [
     "httpx>=0.27.0,<1",
 ]
 server = [
+    # TensorRT is a platform prerequisite installed separately because one
+    # architecture wheel carries payloads for multiple TensorRT releases.
     "cuda-python>=12.6,<14",
     "fastapi==0.139.2",
     "uvicorn==0.51.0",
@@ -126,7 +128,9 @@ sdist.exclude = [
     ".venv*/**",
     "AGENTS.local.md",
     "CODEOWNERS",
+    # {$edge-llm-internal-release begin}
     "DO_NOT_RELEASE",
+    # {$edge-llm-internal-release end}
     "TODO.md",
     "TODOS.md",
     "artifacts/**",

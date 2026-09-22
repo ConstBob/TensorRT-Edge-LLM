@@ -22,6 +22,7 @@
     "strip_paths": [
       "AGENTS.md",
       ".dockerignore",
+      "pyproject.toml",
       "cmake/CuteDsl.cmake",
       "kernelSrcs/build_cutedsl.py",
       "kernelSrcs/gemm_cutedsl/gemm_blackwell_nvfp4_ws.py",
