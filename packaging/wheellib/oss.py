@@ -51,10 +51,14 @@ def policy_digest(root: Path = config.REPO_ROOT) -> str:
     """Bind artifacts to both policy inputs and the sanitizer implementation."""
     if not enabled():
         return "0" * 64
-    names = ("oss_release_manifest.json", "DO_NOT_RELEASE",
-             "scripts/strip_internal_release.py",
-             "scripts/check_oss_release_sanitizer.py",
-             "packaging/wheellib/oss.py")
+    names = (
+        "oss_release_manifest.json",
+        # {$edge-llm-internal-release begin}
+        "DO_NOT_RELEASE",
+        # {$edge-llm-internal-release end}
+        "scripts/strip_internal_release.py",
+        "scripts/check_oss_release_sanitizer.py",
+        "packaging/wheellib/oss.py")
     digest = hashlib.sha256()
     for name in names:
         digest.update(name.encode() + b"\0")

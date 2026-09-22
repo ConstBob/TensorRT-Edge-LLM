@@ -25,7 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from . import NativeDetectionError
+from . import NativeDetectionError, TensorRTDependencyError
+from .dependencies import loaded_tensorrt_soname, require_tensorrt
 
 _CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75
 _CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76
@@ -178,11 +179,31 @@ def _platform_probe(cpu_arch: str) -> Tuple[str, str]:
 
 
 def _find_soname(library: str) -> str:
+    if library == "nvinfer":
+        loaded = loaded_tensorrt_soname()
+        if loaded is not None:
+            return loaded
+        try:
+            return _tensorrt_soname_from_package()
+        except TensorRTDependencyError as dependency_error:
+            soname = ctypes.util.find_library(library)
+            if soname:
+                return Path(soname).name
+            raise dependency_error
     soname = ctypes.util.find_library(library)
-    if not soname:
+    if soname:
+        return Path(soname).name
+    raise NativeDetectionError(
+        f"Required system library {library!r} was not found.")
+
+
+def _tensorrt_soname_from_package() -> str:
+    require_tensorrt()
+    soname = loaded_tensorrt_soname()
+    if soname is None:
         raise NativeDetectionError(
-            f"Required system library {library!r} was not found.")
-    return Path(soname).name
+            "TensorRT imported without exposing its runtime library.")
+    return soname
 
 
 def _load_cuda_device_api() -> Any:

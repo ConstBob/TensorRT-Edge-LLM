@@ -124,6 +124,9 @@ def resolve_model_dir(model: str, cache_dir: str = "") -> str:
                 "engine bundles are cache artifacts; pass the checkpoint or "
                 "Hugging Face model ID used to build the model")
         return path
+    from tensorrt_edgellm._native.dependencies import require_tensorrt
+
+    require_tensorrt()
     try:
         from huggingface_hub import snapshot_download
     except ImportError as exc:

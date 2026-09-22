@@ -21,6 +21,7 @@ from dataclasses import replace
 from typing import Iterable, Optional, Sequence, Tuple, Union
 
 from tensorrt_edgellm._native import NativeManifestNotFoundError
+from tensorrt_edgellm._native.dependencies import require_tensorrt
 from tensorrt_edgellm._native.load import resolve_payload
 from tensorrt_edgellm.dflash import DFlashVersion, resolve_dflash_contract
 
@@ -248,6 +249,7 @@ def _build_one(args: argparse.Namespace, bundle, component,
 
 
 def _build(args: argparse.Namespace) -> None:
+    require_tensorrt()
     from .core.builder import load_plugin_library
 
     plugin_path = args.plugin_path
