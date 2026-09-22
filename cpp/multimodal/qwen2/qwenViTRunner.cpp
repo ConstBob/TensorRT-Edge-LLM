@@ -397,7 +397,8 @@ void QwenViTRunner::formatPatch(
     }
 
     kernel::transposeToPatchQwenViT(mNormalizedImageDevice, mVitInput, prevPatchBase * mConfig.inputDim,
-        mConfig.temporalPatchSize, mConfig.patchSize, vitInputMergeSize(), vitPatchTemporalFirst(), stream);
+        mConfig.temporalPatchSize, mConfig.patchSize, vitInputMergeSize(), vitPatchTemporalFirst(),
+        vitPatchChannelLast(), stream);
 }
 
 void QwenViTRunner::buildCuSeqlens(
@@ -962,6 +963,11 @@ int64_t QwenViTRunner::vitInputMergeSize() const
 }
 
 bool QwenViTRunner::vitPatchTemporalFirst() const
+{
+    return false;
+}
+
+bool QwenViTRunner::vitPatchChannelLast() const
 {
     return false;
 }

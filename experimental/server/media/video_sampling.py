@@ -347,6 +347,12 @@ def _check_aspect_ratio(width: int, height: int) -> None:
             "supported maximum of 200")
 
 
+def _uses_qwen3d_resize(model_type: str) -> bool:
+    """Whether the visual runner uses Qwen3-VL's whole-media 3D resize."""
+    return ("qwen3_vl" in model_type or "qwen3_5" in model_type
+            or model_type == "cosmos3_edge_vision")
+
+
 def _estimate_qwen2d_frame_tokens(width: int,
                                   height: int,
                                   limits: dict,
@@ -509,7 +515,7 @@ def estimate_image_tokens(path: str,
         return tokens
     _check_aspect_ratio(width, height)
     model_type = limits.get("model_type", "")
-    if "qwen3_vl" in model_type or "qwen3_5" in model_type:
+    if _uses_qwen3d_resize(model_type):
         # Still image on a 3D family: the C++ resize routes stills through
         # qwenSmartResize3D with isVideo=false (temporal factor 1), which
         # includes the factor-grid fallback the 2D estimate lacks.
@@ -675,7 +681,7 @@ def clamp_nframes_to_profile(
         return n, _estimate_nemotron_video_tokens(n, limits)
     model_type = limits.get("model_type", "")
     per_image = limits.get("max_image_tokens_per_image", 0)
-    if "qwen3_vl" in model_type or "qwen3_5" in model_type:
+    if _uses_qwen3d_resize(model_type):
         # The 3D resize fits the whole video per media, but each temporal group
         # needs >= 1 token, so frames are bounded by temporalPatchSize * budget;
         # charge the tokens the resize actually produces.
@@ -852,7 +858,9 @@ def sample_video(source: str,
                               target_fps=target_fps,
                               nframes=nframes,
                               min_frames=min_frames,
-                              max_frames=max_frames)
+                              max_frames=max_frames,
+                              frame_factor=max(1, (frame_limits or {}).get(
+                                  "temporal_patch_size", FRAME_FACTOR)))
         if do_resize:
             planned = n
             n, est_tokens = clamp_nframes_to_profile(n, family, stream.width
@@ -1116,8 +1124,7 @@ def load_video_buffer(rt_module,
                         "blocks")
                 _check_cu_budget(len(frame_paths), family, limits, cu_budget)
                 est = len(frame_paths) * block_tokens
-            elif ("qwen3_vl" in limits.get("model_type", "")
-                  or "qwen3_5" in limits.get("model_type", "")):
+            elif _uses_qwen3d_resize(limits.get("model_type", "")):
                 # 3D families use the whole-video 3D estimate, not the
                 # per-frame 2D one (same constraints as the clip path).
                 _check_aspect_ratio(width, height)

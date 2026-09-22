@@ -346,6 +346,16 @@ _QWEN3VL_LIMITS = {
     "temporal_patch_size": 2,
 }
 
+_COSMOS3_LIMITS = {
+    "model_type": "cosmos3_edge_vision",
+    "min_image_tokens": 64,
+    "max_image_tokens": 4096,
+    "max_image_tokens_per_image": 4096,
+    "patch_size": 16,
+    "merge_size": 2,
+    "temporal_patch_size": 1,
+}
+
 
 def test_clamp_qwen3d_uses_real_resize_tokens():
     # The 3D estimate must be the tokens the C++ resize actually produces
@@ -362,6 +372,24 @@ def test_clamp_qwen3d_uses_real_resize_tokens():
                                     720,
                                     _QWEN3VL_LIMITS,
                                     budget=8192 - 2 * 3520)
+
+
+def test_clamp_cosmos3_uses_whole_video_3d_estimate():
+    # Cosmos3 inherits Qwen3-VL's whole-video 3D resize. All 64 frames fit at
+    # 3840 tokens; per-frame 2D accounting would incorrectly clamp to four.
+    assert vs.clamp_nframes_to_profile(64, "qwen", 1280, 720,
+                                       _COSMOS3_LIMITS) == (64, 3840)
+
+
+def test_sample_video_cosmos3_preserves_odd_frame_count(tmp_path):
+    pytest.importorskip("av")
+    pytest.importorskip("numpy")
+    clip = tmp_path / "cosmos3-odd.mp4"
+    _write_synthetic_clip(clip, n_frames=75, size=64, fps=30)
+    frames, _, _, _, _ = vs.sample_video(str(clip),
+                                         target_fps=2.0,
+                                         frame_limits=_COSMOS3_LIMITS)
+    assert frames.shape[0] == 5
 
 
 def test_frames_path_qwen3d_uses_3d_estimate(tmp_path):

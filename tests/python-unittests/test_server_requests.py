@@ -257,7 +257,7 @@ def test_cosmos3_reasoner_routes_native_video_file(monkeypatch, tmp_path):
     assert [buffer.video for buffer in buffers] == ["example.mp4"]
 
 
-def test_cosmos3_reasoner_uses_per_frame_video_budget(tmp_path):
+def test_cosmos3_reasoner_uses_single_frame_temporal_patches(tmp_path):
     eng = _engine()
     visual = tmp_path / "cosmos3" / "visual"
     visual.mkdir(parents=True)

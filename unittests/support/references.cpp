@@ -981,7 +981,8 @@ EagleAcceptResult eagleAcceptRef(std::vector<float> const& logits, std::vector<i
 
 void transposeToPatchQwenReference(std::vector<half> const& originalImage, std::vector<half>& patch,
     int32_t const inputOffset, int32_t const T, int32_t const height, int32_t const width, int32_t const channels,
-    int32_t const temporalPatchSize, int32_t const patchSize, int32_t const mergeSize, bool const temporalFirst)
+    int32_t const temporalPatchSize, int32_t const patchSize, int32_t const mergeSize, bool const temporalFirst,
+    bool const channelLast)
 {
     assert(originalImage.size() == static_cast<size_t>(T) * height * width * channels);
     assert(patch.size() == originalImage.size());
@@ -1021,11 +1022,12 @@ void transposeToPatchQwenReference(std::vector<half> const& originalImage, std::
                                         int32_t dstHW = gt * gridH * gridW * mergeSize * mergeSize
                                             + gh * gridW * mergeSize * mergeSize + gw * mergeSize * mergeSize
                                             + mergeH * mergeSize + mergeW;
-                                        int32_t const dstDim = temporalFirst
-                                            ? t * channels * patchSize * patchSize + c * patchSize * patchSize
-                                                + patchH * patchSize + patchW
-                                            : c * temporalPatchSize * patchSize * patchSize + t * patchSize * patchSize
-                                                + patchH * patchSize + patchW;
+                                        int32_t const dstDim = channelLast
+                                            ? ((patchH * patchSize + patchW) * channels + c) * temporalPatchSize + t
+                                            : (temporalFirst ? t * channels * patchSize * patchSize
+                                                          + c * patchSize * patchSize + patchH * patchSize + patchW
+                                                             : c * temporalPatchSize * patchSize * patchSize
+                                                          + t * patchSize * patchSize + patchH * patchSize + patchW);
                                         patch[dstHW * channels * temporalPatchSize * patchSize * patchSize + dstDim]
                                             = value;
                                     }

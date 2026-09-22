@@ -39,7 +39,7 @@ namespace kernel
 
 __global__ void transposeToPatchQwenKernel(half const* originalImage, half* inputPatches, int64_t const T,
     int64_t const H, int64_t const W, int64_t const C, int64_t const temporalPatchSize, int64_t const patchSize,
-    int64_t const mergeSize, bool const temporalFirst, int64_t const inputOffset)
+    int64_t const mergeSize, bool const temporalFirst, bool const channelLast, int64_t const inputOffset)
 {
     // This is a naive implementation of 9D transpose.
     // Each CTA get assigned 256 threads. Each thread processes one element
@@ -76,13 +76,26 @@ __global__ void transposeToPatchQwenKernel(half const* originalImage, half* inpu
     auto const mergeW = seqIdx % mergeSize;
 
     // Calculate coordinates within the patch
-    auto const cIdx = temporalFirst ? (elemIdx % (C * patchSize * patchSize)) / (patchSize * patchSize)
-                                    : elemIdx / (temporalPatchSize * patchSize * patchSize);
-    auto const tPatchIdx = temporalFirst
-        ? elemIdx / (C * patchSize * patchSize)
-        : (elemIdx % (temporalPatchSize * patchSize * patchSize)) / (patchSize * patchSize);
-    auto const patchH = (elemIdx % (patchSize * patchSize)) / patchSize;
-    auto const patchW = elemIdx % patchSize;
+    int64_t cIdx;
+    int64_t tPatchIdx;
+    int64_t patchH;
+    int64_t patchW;
+    if (channelLast)
+    {
+        patchH = elemIdx / (patchSize * C * temporalPatchSize);
+        patchW = (elemIdx % (patchSize * C * temporalPatchSize)) / (C * temporalPatchSize);
+        cIdx = (elemIdx % (C * temporalPatchSize)) / temporalPatchSize;
+        tPatchIdx = elemIdx % temporalPatchSize;
+    }
+    else
+    {
+        cIdx = temporalFirst ? (elemIdx % (C * patchSize * patchSize)) / (patchSize * patchSize)
+                             : elemIdx / (temporalPatchSize * patchSize * patchSize);
+        tPatchIdx = temporalFirst ? elemIdx / (C * patchSize * patchSize)
+                                  : (elemIdx % (temporalPatchSize * patchSize * patchSize)) / (patchSize * patchSize);
+        patchH = (elemIdx % (patchSize * patchSize)) / patchSize;
+        patchW = elemIdx % patchSize;
+    }
 
     // Calculate source coordinates
     auto const srcT = tIdx * temporalPatchSize + tPatchIdx;
@@ -179,7 +192,7 @@ void transposeToPatchGemma4ViT(rt::Tensor const& originalImage, rt::Tensor& inpu
 
 void transposeToPatchQwenViT(rt::Tensor const& originalImage, rt::Tensor& inputPatches, int64_t const inputOffset,
     int64_t const temporalPatchSize, int64_t const patchSize, int64_t const mergeSize, bool const temporalFirst,
-    cudaStream_t stream)
+    bool const channelLast, cudaStream_t stream)
 {
     check::check(
         originalImage.getDeviceType() == rt::DeviceType::kGPU && inputPatches.getDeviceType() == rt::DeviceType::kGPU,
@@ -204,6 +217,7 @@ void transposeToPatchQwenViT(rt::Tensor const& originalImage, rt::Tensor& inputP
     check::check(T % temporalPatchSize == 0,
         "T must be multiple of temporalPatchSize: T=" + std::to_string(T)
             + ", temporalPatchSize=" + std::to_string(temporalPatchSize));
+    check::check(!(temporalFirst && channelLast), "temporalFirst and channelLast patch layouts are mutually exclusive");
     check::check(H % (mergeSize * patchSize) == 0,
         "H must be multiple of mergeSize * patchSize: H=" + std::to_string(H)
             + ", mergeSize * patchSize=" + std::to_string(mergeSize * patchSize));
@@ -216,7 +230,7 @@ void transposeToPatchQwenViT(rt::Tensor const& originalImage, rt::Tensor& inputP
 
     transposeToPatchQwenKernel<<<gridSize, blockSize, 0, stream>>>(originalImage.dataPointer<half>(),
         inputPatches.dataPointer<half>(), T, H, W, C, temporalPatchSize, patchSize, mergeSize, temporalFirst,
-        inputOffset);
+        channelLast, inputOffset);
 }
 
 __global__ void transposeToPatchInternVLPhi4MMKernel(half const* originalImage, half* inputPatches,
@@ -687,6 +701,89 @@ void initFastPosEmbedQwenViT(rt::Tensor& fastPosEmbedIdx, rt::Tensor& fastPosEmb
         initFastPosEmbedQwenViTKernel<<<gridSize, blockSize, 0, stream>>>(fastPosEmbedIdx.dataPointer<int64_t>(),
             fastPosEmbedWeight.dataPointer<half>(), llmGridH, llmGridW, mergeSize, numGridPerSide, lineSpaceH,
             lineSpaceW, startIdx + t * H * W, totalSeqLength);
+    }
+}
+
+__global__ void initFastPosEmbedCosmos3ViTKernel(int64_t* fastPosEmbedIdx, half* fastPosEmbedWeight, int64_t const H,
+    int64_t const W, int64_t const mergeSize, int64_t const numGridPerSide, int64_t const startIdx,
+    int64_t const totalSeqLength)
+{
+    auto const tid = blockIdx.x * blockDim.x + threadIdx.x;
+    auto const totalElements = H * W;
+    if (tid >= totalElements)
+        return;
+
+    int64_t const llmGridW = W / mergeSize;
+    auto const llmGridHIdx = tid / (llmGridW * mergeSize * mergeSize);
+    auto const llmGridWIdx = (tid % (llmGridW * mergeSize * mergeSize)) / (mergeSize * mergeSize);
+    auto const mergeHIdx = (tid % (mergeSize * mergeSize)) / mergeSize;
+    auto const mergeWIdx = tid % mergeSize;
+
+    int64_t const targetH = llmGridHIdx * mergeSize + mergeHIdx;
+    int64_t const targetW = llmGridWIdx * mergeSize + mergeWIdx;
+
+    // PyTorch interpolate(..., mode="bilinear", align_corners=false) uses half-pixel source
+    // coordinates. Clamp before forming the two neighbors to reproduce border replication.
+    float const hIdx = fminf(fmaxf((static_cast<float>(targetH) + 0.5F) * numGridPerSide / H - 0.5F, 0.0F),
+        static_cast<float>(numGridPerSide - 1));
+    float const wIdx = fminf(fmaxf((static_cast<float>(targetW) + 0.5F) * numGridPerSide / W - 0.5F, 0.0F),
+        static_cast<float>(numGridPerSide - 1));
+
+    int64_t const hIdxFloor = static_cast<int64_t>(floorf(hIdx));
+    int64_t const wIdxFloor = static_cast<int64_t>(floorf(wIdx));
+    int64_t const hIdxCeil = min(hIdxFloor + 1, numGridPerSide - 1);
+    int64_t const wIdxCeil = min(wIdxFloor + 1, numGridPerSide - 1);
+    float const dh = hIdx - hIdxFloor;
+    float const dw = wIdx - wIdxFloor;
+
+    int64_t const targetIdx = startIdx + tid;
+    int64_t const baseH = hIdxFloor * numGridPerSide;
+    int64_t const baseHCeil = hIdxCeil * numGridPerSide;
+    fastPosEmbedIdx[0 * totalSeqLength + targetIdx] = baseH + wIdxFloor;
+    fastPosEmbedIdx[1 * totalSeqLength + targetIdx] = baseH + wIdxCeil;
+    fastPosEmbedIdx[2 * totalSeqLength + targetIdx] = baseHCeil + wIdxFloor;
+    fastPosEmbedIdx[3 * totalSeqLength + targetIdx] = baseHCeil + wIdxCeil;
+    fastPosEmbedWeight[0 * totalSeqLength + targetIdx] = __float2half((1.0F - dh) * (1.0F - dw));
+    fastPosEmbedWeight[1 * totalSeqLength + targetIdx] = __float2half((1.0F - dh) * dw);
+    fastPosEmbedWeight[2 * totalSeqLength + targetIdx] = __float2half(dh * (1.0F - dw));
+    fastPosEmbedWeight[3 * totalSeqLength + targetIdx] = __float2half(dh * dw);
+}
+
+void initFastPosEmbedCosmos3ViT(rt::Tensor& fastPosEmbedIdx, rt::Tensor& fastPosEmbedWeight,
+    std::vector<int64_t> const& gridTHW, int64_t const mergeSize, int64_t const numGridPerSide, int64_t const startIdx,
+    cudaStream_t stream)
+{
+    check::check(fastPosEmbedIdx.getDeviceType() == rt::DeviceType::kGPU
+            && fastPosEmbedWeight.getDeviceType() == rt::DeviceType::kGPU,
+        "Device type shall all be GPU for these tensors.");
+    check::check(
+        fastPosEmbedIdx.getDataType() == DataType::kINT64 && fastPosEmbedWeight.getDataType() == DataType::kHALF,
+        "Data type check failed for the input tensors.");
+    check::check(fastPosEmbedIdx.getShape().getNumDims() == 2 && fastPosEmbedIdx.getShape()[0] == 4,
+        "Fast position embeddings index shapes shall be [4, totalSeqLength].");
+    check::check(fastPosEmbedWeight.getShape().getNumDims() == 2 && fastPosEmbedWeight.getShape()[0] == 4,
+        "Fast position embeddings weight shapes shall be [4, totalSeqLength].");
+    check::check(gridTHW.size() == 3, "gridTHW must have exactly 3 elements [T, H, W]");
+
+    int64_t const totalSeqLength = fastPosEmbedIdx.getShape()[1];
+    check::check(totalSeqLength == fastPosEmbedWeight.getShape()[1], "Total sequence length mismatch.");
+    int64_t const T = gridTHW[0];
+    int64_t const H = gridTHW[1];
+    int64_t const W = gridTHW[2];
+    check::check(T > 0 && H > 0 && W > 0 && mergeSize > 0 && numGridPerSide > 0,
+        "Cosmos3 fast position embedding dimensions must be positive.");
+    check::check(H % mergeSize == 0 && W % mergeSize == 0,
+        "Cosmos3 fast position embedding grid must be divisible by mergeSize.");
+    check::check(startIdx >= 0 && startIdx + T * H * W <= totalSeqLength,
+        "Cosmos3 fast position embedding range exceeds the output tensors.");
+
+    uint32_t constexpr blockSize = 256;
+    uint32_t const gridSize = static_cast<uint32_t>((H * W + blockSize - 1) / blockSize);
+    for (int64_t t = 0; t < T; ++t)
+    {
+        initFastPosEmbedCosmos3ViTKernel<<<gridSize, blockSize, 0, stream>>>(fastPosEmbedIdx.dataPointer<int64_t>(),
+            fastPosEmbedWeight.dataPointer<half>(), H, W, mergeSize, numGridPerSide, startIdx + t * H * W,
+            totalSeqLength);
     }
 }
 
