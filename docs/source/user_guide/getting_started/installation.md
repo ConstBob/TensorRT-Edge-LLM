@@ -9,6 +9,13 @@
 | [Python from source](#optional-python-frontend) | The application uses the experimental checkpoint-direct builder or Python server from the same source and build tree. | Hugging Face checkpoint → checkpoint-direct builder → TensorRT engine → Python inference |
 | [Local wheel build](#build-a-local-wheel-from-source) | A source user needs a wheel from the current checkout or for a custom target subset. | Local source build → target-specific wheel → Python inference |
 
+## Inference Prerequisite
+
+The target must have at least the deployed model size plus 2 GB of available
+device memory before starting inference. Treat this as a minimum: KV cache,
+multimodal components, speculative draft engines, and larger batch or sequence
+profiles can require additional memory.
+
 ## Source workflow: C++ runtime
 
 The C++ runtime builds TensorRT engines and runs inference on the target. For
@@ -490,8 +497,12 @@ the [Wheel Packaging Matrix](support-matrix.md#wheel-packaging-matrix).
 
 Release wheels are published on PyPI and NVIDIA's Python package index. Install
 on the target machine; no Edge-LLM checkout, CMake build, or CuTe DSL download is
-needed. Install a compatible NVIDIA driver and the CUDA/TensorRT versions
-listed in the support matrix, including the matching TensorRT Python package.
+needed. Install the CUDA and TensorRT stack supported by the target platform,
+including the TensorRT Python bindings.
+TensorRT is deliberately not a package extra: one Edge-LLM architecture wheel
+contains payloads for several platform and TensorRT releases, which Python
+package metadata cannot select from the GPU and platform release.
+
 For a standalone TensorRT SDK, install its Python wheel for your interpreter
 and expose its shared libraries before starting Python:
 
@@ -505,6 +516,15 @@ system loader search path. `TRT_PACKAGE_DIR` is a convenience in this example
 and a source-build setting; setting it alone does not configure wheel loading.
 No TensorRT-specific `PATH` or `PYTHONPATH` change is needed when its Python
 bindings are installed in the active environment.
+
+On Debian or Ubuntu, install venv support before creating the environment. Use
+the package matching the selected interpreter; the stock JetPack 7.2 Python
+3.12 image, for example, requires:
+
+```bash
+sudo apt update
+sudo apt install -y python3.12-venv
+```
 
 ### Recommended: Python API and server
 

@@ -17,6 +17,7 @@ for checkpoint IDs and [Installation](installation.md) for build commands.
 | NVIDIA DRIVE Thor | Official | DriveOS 7.2 | 13.3 | DriveOS SDK package | SDK container, then deploy `build/` | Model-dependent |
 | NVIDIA DGX Spark (GB10) | Official | DGX Spark software stack | 13.0 | System package | Device | Model-dependent |
 | Jetson Orin | Official | JetPack 7.2 | 13.2 | JetPack package | Device | FP16, INT8, and INT4 only |
+| NVIDIA IGX Thor | Official | Current Linux stack | 13.0 | 10.13.3.9 | Device | Model-dependent; SM110 iGPU or SM120 dGPU |
 | x86-64 Linux GPU | Developer | Ubuntu 22.04 / 24.04 | 12.x or 13.x | Compatible user package | Workstation | Development and validation |
 
 `Official` combinations are release-tested deployment targets. `Compatible`
