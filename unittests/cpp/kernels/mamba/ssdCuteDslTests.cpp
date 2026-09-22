@@ -1069,7 +1069,9 @@ int runSsdTmaBoundsCase(GuardedSsdInput guardedInput)
         params.dim = dim;
         params.dstate = dstate;
         params.ngroups = ngroups;
-        params.smVersion = 100;
+        // Use the running device's SM: a hardcoded foreign SM would request a
+        // Blackwell cubin the device may not ship.
+        params.smVersion = getSMVersion();
         params.dt_softplus = true;
         params.has_D = true;
         params.has_z = false;
@@ -1395,7 +1397,9 @@ TEST(SsdCuteDslBlackwellChunkedPrefill, StateCarriesAcrossCalls)
               params.dim = dim;
               params.dstate = dstate;
               params.ngroups = ngroups;
-              params.smVersion = 100;
+              // Use the running device's SM: a hardcoded foreign SM would request a
+              // Blackwell cubin the device may not ship.
+              params.smVersion = getSMVersion();
               params.dt_softplus = true;
               params.has_D = true;
               params.has_z = false;
