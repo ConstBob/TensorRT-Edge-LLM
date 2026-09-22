@@ -15,6 +15,9 @@ HF_HOME="${HF_HOME:-/mnt/cosmos-eval/hf-cache}"
 BUILD_DIR="${BUILD_DIR:-/tmp/edgellm-build}"
 CACHE_DIR="${CACHE_DIR:-${WORK_ROOT}/serve-cache}"
 REASONING_CHECKPOINT="${REASONING_CHECKPOINT:-nvidia/Cosmos3-Edge}"
+MAX_INPUT_LEN="${MAX_INPUT_LEN:-16384}"
+MAX_IMAGE_TOKENS="${MAX_IMAGE_TOKENS:-8192}"
+MAX_IMAGE_TOKENS_PER_IMAGE="${MAX_IMAGE_TOKENS_PER_IMAGE:-8192}"
 # Do not name this TRT_VERSION: NGC images already export that (10.14.1.48+cuda13.0).
 EDGELLM_TRT_REPO="${EDGELLM_TRT_REPO:-https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64}"
 EDGELLM_TRT_FALLBACK="${EDGELLM_TRT_FALLBACK:-10.16.1.11-1+cuda12.9}"
@@ -277,13 +280,13 @@ while true; do
     --host 0.0.0.0 \
     --port 8000 \
     --cache-dir "${CACHE_DIR}" \
-    --max-input-len 8192 \
+    --max-input-len "${MAX_INPUT_LEN}" \
     --enable-in-flight-batching \
     --max-batch-size 8 \
     --max-kv-cache-capacity 131072 \
     --max-queued-requests 128 \
-    --max-image-tokens 4096 \
-    --max-image-tokens-per-image 4096
+    --max-image-tokens "${MAX_IMAGE_TOKENS}" \
+    --max-image-tokens-per-image "${MAX_IMAGE_TOKENS_PER_IMAGE}"
   serve_rc=$?
   set -e
   trap 'hold_gpu ERR' ERR
