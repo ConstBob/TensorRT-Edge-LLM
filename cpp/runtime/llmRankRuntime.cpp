@@ -524,6 +524,8 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
                 "LLMRankRuntime::mHostCancellationStates");
         }
 
+        mHostRaggedTokenIds = rt::Tensor({mDeployment.base.maxPhysicalTokens}, rt::DeviceType::kCPU, DataType::kINT32,
+            "LLMRankRuntime::mHostRaggedTokenIds");
         mHostDecoderTokenIds = rt::Tensor({mMaxRuntimeBatchSize, maxInputLength}, rt::DeviceType::kCPU,
             DataType::kINT32, "LLMRankRuntime::mHostDecoderTokenIds");
         mHostSelectedTokenIds = rt::Tensor(
@@ -1722,7 +1724,7 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         LOG_ERROR("Overlapping requests on one runtime are not supported.");
         return nullptr;
     }
-    auto generation = std::make_unique<SteppedGeneration>(mHandleRequestInProgress);
+    auto generation = std::make_unique<SteppedGeneration>(mHandleRequestInProgress, mHostRaggedTokenIds);
 
     mTokenBroadcast = std::move(tokenBroadcast);
     mParallelRank = parallelRank;

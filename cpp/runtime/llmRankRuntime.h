@@ -327,9 +327,17 @@ public:
             std::atomic<bool>& mActive;
         };
 
-        explicit SteppedGeneration(std::atomic<bool>& activeFlag) noexcept
+        explicit SteppedGeneration(std::atomic<bool>& activeFlag, Tensor& hostTokenStorage) noexcept
             : guard(activeFlag)
+            , mHostTokenStorage(hostTokenStorage)
         {
+            context.raggedExecutionBatch.hostTokenIds = std::move(mHostTokenStorage);
+        }
+
+        ~SteppedGeneration() noexcept
+        {
+            // Return ownership before destroying the context and releasing the request latch.
+            mHostTokenStorage = std::move(context.raggedExecutionBatch.hostTokenIds);
         }
 
         SteppedGeneration(SteppedGeneration const&) = delete;
@@ -348,6 +356,9 @@ public:
         {
             return managedKVCacheRequest.has_value() ? &*managedKVCacheRequest : nullptr;
         }
+
+    private:
+        Tensor& mHostTokenStorage;
     };
 
     //! Everything handleRequest does before the generation loop: validation, context population,
@@ -605,6 +616,7 @@ private:
     rt::Tensor mHostCancellationStates; //!< Pinned host staging paired with mDeviceCancellationStates.
 
     // [4] Host pinned memory tensors for optimized CPU-GPU memory transfers
+    rt::Tensor mHostRaggedTokenIds;      //!< Runtime-owned token snapshot lent to each request's ragged batch
     rt::Tensor mHostDecoderTokenIds;     //!< Pinned staging for specialized decoder token inputs
     rt::Tensor mHostSelectedTokenIds;    //!< Host pinned memory for selected token IDs from sampling
     rt::Tensor mHostOutputSpaceIds;      //!< Host pinned copy of the sampled indices taken before reduced-vocab remap
