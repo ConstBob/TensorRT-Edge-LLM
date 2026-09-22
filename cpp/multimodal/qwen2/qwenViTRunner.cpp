@@ -981,7 +981,7 @@ void QwenViTRunner::buildRotaryPosEmb(std::vector<VisionSpan> const& spans, cuda
     }
 }
 
-rt::OptionalInputTensors QwenViTRunner::getDeepstackFeatures()
+std::vector<std::reference_wrapper<rt::Tensor>> QwenViTRunner::getDeepstackFeatures()
 {
     return {};
 }

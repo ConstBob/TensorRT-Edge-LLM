@@ -2638,13 +2638,16 @@ bool LLMRankRuntime::multiModalRuntimePreprocess(LLMGenerationRequest const& req
                 int64_t const hiddenSize = output.getShape()[1];
                 size_t const typeSize = rt::utils::getTypeSize(output.getDataType());
                 int64_t byteOffset = 0;
-                for (size_t i = 0; i < audioHashes.size(); ++i)
+                if (tokenLengths.size() == audioHashes.size())
                 {
-                    int64_t const numTok = tokenLengths[i];
-                    mEncoderEmbeddingCache->storeSlice(audioHashes[i],
-                        static_cast<char const*>(output.rawPointer()) + byteOffset, numTok, hiddenSize,
-                        output.getDataType(), stream);
-                    byteOffset += numTok * hiddenSize * static_cast<int64_t>(typeSize);
+                    for (size_t i = 0; i < audioHashes.size(); ++i)
+                    {
+                        int64_t const numTok = tokenLengths[i];
+                        mEncoderEmbeddingCache->storeSlice(audioHashes[i],
+                            static_cast<char const*>(output.rawPointer()) + byteOffset, numTok, hiddenSize,
+                            output.getDataType(), stream);
+                        byteOffset += numTok * hiddenSize * static_cast<int64_t>(typeSize);
+                    }
                 }
             }
         }
@@ -2654,6 +2657,7 @@ bool LLMRankRuntime::multiModalRuntimePreprocess(LLMGenerationRequest const& req
     if (hasVision && mVisionRunner)
     {
         bool visionCacheHit = false;
+        bool visionTextPreprocessed = false;
         std::vector<Hash128> imageHashes;
 
         if (mEncoderEmbeddingCache)
@@ -2685,45 +2689,41 @@ bool LLMRankRuntime::multiModalRuntimePreprocess(LLMGenerationRequest const& req
         }
 
         bool allHit = mEncoderEmbeddingCache && !imageHashes.empty();
-        std::vector<std::reference_wrapper<rt::Tensor const>> cachedVision;
         if (allHit)
         {
             for (auto const& h : imageHashes)
             {
-                auto r = mEncoderEmbeddingCache->lookup(h);
+                auto r = mEncoderEmbeddingCache->lookupEntry(h);
                 if (!r)
                 {
                     allHit = false;
                     break;
                 }
-                cachedVision.push_back(std::cref(r->get()));
             }
         }
 
         if (allHit)
         {
-            LOG_INFO(
-                "Encoder embedding cache HIT for all %zu images — skipping ViT encoder execution", imageHashes.size());
             if (!mVisionRunner->preprocess(request, batchedInputIds, mTokenizer, mropeCosSinOut, stream, false, true))
             {
                 LOG_ERROR("Vision text preprocessing failed on cache hit.");
                 return false;
             }
-            rt::Tensor& output = mVisionRunner->getOutputEmbedding();
-            int64_t byteOffset = 0;
-            for (auto const& entry : cachedVision)
+            visionTextPreprocessed = true;
+            visionCacheHit = mEncoderEmbeddingCache->tryRestore(imageHashes, mVisionRunner->getLastMediaTokenLengths(),
+                mVisionRunner->getOutputEmbedding(), mVisionRunner->getDeepstackFeatures(), stream);
+            if (visionCacheHit)
             {
-                int64_t const bytes = entry.get().getMemoryCapacity();
-                CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(output.rawPointer()) + byteOffset,
-                    entry.get().rawPointer(), bytes, cudaMemcpyDeviceToDevice, stream));
-                byteOffset += bytes;
+                LOG_INFO("Encoder embedding cache HIT for all %zu images — skipping ViT encoder execution",
+                    imageHashes.size());
             }
-            visionCacheHit = true;
         }
 
         if (!visionCacheHit)
         {
-            if (!mVisionRunner->preprocess(request, batchedInputIds, mTokenizer, mropeCosSinOut, stream))
+            // On a layout mismatch, text and MRoPE are already prepared for this request. Only redo pixel work.
+            if (!mVisionRunner->preprocess(
+                    request, batchedInputIds, mTokenizer, mropeCosSinOut, stream, visionTextPreprocessed))
             {
                 LOG_ERROR("Vision preprocessing failed. This request cannot be handled.");
                 return false;
@@ -2738,19 +2738,21 @@ bool LLMRankRuntime::multiModalRuntimePreprocess(LLMGenerationRequest const& req
             if (mEncoderEmbeddingCache && !imageHashes.empty())
             {
                 rt::Tensor const& output = mVisionRunner->getOutputEmbedding();
+                auto const features = mVisionRunner->getDeepstackFeatures();
                 auto const& tokenLengths = mVisionRunner->getLastMediaTokenLengths();
                 if (tokenLengths.size() == imageHashes.size())
                 {
                     int64_t const hiddenSize = output.getShape()[1];
                     size_t const typeSize = rt::utils::getTypeSize(output.getDataType());
-                    int64_t byteOffset = 0;
+                    int64_t tokenOffset = 0;
                     for (size_t i = 0; i < imageHashes.size(); ++i)
                     {
                         int64_t const numTok = tokenLengths[i];
                         mEncoderEmbeddingCache->storeSlice(imageHashes[i],
-                            static_cast<char const*>(output.rawPointer()) + byteOffset, numTok, hiddenSize,
-                            output.getDataType(), stream);
-                        byteOffset += numTok * hiddenSize * static_cast<int64_t>(typeSize);
+                            static_cast<char const*>(output.rawPointer())
+                                + tokenOffset * hiddenSize * static_cast<int64_t>(typeSize),
+                            numTok, hiddenSize, output.getDataType(), stream, features, tokenOffset);
+                        tokenOffset += numTok;
                     }
                 }
             }
@@ -2786,11 +2788,13 @@ bool LLMRankRuntime::multiModalRuntimePreprocess(LLMGenerationRequest const& req
         = (hasVision && mVisionRunner) ? std::optional{std::ref(mVisionRunner->getOutputEmbedding())} : std::nullopt;
     rt::OptionalInputTensor audioEmbeddings
         = (hasAudio && mAudioRunner) ? std::optional{std::ref(mAudioRunner->getOutputEmbedding())} : std::nullopt;
-    rt::OptionalInputTensors deepstackFeatures
-        = (hasVision && mVisionRunner) ? mVisionRunner->getDeepstackFeatures() : rt::OptionalInputTensors{};
-
     context.visualEmbeddings = visionEmbeddings;
-    context.deepstackFeatures = deepstackFeatures;
+    context.deepstackFeatures.clear();
+    if (hasVision && mVisionRunner)
+    {
+        auto const features = mVisionRunner->getDeepstackFeatures();
+        context.deepstackFeatures.assign(features.begin(), features.end());
+    }
     context.audioEmbeddings = audioEmbeddings;
 
     // Populate system prompts and raw input IDs from batchedInputIds
