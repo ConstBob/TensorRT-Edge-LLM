@@ -10,6 +10,11 @@ This guide provides two independent ways to run the image-capable
 Complete [Installation](installation.md) first. You do not need to complete the
 ONNX workflow before using the Python server.
 
+Before building engines or launching inference, verify that the target has at
+least the deployed model size plus 2 GB of available device memory. KV cache,
+multimodal components, speculative draft engines, and larger batch or sequence
+profiles can require more.
+
 ```bash
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace/Qwen3.5-0.8B
 mkdir -p "$WORKSPACE_DIR"

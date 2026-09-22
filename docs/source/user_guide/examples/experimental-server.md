@@ -12,7 +12,9 @@ Anthropic HTTP APIs. ONNX is not used by this path.
 For a supported target, follow [published-wheel installation](../getting_started/installation.md#published-python-wheel)
 and select `tensorrt-edgellm[server]==0.11.0`. The wheel includes the runtime
 bindings, builder, and plugin; no checkout, `native-build` extra, or CMake build
-is needed. Run the examples in that environment outside a source checkout.
+is needed. Install the TensorRT Python bindings supported by the target
+platform before launching the server. Run the examples in that environment
+outside a source checkout.
 
 Alternatively, complete the [source build and server setup](../getting_started/installation.md#install-and-launch-the-python-server).
 Do not reinstall the source package over a published wheel.
@@ -237,8 +239,13 @@ tokenization pass.
 
 The request contract includes sampling, stop strings, log probabilities,
 `logit_bias`, tools, `parallel_tool_calls`, thinking, structured output, and
-per-request speculative disablement. Unsupported fields such as penalties and
-seed are rejected rather than ignored. Only `n=1` is supported.
+per-request speculative disablement. `seed` accepts an unsigned 64-bit request
+seed, and `top_k=-1` disables top-k filtering. `min_p` and text
+`repetition_penalty` are accepted for client compatibility, but the runtime
+currently supports only their defaults (`0.0` and `1.0`); non-default values
+are normalized to those defaults with a server warning. Nonzero
+`frequency_penalty` and `presence_penalty` remain unsupported and are rejected.
+Only `n=1` is supported.
 Provider chat templating and the assistant generation prompt are enabled by
 default. Set `apply_chat_template=false` only for an already formatted prompt,
 or `add_generation_prompt=false` when continuing an existing assistant turn.
