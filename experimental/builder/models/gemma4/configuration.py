@@ -45,6 +45,32 @@ def component_config(root: dict, component: contracts.Component) -> dict:
     raise ValueError(f"Gemma4 has no {component.value} configuration")
 
 
+def setup_profiles(builder, builder_config, network, args, bundle) -> bool:
+    """Install the one-frame minimum required by unified audio runtime."""
+    if (args.resolved_component != contracts.Component.AUDIO
+            or bundle.root_model_type != "gemma4_unified"):
+        return False
+    inputs = {
+        network.get_input(index).name: network.get_input(index)
+        for index in range(network.num_inputs)
+    }
+    features = inputs.get("input_features")
+    if features is None or tuple(int(dim)
+                                 for dim in features.shape) != (1, -1, 640):
+        raise ValueError(
+            "Gemma4 Unified audio network must define input_features [1,T,640]"
+        )
+    maximum = int(args.max_time_steps)
+    if maximum < 1:
+        raise ValueError("Gemma4 Unified max_time_steps must be positive")
+    optimum = 1 + (maximum - 1) // 2
+    profile = builder.create_optimization_profile()
+    profile.set_shape("input_features", (1, 1, 640), (1, optimum, 640),
+                      (1, maximum, 640))
+    builder_config.add_optimization_profile(profile)
+    return True
+
+
 def prepare_text_config(config: dict, root: dict,
                         component: contracts.Component,
                         model_dir: str) -> dict:
@@ -83,6 +109,31 @@ def prepare_text_config(config: dict, root: dict,
     rope_parameters["sliding_attention"] = sliding
     config["rope_parameters"] = rope_parameters
     return config
+
+
+def normalize_block_draft_config(config) -> None:
+    """Select Gemma4's single global-attention contract for block drafts."""
+    if (not str(config.model_type).startswith("gemma4")
+            or not config.attention_layer_types
+            or any(layer_type != "full_attention"
+                   for layer_type in config.attention_layer_types)):
+        return
+
+    if config.global_head_dim > 0:
+        config.head_dim = config.global_head_dim
+    if config.num_global_key_value_heads > 0:
+        config.num_key_value_heads = config.num_global_key_value_heads
+
+    full_rope = config.full_rope_config or {}
+    scaling = full_rope.get("rope_scaling")
+    if isinstance(scaling, dict):
+        config.rope_scaling = dict(scaling)
+    config.rope_theta = float(full_rope.get("rope_theta", config.rope_theta))
+    config.partial_rotary_factor = float(
+        full_rope.get("partial_rotary_factor", config.partial_rotary_factor))
+    config.sliding_rope_config = None
+    config.full_rope_config = None
+    config.sliding_window_size = -1
 
 
 def update_device_config(config, root: dict,

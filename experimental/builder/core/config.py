@@ -475,18 +475,17 @@ class DeviceConfig:
             mtp_tree_base=bool(llm.get("mtp_tree_base", False)),
             dflash_base=bool(llm.get("dflash_base", False)),
             dflash_tree_base=bool(llm.get("dflash_tree_base", False)),
-            dflash_target_layer_ids=list(
-                (llm.get("dflash_config")
-                 or {}).get("target_layer_ids",
-                            llm.get("dflash_target_layer_ids", []))),
-            dflash_block_size=int((llm.get("dflash_config")
-                                   or {}).get("block_size",
-                                              llm.get("dflash_block_size",
-                                                      16))),
-            dflash_mask_token_id=int(
-                (llm.get("dflash_config")
-                 or {}).get("mask_token_id",
-                            llm.get("dflash_mask_token_id", 248070))),
+            dflash_target_layer_ids=list((llm.get("dflash_config") or {}).get(
+                "target_layer_ids",
+                llm.get("dflash_target_layer_ids",
+                        llm.get("target_layer_ids", [])))),
+            dflash_block_size=int((llm.get("dflash_config") or {}).get(
+                "block_size",
+                llm.get("dflash_block_size", llm.get("block_size", 16)))),
+            dflash_mask_token_id=int((llm.get("dflash_config") or {}).get(
+                "mask_token_id",
+                llm.get("dflash_mask_token_id",
+                        llm.get("mask_token_id", 248070)))),
             dflash_version=dflash_contract.version,
             dflash2_target_layer_ids=list((llm.get("dflash_config")
                                            or {}).get("target_layer_ids", [])),

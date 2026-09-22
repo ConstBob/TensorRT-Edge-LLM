@@ -406,6 +406,23 @@ class Weights:
         """Return one tensor while retaining its stored integer/float dtype."""
         return np.ascontiguousarray(self.store.get_numpy(self._resolve(name)))
 
+    def gptq_expert_projection(self, experts_prefix: str, expert_index: int,
+                               projection: str):
+        """Load one GPTQ expert projection in its provider layout."""
+        prefix = f"{experts_prefix}.{expert_index}.{projection}"
+        if self.has(prefix + ".g_idx"):
+            group_index = self.array(prefix + ".g_idx").reshape(-1)
+            group_size = self.module_quant_group_size(prefix)
+            expected = np.arange(group_index.size) // group_size
+            if not np.array_equal(group_index, expected):
+                raise ValueError(
+                    f"act-order GPTQ experts are not supported: {prefix}")
+        qzeros = (self.array(prefix + ".qzeros")
+                  if self.has(prefix + ".qzeros") else np.empty(
+                      (1, 0), dtype=np.int32))
+        return (self.array(prefix + ".qweight"), qzeros,
+                self.f16(prefix + ".scales"))
+
     def opt_f16(self, name: str) -> Optional[np.ndarray]:
         return self.f16(name) if self.has(name) else None
 

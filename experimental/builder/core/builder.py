@@ -671,16 +671,6 @@ def _setup_llm_profiles(builder, config, network, cfg: DeviceConfig,
             (2, ragged.checked_physical_tokens(max_sequences,
                                                optimum_width), maximum_tokens),
             generation_range.query_offsets, generation_range.logits_rows)
-    if (args.resolved_spec_role == contracts.SpecRole.DRAFT
-            and args.spec_type == "dspark"
-            and not cfg.dspark_sample_from_anchor):
-        proposal_width = args.max_draft_tree_size
-        proposal_tokens = tuple(
-            ragged.checked_physical_tokens(sequences, proposal_width)
-            for sequences in generation_range.num_sequences)
-        generation_range = ragged.DecoderProfileRange(
-            generation_range.num_sequences, proposal_tokens,
-            generation_range.query_offsets, proposal_tokens)
     proposal_context_range = generation_range if block_draft else prefill_range
 
     delta_context_tokens = (
