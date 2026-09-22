@@ -258,7 +258,7 @@ rt::Tensor& MultimodalRunner::getOutputEmbedding()
     return mOutputEmbedding;
 }
 
-rt::OptionalInputTensors MultimodalRunner::getDeepstackFeatures()
+std::vector<std::reference_wrapper<rt::Tensor>> MultimodalRunner::getDeepstackFeatures()
 {
     return {};
 }

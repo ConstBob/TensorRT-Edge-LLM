@@ -151,7 +151,7 @@ public:
 
     //! \brief Get deepstack features for Qwen3-VL
     //! \return Optional input tensors vector containing deepstack features
-    rt::OptionalInputTensors getDeepstackFeatures() override;
+    std::vector<std::reference_wrapper<rt::Tensor>> getDeepstackFeatures() override;
 
     //! \brief Get MRoPE rope deltas for each batch from the last preprocess/infer run.
     //! \return Vector of length (batch size): delta = maxMropePositionId + 1 - inputIdSize per batch; empty if not yet
